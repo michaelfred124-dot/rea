@@ -74,6 +74,23 @@ jobs:
           cargo run --locked -q -- rebuild "$rig/hive_demo.hive.json"
           python3 -I tests/dcc_stub_run.py unreal "$rig/hive_demo_unreal.py"
           python3 -I tests/dcc_stub_run.py maya "$rig/hive_demo_maya.py" --guides
+      - name: Rig templates - save, apply onto another character, rebuild
+        run: |
+          t="$RUNNER_TEMP/templates"
+          export XDG_CONFIG_HOME="$t/config"
+          cargo run --locked -q -- demo -o "$t/a"
+          cargo run --locked -q -- demo -o "$t/b" --arm-drop 45
+          for part in fingers tail eyes; do cargo run --locked -q -- add "$t/a/hive_demo.guides.json" "$part"; done
+          cargo run --locked -q -- template save "$t/a/hive_demo.guides.json" "$t/studio.template.json"
+          cargo run --locked -q -- template save "$t/a/hive_demo.guides.json" "$XDG_CONFIG_HOME/hive-rig/templates/bits.template.json" --only index_l,tail
+          cargo run --locked -q -- template list | grep -q "^bits "
+          cargo run --locked -q -- template apply "$t/b/hive_demo.guides.json" "$t/studio.template.json"
+          cargo run --locked -q -- template apply "$t/b/hive_demo.guides.json" bits | tee "$t/log.txt"
+          grep -q "index2_l, tail2" "$t/log.txt"
+          cargo run --locked -q -- template apply "$t/b/hive_demo.guides.json" bits --parent head
+          cargo run --locked -q -- template apply "$t/a/hive_demo.guides.json" biped_face_fingers
+          for rig in a b; do cargo run --locked -q -- rebuild "$t/$rig/hive_demo.hive.json"; done
+          python3 -I tests/dcc_stub_run.py maya "$t/b/hive_demo_maya.py"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: hive-demo-rigs

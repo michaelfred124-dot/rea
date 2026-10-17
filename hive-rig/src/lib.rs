@@ -24,6 +24,7 @@ pub mod naming;
 pub mod rig;
 pub mod skeleton;
 pub mod skin;
+pub mod template;
 
 pub use export::Target;
 pub use rig::{Rig, RigOptions, auto_rig, build_rig};

@@ -32,7 +32,8 @@ a joint; with Symmetry on, its twin on the other side follows.
   bones will export as. Click a panel's title to fold it away.
 * **The rigging window** (Add, or Shift+A) is the library of premade parts, each
   with an illustration: face joints, eyes with a look-at control, a jaw, ears, fingers, toes, a
-  tail, a ponytail, a prop socket in the right hand, and a custom chain.
+  tail, a ponytail, a prop socket in the right hand, and a custom chain. Its
+  **Templates** category lists saved setups (see [Rig templates](#rig-templates)).
 * **The export window** (Ctrl+E) picks the programs, the naming convention, the
   file name and the folder.
 
@@ -212,9 +213,49 @@ From the right-click menu, **Import components…** brings the premade parts of
 another guides file in, hung from the bone under the pointer. The CLI has the
 same: `hive-rig import <guides> <other.guides.json> --parent ball_l` and
 `hive-rig attach <guides> <id> <bone>`. Components keep their ids, so an id the
-rig already uses is refused rather than renamed.
+rig already uses is refused rather than renamed (a parts template renames instead).
 
 Toes (`hive-rig add <guides> toes`) are five chains from each foot's ball.
+
+### Rig templates
+
+A template is a studio's own setup saved to reuse on other characters: a set of
+components with their options and control looks, in `<name>.template.json`.
+Guide positions are stored in body heights from the root guide, so a template
+made on one character fits another of any size.
+
+* A **layout** template holds every component. Loading it replaces the
+  character's guides, scaled to its body, along with the control looks (and the
+  naming convention, when the template has its own).
+* A **parts** template holds premade parts only (fingers, toes, tails, chains,
+  eyes, a jaw, the face). Loading it adds them like an import, except that an id
+  the rig already uses gets a number (`index_l` becomes `index2_l`, `tail`
+  becomes `tail2`) and the bones and control looks follow the new name. Parts
+  that hang from a bone outside the template keep that bone, or hang from the one
+  you choose; parts hanging from another part of the template stay on it.
+
+In the app, **File > Save as template…** saves the whole layout and **Save
+picked as template…** saves the parts picked with Shift. The rigging window's
+**Templates** category shows a card for each template, drawn from its guides;
+click one to load it (one undo step). **Load template…** loads a file, and the
+viewport's right-click **Load template here…** hangs a parts template from the
+bone under the pointer.
+
+Templates are listed from two folders, plus two built in (`biped`, and
+`biped_face_fingers` with eyes, a jaw, face joints and fingers):
+
+* `templates/` next to the program, for a studio to ship its own;
+* the user folder, where new templates are saved: `%APPDATA%\HiveRig\templates`
+  on Windows, `$XDG_CONFIG_HOME/hive-rig/templates` or `~/.config/hive-rig/templates`
+  elsewhere.
+
+```bash
+hive-rig template save out/hero.guides.json studio_biped.template.json
+hive-rig template save out/hero.guides.json hands.template.json --only thumb_l,index_l
+hive-rig template apply other.guides.json biped_face_fingers     # by name or file
+hive-rig template apply other.guides.json hands.template.json --parent head
+hive-rig template list
+```
 
 ### Weight tools
 
@@ -300,7 +341,9 @@ mirrors it, paints a weight, adds fingers and a tail, and rebuilds. Then it
 checks that the bones moved, the painted weight survived, the new fingers got
 weights and controls, and a finger control bends the finger.
 The app's editing operations (add, remove, mirror, symmetric moves, undo, build,
-export and reopening a rig) have unit tests in `src/studio/app.rs`, and CI opens
+export, reopening a rig and loading templates) have unit tests in `src/studio/app.rs`;
+templates have their own (`src/template.rs`: JSON round trip, scaling to another
+body height, id clashes, inner parent links and the folders). CI opens
 the app on a virtual screen and screenshots it after building the demo rig.
 CI runs all of this (`.github/workflows/hive-rig.yml`), and builds both Windows
 executables as a downloadable artifact.

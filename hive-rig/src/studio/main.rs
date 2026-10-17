@@ -1,7 +1,7 @@
 //! Hive Rig: the desktop rigging app. Double-click it, open a character, adjust
 //! the guides, build and export.
 //!
-//! `HiveRig [character file] [--demo] [--build] [--weights BONE] [--library] [--export]
+//! `HiveRig [character file] [--demo] [--build] [--weights BONE] [--library] [--templates] [--export]
 //! [--select COMPONENT[,COMPONENT...]] [--pick NAME] [--pose BONE] [--screenshot OUT.ppm]`
 //! (the flags exist so the window can be checked automatically).
 
@@ -25,6 +25,7 @@ struct Launch {
     build: bool,
     weights: Option<String>,
     library: bool,
+    templates: bool,
     export: bool,
     select: Option<String>,
     pick: Option<String>,
@@ -43,6 +44,10 @@ fn parse_args() -> Launch {
                 launch.weights = args.next().map(|s| s.to_string_lossy().into_owned())
             }
             Some("--library") => launch.library = true,
+            Some("--templates") => {
+                launch.library = true;
+                launch.templates = true;
+            }
             Some("--export") => launch.export = true,
             Some("--select") => {
                 launch.select = args.next().map(|s| s.to_string_lossy().into_owned())
@@ -112,6 +117,9 @@ fn main() -> eframe::Result {
     }
     studio.weights_bone = launch.weights;
     studio.library_open = launch.library;
+    if launch.templates {
+        studio.category = app::Category::Templates;
+    }
     studio.export_open = launch.export;
     if let Some(bone) = &launch.pose {
         studio.start_pose(bone);

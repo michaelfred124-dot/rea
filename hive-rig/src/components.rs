@@ -241,7 +241,30 @@ fn chain_bone_name(id: &str, side: Side, i: usize) -> String {
     format!("{base}_{i:02}{s}")
 }
 
-// --------------------------------------------------------------------------- templates
+/// The bone and control names a component takes from its id, in build order
+/// (chain bones and their controls, the eyes' master control). Every other name
+/// a component builds is fixed by its kind.
+pub fn id_names(c: &Component) -> (Vec<String>, Vec<String>) {
+    match c.kind {
+        Kind::Chain => {
+            let bones: Vec<String> = (1..c.guides.len())
+                .map(|i| chain_bone_name(&c.id, c.side, i))
+                .collect();
+            let controls = bones.iter().map(|b| ctrl_name(b)).collect();
+            (bones, controls)
+        }
+        Kind::Eyes => (Vec::new(), vec![format!("{}_ctrl", c.id)]),
+        _ => (Vec::new(), Vec::new()),
+    }
+}
+
+/// Kinds that can be added to any rig: the body's own kinds are fixed to the
+/// mannequin's bone names, so a rig has exactly one of each.
+pub fn is_premade_part(kind: Kind) -> bool {
+    matches!(kind, Kind::Chain | Kind::Eyes | Kind::Jaw | Kind::Face)
+}
+
+// --------------------------------------------------------------------------- default layout
 
 /// The default biped layout (mannequin bone names) placed on detected landmarks.
 pub fn biped(lm: &Landmarks) -> Guides {
@@ -734,7 +757,7 @@ pub fn import(g: &mut Guides, src: &Guides, bone: &str) -> Result<Vec<String>> {
     let imported: Vec<&Component> = src
         .components
         .iter()
-        .filter(|c| matches!(c.kind, Kind::Chain | Kind::Eyes | Kind::Jaw | Kind::Face))
+        .filter(|c| is_premade_part(c.kind))
         .collect();
     let ids: HashSet<&str> = imported.iter().map(|c| c.id.as_str()).collect();
     for c in &imported {
@@ -963,6 +986,7 @@ impl Builder {
             size,
             color,
             spaces: Vec::new(),
+            component: self.component.clone(),
         });
     }
 
@@ -1464,9 +1488,7 @@ fn build_chain(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
         b.sk.bone(parent)
             .map(|p| p.region)
             .unwrap_or(Region::Center);
-    let names: Vec<String> = (1..c.guides.len())
-        .map(|i| chain_bone_name(&c.id, c.side, i))
-        .collect();
+    let (names, _) = id_names(c);
     let mut prev = parent.to_string();
     for (i, name) in names.iter().enumerate() {
         b.bone(
@@ -1512,7 +1534,7 @@ fn build_eyes(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
         c.id
     );
     let dir = gaze.normalize();
-    let master = format!("{}_ctrl", c.id);
+    let master = id_names(c).1.remove(0);
     let parent_ctrl = b.parent_control(parent);
     let spread = l.distance(r).max(0.01 * b.h);
     b.control(

@@ -15,6 +15,7 @@ use hive_rig::components::{
 use hive_rig::naming::Naming;
 use hive_rig::rig::detect_guides;
 use hive_rig::skeleton::{Side, turn_about};
+use hive_rig::template::{self, Listed, Scope, Template};
 use hive_rig::{Rig, RigOptions, Target, build_rig, demo, export, import, mesh::Mesh, skin};
 
 use crate::view::{self, Camera};
@@ -93,6 +94,8 @@ pub enum Category {
     Face,
     Body,
     Extras,
+    /// Saved setups: the built-in templates and the ones in the template folders.
+    Templates,
 }
 
 struct Drag {
@@ -167,6 +170,9 @@ pub struct Studio {
     pub menu_rig: Option<RigPick>,
     /// Component whose handle is being dragged onto a joint to attach it.
     pub handle_drag: Option<usize>,
+    /// Templates found by the last scan of the template folders, and the files
+    /// that couldn't be read. `None` until the first scan.
+    pub templates: Option<(Vec<Listed>, Vec<String>)>,
     drag: Option<Drag>,
     weight_colors: Option<(String, Vec<Color32>)>,
 }
@@ -183,6 +189,7 @@ impl Default for Studio {
             menu_guide: None,
             menu_rig: None,
             handle_drag: None,
+            templates: None,
             symmetry: true,
             mode: Mode::Guides,
             outliner_open: true,
@@ -591,6 +598,81 @@ impl Studio {
             let added = components::import(g, &src, &bone)?;
             Ok(format!("Imported {} from {}.", added.join(", "), bone))
         });
+    }
+
+    /// Look for templates again (built-in ones and the template folders).
+    pub fn scan_templates(&mut self) {
+        self.templates = Some(template::list());
+    }
+
+    /// The listed templates, scanning the folders the first time.
+    pub fn listed_templates(&mut self) -> &(Vec<Listed>, Vec<String>) {
+        self.templates.get_or_insert_with(template::list)
+    }
+
+    /// Load a template onto the character as one undo step: a whole layout
+    /// replaces the guides, parts are added (hung from `bone` when their parent
+    /// isn't in the template and a bone is given).
+    pub fn apply_template(&mut self, t: &Template, bone: Option<&str>) -> bool {
+        let done = self.edit("load the template", |g| {
+            let applied = t.apply(g, bone)?;
+            Ok(match t.scope {
+                Scope::Layout => format!(
+                    "Loaded the {} layout: {} components.",
+                    t.name,
+                    applied.added.len()
+                ),
+                Scope::Parts => format!("Added {} from {}.", applied.summary(), t.name),
+            })
+        });
+        if done {
+            self.selected = None;
+            self.picked.clear();
+            self.mode = Mode::Guides;
+        }
+        done
+    }
+
+    /// Read a template file and load it onto the character.
+    pub fn apply_template_file(&mut self, path: &Path, bone: Option<&str>) {
+        match Template::load(path) {
+            Ok(t) => {
+                self.apply_template(&t, bone);
+            }
+            Err(e) => self.fail(format!("Couldn't load the template: {e:#}")),
+        }
+    }
+
+    /// Save the whole layout, or only the picked components, as a template.
+    pub fn save_template(&mut self, path: &Path, picked_only: bool) {
+        let Some(doc) = &self.doc else { return };
+        let only: Option<Vec<String>> =
+            picked_only.then(|| self.picked.iter().map(|(id, _)| id.clone()).collect());
+        let name = template::name_from_path(path);
+        let result = Template::from_guides(&doc.guides, only.as_deref(), &name)
+            .and_then(|t| t.save(path).map(|_| t));
+        match result {
+            Ok(t) => {
+                self.scan_templates();
+                let what = match t.scope {
+                    Scope::Layout => "the layout".to_string(),
+                    Scope::Parts => {
+                        let ids: Vec<&str> = t
+                            .components
+                            .iter()
+                            .map(|p| p.component.id.as_str())
+                            .collect();
+                        ids.join(", ")
+                    }
+                };
+                self.info(format!(
+                    "Saved {what} as the {} template in {}",
+                    t.name,
+                    path.display()
+                ));
+            }
+            Err(e) => self.fail(format!("Couldn't save the template: {e:#}")),
+        }
     }
 
     /// The bones, controls and skin as they show now, with any test pose applied.
@@ -1587,5 +1669,44 @@ mod tests {
         );
         assert_eq!(guides(&s, "leg_l"), leg);
         assert!(s.build(), "{}", s.status);
+    }
+
+    #[test]
+    fn templates_save_picks_and_load_as_one_undo_step() {
+        let mut s = demo_studio();
+        s.add_tail();
+        s.add_eyes();
+        let dir =
+            std::env::temp_dir().join(format!("hive_studio_templates_{}", std::process::id()));
+        let path = dir.join(format!("bits{}", template::TEMPLATE_SUFFIX));
+        // Picked parts only: the tail and the eyes.
+        s.pick_one(comp(&s, "tail"), None);
+        s.toggle_pick(comp(&s, "eyes"), None);
+        s.save_template(&path, true);
+        assert!(!s.error, "{}", s.status);
+        let t = Template::load(&path).unwrap();
+        assert_eq!(t.scope, Scope::Parts);
+        assert_eq!(t.components.len(), 2);
+
+        // The rig has eyes already, so the template is refused and nothing changes.
+        s.apply_template_file(&path, None);
+        assert!(s.error);
+        // Without the eyes it loads; the tail id is taken, so it gets a number.
+        s.edit("remove", |g| {
+            components::remove(g, "eyes")?;
+            Ok(String::new())
+        });
+        s.apply_template_file(&path, None);
+        assert!(!s.error, "{}", s.status);
+        let g = &s.doc.as_ref().unwrap().guides;
+        assert!(g.component("tail2").is_some() && g.component("eyes").is_some());
+
+        // A built-in layout replaces the whole layout; undo brings the parts back.
+        let biped = template::built_in()[0].clone();
+        assert!(s.apply_template(&biped, None), "{}", s.status);
+        assert!(s.doc.as_ref().unwrap().guides.component("tail").is_none());
+        s.undo();
+        assert!(s.doc.as_ref().unwrap().guides.component("tail2").is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

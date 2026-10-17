@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use hive_rig::components::{self, AddOptions, Guides, Kind, Preset};
 use hive_rig::rig::detect_guides;
 use hive_rig::skeleton::Side;
+use hive_rig::template::{self, Template};
 use hive_rig::{Rig, RigOptions, Target, build_rig, demo, export, import, mesh::Mesh, naming, rig};
 
 #[derive(Parser)]
@@ -101,6 +102,11 @@ enum Command {
     Remove { guides: PathBuf, id: String },
     /// List the components in a guides file.
     Components { guides: PathBuf },
+    /// Save a layout as a template, load one onto a layout, or list them.
+    Template {
+        #[command(subcommand)]
+        action: TemplateCommand,
+    },
     /// Show or set how a guides file names joints and controls on export.
     Naming {
         guides: PathBuf,
@@ -120,6 +126,37 @@ enum Command {
         #[arg(long)]
         center: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum TemplateCommand {
+    /// Save the whole layout, or only some premade parts, as `<name>.template.json`.
+    Save {
+        guides: PathBuf,
+        /// The template file (`<name>.template.json`), or a folder to save it in.
+        out: PathBuf,
+        /// Only these components (premade parts such as fingers, a tail or eyes).
+        #[arg(long, value_delimiter = ',')]
+        only: Option<Vec<String>>,
+        /// Template name (default: the file name).
+        #[arg(long)]
+        name: Option<String>,
+        /// A line describing the template.
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// Load a template onto a guides file: a whole layout replaces the guides
+    /// (scaled to this body), parts are added (ids in use get a number).
+    Apply {
+        guides: PathBuf,
+        /// A template file, or the name of a built-in or saved template.
+        template: String,
+        /// Bone to hang parts from whose parent isn't in the template.
+        #[arg(long)]
+        parent: Option<String>,
+    },
+    /// List the built-in templates and the ones in the template folders.
+    List,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -302,6 +339,98 @@ fn guided_rig(dropped: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+fn template_command(action: TemplateCommand) -> Result<()> {
+    match action {
+        TemplateCommand::Save {
+            guides,
+            out,
+            only,
+            name,
+            description,
+        } => {
+            let g = Guides::load(&guides)?;
+            let name = name.unwrap_or_else(|| {
+                if out.is_dir() {
+                    guides
+                        .file_name()
+                        .map(|f| f.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                        .trim_end_matches(".json")
+                        .trim_end_matches(".guides")
+                        .to_string()
+                } else {
+                    template::name_from_path(&out)
+                }
+            });
+            let path = if out.is_dir() {
+                template::file_for(&out, &name)
+            } else {
+                anyhow::ensure!(
+                    out.to_string_lossy().ends_with(template::TEMPLATE_SUFFIX),
+                    "name the template file <name>{}",
+                    template::TEMPLATE_SUFFIX
+                );
+                out
+            };
+            let mut t = Template::from_guides(&g, only.as_deref(), &name)?;
+            t.description = description.unwrap_or_default();
+            t.save(&path)?;
+            let what = t
+                .components
+                .iter()
+                .map(|p| p.component.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("Saved template '{}' ({what}) to {}", t.name, path.display());
+            Ok(())
+        }
+        TemplateCommand::Apply {
+            guides,
+            template: spec,
+            parent,
+        } => {
+            let mut g = Guides::load(&guides)?;
+            let t = template::find(&spec)?;
+            let applied = t.apply(&mut g, parent.as_deref())?;
+            save_guides(&guides, &g)?;
+            match t.scope {
+                template::Scope::Layout => println!(
+                    "Loaded the '{}' layout ({} components)",
+                    t.name,
+                    applied.added.len()
+                ),
+                template::Scope::Parts => {
+                    println!("Added {} from '{}'", applied.summary(), t.name)
+                }
+            }
+            Ok(())
+        }
+        TemplateCommand::List => {
+            let (listed, problems) = template::list();
+            for l in &listed {
+                let scope = match l.template.scope {
+                    template::Scope::Layout => "layout",
+                    template::Scope::Parts => "parts",
+                };
+                let from = match &l.source {
+                    template::Source::BuiltIn => "built in".to_string(),
+                    template::Source::File(p) => p.display().to_string(),
+                };
+                println!("{:<22} {scope:<7} {from}", l.template.name);
+            }
+            for p in problems {
+                eprintln!("warning: {p}");
+            }
+            let folders: Vec<String> = template::folders()
+                .iter()
+                .map(|d| d.display().to_string())
+                .collect();
+            println!("Template folders: {}", folders.join(", "));
+            Ok(())
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     match args.as_slice() {
@@ -423,6 +552,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Template { action } => template_command(action),
         Command::Naming {
             guides,
             preset,

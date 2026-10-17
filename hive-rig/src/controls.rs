@@ -63,6 +63,10 @@ pub struct Control {
     /// parent and the animator can switch the control to follow any of the others.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spaces: Vec<String>,
+    /// Id of the component that built this control. Only known for a freshly
+    /// built rig; it isn't written to rig files.
+    #[serde(skip)]
+    pub component: String,
 }
 
 /// A two-bone limb with IK and FK controls and a blend between them.

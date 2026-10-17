@@ -18,6 +18,7 @@ use hive_rig::components::{self, ControlStyle, Guides, Kind};
 use hive_rig::controls::{ControlKind, Shape};
 use hive_rig::naming::{Naming, Preset};
 use hive_rig::skeleton::Side;
+use hive_rig::template::{self, Listed, Scope, Source, Template};
 
 use super::{Category, Doc, Drag, FingerSides, Mode, Pose, RigPick, Studio, push_undo};
 use crate::theme::{self, ACCENT, BORDER, CARD, CARD_HI, ERR, OK, TEXT, TEXT_DIM, TEXT_FAINT};
@@ -91,6 +92,17 @@ fn open_folder(dir: &Path) {
         "xdg-open"
     };
     let _ = std::process::Command::new(program).arg(dir).spawn();
+}
+
+/// A file dialog for templates, opening in the user's template folder.
+fn template_dialog(title: &str) -> rfd::FileDialog {
+    let dialog = rfd::FileDialog::new()
+        .set_title(title)
+        .add_filter("Hive template", &["json"]);
+    match template::user_folder() {
+        Some(dir) if std::fs::create_dir_all(&dir).is_ok() => dialog.set_directory(dir),
+        _ => dialog,
+    }
 }
 
 fn character_dialog() -> rfd::FileDialog {
@@ -361,6 +373,37 @@ impl Studio {
                     self.save_guides(&p);
                 }
             }
+            ui.separator();
+            if ui
+                .add_enabled(has_doc, egui::Button::new("Load template…"))
+                .clicked()
+            {
+                ui.close();
+                if let Some(p) = template_dialog("Load a template").pick_file() {
+                    self.apply_template_file(&p, None);
+                }
+            }
+            if ui
+                .add_enabled(has_doc, egui::Button::new("Save as template…"))
+                .on_hover_text("Save the whole layout, its options and control looks")
+                .clicked()
+            {
+                ui.close();
+                self.save_template_dialog(false);
+            }
+            let picks = self.picked.len();
+            if ui
+                .add_enabled(
+                    has_doc && picks > 0,
+                    egui::Button::new(format!("Save picked as template… ({picks})")),
+                )
+                .on_hover_text("Save only the parts picked with Shift")
+                .clicked()
+            {
+                ui.close();
+                self.save_template_dialog(true);
+            }
+            ui.separator();
             if ui
                 .add_enabled(has_doc, egui::Button::new("Reset guides to the body"))
                 .clicked()
@@ -380,6 +423,25 @@ impl Studio {
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             }
         });
+    }
+
+    /// Ask where to save a template, then save the layout or the picks.
+    fn save_template_dialog(&mut self, picked_only: bool) {
+        let name = match (picked_only, &self.doc) {
+            (true, _) => self
+                .picked
+                .first()
+                .map(|(id, _)| id.clone())
+                .unwrap_or_default(),
+            (false, Some(doc)) => doc.name.clone(),
+            (false, None) => return,
+        };
+        if let Some(p) = template_dialog("Save as template")
+            .set_file_name(format!("{name}{}", template::TEMPLATE_SUFFIX))
+            .save_file()
+        {
+            self.save_template(&p, picked_only);
+        }
     }
 
     fn steps_pill(&mut self, ctx: &egui::Context) {
@@ -981,6 +1043,20 @@ impl Studio {
                 _ => "pelvis".to_string(),
             });
             ui.close();
+        }
+        if ui
+            .button("Load template here…")
+            .on_hover_text("Add a parts template, hung from the bone under the pointer")
+            .clicked()
+        {
+            let bone = match &self.menu_rig {
+                Some(RigPick::Bone(b)) => b.clone(),
+                _ => "pelvis".to_string(),
+            };
+            ui.close();
+            if let Some(p) = template_dialog("Load a template here").pick_file() {
+                self.apply_template_file(&p, Some(&bone));
+            }
         }
         if let Some(bone) = import_at
             && let Some(p) = rfd::FileDialog::new()
@@ -1730,10 +1806,15 @@ impl Studio {
                         (Category::Face, "Face"),
                         (Category::Body, "Body"),
                         (Category::Extras, "Extras"),
+                        (Category::Templates, "Templates"),
                     ],
                 );
                 self.category = cat;
                 ui.add_space(8.0);
+                if self.category == Category::Templates {
+                    close |= self.template_cards(ui, width);
+                    return;
+                }
                 let parts: Vec<&LibraryPart> = LIBRARY
                     .iter()
                     .filter(|p| self.category == Category::All || p.category == self.category)
@@ -1764,6 +1845,85 @@ impl Studio {
         if close || modal.should_close() {
             self.library_open = false;
         }
+    }
+
+    /// The Templates category: a card per template, then saving and the folders.
+    /// Returns whether a template was loaded.
+    fn template_cards(&mut self, ui: &mut Ui, width: f32) -> bool {
+        let (listed, problems) = self.listed_templates().clone();
+        let gap = 12.0;
+        let cols = 5;
+        let card_w = ((width - (cols - 1) as f32 * gap) / cols as f32).floor();
+        let mut loaded = false;
+        for row in listed.chunks(cols) {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                for l in row {
+                    if template_card(ui, card_w, l).clicked()
+                        && self.apply_template(&l.template, None)
+                    {
+                        loaded = true;
+                    }
+                }
+            });
+            ui.add_space(gap - 8.0);
+        }
+        ui.add_space(4.0);
+        egui::Frame::new()
+            .fill(Color32::from_rgb(17, 20, 26))
+            .stroke(Stroke::new(1.0, BORDER))
+            .corner_radius(12)
+            .inner_margin(12)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    theme::label_caps(ui, "Save");
+                    ui.add_space(8.0);
+                    if ui.button("Whole layout…").clicked() {
+                        self.save_template_dialog(false);
+                    }
+                    let picks = self.picked.len();
+                    if ui
+                        .add_enabled(picks > 0, egui::Button::new(format!("Picked parts ({picks})…")))
+                        .on_disabled_hover_text("Shift-click parts in the view or the outliner first")
+                        .clicked()
+                    {
+                        self.save_template_dialog(true);
+                    }
+                    if ui.button("Load file…").clicked()
+                        && let Some(p) = template_dialog("Load a template").pick_file()
+                    {
+                        self.apply_template_file(&p, None);
+                        loaded |= !self.error;
+                    }
+                    if ui.button("Refresh").clicked() {
+                        self.scan_templates();
+                    }
+                    if let Some(dir) = template::user_folder()
+                        && ui.button("Open folder").clicked()
+                        && std::fs::create_dir_all(&dir).is_ok()
+                    {
+                        open_folder(&dir);
+                    }
+                });
+                ui.add_space(4.0);
+                let folders: Vec<String> = template::folders()
+                    .iter()
+                    .map(|d| d.display().to_string())
+                    .collect();
+                ui.label(
+                    RichText::new(format!(
+                        "Layouts replace the guides, scaled to this character. Parts are added; ids in use get a number. Folders: {}",
+                        folders.join("  ·  ")
+                    ))
+                    .color(TEXT_FAINT)
+                    .size(12.0),
+                );
+                for p in &problems {
+                    ui.label(RichText::new(format!("Couldn't read {p}")).color(ERR).size(12.0));
+                }
+            });
+        loaded
     }
 
     fn library_options(&mut self, ui: &mut Ui) {
@@ -3063,6 +3223,150 @@ fn part_card(ui: &mut Ui, width: f32, part: &LibraryPart, added: bool) -> egui::
         response
             .on_hover_cursor(egui::CursorIcon::PointingHand)
             .on_hover_text(format!("Add {}", part.title.to_lowercase()))
+    }
+}
+
+/// A card in the Templates category: the template's guides seen from the
+/// front, its name, what it holds and where it comes from.
+fn template_card(ui: &mut Ui, width: f32, l: &Listed) -> egui::Response {
+    let t = &l.template;
+    let height = 204.0;
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
+    let hovered = response.hovered();
+    let painter = ui.painter();
+    painter.rect_filled(rect, 14, if hovered { CARD_HI } else { CARD });
+    painter.rect_stroke(
+        rect,
+        14,
+        Stroke::new(
+            if hovered { 1.5 } else { 1.0 },
+            if hovered {
+                ACCENT.gamma_multiply(0.8)
+            } else {
+                BORDER
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    let art = Rect::from_min_size(rect.min + Vec2::splat(6.0), Vec2::new(width - 12.0, 128.0));
+    paint_art_backdrop(painter, art, hovered);
+    template_preview(&painter.with_clip_rect(art), art, t, hovered);
+    let (chip_text, chip_color) = match t.scope {
+        Scope::Layout => ("Layout", ACCENT),
+        Scope::Parts => ("Parts", theme::LEFT),
+    };
+    let chip = Rect::from_min_size(art.left_top() + Vec2::new(8.0, 8.0), Vec2::new(54.0, 20.0));
+    painter.rect_filled(chip, 10, chip_color.gamma_multiply(0.22));
+    painter.text(
+        chip.center(),
+        Align2::CENTER_CENTER,
+        chip_text,
+        FontId::proportional(11.0),
+        chip_color,
+    );
+    if l.source == Source::BuiltIn {
+        painter.text(
+            art.right_top() + Vec2::new(-10.0, 12.0),
+            Align2::RIGHT_TOP,
+            "built in",
+            FontId::proportional(11.0),
+            TEXT_FAINT,
+        );
+    }
+    painter.text(
+        Pos2::new(rect.left() + 14.0, art.bottom() + 12.0),
+        Align2::LEFT_TOP,
+        &t.name,
+        FontId::proportional(15.5),
+        TEXT,
+    );
+    let text = if t.description.is_empty() {
+        let ids: Vec<&str> = t
+            .components
+            .iter()
+            .map(|p| p.component.id.as_str())
+            .collect();
+        let mut s = ids.iter().take(6).copied().collect::<Vec<_>>().join(", ");
+        if ids.len() > 6 {
+            s.push_str(&format!(" and {} more", ids.len() - 6));
+        }
+        s
+    } else {
+        t.description.clone()
+    };
+    let galley = painter.layout(text, FontId::proportional(12.0), TEXT_DIM, width - 28.0);
+    painter.galley(
+        Pos2::new(rect.left() + 14.0, art.bottom() + 34.0),
+        galley,
+        TEXT_DIM,
+    );
+    let tip = match (&l.source, t.scope) {
+        (Source::File(p), _) => format!("Load {} ({})", t.name, p.display()),
+        (Source::BuiltIn, Scope::Layout) => {
+            format!("Replace the guides with the {} layout", t.name)
+        }
+        (Source::BuiltIn, Scope::Parts) => format!("Add the parts of {}", t.name),
+    };
+    response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(tip)
+}
+
+/// A template's guides from the front, fitted into `r`: each component as a
+/// line through its guides (the face, eyes and root as dots), coloured by side.
+fn template_preview(painter: &egui::Painter, r: Rect, t: &Template, hot: bool) {
+    // Parts are shown on the built-in biped, faintly, so they read in place.
+    let body: &[template::Part] = match t.scope {
+        Scope::Layout => &[],
+        Scope::Parts => &template::built_in()[0].components,
+    };
+    let shown = |g: &&components::Guide| g.name != "target" && g.name != "heel";
+    // Facing the viewer, the character's left (+X) is on screen right.
+    let flat = |p: Vec3| Vec2::new(p.x, -p.y);
+    let mut lo = Vec2::splat(f32::MAX);
+    let mut hi = Vec2::splat(f32::MIN);
+    for p in body.iter().chain(&t.components) {
+        for g in p.component.guides.iter().filter(shown) {
+            lo = lo.min(flat(g.position));
+            hi = hi.max(flat(g.position));
+        }
+    }
+    if lo.x > hi.x {
+        return;
+    }
+    // Room for the chips along the top.
+    let fit = Rect::from_min_max(r.min + Vec2::new(14.0, 34.0), r.max - Vec2::new(14.0, 10.0));
+    let span = (hi - lo).max(Vec2::splat(1e-3));
+    let k = (fit.width() / span.x).min(fit.height() / span.y);
+    let center = (lo + hi) * 0.5;
+    let at = |p: Vec3| fit.center() + (flat(p) - center) * k;
+    let dot = (k * 0.006).clamp(1.2, 2.6);
+    let faint = Color32::from_white_alpha(40);
+    for (layer, parts) in [(true, body), (false, t.components.as_slice())] {
+        for p in parts {
+            let c = &p.component;
+            let color = if layer {
+                faint
+            } else if hot {
+                side_color(c.side)
+            } else {
+                side_color(c.side).gamma_multiply(0.85)
+            };
+            let pts: Vec<Pos2> = c
+                .guides
+                .iter()
+                .filter(shown)
+                .map(|g| at(g.position))
+                .collect();
+            if !matches!(c.kind, Kind::Face | Kind::Eyes | Kind::Root) {
+                painter.add(egui::Shape::line(pts.clone(), Stroke::new(2.0, color)));
+            }
+            if !layer {
+                for q in &pts {
+                    painter.circle_filled(*q, dot, JOINT.gamma_multiply(0.9));
+                }
+            }
+        }
     }
 }
 
