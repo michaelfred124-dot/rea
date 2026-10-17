@@ -30,6 +30,9 @@ pub enum ControlKind {
     IkEffector,
     /// Pole vector aiming the middle joint of a two-bone chain.
     Pole,
+    /// Look-at target: `bone`, if set, aims at the control (eyes). Without a bone it
+    /// is the master that moves its aim targets together.
+    Aim,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

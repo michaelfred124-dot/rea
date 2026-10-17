@@ -357,21 +357,18 @@ impl Studio {
     pub fn move_guide(&mut self, comp: usize, guide: usize, to: Vec3) {
         let symmetry = self.symmetry;
         let Some(doc) = &mut self.doc else { return };
-        let Some(c) = doc.guides.components.get(comp) else {
+        if comp >= doc.guides.components.len() {
             return;
-        };
+        }
         let twin = if symmetry {
-            components::twin_id(c)
-                .and_then(|t| doc.guides.components.iter().position(|o| o.id == t))
+            components::mirror_guide(&doc.guides, comp, guide)
         } else {
             None
         };
         doc.guides.components[comp].guides[guide].position = to;
         let mirrored = components::mirror_point(&doc.guides, to);
-        if let Some(t) = twin
-            && let Some(g) = doc.guides.components[t].guides.get_mut(guide)
-        {
-            g.position = mirrored;
+        if let Some((tc, tg)) = twin {
+            doc.guides.components[tc].guides[tg].position = mirrored;
         }
         doc.refresh();
         self.weight_colors = None;
@@ -417,6 +414,50 @@ impl Studio {
         if added && let Some(doc) = &self.doc {
             self.selected = Some((doc.guides.components.len() - 1, None));
         }
+    }
+
+    /// Eyes with a look-at control, pushed onto the front of the face.
+    pub fn add_eyes(&mut self) {
+        self.add(Preset::Eyes, AddOptions::default());
+        self.snap_to_face(Kind::Eyes, &["eye_l", "eye_r"], 0.012);
+    }
+
+    /// A jaw, with the chin on the front of the face.
+    pub fn add_jaw(&mut self) {
+        self.add(Preset::Jaw, AddOptions::default());
+        self.snap_to_face(Kind::Jaw, &["chin"], 0.0);
+    }
+
+    /// Move the named guides of the just-added component forward or back to the
+    /// mesh surface in front of them, `inset` (fraction of the body height) inside it.
+    fn snap_to_face(&mut self, kind: Kind, names: &[&str], inset: f32) {
+        if self.error {
+            return;
+        }
+        let Some(doc) = &mut self.doc else { return };
+        let h = doc.guides.body.height;
+        let Some(c) = doc.guides.components.iter_mut().find(|c| c.kind == kind) else {
+            return;
+        };
+        let reach = 0.02 * h;
+        for guide in c
+            .guides
+            .iter_mut()
+            .filter(|g| names.contains(&g.name.as_str()))
+        {
+            let p = guide.position;
+            let front = doc
+                .mesh
+                .positions
+                .iter()
+                .filter(|v| (v.x - p.x).abs() < reach && (v.y - p.y).abs() < reach)
+                .map(|v| v.z)
+                .fold(f32::NEG_INFINITY, f32::max);
+            if front.is_finite() {
+                guide.position.z = front - inset * h;
+            }
+        }
+        doc.refresh();
     }
 
     /// A pair of ears on the head, two bones each.

@@ -23,7 +23,7 @@ side follows. The component list lets you type exact guide positions, change
 spine joints, twist bones and what a component is attached to, remove
 components, mirror one side onto the other, and add fingers, a tail or a chain
 on any bone. The "Add components" tab is a library of premade parts:
-fingers, a tail, a pair of ears, a ponytail, a prop socket in the right hand,
+eyes with a look-at control, a jaw, fingers, a tail, a pair of ears, a ponytail, a prop socket in the right hand,
 and a custom chain. Every change rebuilds the bone and control preview at once;
 Ctrl+Z and Ctrl+Y undo and redo. The view switches between Guides, Skeleton and
 Controls, and the top bar tracks the steps from character to export. Build Rig computes the skin weights, which you can inspect per
@@ -107,6 +107,8 @@ A rig is a list of components, each placed by a few guide points:
 | arm | clavicle, shoulder, elbow, wrist, hand_tip | clavicle, IK/FK arm, stretch, spaces, twist bones |
 | leg | hip, knee, ankle, ball, toe, heel | IK/FK leg, reverse foot, stretch, spaces, twist bones |
 | chain | two or more | an FK chain: fingers, tails, ears, hair, props |
+| eyes | eye_l, eye_r, target | `eye_l`, `eye_r` aimed by a look-at control that follows the head or stays in the world |
+| jaw | jaw, chin | `jaw` with a rotate control |
 
 The first rig detects the body and places the default biped. From then on you
 can change the layout and rebuild:
@@ -114,6 +116,8 @@ can change the layout and rebuild:
 ```bash
 hive-rig add out/hero.guides.json fingers           # five fingers on each hand
 hive-rig add out/hero.guides.json tail --joints 6
+hive-rig add out/hero.guides.json eyes              # look-at eyes on the head
+hive-rig add out/hero.guides.json jaw
 hive-rig add out/hero.guides.json chain --parent head --joints 2 --id ear_l
 hive-rig remove out/hero.guides.json tail           # also removes anything attached to it
 hive-rig components out/hero.guides.json            # list the layout

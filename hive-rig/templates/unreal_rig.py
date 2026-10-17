@@ -119,6 +119,51 @@ def bone_location(name):
     return initial(bone_key(name)).translation
 
 
+# ----------------------------------------------------------------------- hive -> Unreal space
+# The importer converts axes and units; recover that mapping from four imported
+# bones instead of assuming it, so pivot placement holds for any import settings.
+def hive_head(name):
+    return next(b["head"] for b in BONES if b["name"] == name)
+
+
+def solve_basis():
+    names = ("pelvis", "hand_l", "head", "ball_l")
+    hp = [hive_head(n) for n in names]
+    up = [bone_location(n) for n in names]
+    u = [[hp[i][k] - hp[0][k] for k in range(3)] for i in (1, 2, 3)]  # hive columns
+    v = [[up[i].x - up[0].x, up[i].y - up[0].y, up[i].z - up[0].z] for i in (1, 2, 3)]
+    # M = V * U^-1, with U's columns u[0..2].
+    a, b, c = u
+    det = (a[0] * (b[1] * c[2] - b[2] * c[1]) - b[0] * (a[1] * c[2] - a[2] * c[1])
+           + c[0] * (a[1] * b[2] - a[2] * b[1]))
+    inv_rows = [
+        [(b[1] * c[2] - b[2] * c[1]) / det, (b[2] * c[0] - b[0] * c[2]) / det, (b[0] * c[1] - b[1] * c[0]) / det],
+        [(a[2] * c[1] - a[1] * c[2]) / det, (a[0] * c[2] - a[2] * c[0]) / det, (a[1] * c[0] - a[0] * c[1]) / det],
+        [(a[1] * b[2] - a[2] * b[1]) / det, (a[2] * b[0] - a[0] * b[2]) / det, (a[0] * b[1] - a[1] * b[0]) / det],
+    ]
+    m = [[sum(v[k][r] * inv_rows[k][col] for k in range(3)) for col in range(3)] for r in range(3)]
+    return m, hp[0], up[0]
+
+
+BASIS, HIVE_ORIGIN, UE_ORIGIN = solve_basis()
+
+
+def to_ue_dir(d):
+    return unreal.Vector(*[sum(BASIS[r][k] * d[k] for k in range(3)) for r in range(3)])
+
+
+def to_ue(p):
+    return UE_ORIGIN + to_ue_dir([p[k] - HIVE_ORIGIN[k] for k in range(3)])
+
+
+def rotate(vec, axis, angle):
+    """Rodrigues rotation, matching FQuat(axis, angle).RotateVector."""
+    cos, sin = _math.cos(angle), _math.sin(angle)
+    cross = unreal.Vector(axis.y * vec.z - axis.z * vec.y, axis.z * vec.x - axis.x * vec.z, axis.x * vec.y - axis.y * vec.x)
+    dot = axis.x * vec.x + axis.y * vec.y + axis.z * vec.z
+    return vec * cos + cross * sin + axis * (dot * (1 - cos))
+
+
 # ----------------------------------------------------------------------- controls
 chain_end_ik = {c["ik_control"]: c["end"] for c in CHAINS}
 chain_of_pole = {c["pole_control"]: c for c in CHAINS}
@@ -132,6 +177,8 @@ def target_transform(c):
         return initial(bone_key(chain_end_ik[c["name"]]))
     if c["kind"] == "cog":
         return initial(bone_key("pelvis"))
+    if c["kind"] == "aim":
+        return unreal.Transform(location=to_ue(c["position"]))
     if c["kind"] == "pole":
         chain = chain_of_pole[c["name"]]
         a, m, e = (bone_location(chain[k]) for k in ("upper", "lower", "end"))
@@ -197,51 +244,6 @@ for c in CONTROLS:
         except AttributeError:
             unreal.log_warning("hive-rig: this engine version has no control spaces; skipped %s" % c["name"])
             break
-
-
-# ----------------------------------------------------------------------- hive -> Unreal space
-# The importer converts axes and units; recover that mapping from four imported
-# bones instead of assuming it, so pivot placement holds for any import settings.
-def hive_head(name):
-    return next(b["head"] for b in BONES if b["name"] == name)
-
-
-def solve_basis():
-    names = ("pelvis", "hand_l", "head", "ball_l")
-    hp = [hive_head(n) for n in names]
-    up = [bone_location(n) for n in names]
-    u = [[hp[i][k] - hp[0][k] for k in range(3)] for i in (1, 2, 3)]  # hive columns
-    v = [[up[i].x - up[0].x, up[i].y - up[0].y, up[i].z - up[0].z] for i in (1, 2, 3)]
-    # M = V * U^-1, with U's columns u[0..2].
-    a, b, c = u
-    det = (a[0] * (b[1] * c[2] - b[2] * c[1]) - b[0] * (a[1] * c[2] - a[2] * c[1])
-           + c[0] * (a[1] * b[2] - a[2] * b[1]))
-    inv_rows = [
-        [(b[1] * c[2] - b[2] * c[1]) / det, (b[2] * c[0] - b[0] * c[2]) / det, (b[0] * c[1] - b[1] * c[0]) / det],
-        [(a[2] * c[1] - a[1] * c[2]) / det, (a[0] * c[2] - a[2] * c[0]) / det, (a[1] * c[0] - a[0] * c[1]) / det],
-        [(a[1] * b[2] - a[2] * b[1]) / det, (a[2] * b[0] - a[0] * b[2]) / det, (a[0] * b[1] - a[1] * b[0]) / det],
-    ]
-    m = [[sum(v[k][r] * inv_rows[k][col] for k in range(3)) for col in range(3)] for r in range(3)]
-    return m, hp[0], up[0]
-
-
-BASIS, HIVE_ORIGIN, UE_ORIGIN = solve_basis()
-
-
-def to_ue_dir(d):
-    return unreal.Vector(*[sum(BASIS[r][k] * d[k] for k in range(3)) for r in range(3)])
-
-
-def to_ue(p):
-    return UE_ORIGIN + to_ue_dir([p[k] - HIVE_ORIGIN[k] for k in range(3)])
-
-
-def rotate(vec, axis, angle):
-    """Rodrigues rotation, matching FQuat(axis, angle).RotateVector."""
-    cos, sin = _math.cos(angle), _math.sin(angle)
-    cross = unreal.Vector(axis.y * vec.z - axis.z * vec.y, axis.z * vec.x - axis.x * vec.z, axis.x * vec.y - axis.y * vec.x)
-    dot = axis.x * vec.x + axis.y * vec.y + axis.z * vec.z
-    return vec * cos + cross * sin + axis * (dot * (1 - cos))
 
 
 # Reverse-foot nulls: heel > toe tip > ball > ankle under each foot's IK control.
@@ -344,6 +346,21 @@ for c in CONTROLS:
                     {"Item": item_pin("Bone", c["bone"]), "Space": "GlobalSpace", "bPropagateToChildren": "True"})
         vm.add_link(get + ".Transform.Rotation", node + ".Value")
     chain_exec(node)
+
+# Eyes: aim each eye bone's rest direction at its control.
+for c in CONTROLS:
+    if c["kind"] != "aim" or not c["bone"]:
+        continue
+    eye = initial(bone_key(c["bone"]))
+    axis = eye.inverse_transform_direction((to_ue(c["position"]) - eye.translation).normal())
+    aim = unit("RigUnit_AimItem", "Aim_" + c["bone"], {
+        "Item": item_pin("Bone", c["bone"]),
+        "Primary.Axis": vector_text(axis),
+        "Primary.Kind": "Location",
+        "Secondary.Weight": "0.0",
+    })
+    vm.add_link(get_control(c["name"]) + ".Transform.Translation", aim + ".Primary.Target")
+    chain_exec(aim)
 
 # IK on top of FK, weighted by the blend control.
 for chain in CHAINS:

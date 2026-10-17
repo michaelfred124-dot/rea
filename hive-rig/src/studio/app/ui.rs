@@ -27,6 +27,8 @@ fn kind_label(k: Kind) -> &'static str {
         Kind::Arm => "Arm",
         Kind::Leg => "Leg",
         Kind::Chain => "Chain",
+        Kind::Eyes => "Eyes",
+        Kind::Jaw => "Jaw",
     }
 }
 
@@ -777,7 +779,9 @@ impl Studio {
 
     fn library_tab(&mut self, ui: &mut Ui) {
         let w = ((ui.available_width() - 14.0) / 2.0).floor();
-        let tiles: [LibraryItem; 6] = [
+        let tiles: [LibraryItem; 8] = [
+            (TileIcon::Eyes, "Eyes", "Look-at control", Studio::add_eyes),
+            (TileIcon::Jaw, "Jaw", "Opens the mouth", Studio::add_jaw),
             (
                 TileIcon::Fingers,
                 "Fingers",
@@ -1326,9 +1330,18 @@ impl Studio {
                 if comp_sel { 2.5 } else { 1.5 },
                 color.gamma_multiply(if comp_sel { 1.0 } else { 0.65 }),
             );
-            for w in pts.windows(2) {
-                if let [Some(a), Some(b)] = w {
-                    painter.line_segment([*a, *b], line);
+            if c.kind == Kind::Eyes {
+                // Sight lines from each eye to the look-at target.
+                if let [Some(l), Some(r), Some(t)] = pts[..] {
+                    for e in [l, r] {
+                        painter.extend(egui::Shape::dashed_line(&[e, t], line, 5.0, 4.0));
+                    }
+                }
+            } else {
+                for w in pts.windows(2) {
+                    if let [Some(a), Some(b)] = w {
+                        painter.line_segment([*a, *b], line);
+                    }
                 }
             }
             for (gi, p) in pts.iter().enumerate() {
@@ -1501,6 +1514,8 @@ type LibraryItem = (TileIcon, &'static str, &'static str, fn(&mut Studio));
 
 #[derive(Clone, Copy)]
 enum TileIcon {
+    Eyes,
+    Jaw,
     Fingers,
     Tail,
     Ears,
@@ -1514,6 +1529,25 @@ fn tile_icon(painter: &egui::Painter, c: Pos2, icon: TileIcon) {
     let s = Stroke::new(2.0, ACCENT);
     let p = |x: f32, y: f32| c + Vec2::new(x, y);
     match icon {
+        TileIcon::Eyes => {
+            for x in [-5.0f32, 5.0] {
+                painter.circle_stroke(p(x, 0.0), 4.5, s);
+                painter.circle_filled(p(x + 1.0, 0.5), 1.8, ACCENT);
+            }
+        }
+        TileIcon::Jaw => {
+            painter.add(egui::Shape::line(
+                vec![
+                    p(-8.0, -6.0),
+                    p(-7.0, 2.0),
+                    p(0.0, 8.0),
+                    p(7.0, 2.0),
+                    p(8.0, -6.0),
+                ],
+                s,
+            ));
+            painter.line_segment([p(-4.0, 1.0), p(4.0, 1.0)], s);
+        }
         TileIcon::Fingers => {
             for (x, top) in [(-4.5, -8.0), (-1.5, -9.5), (1.5, -9.0), (4.5, -7.0)] {
                 painter.line_segment([p(x, 1.0), p(x, top)], s);

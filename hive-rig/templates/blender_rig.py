@@ -322,6 +322,15 @@ def build(RIG, geo=None):
             con.target = rig
             con.subtarget = c["name"]
 
+    # Eyes: each eye bone tracks its aim control (it points at it at rest, so no offset).
+    for c in CONTROLS:
+        if c["kind"] == "aim" and c["bone"]:
+            con = pose[c["bone"]].constraints.new("DAMPED_TRACK")
+            con.name = "Aim"
+            con.target = rig
+            con.subtarget = c["name"]
+            con.track_axis = "TRACK_Y"
+
     for chain in CHAINS:
         ik_pb = pose[chain["ik_control"]]
         add_property(ik_pb, "ik_fk", float(chain["default_blend"]), 0.0, 1.0, "0 = FK, 1 = IK")

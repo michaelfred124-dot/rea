@@ -150,6 +150,40 @@ move("cog_ctrl", (0, 0, -0.1))
 check(abs(head("head").z - rest_head("head").z + 0.1) < 1e-3, "COG moves the upper body")
 check(max((a - b).length for a, b in zip(rest, deformed())) > 0.1, "skin follows the skeleton")
 
+if "eyes_ctrl" in pb:
+    # Eyes look at their control, follow the head, and the gaze can stay put in world space.
+    reset()
+
+    def gaze(eye):
+        update()
+        b = pb[eye]
+        return ((rig.matrix_world @ b.tail) - (rig.matrix_world @ b.head)).normalized()
+
+    rest_gaze = gaze("eye_l")
+    move("eyes_ctrl", (0.3, 0, 0))
+    to_target = (head("eye_l_aim_ctrl") - head("eye_l")).normalized()
+    check(gaze("eye_l").dot(to_target) > 0.9999 and gaze("eye_l").dot(rest_gaze) < 0.98,
+          "eyes turn to look at the moved eye control")
+    check(gaze("eye_r").x > 0.1, "both eyes follow the master eye control")
+    reset()
+    pb["head_ctrl"].rotation_euler = (0.0, 0.0, 0.5)
+    followed = (head("eyes_ctrl") - pb["eyes_ctrl"].bone.head_local).length
+    check(followed > 0.01, "the eye control follows the head in head space")
+    reset()
+    pb["eyes_ctrl"]["space"] = 2  # root: the gaze stays fixed while the head turns
+    pb["head_ctrl"].rotation_euler = (0.0, 0.0, 0.5)
+    look = (head("eye_l_aim_ctrl") - head("eye_l")).normalized()
+    check(gaze("eye_l").dot(look) > 0.9999 and (head("eyes_ctrl") - pb["eyes_ctrl"].bone.head_local).length < 1e-3,
+          "in world space the eyes keep looking at a fixed target")
+
+if "jaw_ctrl" in pb:
+    reset()
+    chin = pb["jaw"].tail.copy()
+    pb["jaw_ctrl"].rotation_euler = (0.4, 0.0, 0.0)
+    update()
+    check((pb["jaw"].tail - chin).length > 0.01, "the jaw control opens the jaw")
+    reset()
+
 bpy.ops.wm.read_factory_settings(use_empty=True)
 bpy.ops.import_scene.gltf(filepath=glb)
 armatures = [o for o in bpy.data.objects if o.type == "ARMATURE"]

@@ -222,6 +222,15 @@ def build(RIG, geo=None):
             else:
                 cmds.orientConstraint(ctrl_of[c["name"]], j, maintainOffset=True)
 
+    # Eyes: each eye joint aims at its control, keeping its rest orientation.
+    for c in CONTROLS:
+        if c["kind"] == "aim" and c["bone"]:
+            j = joint_of[c["bone"]]
+            parent = BONES[bone_by_name[c["bone"]]["parent"]]["name"]
+            cmds.aimConstraint(ctrl_of[c["name"]], j, maintainOffset=True, aimVector=(1, 0, 0),
+                               upVector=(0, 1, 0), worldUpType="objectrotation",
+                               worldUpVector=(0, 1, 0), worldUpObject=joint_of[parent])
+
     # --------------------------------------------------------------------------- limbs: IK/FK blend
     def duplicate_chain(chain, suffix):
         parent = cmds.listRelatives(joint_of[chain["upper"]], parent=True)[0]

@@ -54,6 +54,10 @@ pub enum Kind {
     Leg,
     /// FK chain of any length: fingers, tails, ears, hair, props.
     Chain,
+    /// Two eyes that look at a movable target.
+    Eyes,
+    /// A jaw hinging open from below the ears.
+    Jaw,
 }
 
 impl Kind {
@@ -65,6 +69,8 @@ impl Kind {
             Kind::Head => &["neck", "head", "head_top"],
             Kind::Arm => &["clavicle", "shoulder", "elbow", "wrist", "hand_tip"],
             Kind::Leg => &["hip", "knee", "ankle", "ball", "toe", "heel"],
+            Kind::Eyes => &["eye_l", "eye_r", "target"],
+            Kind::Jaw => &["jaw", "chin"],
             Kind::Chain => return None,
         })
     }
@@ -265,6 +271,10 @@ pub enum Preset {
     Tail,
     /// A plain FK chain continuing from any bone (`--parent`).
     Chain,
+    /// Eyes on the head with a look-at control.
+    Eyes,
+    /// A jaw on the head.
+    Jaw,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -336,6 +346,49 @@ pub fn add_preset(g: &mut Guides, preset: Preset, opts: &AddOptions) -> Result<V
                     added.push(id);
                 }
             }
+        }
+        Preset::Eyes | Preset::Jaw => {
+            let kind = if preset == Preset::Eyes {
+                Kind::Eyes
+            } else {
+                Kind::Jaw
+            };
+            ensure!(
+                !g.components.iter().any(|c| c.kind == kind),
+                "the rig already has {}",
+                if kind == Kind::Eyes { "eyes" } else { "a jaw" }
+            );
+            let head = g
+                .components
+                .iter()
+                .find(|c| c.kind == Kind::Head)
+                .context("eyes and jaws go on a head component")?;
+            let (base, top) = (
+                head.position("head").unwrap(),
+                head.position("head_top").unwrap(),
+            );
+            let parent = opts.parent.clone().unwrap_or_else(|| "head".into());
+            ensure!(sk.bone(&parent).is_some(), "no bone named {parent}");
+            let up = (top - base).try_normalize().unwrap_or(Vec3::Y);
+            let id = opts
+                .id
+                .clone()
+                .unwrap_or_else(|| (if kind == Kind::Eyes { "eyes" } else { "jaw" }).to_string());
+            ensure!(g.component(&id).is_none(), "{id} already exists");
+            let mut c = Component::new(&id, kind, Side::Center, Some(&parent));
+            if kind == Kind::Eyes {
+                let level = base + (top - base) * 0.45 + Vec3::Z * (0.04 * h);
+                for (name, sx) in [("eye_l", 1.0), ("eye_r", -1.0)] {
+                    c = c.guide(name, level + Vec3::X * (0.0175 * h * sx));
+                }
+                c = c.guide("target", level + Vec3::Z * (0.35 * h));
+            } else {
+                c = c
+                    .guide("jaw", base + up * (0.02 * h) + Vec3::Z * (0.01 * h))
+                    .guide("chin", base - up * (0.025 * h) + Vec3::Z * (0.06 * h));
+            }
+            g.components.push(c);
+            added.push(id);
         }
         Preset::Tail | Preset::Chain => {
             let joints = opts
@@ -466,13 +519,26 @@ pub fn mirror_side(g: &mut Guides, source: Side) -> usize {
         }
     }
     let cx = g.body.center_x;
+    // Eyes keep both sides in one component.
+    let (from, to) = match source {
+        Side::Left => ("eye_l", "eye_r"),
+        Side::Right => ("eye_r", "eye_l"),
+        Side::Center => ("", ""),
+    };
+    let mut paired = 0;
+    for c in g.components.iter_mut().filter(|c| c.kind == Kind::Eyes) {
+        if let Some(p) = c.position(from) {
+            c.guides.iter_mut().find(|x| x.name == to).unwrap().position = mirror(p, cx);
+            paired += 1;
+        }
+    }
     for &(i, j) in &updates {
         let points: Vec<Vec3> = g.components[i].guides.iter().map(|x| x.position).collect();
         for (guide, p) in g.components[j].guides.iter_mut().zip(points) {
             guide.position = mirror(p, cx);
         }
     }
-    updates.len()
+    updates.len() + paired
 }
 
 /// Change the spine component's joint count, re-attaching components that hung
@@ -639,6 +705,8 @@ pub fn build(g: &Guides) -> Result<Built> {
             Kind::Arm => build_arm(&mut b, c, parent)?,
             Kind::Leg => build_leg(&mut b, c, parent)?,
             Kind::Chain => build_chain(&mut b, c, parent)?,
+            Kind::Eyes => build_eyes(&mut b, c, parent)?,
+            Kind::Jaw => build_jaw(&mut b, p("jaw"), p("chin"), parent)?,
         }
     }
     assign_spaces(&mut b);
@@ -1117,6 +1185,74 @@ fn build_chain(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
     Ok(())
 }
 
+/// One bone per eye, pointing at the target, aimed by a control in front of it;
+/// both aim controls hang from a master that moves the gaze as a whole.
+fn build_eyes(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
+    let p = |n: &str| c.position(n).unwrap();
+    let (l, r, target) = (p("eye_l"), p("eye_r"), p("target"));
+    let mid = (l + r) * 0.5;
+    let gaze = target - mid;
+    ensure!(
+        gaze.length() > 0.02 * b.h,
+        "component {}: the eye target must be in front of the eyes",
+        c.id
+    );
+    let dir = gaze.normalize();
+    let master = format!("{}_ctrl", c.id);
+    let parent_ctrl = b.parent_control(parent);
+    let spread = l.distance(r).max(0.01 * b.h);
+    b.control(
+        master.clone(),
+        ControlKind::Aim,
+        parent_ctrl,
+        None,
+        target,
+        dir,
+        Shape::Square,
+        spread * 1.1,
+        CENTER,
+    );
+    for (name, side, eye) in [("eye_l", Side::Left, l), ("eye_r", Side::Right, r)] {
+        b.bone(
+            name,
+            parent,
+            eye,
+            eye + dir * (0.02 * b.h),
+            side,
+            Region::Center,
+        )?;
+        b.control(
+            format!("{name}_aim_ctrl"),
+            ControlKind::Aim,
+            ControlParent::Control(master.clone()),
+            Some(name),
+            eye + gaze,
+            dir,
+            Shape::Circle,
+            spread * 0.3,
+            side_color(side),
+        );
+    }
+    Ok(())
+}
+
+fn build_jaw(b: &mut Builder, jaw: Vec3, chin: Vec3, parent: &str) -> Result<()> {
+    b.bone("jaw", parent, jaw, chin, Side::Center, Region::Center)?;
+    let parent_ctrl = b.parent_control(parent);
+    b.control(
+        ctrl_name("jaw"),
+        ControlKind::Fk,
+        parent_ctrl,
+        Some("jaw"),
+        chin,
+        (chin - jaw).normalize(),
+        Shape::Circle,
+        0.03 * b.h,
+        CENTER,
+    );
+    Ok(())
+}
+
 /// Space switching, as animators expect from production rigs: hands can follow the
 /// world, body, chest or head; feet the world or body; poles their goal; the head
 /// its neck, the chest, the body or the world.
@@ -1167,6 +1303,20 @@ fn assign_spaces(b: &mut Builder) {
             ),
         ));
     }
+    let eyes: Vec<(String, String)> = b
+        .rig
+        .controls
+        .iter()
+        .filter(|c| c.kind == ControlKind::Aim && c.bone.is_none())
+        .filter_map(|c| match &c.parent {
+            ControlParent::Control(p) => Some((c.name.clone(), p.clone())),
+            _ => None,
+        })
+        .collect();
+    for (name, parent) in eyes {
+        let spaces = optional(b, &[Some(&parent), Some("cog_ctrl"), Some("root_ctrl")]);
+        assignments.push((name, spaces));
+    }
     for (name, spaces) in assignments {
         // The first space must be the control's own parent, and a single space is
         // no switch at all.
@@ -1179,10 +1329,78 @@ fn assign_spaces(b: &mut Builder) {
     }
 }
 
+/// The guide that mirrors guide `index` of component `comp`, as (component, guide):
+/// the same guide on the twin component, or the other eye.
+pub fn mirror_guide(g: &Guides, comp: usize, index: usize) -> Option<(usize, usize)> {
+    let c = g.components.get(comp)?;
+    if c.kind == Kind::Eyes {
+        let other = match c.guides.get(index)?.name.as_str() {
+            "eye_l" => "eye_r",
+            "eye_r" => "eye_l",
+            _ => return None,
+        };
+        return Some((comp, c.guides.iter().position(|x| x.name == other)?));
+    }
+    let twin = twin_id(c)?;
+    let t = g.components.iter().position(|o| o.id == twin)?;
+    (index < g.components[t].guides.len()).then_some((t, index))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{demo::demo_humanoid, landmarks::detect};
+
+    #[test]
+    fn eyes_and_jaw() {
+        let mut g = demo_guides();
+        add_preset(&mut g, Preset::Eyes, &AddOptions::default()).unwrap();
+        add_preset(&mut g, Preset::Jaw, &AddOptions::default()).unwrap();
+        assert!(add_preset(&mut g, Preset::Eyes, &AddOptions::default()).is_err());
+        let Built {
+            skeleton: sk,
+            controls,
+        } = build(&g).unwrap();
+        for bone in ["eye_l", "eye_r", "jaw"] {
+            assert_eq!(sk.bone(bone).unwrap().parent, sk.index_of("head"));
+        }
+        let master = controls.control("eyes_ctrl").unwrap();
+        assert_eq!(
+            (master.kind, master.bone.as_deref()),
+            (ControlKind::Aim, None)
+        );
+        assert_eq!(master.parent, ControlParent::Control("head_ctrl".into()));
+        assert!(master.spaces.contains(&"root_ctrl".to_string()));
+        let aim = controls.control("eye_l_aim_ctrl").unwrap();
+        assert_eq!(aim.bone.as_deref(), Some("eye_l"));
+        // Each eye bone points at its own aim control: a parallel gaze.
+        let eye = sk.bone("eye_l").unwrap();
+        assert!(eye.direction().dot((aim.position - eye.head).normalize()) > 0.9999);
+        assert_eq!(
+            controls.control("jaw_ctrl").unwrap().bone.as_deref(),
+            Some("jaw")
+        );
+        let jaw = sk.bone("jaw").unwrap();
+        assert!(
+            jaw.tail.y < jaw.head.y && jaw.tail.z > jaw.head.z,
+            "the chin is below and in front of the hinge"
+        );
+
+        // The eyes mirror as a pair.
+        let i = g
+            .components
+            .iter()
+            .position(|c| c.kind == Kind::Eyes)
+            .unwrap();
+        assert_eq!(mirror_guide(&g, i, 0), Some((i, 1)));
+        assert_eq!(mirror_guide(&g, i, 2), None);
+        g.components[i].guides[0].position.y += 0.01;
+        mirror_side(&mut g, Side::Left);
+        let e = &g.components[i];
+        assert!(
+            (mirror(e.guides[0].position, g.body.center_x) - e.guides[1].position).length() < 1e-6
+        );
+    }
 
     fn demo_guides() -> Guides {
         biped(&detect(&demo_humanoid()))

@@ -69,7 +69,7 @@ def stub_maya():
                 if kwargs.get("allDescendents"):
                     return sorted(nodes)
                 return ["parent_or_shape"]
-            if name in ("skinCluster", "ikHandle", "orientConstraint", "parentConstraint", "poleVectorConstraint"):
+            if name in ("skinCluster", "ikHandle", "orientConstraint", "aimConstraint", "parentConstraint", "poleVectorConstraint"):
                 if kwargs.get("query") and kwargs.get("weightAliasList"):
                     targets = [a for a in args if isinstance(a, str)]
                     return ["t%d_W%d" % (i, i) for i in range(max(2, len(targets)))]
@@ -127,7 +127,7 @@ def stub_maya():
 
     for n in ["about", "group", "rename", "parent", "listRelatives", "sets", "polySoftEdge", "createNode", "xform",
               "joint", "setAttr", "skinCluster", "curve", "matchTransform", "move", "parentConstraint",
-              "orientConstraint", "addAttr", "makeIdentity", "ikHandle", "poleVectorConstraint", "connectAttr",
+              "orientConstraint", "aimConstraint", "addAttr", "makeIdentity", "ikHandle", "poleVectorConstraint", "connectAttr",
               "select", "file", "getAttr", "expression", "attributeQuery", "objExists", "delete", "ls",
               "spaceLocator", "listHistory", "polyEvaluate", "warning"]:
         setattr(cmds, n, generic(n))
