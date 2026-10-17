@@ -2,7 +2,7 @@
 //! the guides, build and export.
 //!
 //! `HiveRig [character file] [--demo] [--build] [--weights BONE] [--library] [--export]
-//! [--select COMPONENT] [--screenshot OUT.ppm]`
+//! [--select COMPONENT[,COMPONENT...]] [--pick NAME] [--pose BONE] [--screenshot OUT.ppm]`
 //! (the flags exist so the window can be checked automatically).
 
 // No console window behind the app on Windows.
@@ -126,13 +126,11 @@ fn main() -> eframe::Result {
             app::RigPick::Bone(name.clone())
         });
     }
-    if let (Some(id), Some(doc)) = (&launch.select, &studio.doc) {
-        studio.selected = doc
-            .guides
-            .components
-            .iter()
-            .position(|c| &c.id == id)
-            .map(|c| (c, None));
+    // Several ids (comma separated) are picked in order, as with Shift+click.
+    for id in launch.select.iter().flat_map(|s| s.split(',')) {
+        if let Some(c) = studio.component_index(id) {
+            studio.toggle_pick(c, None);
+        }
     }
 
     let options = eframe::NativeOptions {

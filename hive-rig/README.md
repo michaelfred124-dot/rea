@@ -182,10 +182,23 @@ used. Guides with no matching joint stay where body detection put them. Pass
 
 ### Parenting, test poses and control looks
 
-In the guides stage each component has a red handle on its first guide. Drag
-it onto a yellow joint to hang the component from that joint, or right-click a
-guide and choose **Attach component to**. In the build stages, click a joint or
-a control to pick it. Its panel in Properties shows the name and lets you:
+In the guides stage each guide is drawn as a yellow joint control, and each
+component has red corner brackets around its first guide. Click or drag a
+guide's centre to move it; grab the brackets to carry the whole component onto
+a joint and hang it there. Green plus markers show where each arm and leg's IK
+pole sits.
+
+To parent several parts at once, Shift-click them (in the view or the
+outliner), picking the parent last, then press **P** or right-click and choose
+**Parent**. The children hang from the parent's bone nearest the guide you
+picked it by. Right-clicking another part's guide offers **Parent … here**
+instead, and **Unparent** (Shift+P) hangs the picks from the root again. With
+several parts picked, Properties lists them as child and parent with the same
+buttons. Parenting keeps the layout buildable: parts are reordered when needed,
+and hanging a part from its own child is refused.
+
+In the build stages, click a joint or a control to pick it. Its panel in
+Properties shows the name and lets you:
 
 * **Test this bone** turns it, with everything hanging from it and the skin
   that follows it, so you can check the rig before it reaches a DCC. Nothing is

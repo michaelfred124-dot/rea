@@ -651,7 +651,53 @@ pub fn attach(g: &mut Guides, id: &str, bone: &str) -> Result<()> {
         .find(|c| c.id == id)
         .with_context(|| format!("no component named {id}"))?;
     ensure!(c.kind != Kind::Root, "the root component stays where it is");
+    let owner_of: HashMap<String, String> = build(g)?
+        .skeleton
+        .bones
+        .into_iter()
+        .map(|b| (b.name, b.component))
+        .collect();
+    let owner = owner_of
+        .get(bone)
+        .with_context(|| format!("there is no bone called {bone}"))?;
+    ensure!(owner != id, "{id} can't hang from one of its own bones");
+    let c = g.components.iter_mut().find(|c| c.id == id).unwrap();
     c.parent = Some(bone.to_string());
+    // Components build in order, so each must follow the one owning its parent
+    // bone. Keep the existing order wherever that already holds.
+    let mut order = Vec::with_capacity(g.components.len());
+    let mut state: HashMap<&str, bool> = HashMap::new(); // false = visiting
+    fn visit<'a>(
+        g: &'a Guides,
+        owner_of: &HashMap<String, String>,
+        i: usize,
+        state: &mut HashMap<&'a str, bool>,
+        order: &mut Vec<usize>,
+    ) -> Result<()> {
+        let c = &g.components[i];
+        match state.get(c.id.as_str()) {
+            Some(true) => return Ok(()),
+            Some(false) => bail!("{} would end up hanging from its own child", c.id),
+            None => {}
+        }
+        state.insert(&c.id, false);
+        if let Some(owner) = c.parent.as_ref().and_then(|p| owner_of.get(p))
+            && let Some(j) = g.components.iter().position(|o| &o.id == owner)
+        {
+            visit(g, owner_of, j, state, order)?;
+        }
+        state.insert(&c.id, true);
+        order.push(i);
+        Ok(())
+    }
+    for i in 0..g.components.len() {
+        visit(g, &owner_of, i, &mut state, &mut order)?;
+    }
+    let mut slots: Vec<Option<Component>> = g.components.drain(..).map(Some).collect();
+    g.components = order
+        .into_iter()
+        .map(|i| slots[i].take().unwrap())
+        .collect();
     build(g).map(|_| ())
 }
 
@@ -2064,6 +2110,26 @@ mod tests {
                 .is_some()
         );
         assert!(attach(&mut dst, "tail", "no_such_bone").is_err());
+
+        // A part can hang from one built after it: the order follows the parent.
+        let last = build(&dst)
+            .unwrap()
+            .skeleton
+            .bones
+            .iter()
+            .rev()
+            .find(|b| b.component == "tail")
+            .unwrap()
+            .name
+            .clone();
+        attach(&mut dst, "arm_l", &last).unwrap();
+        let at = |id: &str| dst.components.iter().position(|c| c.id == id).unwrap();
+        assert!(at("tail") < at("arm_l"));
+        // Hanging a part from its own child, or its own bones, is refused.
+        let before = dst.components.len();
+        assert!(attach(&mut dst, "tail", "hand_l").is_err());
+        assert!(attach(&mut dst, "tail", &last).is_err());
+        assert_eq!(dst.components.len(), before);
     }
 
     #[test]

@@ -24,12 +24,18 @@ use crate::theme::{self, ACCENT, BORDER, CARD, CARD_HI, ERR, OK, TEXT, TEXT_DIM,
 use crate::view::{self, Projector};
 
 const PICK_RADIUS: f32 = 10.0;
-/// Component handles: half their size on screen, and how close a drop must be.
-const HANDLE_HALF: f32 = 4.5;
-const HANDLE_RADIUS: f32 = 9.0;
+/// Component handles are corner brackets around the first guide: their half
+/// size on screen, the guide's own centre inside them, and the reach of the ring.
+const HANDLE_HALF: f32 = 11.0;
+const HANDLE_CORE: f32 = 6.5;
+const HANDLE_RADIUS: f32 = 16.0;
 const JOINT_RADIUS: f32 = 16.0;
 const HANDLE: Color32 = Color32::from_rgb(230, 52, 52);
 const JOINT: Color32 = Color32::from_rgb(255, 205, 60);
+/// Picked parts, Maya-style light blue.
+const PICK: Color32 = Color32::from_rgb(110, 200, 255);
+/// IK pole markers.
+const POLE: Color32 = Color32::from_rgb(90, 220, 110);
 const TOAST_SECONDS: f64 = 5.0;
 const EDGE: f32 = 16.0;
 /// Where the side panels start, below the top pills.
@@ -230,6 +236,7 @@ impl Studio {
             self.open(path);
         }
         self.shortcuts(&ctx);
+        self.sync_picks();
 
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::BG))
@@ -675,14 +682,42 @@ impl Studio {
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
+                        let shift = ui.input(|i| i.modifiers.shift);
                         for (i, (id, kind, side, depth)) in rows.iter().enumerate() {
-                            let selected = self.selected.is_some_and(|(c, _)| c == i);
-                            let row =
-                                component_row(ui, id, *kind, *side, (*depth).min(4), selected);
+                            let order = self.picked.iter().position(|(p, _)| p == id);
+                            let selected = order.is_some();
+                            // Pick order shows once there are several: the last is the parent.
+                            let badge = order
+                                .filter(|_| self.picked.len() > 1)
+                                .map(|n| n + 1 == self.picked.len());
+                            let row = component_row(
+                                ui,
+                                id,
+                                *kind,
+                                *side,
+                                (*depth).min(4),
+                                selected,
+                                badge,
+                            );
                             if row.clicked() {
-                                self.selected = if selected { None } else { Some((i, None)) };
+                                if shift {
+                                    self.toggle_pick(i, None);
+                                } else if selected && self.picked.len() == 1 {
+                                    self.selected = None;
+                                    self.sync_picks();
+                                } else {
+                                    self.pick_one(i, None);
+                                }
                                 self.mode = Mode::Guides;
                             }
+                            row.context_menu(|ui| {
+                                self.mode = Mode::Guides;
+                                self.parent_menu(ui, Some((i, None)));
+                                if ui.button("Select only this").clicked() {
+                                    self.pick_one(i, None);
+                                    ui.close();
+                                }
+                            });
                         }
                     });
                 ui.add_space(4.0);
@@ -708,7 +743,9 @@ impl Studio {
     fn properties(&mut self, ctx: &egui::Context) {
         let max_h = ctx.content_rect().height() - PANEL_TOP - DOCK_CLEARANCE - 50.0;
         let picking = self.mode != Mode::Guides && self.rig_pick.is_some();
+        let several = self.mode == Mode::Guides && self.picked.len() > 1;
         let title = match (&self.rig_pick, self.selected, picking) {
+            _ if several => "Parenting",
             (Some(RigPick::Control(_)), _, true) => "Control",
             (Some(RigPick::Bone(_)), _, true) => "Bone",
             (_, Some(_), _) => "Component",
@@ -731,12 +768,121 @@ impl Studio {
                         .auto_shrink([false, true])
                         .show(ui, |ui| match self.selected {
                             _ if picking => self.rig_inspector(ui),
+                            _ if several => self.picks_inspector(ui),
                             Some((c, guide)) => self.component_inspector(ui, c, guide),
                             None => self.rig_overview(ui),
                         });
                 });
             },
         );
+    }
+
+    /// Several parts picked: who hangs from whom, and the buttons to do it.
+    fn picks_inspector(&mut self, ui: &mut Ui) {
+        let Some(((parent, guide), children)) = self.picked.split_last() else {
+            return;
+        };
+        let children: Vec<String> = children.iter().map(|(id, _)| id.clone()).collect();
+        let parent = parent.clone();
+        let bone = self.parent_bone(&parent, *guide);
+        theme::label_caps(ui, "Picked");
+        for id in &children {
+            pick_line(ui, id, "child", PICK);
+        }
+        pick_line(ui, &parent, "parent", JOINT);
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(match &bone {
+                Some(b) => format!("The children will hang from {b}. Pick a guide on the parent last to choose its joint."),
+                None => "The last part picked is the parent.".into(),
+            })
+            .color(TEXT_DIM)
+            .size(12.0),
+        );
+        ui.add_space(8.0);
+        let w = (ui.available_width() - 8.0) / 2.0;
+        ui.horizontal(|ui| {
+            if theme::primary(ui, "Parent  (P)", w, bone.is_some()).clicked() {
+                self.parent_picked();
+            }
+            if theme::secondary(ui, "Unparent", w)
+                .on_hover_text("Hang them from the root (Shift+P)")
+                .clicked()
+            {
+                self.unparent_picked();
+            }
+        });
+        ui.add_space(4.0);
+        if ui
+            .add(egui::Button::new(RichText::new("Clear picks").color(TEXT_DIM)).frame(false))
+            .clicked()
+        {
+            self.selected = None;
+            self.sync_picks();
+        }
+    }
+
+    /// Parent and Unparent for the Shift picks, at the top of a right-click menu.
+    /// `target` is what was right-clicked: a part that isn't picked becomes the
+    /// parent, so picking children and right-clicking a joint parents them there.
+    fn parent_menu(&mut self, ui: &mut Ui, target: Option<(usize, Option<usize>)>) {
+        self.sync_picks();
+        let Some(doc) = &self.doc else { return };
+        let target_id =
+            target.and_then(|(c, _)| doc.guides.components.get(c).map(|c| c.id.clone()));
+        let picked: Vec<String> = self.picked.iter().map(|(id, _)| id.clone()).collect();
+        let outside = target_id.as_ref().filter(|t| !picked.contains(t));
+        let mut any = false;
+        if let (Some(parent), Some((c, g)), false) = (outside, target, picked.is_empty()) {
+            let label = format!("Parent {} here", names(&picked));
+            if ui
+                .button(label)
+                .on_hover_text(format!("Hang them from {parent}"))
+                .clicked()
+            {
+                self.parent_picked_to(c, g);
+                ui.close();
+            }
+            any = true;
+        } else if let [children @ .., parent] = &picked[..]
+            && !children.is_empty()
+        {
+            let label = format!("Parent {} to {parent}", names(children));
+            if ui
+                .button(label)
+                .on_hover_text("The last part picked is the parent (P)")
+                .clicked()
+            {
+                self.parent_picked();
+                ui.close();
+            }
+            any = true;
+        }
+        if !picked.is_empty() && picked.iter().any(|id| id != "root") {
+            if ui
+                .button(format!("Unparent {}", names(&picked)))
+                .on_hover_text("Hang from the root again (Shift+P)")
+                .clicked()
+            {
+                self.unparent_picked();
+                ui.close();
+            }
+            any = true;
+        }
+        if picked.len() > 1 && ui.button("Clear picks").clicked() {
+            self.selected = None;
+            self.sync_picks();
+            ui.close();
+        }
+        if any {
+            ui.separator();
+        } else if target.is_some() {
+            ui.label(
+                RichText::new("Shift-click parts to pick several")
+                    .color(TEXT_FAINT)
+                    .size(12.0),
+            );
+        }
     }
 
     /// The right-click menu of the viewport: attaching and importing in the guides
@@ -762,9 +908,13 @@ impl Studio {
         };
         let mut import_at = None;
         if self.mode == Mode::Guides {
-            if let Some((c, g)) = self.menu_guide {
-                if ui.button("Select this guide").clicked() {
-                    self.selected = Some((c, Some(g)));
+            let target = self.menu_guide;
+            self.parent_menu(ui, target);
+            if let Some((c, g)) = target {
+                if let Some(g) = g
+                    && ui.button("Select this guide").clicked()
+                {
+                    self.pick_one(c, Some(g));
                     ui.close();
                 }
                 ui.menu_button("Attach component to", |ui| {
@@ -1918,7 +2068,16 @@ impl Studio {
             if ui.input(|i| i.key_pressed(Key::Delete)) {
                 self.remove_selected();
             }
+            // Maya's keys: P parents the picks under the last one, Shift+P unparents.
+            if self.mode == Mode::Guides && ui.input(|i| i.key_pressed(Key::P)) {
+                if ui.input(|i| i.modifiers.shift) {
+                    self.unparent_picked();
+                } else {
+                    self.parent_picked();
+                }
+            }
         }
+        let shift = ui.input(|i| i.modifiers.shift);
         let pr = self.camera.projector(rect);
         let pointer = response.interact_pointer_pos().or(response.hover_pos());
         let press = ui.input(|i| i.pointer.press_origin());
@@ -1927,13 +2086,15 @@ impl Studio {
         if response.drag_started_by(PointerButton::Primary)
             && let Some(p) = press.or(pointer)
         {
-            if let Some(c) = self.handle_at(&pr, p) {
-                self.selected = Some((c, None));
-                self.handle_drag = Some(c);
-            } else if let Some((c, g)) = self.pick_guide(&pr, p) {
-                self.selected = Some((c, Some(g)));
+            // The guide's centre moves it; the red brackets around a component's
+            // first guide carry the whole component onto a joint.
+            if let Some((c, g)) = self.pick_guide(&pr, p) {
+                self.keep_or_pick(c, Some(g));
                 self.begin_change();
                 self.drag = Some(Drag { comp: c, guide: g });
+            } else if let Some(c) = self.handle_at(&pr, p) {
+                self.keep_or_pick(c, None);
+                self.handle_drag = Some(c);
             }
         }
         if response.dragged_by(PointerButton::Primary) {
@@ -1970,7 +2131,19 @@ impl Studio {
             && let Some(p) = pointer
         {
             if self.mode == Mode::Guides {
-                self.selected = self.pick_guide(&pr, p).map(|(c, g)| (c, Some(g)));
+                let hit = self
+                    .pick_guide(&pr, p)
+                    .map(|(c, g)| (c, Some(g)))
+                    .or_else(|| self.handle_at(&pr, p).map(|c| (c, None)));
+                match hit {
+                    Some((c, g)) if shift => self.toggle_pick(c, g),
+                    Some((c, g)) => self.pick_one(c, g),
+                    None if shift => {}
+                    None => {
+                        self.selected = None;
+                        self.sync_picks();
+                    }
+                }
             } else {
                 self.rig_pick = self.pick_rig(&pr, p);
             }
@@ -1978,7 +2151,10 @@ impl Studio {
         if response.secondary_clicked()
             && let Some(p) = pointer
         {
-            self.menu_guide = self.pick_guide(&pr, p);
+            self.menu_guide = self
+                .pick_guide(&pr, p)
+                .map(|(c, g)| (c, Some(g)))
+                .or_else(|| self.handle_at(&pr, p).map(|c| (c, None)));
             self.menu_rig = self.pick_rig(&pr, p);
         }
         response.context_menu(|ui| self.canvas_menu(ui));
@@ -2012,8 +2188,15 @@ impl Studio {
                     continue;
                 };
                 let d = s.distance(at);
+                // A component's first guide sits inside its handle: only the centre
+                // grabs the guide, the ring around it grabs the component.
+                let reach = if gi == 0 && c.kind != Kind::Root {
+                    HANDLE_CORE
+                } else {
+                    PICK_RADIUS
+                };
                 // Nearest on screen; ties (overlapping guides) go to the nearer one.
-                if d <= PICK_RADIUS && best.is_none_or(|b| (d, depth) < (b.0, b.1)) {
+                if d <= reach && best.is_none_or(|b| (d, depth) < (b.0, b.1)) {
                     best = Some((d, depth, ci, gi));
                 }
             }
@@ -2059,19 +2242,24 @@ impl Studio {
     }
 
     /// The red handle of a component under the pointer, if any. Each component
-    /// (except the root) has one on its first guide; dragging it onto a joint
+    /// (except the root) has one around its first guide; dragging it onto a joint
     /// hangs the component from that joint.
     fn handle_at(&self, pr: &Projector, at: Pos2) -> Option<usize> {
+        if self.mode != Mode::Guides {
+            return None;
+        }
         let doc = self.doc.as_ref()?;
         doc.guides
             .components
             .iter()
             .enumerate()
             .filter(|(_, c)| c.kind != Kind::Root)
-            .find_map(|(ci, c)| {
-                let p = pr.pos(c.guides.first()?.position)?;
-                (p.distance(at) <= HANDLE_RADIUS).then_some(ci)
+            .filter_map(|(ci, c)| {
+                let d = pr.pos(c.guides.first()?.position)?.distance(at);
+                (d <= HANDLE_RADIUS).then_some((d, ci))
             })
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, ci)| ci)
     }
 
     /// The bone whose joint (its head) is under the pointer.
@@ -2091,7 +2279,12 @@ impl Studio {
 
     fn paint_handles(&self, painter: &egui::Painter, pr: &Projector, pointer: Option<Pos2>) {
         let Some(doc) = &self.doc else { return };
-        let hot = pointer.and_then(|p| self.handle_at(pr, p));
+        if self.mode != Mode::Guides {
+            return;
+        }
+        let hot = pointer
+            .filter(|p| self.pick_guide(pr, *p).is_none())
+            .and_then(|p| self.handle_at(pr, p));
         for (ci, c) in doc.guides.components.iter().enumerate() {
             if c.kind == Kind::Root {
                 continue;
@@ -2099,19 +2292,20 @@ impl Studio {
             let Some(at) = c.guides.first().and_then(|g| pr.pos(g.position)) else {
                 continue;
             };
-            let grow = if hot == Some(ci) || self.handle_drag == Some(ci) {
-                2.0
-            } else {
-                0.0
-            };
-            let rect = Rect::from_center_size(at, Vec2::splat(2.0 * HANDLE_HALF + grow));
-            painter.rect_filled(rect, 2.0, HANDLE);
-            painter.rect_stroke(
-                rect,
-                2.0,
-                Stroke::new(1.2, Color32::WHITE),
-                egui::StrokeKind::Inside,
-            );
+            let live = hot == Some(ci) || self.handle_drag == Some(ci);
+            let picked = self.picked.iter().any(|(id, _)| *id == c.id);
+            let half = HANDLE_HALF + if live { 2.0 } else { 0.0 };
+            if live {
+                painter.rect_filled(
+                    Rect::from_center_size(at, Vec2::splat(2.0 * half)),
+                    3.0,
+                    HANDLE.gamma_multiply(0.18),
+                );
+            }
+            brackets(painter, at, half, Stroke::new(2.2, HANDLE));
+            if picked {
+                brackets(painter, at, half + 3.5, Stroke::new(1.2, PICK));
+            }
         }
         if let (Some(ci), Some(p)) = (self.handle_drag, pointer)
             && let Some(c) = doc.guides.components.get(ci)
@@ -2195,33 +2389,57 @@ impl Studio {
                 Color32::from_rgb(130, 134, 150)
             };
             bone_shape(painter, h, t, color.gamma_multiply(bone_alpha));
-            joint_marker(painter, h, if picked { ACCENT } else { JOINT });
+            // In the guides stage the guides are the joints; bone joints only show
+            // as drop targets while a handle is being dragged.
+            if self.mode != Mode::Guides || self.handle_drag.is_some() {
+                joint_marker(painter, h, if picked { ACCENT } else { JOINT });
+            }
         }
-        self.paint_handles(painter, pr, pointer);
         if self.mode != Mode::Guides {
             return;
         }
+        // IK pole markers, each tied to the elbow or knee it aims.
+        for ik in &built.controls.ik_chains {
+            let pole = built
+                .controls
+                .control(&ik.pole_control)
+                .and_then(|c| pr.pos(c.position));
+            let knee = built.skeleton.bone(&ik.lower).and_then(|b| pr.pos(b.head));
+            if let Some(at) = pole {
+                if let Some(k) = knee {
+                    painter.extend(egui::Shape::dashed_line(
+                        &[k, at],
+                        Stroke::new(1.0, POLE.gamma_multiply(0.7)),
+                        4.0,
+                        3.0,
+                    ));
+                }
+                pole_marker(painter, at);
+            }
+        }
         let hover = pointer.and_then(|p| self.pick_guide(pr, p));
+        let several = self.picked.len() > 1;
         for (ci, c) in doc.guides.components.iter().enumerate() {
-            let comp_sel = self.selected.is_some_and(|(s, _)| s == ci);
-            let color = side_color(c.side);
+            let order = self.picked.iter().position(|(id, _)| *id == c.id);
+            let picked = order.is_some();
             let pts: Vec<Option<Pos2>> = c.guides.iter().map(|g| pr.pos(g.position)).collect();
             // Link the component to the bone it hangs from.
             if let (Some(parent), Some(Some(first))) = (&c.parent, pts.first())
                 && let Some(pb) = bones.iter().find(|b| &b.name == parent)
-                && let Some(ph) = pr.pos(pb.tail)
+                && let Some(ph) = pr.pos(pb.head)
             {
                 painter.extend(egui::Shape::dashed_line(
                     &[ph, *first],
-                    Stroke::new(1.0, TEXT_FAINT),
+                    Stroke::new(1.0, if picked { PICK } else { TEXT_FAINT }),
                     4.0,
                     4.0,
                 ));
             }
-            let line = Stroke::new(
-                if comp_sel { 2.5 } else { 1.5 },
-                color.gamma_multiply(if comp_sel { 1.0 } else { 0.65 }),
-            );
+            let line = if picked {
+                Stroke::new(2.0, PICK)
+            } else {
+                Stroke::new(1.3, Color32::from_gray(185).gamma_multiply(0.8))
+            };
             if c.kind == Kind::Eyes {
                 // Sight lines from each eye to the look-at target.
                 if let [Some(l), Some(r), Some(t)] = pts[..] {
@@ -2241,42 +2459,75 @@ impl Studio {
                 let Some(p) = p else { continue };
                 let sel = self.selected == Some((ci, Some(gi)));
                 let hot = hover == Some((ci, gi));
-                let r = if sel || hot {
-                    7.5
-                } else if comp_sel {
-                    6.0
-                } else {
-                    5.0
-                } * if c.kind == Kind::Face { 0.6 } else { 1.0 };
+                let scale = if c.kind == Kind::Face { 0.6 } else { 1.0 };
+                let r = if sel || hot { 7.0 } else { 5.5 } * scale;
                 if sel || hot {
-                    painter.circle_filled(*p, r + 5.0, color.gamma_multiply(0.25));
+                    painter.circle_filled(*p, r + 5.0, JOINT.gamma_multiply(0.22));
                 }
-                painter.circle_filled(*p, r, color);
-                painter.circle_stroke(
-                    *p,
-                    r,
-                    Stroke::new(
-                        if sel { 2.0 } else { 1.2 },
-                        if sel {
-                            Color32::WHITE
-                        } else {
-                            Color32::from_black_alpha(200)
-                        },
-                    ),
-                );
+                let ring = match (sel, picked) {
+                    (true, _) => Stroke::new(2.4, Color32::WHITE),
+                    (_, true) => Stroke::new(2.0, PICK),
+                    _ => Stroke::new(1.8, JOINT),
+                };
+                // Eyes get a wide ring like an eye control; the root a double ring.
+                if c.kind == Kind::Eyes && gi < 2 {
+                    painter.circle_stroke(*p, r + 8.0, Stroke::new(1.6, ring.color));
+                }
+                if c.kind == Kind::Root {
+                    painter.circle_stroke(*p, r + 9.0, Stroke::new(1.6, ring.color));
+                    painter.circle_stroke(
+                        *p,
+                        r + 13.0,
+                        Stroke::new(1.0, ring.color.gamma_multiply(0.6)),
+                    );
+                }
+                guide_control(painter, *p, r, ring, side_color(c.side));
                 if sel || hot {
                     label_chip(
                         painter,
-                        *p + Vec2::new(12.0, -12.0),
+                        *p + Vec2::new(14.0, -14.0),
                         &format!("{}  ·  {}", c.id, c.guides[gi].name),
                     );
                 }
             }
+            // Pick order, so it's clear which part becomes the parent.
+            if several && let (Some(n), Some(Some(first))) = (order, pts.first()) {
+                let word = if n + 1 == self.picked.len() {
+                    format!("parent  ·  {}", c.id)
+                } else {
+                    format!("{}  ·  {}", n + 1, c.id)
+                };
+                label_chip(painter, *first + Vec2::new(16.0, 10.0), &word);
+            }
         }
+        self.paint_handles(painter, pr, pointer);
     }
 }
 
 // --------------------------------------------------------------------------- frames
+
+/// One row of the picks list: the part and its role.
+fn pick_line(ui: &mut Ui, id: &str, role: &str, color: Color32) {
+    ui.horizontal(|ui| {
+        let (dot, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+        ui.painter()
+            .circle_stroke(dot.center(), 4.5, Stroke::new(2.0, color));
+        ui.label(RichText::new(id).color(TEXT).size(13.5));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(RichText::new(role).color(color).size(11.5));
+        });
+    });
+}
+
+/// "a", "a and b", "a, b and 2 more", for menu labels.
+fn names(ids: &[String]) -> String {
+    match ids {
+        [] => String::new(),
+        [a] => a.clone(),
+        [a, b] => format!("{a} and {b}"),
+        [a, b, rest @ ..] => format!("{a}, {b} and {} more", rest.len()),
+    }
+}
 
 fn theme_once(ctx: &egui::Context) {
     let id = egui::Id::unique("hive_theme");
@@ -2872,7 +3123,7 @@ fn paint_art_backdrop(painter: &egui::Painter, r: Rect, hot: bool) {
 const SKIN: Color32 = Color32::from_rgb(68, 76, 92);
 const BONE: Color32 = Color32::from_rgb(140, 148, 166);
 
-/// A joint dot coloured by side, like the guides in the view.
+/// A guide drawn as in the view: a yellow ring around a diamond coloured by side.
 fn joint(painter: &egui::Painter, at: Pos2, x: f32, r: f32) {
     let color = if x.abs() < 0.5 {
         theme::CENTER
@@ -2881,11 +3132,17 @@ fn joint(painter: &egui::Painter, at: Pos2, x: f32, r: f32) {
     } else {
         theme::RIGHT
     };
-    painter.circle_filled(at, r + 1.0, Color32::from_black_alpha(160));
-    painter.circle_filled(at, r, color.gamma_multiply(0.85));
+    guide_control(
+        painter,
+        at,
+        r + 0.6,
+        Stroke::new(1.0, JOINT.gamma_multiply(0.75)),
+        color,
+    );
 }
 
-/// A highlighted chain: glow, honey line and joint rings.
+/// The part a card adds: a honey chain of guide controls, with the red handle
+/// brackets on its first guide where there's room for them.
 fn hot_chain(painter: &egui::Painter, pts: &[Pos2], width: f32, hot: bool) {
     let honey = if hot {
         Color32::from_rgb(255, 205, 100)
@@ -2896,10 +3153,18 @@ fn hot_chain(painter: &egui::Painter, pts: &[Pos2], width: f32, hot: bool) {
         pts.to_vec(),
         Stroke::new(width + 6.0, ACCENT.gamma_multiply(0.18)),
     ));
-    painter.add(egui::Shape::line(pts.to_vec(), Stroke::new(width, honey)));
+    painter.add(egui::Shape::line(
+        pts.to_vec(),
+        Stroke::new(width.min(1.6), honey),
+    ));
+    let r = width + 1.8;
     for p in pts {
-        painter.circle_filled(*p, width + 1.6, Color32::from_rgb(29, 33, 42));
-        painter.circle_stroke(*p, width + 1.6, Stroke::new(1.6, honey));
+        guide_control(painter, *p, r, Stroke::new(1.6, honey), honey);
+    }
+    if width >= 1.8
+        && let Some(first) = pts.first()
+    {
+        brackets(painter, *first, r + 4.0, Stroke::new(1.6, HANDLE));
     }
 }
 
@@ -3244,6 +3509,7 @@ fn component_row(
     side: Side,
     depth: usize,
     selected: bool,
+    badge: Option<bool>,
 ) -> egui::Response {
     let height = 28.0;
     let (rect, response) =
@@ -3290,13 +3556,30 @@ fn component_row(
             Color32::from_rgb(205, 209, 218)
         },
     );
-    painter.text(
+    let kind_rect = painter.text(
         Pos2::new(rect.right() - 10.0, rect.center().y),
         Align2::RIGHT_CENTER,
         kind_label(kind),
         FontId::proportional(11.5),
         TEXT_FAINT,
     );
+    if let Some(parent) = badge {
+        let (word, color) = if parent {
+            ("parent", JOINT)
+        } else {
+            ("child", PICK)
+        };
+        let galley = painter.layout_no_wrap(word.into(), FontId::proportional(10.5), color);
+        let chip = Rect::from_min_size(
+            Pos2::new(
+                kind_rect.left() - 10.0 - galley.size().x - 12.0,
+                rect.center().y - 9.0,
+            ),
+            Vec2::new(galley.size().x + 12.0, 18.0),
+        );
+        painter.rect_filled(chip, 9, color.gamma_multiply(0.16));
+        painter.galley(chip.center() - galley.size() / 2.0, galley, color);
+    }
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -3572,6 +3855,44 @@ fn kind_word(kind: ControlKind) -> &'static str {
 }
 
 /// A joint as a small ring with a cross, so it reads as a joint rather than a dot.
+/// Four corner brackets around `at`: a component's handle.
+fn brackets(painter: &egui::Painter, at: Pos2, half: f32, stroke: Stroke) {
+    let arm = half * 0.45;
+    for (sx, sy) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+        let corner = at + Vec2::new(sx * half, sy * half);
+        painter.line_segment([corner, corner - Vec2::new(sx * arm, 0.0)], stroke);
+        painter.line_segment([corner, corner - Vec2::new(0.0, sy * arm)], stroke);
+    }
+}
+
+/// A guide drawn as a joint control: a dark core, a coloured ring and a small
+/// diamond tinted by side, rather than a plain dot.
+fn guide_control(painter: &egui::Painter, at: Pos2, r: f32, ring: Stroke, core: Color32) {
+    painter.circle_filled(at, r, Color32::from_black_alpha(150));
+    painter.circle_stroke(at, r, ring);
+    let d = r * 0.45;
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            at + Vec2::new(0.0, -d),
+            at + Vec2::new(d, 0.0),
+            at + Vec2::new(0.0, d),
+            at + Vec2::new(-d, 0.0),
+        ],
+        core,
+        Stroke::NONE,
+    ));
+}
+
+/// An IK pole marker: a green plus in a thin ring.
+fn pole_marker(painter: &egui::Painter, at: Pos2) {
+    let arm = 7.0;
+    let stroke = Stroke::new(2.2, POLE);
+    painter.circle_filled(at, 9.0, Color32::from_black_alpha(110));
+    painter.line_segment([at - Vec2::X * arm, at + Vec2::X * arm], stroke);
+    painter.line_segment([at - Vec2::Y * arm, at + Vec2::Y * arm], stroke);
+    painter.circle_stroke(at, 9.0, Stroke::new(1.0, POLE.gamma_multiply(0.6)));
+}
+
 fn joint_marker(painter: &egui::Painter, at: Pos2, color: Color32) {
     painter.circle_filled(at, 4.5, Color32::from_black_alpha(160));
     painter.circle_stroke(at, 4.5, Stroke::new(1.6, color));

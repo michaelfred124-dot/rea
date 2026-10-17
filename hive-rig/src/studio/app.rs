@@ -130,6 +130,9 @@ pub struct Studio {
     pub camera: Camera,
     /// Selected component and, optionally, one of its guides.
     pub selected: Option<(usize, Option<usize>)>,
+    /// Components picked with Shift, in pick order, each with the guide it was
+    /// picked by. The last one is the parent when parenting.
+    pub picked: Vec<(String, Option<usize>)>,
     pub symmetry: bool,
     pub mode: Mode,
     /// The floating outliner and properties panels are expanded.
@@ -160,7 +163,7 @@ pub struct Studio {
     pub rig_pick: Option<RigPick>,
     pub pose: Option<Pose>,
     /// What a right-click in the viewport landed on, for its menu.
-    pub menu_guide: Option<(usize, usize)>,
+    pub menu_guide: Option<(usize, Option<usize>)>,
     pub menu_rig: Option<RigPick>,
     /// Component whose handle is being dragged onto a joint to attach it.
     pub handle_drag: Option<usize>,
@@ -174,6 +177,7 @@ impl Default for Studio {
             doc: None,
             camera: Camera::default(),
             selected: None,
+            picked: Vec::new(),
             rig_pick: None,
             pose: None,
             menu_guide: None,
@@ -207,6 +211,10 @@ impl Default for Studio {
 
 // --------------------------------------------------------------------------- operations
 
+fn hang(n: usize) -> &'static str {
+    if n == 1 { "hangs" } else { "hang" }
+}
+
 impl Studio {
     fn info(&mut self, msg: impl Into<String>) {
         self.status = msg.into();
@@ -225,6 +233,7 @@ impl Studio {
         self.camera = Camera::default();
         self.camera.frame(min, max);
         self.selected = None;
+        self.picked.clear();
         self.rig_pick = None;
         self.pose = None;
         self.weights_bone = None;
@@ -381,10 +390,194 @@ impl Studio {
             return;
         };
         let bone = bone.to_string();
-        self.edit("attach the component", |g| {
+        let guide = self
+            .selected
+            .and_then(|(c, g)| (c == comp).then_some(g).flatten());
+        if self.edit("attach the component", |g| {
             components::attach(g, &id, &bone)?;
             Ok(format!("{id} now hangs from {bone}."))
-        });
+        }) {
+            self.reselect(vec![(id, guide)]);
+        }
+    }
+
+    /// Keep the Shift picks in step with the plain selection: a selection made any
+    /// other way (a click, a new part, undo) becomes the only pick.
+    pub fn sync_picks(&mut self) {
+        let Some(doc) = &self.doc else {
+            self.picked.clear();
+            return;
+        };
+        let comps = &doc.guides.components;
+        self.picked
+            .retain(|(id, _)| comps.iter().any(|c| &c.id == id));
+        match self
+            .selected
+            .and_then(|(c, g)| comps.get(c).map(|c| (c.id.clone(), g)))
+        {
+            None => self.picked.clear(),
+            Some((id, g)) => {
+                if !self.picked.iter().any(|(p, _)| *p == id) {
+                    self.picked = vec![(id, g)];
+                }
+            }
+        }
+    }
+
+    /// Plain click: this component (and guide) alone.
+    pub fn pick_one(&mut self, comp: usize, guide: Option<usize>) {
+        self.selected = Some((comp, guide));
+        self.picked.clear();
+        self.sync_picks();
+    }
+
+    /// Press on a part that's already picked keeps the picks (so dragging one of
+    /// several doesn't drop the rest); any other part becomes the only pick.
+    pub fn keep_or_pick(&mut self, comp: usize, guide: Option<usize>) {
+        self.sync_picks();
+        let id = self.component_id(comp);
+        if self.picked.len() > 1 && self.picked.iter().any(|(p, _)| Some(p) == id.as_ref()) {
+            self.selected = Some((comp, guide));
+        } else {
+            self.pick_one(comp, guide);
+        }
+    }
+
+    /// Shift+click: add a component to the picks, or drop it if it's already in.
+    pub fn toggle_pick(&mut self, comp: usize, guide: Option<usize>) {
+        self.sync_picks();
+        let Some(id) = self.component_id(comp) else {
+            return;
+        };
+        if let Some(at) = self.picked.iter().position(|(p, _)| *p == id) {
+            self.picked.remove(at);
+            let last = self.picked.last().cloned();
+            self.selected = last.and_then(|(id, g)| self.component_index(&id).map(|c| (c, g)));
+        } else {
+            self.picked.push((id, guide));
+            self.selected = Some((comp, guide));
+        }
+    }
+
+    fn component_id(&self, comp: usize) -> Option<String> {
+        let doc = self.doc.as_ref()?;
+        doc.guides.components.get(comp).map(|c| c.id.clone())
+    }
+
+    pub fn component_index(&self, id: &str) -> Option<usize> {
+        let doc = self.doc.as_ref()?;
+        doc.guides.components.iter().position(|c| c.id == id)
+    }
+
+    /// The bone a part hangs from when parented under `comp`: the one nearest the
+    /// guide it was picked by, else the component's first bone.
+    pub fn parent_bone(&self, comp: &str, guide: Option<usize>) -> Option<String> {
+        let doc = self.doc.as_ref()?;
+        let built = doc.preview.as_ref().ok()?;
+        let c = doc.guides.component(comp)?;
+        let bones = built.skeleton.bones.iter().filter(|b| b.component == comp);
+        match guide.and_then(|g| c.guides.get(g)) {
+            Some(g) => bones
+                .min_by(|a, b| {
+                    a.head
+                        .distance(g.position)
+                        .total_cmp(&b.head.distance(g.position))
+                })
+                .map(|b| b.name.clone()),
+            None => bones.map(|b| b.name.clone()).next(),
+        }
+    }
+
+    /// Parent every pick under the last one picked, as one undo step.
+    pub fn parent_picked(&mut self) {
+        self.sync_picks();
+        let Some(((parent, guide), children)) = self.picked.split_last() else {
+            return;
+        };
+        if children.is_empty() {
+            return self.fail("Shift-click the parts to parent, then the one they hang from last.");
+        }
+        let ids: Vec<String> = children.iter().map(|(id, _)| id.clone()).collect();
+        let (parent, guide) = (parent.clone(), *guide);
+        self.parent_under(&ids, &parent, guide);
+    }
+
+    /// Parent every pick under a guide of another component (right-click on it).
+    pub fn parent_picked_to(&mut self, comp: usize, guide: Option<usize>) {
+        self.sync_picks();
+        let Some(parent) = self.component_id(comp) else {
+            return;
+        };
+        let ids: Vec<String> = self
+            .picked
+            .iter()
+            .map(|(id, _)| id.clone())
+            .filter(|id| *id != parent)
+            .collect();
+        if ids.is_empty() {
+            return self.fail("Pick the parts to parent first.");
+        }
+        self.parent_under(&ids, &parent, guide);
+    }
+
+    fn parent_under(&mut self, ids: &[String], parent: &str, guide: Option<usize>) {
+        let Some(bone) = self.parent_bone(parent, guide) else {
+            return self.fail(format!("{parent} has no bones to hang anything from."));
+        };
+        let keep = self.picked.clone();
+        if self.edit("parent", |g| {
+            for id in ids {
+                components::attach(g, id, &bone)?;
+            }
+            Ok(format!(
+                "{} now {} from {bone}.",
+                ids.join(", "),
+                hang(ids.len())
+            ))
+        }) {
+            self.reselect(keep);
+        }
+    }
+
+    /// Hang every pick straight from the root again, as one undo step.
+    pub fn unparent_picked(&mut self) {
+        self.sync_picks();
+        let ids: Vec<String> = self
+            .picked
+            .iter()
+            .map(|(id, _)| id.clone())
+            .filter(|id| {
+                self.doc
+                    .as_ref()
+                    .and_then(|d| d.guides.component(id))
+                    .is_some_and(|c| c.kind != Kind::Root)
+            })
+            .collect();
+        if ids.is_empty() {
+            return self.fail("Pick a part to unparent (the root stays where it is).");
+        }
+        let keep = self.picked.clone();
+        if self.edit("unparent", |g| {
+            for id in &ids {
+                components::attach(g, id, "root")?;
+            }
+            Ok(format!(
+                "{} now {} from the root.",
+                ids.join(", "),
+                hang(ids.len())
+            ))
+        }) {
+            self.reselect(keep);
+        }
+    }
+
+    /// Parenting can reorder components, so find the picks again by id.
+    fn reselect(&mut self, picks: Vec<(String, Option<usize>)>) {
+        self.picked = picks;
+        self.selected = self
+            .picked
+            .last()
+            .and_then(|(id, g)| self.component_index(id).map(|c| (c, *g)));
     }
 
     /// Bring the components of another guides file in, hung from `bone`.
@@ -1220,5 +1413,69 @@ mod tests {
             back.controls.control(&name).unwrap().shape,
             hive_rig::controls::Shape::Cross
         );
+    }
+
+    #[test]
+    fn shift_picks_parent_under_the_last_and_unparent_to_the_root() {
+        let mut s = demo_studio();
+        s.add_tail();
+        s.add_eyes();
+        let parent_of = |s: &Studio, id: &str| {
+            s.doc
+                .as_ref()
+                .unwrap()
+                .guides
+                .component(id)
+                .unwrap()
+                .parent
+                .clone()
+                .unwrap()
+        };
+        // Tail and eyes picked, then the head by its top guide: both hang from the
+        // head bone nearest that guide.
+        s.pick_one(comp(&s, "tail"), None);
+        s.toggle_pick(comp(&s, "eyes"), None);
+        let head = comp(&s, "head");
+        s.toggle_pick(head, Some(2));
+        assert_eq!(s.picked.len(), 3);
+        s.parent_picked();
+        assert!(!s.error, "{}", s.status);
+        assert_eq!(parent_of(&s, "tail"), "head");
+        assert_eq!(parent_of(&s, "eyes"), "head");
+        // The picks survive the edit, and one undo puts both back.
+        assert_eq!(s.picked.len(), 3);
+        s.undo();
+        assert_eq!(parent_of(&s, "tail"), "pelvis");
+
+        // Shift-clicking a pick again drops it; a plain click starts over.
+        s.pick_one(comp(&s, "tail"), None);
+        s.toggle_pick(comp(&s, "eyes"), None);
+        s.toggle_pick(comp(&s, "eyes"), None);
+        assert_eq!(s.picked.len(), 1);
+        s.pick_one(comp(&s, "arm_l"), None);
+        assert_eq!(s.picked.len(), 1);
+
+        // Picks right-clicked onto another part's guide hang from it.
+        s.toggle_pick(comp(&s, "tail"), None);
+        let leg = comp(&s, "leg_l");
+        s.parent_picked_to(leg, Some(0));
+        assert!(!s.error, "{}", s.status);
+        assert_eq!(parent_of(&s, "arm_l"), "thigh_l");
+        assert_eq!(parent_of(&s, "tail"), "thigh_l");
+        // Selection follows the parts even though parenting reordered them.
+        let (c, _) = s.selected.unwrap();
+        assert_eq!(s.doc.as_ref().unwrap().guides.components[c].id, "tail");
+
+        s.unparent_picked();
+        assert_eq!(parent_of(&s, "arm_l"), "root");
+        assert_eq!(parent_of(&s, "tail"), "root");
+        assert!(s.build(), "{}", s.status);
+
+        // A part can't be parented under its own child.
+        s.pick_one(comp(&s, "spine"), None);
+        s.toggle_pick(comp(&s, "head"), Some(1));
+        s.parent_picked();
+        assert!(s.error);
+        assert_eq!(parent_of(&s, "spine"), "root");
     }
 }
