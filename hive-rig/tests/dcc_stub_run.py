@@ -79,6 +79,9 @@ def stub_maya():
                 calls.append((name, args))
                 return [kwargs.get("name", name + "1")]
             if name == "xform":
+                if kwargs.get("q") and (kwargs.get("matrix") or kwargs.get("m")):
+                    x, y, z = positions.get(args[0], [0.0, 0.0, 0.0])
+                    return [1.0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, 1.0, 0, x, y, z, 1.0]
                 if kwargs.get("q"):
                     return list(positions.get(args[0], [0.0, 0.0, 0.0]))
                 if "t" in kwargs:
@@ -132,7 +135,9 @@ def stub_maya():
               "joint", "setAttr", "skinCluster", "curve", "matchTransform", "move", "parentConstraint",
               "orientConstraint", "aimConstraint", "addAttr", "makeIdentity", "ikHandle", "poleVectorConstraint", "connectAttr",
               "select", "file", "getAttr", "expression", "attributeQuery", "objExists", "delete", "ls",
-              "spaceLocator", "listHistory", "polyEvaluate", "warning"]:
+              "spaceLocator", "listHistory", "polyEvaluate", "warning", "autoKeyframe", "setKeyframe",
+              "window", "deleteUI", "columnLayout", "rowLayout", "setParent", "button", "text", "separator",
+              "checkBox", "showWindow", "confirmDialog"]:
         setattr(cmds, n, generic(n))
 
     om = types.ModuleType("maya.api.OpenMaya")
@@ -256,6 +261,20 @@ if __name__ == "__main__":
                 for j, p in enumerate(line):
                     got = CV_POSITIONS.get("%s.cv[%d]" % (shape, j))
                     assert got is not None and max(abs(g - 100.0 * w) for g, w in zip(got, p)) < 1e-6, (shape, j)
+        # Animator tools: IK/FK matching, mirror, reset, select, space switch, and the window.
+        anim = json.loads(ns["cmds"].getAttr(ns["TOP"] + ".hiveAnim"))
+        assert anim["limbs"] and anim["mirror"] and anim["spaces"], sorted(anim)
+        for limb in anim["limbs"]:
+            ns["ik_to_fk"](limb["name"])
+            ns["fk_to_ik"](limb["name"])
+        assert ns["mirror_pose"](None, "left") == len(anim["mirror"])
+        assert ns["mirror_pose"]([anim["mirror"][0][1]], "right") == 1
+        assert ns["reset_pose"]() == len(anim["controls"])
+        assert ns["select_controls"]() == len(anim["controls"])
+        ns["switch_space"](next(iter(anim["spaces"])), 1)
+        ns["show_window"]()
+        assert "rowLayout" in calls and "confirmDialog" not in calls
+        print("maya animator tools ran against stubs: ok")
         if os.path.isfile(ns["HIVE_EXE"]) and "--guides" in sys_args:
             # Guide tools: edit, mirror, add a component, rebuild keeping weights.
             ns["show_guides"]()

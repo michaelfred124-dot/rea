@@ -21,6 +21,9 @@ patterns) applied to every export, and now:
   face and fingers. Checked by renaming and editing a rig in real Blender.
 - **Weight tools**: mirror weights left to right (or back) and smooth one
   bone's weights or all of them.
+- **Animator tools** (Blender tab and Maya window): IK to FK and FK to IK
+  matching per limb, mirror pose, reset pose, select all controls and space
+  switching without a pop. Checked in real Blender; Maya only against stubs.
 
 ## Gaps, ranked by how much they'd help a rigger
 
@@ -30,8 +33,8 @@ patterns) applied to every export, and now:
 | 2 | Face, next steps | Joint-based face plus face controls on a panel | Done: face joints. Next: a 2D face control board, lip zippers, sticky lips | Medium |
 | 3 | Bendy limbs | Bendy/ribbon arms and legs, soft IK | Extra mid-limb controls driving the twist bones; soft IK to stop knee pop | Medium |
 | 4 | Spine and tentacles | Spline (IK) spine, tentacles, multi-branch FK | A spline-chain component with stretch and volume | Medium |
-| 5 | IK/FK and space matching | Snap IK to FK and back without a pop | A match button in the Blender tab and Maya window | Medium |
-| 6 | Animator tools | Mirror poses, select-all-controls, reset pose | Pose mirror using our L/R naming, reset to bind | Small |
+| 5 | IK/FK and space matching | Snap IK to FK and back without a pop | Done in the Blender tab and Maya window. Next: the same in Unreal (a Control Rig function or editor utility), and matching across a frame range | Small |
+| 6 | Animator tools | Mirror poses, select-all-controls, reset pose | Done in Blender and Maya. Next: flip a whole pose (centre controls too), a pose library | Small |
 | 7 | Joints to guides, next steps | Turn an existing skeleton into guides | Done for .glb. Next: unknown chains (ears, tails, hair) read back as chain components, and FBX input | Small |
 | 8 | FBX and more targets | FBX export; Unity and Houdini use | FBX writer, or document the glTF route for Unity/Houdini | Medium |
 | 9 | Pose-driven correctives | Corrective shapes and helper joints driven by joint angles (Brave Rabbit's weightDriver is the well-known Maya RBF/pose reader) | Our own pose reader: a cone angle between a joint and its rest pose drives a helper joint or shape, written as Blender drivers and Maya nodes | Large |
@@ -54,5 +57,5 @@ patterns) applied to every export, and now:
 
 ## Suggested order
 
-1 (quad leg) and 5 (matching) give the biggest jump for game work; 2 (face) for
-film. 6 and 10 are quick wins we could fit in any time.
+1 (quad leg) gives the biggest jump for game work now that matching is in; 2
+(face) for film. 10 is a quick win we could fit in any time.

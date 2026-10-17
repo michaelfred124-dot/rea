@@ -18,7 +18,7 @@ import subprocess
 import sys
 
 import bpy
-from mathutils import Vector
+from mathutils import Matrix, Vector
 
 RIG_DATA = json.loads(r"""__HIVE_RIG_JSON__""")
 GLB_PATH = r"""__HIVE_GLB_PATH__"""
@@ -398,9 +398,245 @@ def build(RIG, geo=None):
     rig["hive_name"] = NAME
     rig["hive_guides"] = json.dumps(RIG["guides"])
     rig["hive_dir"] = OUT_DIR
+    rig["hive_anim"] = json.dumps(animator_data(RIG, foot_ik_target))
     bpy.context.view_layer.objects.active = rig
     print("hive-rig: built %s with %d bones and %d controls" % (NAME, len(BONES), len(CONTROLS)))
     return rig, geo
+
+
+# --------------------------------------------------------------------------- animator tools
+# IK/FK matching, pose mirroring, reset and space switching. Which controls make
+# up each limb and which controls are left/right twins come from hive-rig (the
+# rig's ik_chains and mirror_pairs), kept on the armature as `hive_anim`.
+ANIM_PROPS = ("ik_fk", "stretch", "roll", "space")
+
+
+def animator_data(RIG, goals):
+    controls = RIG["controls"]
+    limbs, defaults = [], {}
+    for c in controls["ik_chains"]:
+        limbs.append({
+            "name": c["name"], "upper": c["upper"], "lower": c["lower"], "end": c["end"],
+            "ik": c["ik_control"], "pole": c["pole_control"], "fk": c["fk_controls"],
+            "goal": goals.get(c["name"], c["ik_control"]),
+        })
+        d = defaults.setdefault(c["ik_control"], {})
+        d.update(ik_fk=float(c["default_blend"]), stretch=float(c["default_stretch"]))
+        if c.get("foot"):
+            d["roll"] = 0.0
+    spaces = {}
+    for c in controls["controls"]:
+        if c.get("spaces"):
+            spaces[c["name"]] = c["spaces"]
+            defaults.setdefault(c["name"], {})["space"] = 0
+    return {
+        "controls": [c["name"] for c in controls["controls"]],
+        "limbs": limbs,
+        "mirror": controls.get("mirror_pairs", []),
+        "spaces": spaces,
+        "defaults": defaults,
+    }
+
+
+def anim_data(rig):
+    return json.loads(rig["hive_anim"])
+
+
+def refresh(rig):
+    rig.update_tag()
+    bpy.context.view_layer.update()
+
+
+def key_controls(rig, names):
+    """Key what the tools changed when auto-keying is on."""
+    if not bpy.context.scene.tool_settings.use_keyframe_insert_auto:
+        return
+    for n in names:
+        pb = rig.pose.bones[n]
+        pb.keyframe_insert("location")
+        pb.keyframe_insert("rotation_quaternion" if pb.rotation_mode == "QUATERNION" else
+                           "rotation_axis_angle" if pb.rotation_mode == "AXIS_ANGLE" else "rotation_euler")
+        for prop in ANIM_PROPS:
+            if prop in pb.keys():
+                pb.keyframe_insert('["%s"]' % prop)
+
+
+def limb_of(rig, name):
+    return next(l for l in anim_data(rig)["limbs"] if l["name"] == name)
+
+
+def rotation_only(m):
+    """The matrix without scale (a stretched IK bone), so FK controls stay unscaled."""
+    return m.normalized()
+
+
+def limb_frame(a, b, c, fallback_bend):
+    """Axes of a limb: along the reach (root to end), toward the bend of the middle
+    joint, and their normal. A straight limb has no bend; `fallback_bend` stands in."""
+    along = (c - a).normalized()
+    bend = (b - a) - along * (b - a).dot(along)
+    if bend.length < 1e-3 * (b - a).length:
+        bend = fallback_bend - along * fallback_bend.dot(along)
+    bend.normalize()
+    return Matrix((along, bend, along.cross(bend))).transposed()
+
+
+def pole_position(rig, limb, a, b, c, upper_matrix):
+    """The pole in front of the middle joint, in the plane of the limb: it keeps
+    the place it had relative to the limb's frame at rest, so the IK solve lands
+    on the same bend. A straight limb has no plane; then the rest bend is carried
+    along by the upper bone."""
+    bones = rig.data.bones
+    ra, rb, rc = (bones[limb[k]].head_local for k in ("upper", "lower", "end"))
+    rest_pole = bones[limb["pole"]].head_local
+    rest = limb_frame(ra, rb, rc, rest_pole - rb)
+    rest_upper = bones[limb["upper"]].matrix_local.to_3x3().normalized()
+    carried = upper_matrix.to_3x3().normalized() @ rest_upper.inverted() @ (rest @ Vector((0.0, 1.0, 0.0)))
+    now = limb_frame(a, b, c, carried)
+    return b + now @ (rest.transposed() @ (rest_pole - rb))
+
+
+def ik_to_fk(rig, name):
+    """Snap the FK controls onto the IK pose, then switch the limb to FK."""
+    limb = limb_of(rig, name)
+    pose = rig.pose.bones
+    ik = pose[limb["ik"]]
+    ik["ik_fk"] = 1.0
+    refresh(rig)
+    targets = [rotation_only(pose[limb[k]].matrix) for k in ("upper", "lower", "end")]
+    for fk, m in zip(limb["fk"], targets):
+        pb = pose[fk]
+        pb.matrix = m
+        if all(pb.lock_location):
+            pb.location = (0.0, 0.0, 0.0)
+        refresh(rig)
+    ik["ik_fk"] = 0.0
+    refresh(rig)
+    key_controls(rig, limb["fk"] + [limb["ik"]])
+
+
+def fk_to_ik(rig, name):
+    """Move the IK control and pole onto the FK pose, then switch the limb to IK."""
+    limb = limb_of(rig, name)
+    pose = rig.pose.bones
+    refresh(rig)
+    fk = [rotation_only(pose[n].matrix) for n in limb["fk"]]
+    ik, goal = pose[limb["ik"]], pose[limb["goal"]]
+    # The IK goal can sit below the control (a rolled foot); keep that offset.
+    offset = ik.matrix.inverted() @ goal.matrix
+    ik.matrix = fk[2] @ offset.inverted()
+    refresh(rig)
+    pole = pose[limb["pole"]]
+    a, b, c = fk[0].translation, fk[1].translation, fk[2].translation
+    m = pole.matrix.copy()
+    m.translation = pole_position(rig, limb, a, b, c, fk[0])
+    pole.matrix = m
+    ik["ik_fk"] = 1.0
+    refresh(rig)
+    # How the solver turns the limb's plane toward the pole is its own business;
+    # turn the pole about the reach until the middle joint lands on the FK one.
+    along = (c - a).normalized()
+    for _ in range(8):
+        want = b - a - along * (b - a).dot(along)
+        got = pose[limb["lower"]].head - a
+        got -= along * got.dot(along)
+        if want.length < 1e-6 or got.length < 1e-6:
+            break
+        angle = got.angle(want)
+        if angle < 1e-5:
+            break
+        if got.cross(want).dot(along) < 0:
+            angle = -angle
+        m = pole.matrix.copy()
+        m.translation = a + Matrix.Rotation(angle, 3, along) @ (m.translation - a)
+        pole.matrix = m
+        refresh(rig)
+    key_controls(rig, [limb["ik"], limb["pole"]])
+
+
+def mirror_pose(rig, names=None, source="left"):
+    """Copy controls' poses onto their twins on the other side. `names` are the
+    controls to copy from (their twins receive the pose); without names every
+    `source`-side control is copied. Each pose is mirrored relative to the
+    control's parent, so the result is symmetric when the centre is."""
+    data = anim_data(rig)
+    twin = {}
+    for left, right in data["mirror"]:
+        twin[left], twin[right] = right, left
+    lefts = {left for left, _ in data["mirror"]}
+    if names:
+        picked = [n for n in names if n in twin]
+        # With both twins picked, the source side wins.
+        copies = [(n, twin[n]) for n in picked if twin[n] not in picked or (n in lefts) == (source == "left")]
+    else:
+        copies = [(l, r) if source == "left" else (r, l) for l, r in data["mirror"]]
+    pose, bones = rig.pose.bones, rig.data.bones
+    flip = Matrix.Scale(-1.0, 3, (1.0, 0.0, 0.0))
+    # Read every source first, so swapping both sides at once is consistent.
+    poses = [(src, dst, pose[src].matrix_basis.copy(), {p: pose[src][p] for p in ANIM_PROPS if p in pose[src].keys()})
+             for src, dst in copies]
+    for src, dst, basis, props in poses:
+        # The rest frames of twins are mirror images up to an axis flip `f`;
+        # conjugating the source's local pose by it gives the twin's.
+        rs = bones[src].matrix_local.to_3x3().normalized()
+        rd = bones[dst].matrix_local.to_3x3().normalized()
+        f = (rs.inverted() @ flip @ rd).to_4x4()
+        pose[dst].matrix_basis = f.inverted() @ basis @ f
+        for p, v in props.items():
+            if p in pose[dst].keys():
+                pose[dst][p] = v
+    refresh(rig)
+    key_controls(rig, [dst for _, dst in copies])
+    return len(copies)
+
+
+def reset_pose(rig, names=None):
+    """Put controls (all, or `names`) back to the bind pose and default settings."""
+    data = anim_data(rig)
+    names = [n for n in (names or data["controls"]) if n in data["controls"]]
+    pose = rig.pose.bones
+    for n in names:
+        pose[n].matrix_basis = Matrix.Identity(4)
+        for p, v in data["defaults"].get(n, {}).items():
+            pose[n][p] = v
+    refresh(rig)
+    key_controls(rig, names)
+    return len(names)
+
+
+def set_bone_selected(pb, value):
+    if "select" in pb.bl_rna.properties:  # Blender 5: selection lives on the pose bone
+        pb.select = value
+    else:
+        pb.bone.select = value
+
+
+def bone_selected(pb):
+    return pb.select if "select" in pb.bl_rna.properties else pb.bone.select
+
+
+def selected_controls(rig):
+    controls = set(anim_data(rig)["controls"])
+    return [pb.name for pb in rig.pose.bones if pb.name in controls and bone_selected(pb)]
+
+
+def select_controls(rig):
+    controls = set(anim_data(rig)["controls"])
+    for pb in rig.pose.bones:
+        set_bone_selected(pb, pb.name in controls)
+    return len(controls)
+
+
+def switch_space(rig, control, index):
+    """Change a control's space without moving it."""
+    pb = rig.pose.bones[control]
+    refresh(rig)
+    keep = pb.matrix.copy()
+    pb["space"] = int(index)
+    refresh(rig)
+    pb.matrix = keep
+    refresh(rig)
+    key_controls(rig, [control])
 
 
 # --------------------------------------------------------------------------- guides
@@ -649,6 +885,78 @@ class HIVE_OT_rebuild(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class HIVE_OT_match_limb(bpy.types.Operator):
+    bl_idname = "hive.match_limb"
+    bl_label = "Match IK/FK"
+    bl_description = "Switch the limb between IK and FK without it moving"
+    bl_options = {"REGISTER", "UNDO"}
+    limb: bpy.props.StringProperty()
+    to: bpy.props.EnumProperty(items=[("fk", "To FK", "Snap FK to the IK pose"), ("ik", "To IK", "Snap IK to the FK pose")])
+
+    def execute(self, context):
+        (ik_to_fk if self.to == "fk" else fk_to_ik)(find_rig(context), self.limb)
+        return {"FINISHED"}
+
+
+class HIVE_OT_mirror_pose(bpy.types.Operator):
+    bl_idname = "hive.mirror_pose"
+    bl_label = "Mirror Pose"
+    bl_description = "Copy the selected controls' pose to the other side (or every control's, if none is selected)"
+    bl_options = {"REGISTER", "UNDO"}
+    source: bpy.props.EnumProperty(items=[("left", "Left to Right", ""), ("right", "Right to Left", "")])
+
+    def execute(self, context):
+        rig = find_rig(context)
+        n = mirror_pose(rig, selected_controls(rig), self.source)
+        self.report({"INFO"}, "Mirrored %d controls" % n)
+        return {"FINISHED"}
+
+
+class HIVE_OT_reset_pose(bpy.types.Operator):
+    bl_idname = "hive.reset_pose"
+    bl_label = "Reset Pose"
+    bl_description = "Put controls back to the bind pose and default settings"
+    bl_options = {"REGISTER", "UNDO"}
+    selected: bpy.props.BoolProperty(name="Selected Only", default=False)
+
+    def execute(self, context):
+        rig = find_rig(context)
+        names = selected_controls(rig) if self.selected else None
+        if self.selected and not names:
+            self.report({"WARNING"}, "Select the controls to reset")
+            return {"CANCELLED"}
+        reset_pose(rig, names)
+        return {"FINISHED"}
+
+
+class HIVE_OT_select_controls(bpy.types.Operator):
+    bl_idname = "hive.select_controls"
+    bl_label = "Select All Controls"
+    bl_description = "Select every animation control of the rig"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        rig = find_rig(context)
+        if context.mode != "POSE":
+            context.view_layer.objects.active = rig
+            bpy.ops.object.mode_set(mode="POSE")
+        select_controls(rig)
+        return {"FINISHED"}
+
+
+class HIVE_OT_switch_space(bpy.types.Operator):
+    bl_idname = "hive.switch_space"
+    bl_label = "Switch Space"
+    bl_description = "Make the control follow another space without moving it"
+    bl_options = {"REGISTER", "UNDO"}
+    control: bpy.props.StringProperty()
+    index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        switch_space(find_rig(context), self.control, self.index)
+        return {"FINISHED"}
+
+
 class HIVE_PT_panel(bpy.types.Panel):
     bl_label = "Hive Rig"
     bl_space_type = "VIEW_3D"
@@ -674,6 +982,35 @@ class HIVE_PT_panel(bpy.types.Panel):
         col.operator("hive.add_component", text="Add Tail").preset = "tail"
         col.operator("hive.remove_component", icon="X")
         layout.operator("hive.rebuild", icon="FILE_REFRESH").keep_weights = True
+        if editing or not rig.get("hive_anim"):
+            return
+
+        data = anim_data(rig)
+        box = layout.box()
+        box.label(text="Animation")
+        pose = rig.pose.bones
+        for limb in data["limbs"]:
+            row = box.row(align=True)
+            ik_on = pose[limb["ik"]].get("ik_fk", 0.0) >= 0.5
+            row.label(text="%s (%s)" % (limb["name"], "IK" if ik_on else "FK"))
+            op = row.operator("hive.match_limb", text="IK to FK")
+            op.limb, op.to = limb["name"], "fk"
+            op = row.operator("hive.match_limb", text="FK to IK")
+            op.limb, op.to = limb["name"], "ik"
+        row = box.row(align=True)
+        row.operator("hive.mirror_pose", text="Mirror L to R", icon="MOD_MIRROR").source = "left"
+        row.operator("hive.mirror_pose", text="Mirror R to L").source = "right"
+        row = box.row(align=True)
+        row.operator("hive.reset_pose", text="Reset All", icon="LOOP_BACK").selected = False
+        row.operator("hive.reset_pose", text="Reset Selected").selected = True
+        box.operator("hive.select_controls", icon="RESTRICT_SELECT_OFF")
+        active = context.active_pose_bone
+        if active is not None and active.id_data == rig and active.name in data["spaces"]:
+            col = box.column(align=True)
+            col.label(text="Space of %s (no pop)" % active.name)
+            for i, space in enumerate(data["spaces"][active.name]):
+                op = col.operator("hive.switch_space", text=space, depress=int(active.get("space", 0)) == i)
+                op.control, op.index = active.name, i
 
 
 CLASSES = (
@@ -682,6 +1019,11 @@ CLASSES = (
     HIVE_OT_add_component,
     HIVE_OT_remove_component,
     HIVE_OT_rebuild,
+    HIVE_OT_match_limb,
+    HIVE_OT_mirror_pose,
+    HIVE_OT_reset_pose,
+    HIVE_OT_select_controls,
+    HIVE_OT_switch_space,
     HIVE_PT_panel,
 )
 

@@ -285,6 +285,7 @@ impl Naming {
             }
             c.spaces.iter_mut().for_each(ctrl);
         }
+        controls.mirror_pairs.iter_mut().flatten().for_each(ctrl);
         for k in &mut controls.ik_chains {
             bone(&mut k.upper);
             bone(&mut k.lower);
@@ -367,6 +368,10 @@ mod tests {
             for k in &ct.ik_chains {
                 assert!(bones.contains(&k.end) && ctrls.contains(&k.ik_control));
                 assert!(k.fk_controls.iter().all(|f| ctrls.contains(f)));
+            }
+            assert!(!ct.mirror_pairs.is_empty());
+            for [l, r] in &ct.mirror_pairs {
+                assert!(ctrls.contains(l) && ctrls.contains(r), "{l} {r}");
             }
             for b in &sk.bones {
                 if let Some(t) = &b.twist {

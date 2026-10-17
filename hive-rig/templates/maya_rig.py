@@ -243,6 +243,7 @@ def build(RIG, geo=None):
         return out
 
 
+    limb_nodes = {}  # chain name -> its helper joints and IK goal, for the animator tools
     for chain in CHAINS:
         ik_ctrl = ctrl_of[chain["ik_control"]]
         cmds.addAttr(ik_ctrl, longName="ikFk", attributeType="double", min=0, max=1,
@@ -299,6 +300,7 @@ def build(RIG, geo=None):
             cmds.connectAttr(reverse + ".outputX", con + "." + w_foot)
             cmds.connectAttr(ik_ctrl + ".ikFk", con + "." + w_flat)
         cmds.parent(handle, goal)
+        limb_nodes[chain["name"]] = {"fk_joints": fk_chain, "goal": goal}
         cmds.orientConstraint(goal, ik_chain[2], maintainOffset=True)
 
         # Stretch: scale the IK joints' lengths by how far the goal is beyond reach.
@@ -351,14 +353,318 @@ def build(RIG, geo=None):
         cmds.setAttr(share + ".input2X", twist["factor"])
         cmds.connectAttr(share + ".outputX", joint_of[b["name"]] + ".rotateX")
 
+    # What the animator tools need: the limbs and left/right twins from hive-rig,
+    # with the bind-pose frames they match and mirror against.
+    def world_matrix(node):
+        return cmds.xform(node, q=True, ws=True, matrix=True)
+
+    limbs = []
+    defaults = {}
+    for chain in CHAINS:
+        nodes = limb_nodes[chain["name"]]
+        ik_ctrl = ctrl_of[chain["ik_control"]]
+        limbs.append({
+            "name": chain["name"],
+            "joints": [joint_of[chain[k]] for k in ("upper", "lower", "end")],
+            "fk_joints": nodes["fk_joints"],
+            "goal": nodes["goal"],
+            "ik": ik_ctrl,
+            "pole": ctrl_of[chain["pole_control"]],
+            "fk": [ctrl_of[n] for n in chain["fk_controls"]],
+            "rest": [world_matrix(joint_of[chain[k]]) for k in ("upper", "lower", "end")],
+            "rest_pole": world_matrix(ctrl_of[chain["pole_control"]]),
+        })
+        d = defaults.setdefault(ik_ctrl, {})
+        d.update(ikFk=float(chain["default_blend"]), stretch=float(chain["default_stretch"]))
+        if chain.get("foot"):
+            d["roll"] = 0.0
+    spaces = {}
+    for c in CONTROLS:
+        if c.get("spaces"):
+            spaces[ctrl_of[c["name"]]] = c["spaces"]
+            defaults.setdefault(ctrl_of[c["name"]], {})["space"] = 0
+    anim = {
+        "controls": [ctrl_of[c["name"]] for c in CONTROLS],
+        "offsets": {ctrl_of[c["name"]]: offset_of[c["name"]] for c in CONTROLS},
+        "limbs": limbs,
+        "mirror": [[ctrl_of[l], ctrl_of[r]] for l, r in RIG["controls"].get("mirror_pairs", [])],
+        "bind": {ctrl_of[n]: world_matrix(offset_of[n]) for pair in RIG["controls"].get("mirror_pairs", []) for n in pair},
+        "spaces": spaces,
+        "defaults": defaults,
+    }
+
     # What the Hive window needs to edit guides and rebuild, kept on the rig so it
     # survives saving and reopening the scene.
-    for attr, value in (("hiveGuides", json.dumps(RIG["guides"])), ("hiveDir", OUT_DIR)):
+    for attr, value in (("hiveGuides", json.dumps(RIG["guides"])), ("hiveDir", OUT_DIR), ("hiveAnim", json.dumps(anim))):
         cmds.addAttr(top, longName=attr, dataType="string")
         cmds.setAttr(top + "." + attr, value, type="string")
     cmds.select(clear=True)
     print("hive-rig: built %s with %d joints and %d controls" % (NAME, len(joints), len(CONTROLS)))
     return top, geo
+
+
+# --------------------------------------------------------------------------- animator tools
+# IK/FK matching, pose mirroring, reset and space switching. The limbs and the
+# left/right twins come from hive-rig (ik_chains and mirror_pairs), kept on the rig
+# as `hiveAnim` with the bind frames. Matrices here are 4x4 lists of rows acting on
+# column vectors; Maya's flat worldMatrix is the transpose.
+ANIM_ATTRS = ("ikFk", "stretch", "roll", "space")
+CHANNELS = ("tx", "ty", "tz", "rx", "ry", "rz")
+
+
+def anim_data():
+    return json.loads(cmds.getAttr(TOP + ".hiveAnim"))
+
+
+def from_maya(flat):
+    m = [[flat[j * 4 + i] for j in range(4)] for i in range(4)]
+    for j in range(3):  # drop scale
+        n = math.sqrt(sum(m[i][j] ** 2 for i in range(3))) or 1.0
+        for i in range(3):
+            m[i][j] /= n
+    return m
+
+
+def mat_mul(a, b):
+    return [[sum(a[i][k] * b[k][j] for k in range(4)) for j in range(4)] for i in range(4)]
+
+
+def mat_inv(m):
+    """Inverse of a rigid transform."""
+    r = [[m[j][i] for j in range(3)] for i in range(3)]
+    t = [-sum(r[i][k] * m[k][3] for k in range(3)) for i in range(3)]
+    return [r[0] + [t[0]], r[1] + [t[1]], r[2] + [t[2]], [0.0, 0.0, 0.0, 1.0]]
+
+
+def mat_apply(m, v, w=1.0):
+    return [sum(m[i][k] * v[k] for k in range(3)) + m[i][3] * w for i in range(3)]
+
+
+def translation(m):
+    return [m[0][3], m[1][3], m[2][3]]
+
+
+def with_translation(m, t):
+    out = [row[:] for row in m]
+    for i in range(3):
+        out[i][3] = t[i]
+    return out
+
+
+def euler_matrix(rx, ry, rz):
+    """Rotation for Maya's default xyz rotate order (X first)."""
+    x, y, z = (math.radians(a) for a in (rx, ry, rz))
+    cx, sx, cy, sy, cz, sz = math.cos(x), math.sin(x), math.cos(y), math.sin(y), math.cos(z), math.sin(z)
+    return [[cy * cz, sx * sy * cz - cx * sz, cx * sy * cz + sx * sz, 0.0],
+            [cy * sz, sx * sy * sz + cx * cz, cx * sy * sz - sx * cz, 0.0],
+            [-sy, sx * cy, cx * cy, 0.0],
+            [0.0, 0.0, 0.0, 1.0]]
+
+
+def matrix_euler(m):
+    y = math.asin(max(-1.0, min(1.0, -m[2][0])))
+    if abs(m[2][0]) < 0.99999:
+        x, z = math.atan2(m[2][1], m[2][2]), math.atan2(m[1][0], m[0][0])
+    else:  # gimbal: put it all in X
+        x, z = math.atan2(-m[1][2], m[1][1]), 0.0
+    return [math.degrees(a) for a in (x, y, z)]
+
+
+def sub(a, b):
+    return [a[i] - b[i] for i in range(3)]
+
+
+def add(a, b):
+    return [a[i] + b[i] for i in range(3)]
+
+
+def scale(a, k):
+    return [x * k for x in a]
+
+
+def dot(a, b):
+    return sum(a[i] * b[i] for i in range(3))
+
+
+def cross(a, b):
+    return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+
+
+def norm(a):
+    n = math.sqrt(dot(a, a))
+    return scale(a, 1.0 / n) if n > 1e-12 else a
+
+
+def world(node):
+    return from_maya(cmds.xform(node, q=True, ws=True, matrix=True))
+
+
+def settable(plug):
+    return cmds.getAttr(plug, settable=True)
+
+
+def set_local(ctrl, m):
+    """Set a control's channels to the local transform `m` (relative to its offset)."""
+    values = translation(m) + matrix_euler(m)
+    for ch, v in zip(CHANNELS, values):
+        if settable(ctrl + "." + ch):
+            cmds.setAttr(ctrl + "." + ch, v)
+
+
+def set_world(ctrl, m):
+    set_local(ctrl, mat_mul(mat_inv(world(anim_data()["offsets"][ctrl])), m))
+
+
+def key_controls(names):
+    """Key what the tools changed when auto key is on."""
+    if not cmds.autoKeyframe(q=True, state=True):
+        return
+    for n in names:
+        cmds.setKeyframe(n, attribute=[c for c in CHANNELS + ANIM_ATTRS if cmds.attributeQuery(c, node=n, exists=True)])
+
+
+def limb_of(name):
+    return next(l for l in anim_data()["limbs"] if l["name"] == name)
+
+
+def ik_to_fk(name):
+    """Snap the FK controls onto the IK pose, then switch the limb to FK."""
+    limb = limb_of(name)
+    offsets = anim_data()["offsets"]
+    cmds.setAttr(limb["ik"] + ".ikFk", 1)
+    targets = [world(j) for j in limb["joints"]]
+    for ctrl, target in zip(limb["fk"], targets):
+        local = mat_mul(mat_inv(world(offsets[ctrl])), target)
+        for ch, v in zip(("rx", "ry", "rz"), matrix_euler(local)):
+            if settable(ctrl + "." + ch):
+                cmds.setAttr(ctrl + "." + ch, v)
+    cmds.setAttr(limb["ik"] + ".ikFk", 0)
+    key_controls(limb["fk"] + [limb["ik"]])
+
+
+def limb_frame(a, b, c, fallback):
+    """Axes (as columns) along the reach, toward the middle joint's bend, and their normal."""
+    along = norm(sub(c, a))
+    bend = sub(sub(b, a), scale(along, dot(sub(b, a), along)))
+    if math.sqrt(dot(bend, bend)) < 1e-3 * math.sqrt(dot(sub(b, a), sub(b, a))):
+        bend = sub(fallback, scale(along, dot(fallback, along)))
+    bend = norm(bend)
+    return along, bend, cross(along, bend)
+
+
+def pole_position(limb, a, b, c, upper):
+    """Where the pole sat at bind relative to the limb's frame, in today's frame."""
+    ra, rb, rc = (translation(from_maya(m)) for m in limb["rest"])
+    rest_pole = translation(from_maya(limb["rest_pole"]))
+    rest = limb_frame(ra, rb, rc, sub(rest_pole, rb))
+    coords = [dot(axis, sub(rest_pole, rb)) for axis in rest]
+    # A straight limb has no plane: carry the bind bend along with the upper bone.
+    carry = mat_mul(upper, mat_inv(from_maya(limb["rest"][0])))
+    now = limb_frame(a, b, c, mat_apply(carry, rest[1], 0.0))
+    return add(b, [sum(now[k][i] * coords[k] for k in range(3)) for i in range(3)])
+
+
+def rotate_about(p, origin, axis, angle):
+    v = sub(p, origin)
+    c, s = math.cos(angle), math.sin(angle)
+    r = add(add(scale(v, c), scale(cross(axis, v), s)), scale(axis, dot(axis, v) * (1 - c)))
+    return add(origin, r)
+
+
+def fk_to_ik(name):
+    """Move the IK control and pole onto the FK pose, then switch the limb to IK."""
+    limb = limb_of(name)
+    fk = [world(j) for j in limb["fk_joints"]]
+    # The IK goal can sit below the control (a rolled foot); keep that offset.
+    offset = mat_mul(mat_inv(world(limb["ik"])), world(limb["goal"]))
+    set_world(limb["ik"], mat_mul(fk[2], mat_inv(offset)))
+    a, b, c = (translation(m) for m in fk)
+    pole = world(limb["pole"])
+    set_world(limb["pole"], with_translation(pole, pole_position(limb, a, b, c, fk[0])))
+    cmds.setAttr(limb["ik"] + ".ikFk", 1)
+    # Turn the pole about the reach until the middle joint lands on the FK one.
+    along = norm(sub(c, a))
+    want = sub(sub(b, a), scale(along, dot(sub(b, a), along)))
+    for _ in range(8):
+        got = sub(translation(world(limb["joints"][1])), a)
+        got = sub(got, scale(along, dot(got, along)))
+        if dot(got, got) < 1e-12 or dot(want, want) < 1e-12:
+            break
+        angle = math.atan2(dot(cross(got, want), along), dot(got, want))
+        if abs(angle) < 1e-5:
+            break
+        pole = world(limb["pole"])
+        set_world(limb["pole"], with_translation(pole, rotate_about(translation(pole), a, along, angle)))
+    key_controls([limb["ik"], limb["pole"]])
+
+
+def mirror_pose(names=None, source="left"):
+    """Copy controls' poses onto their twins on the other side: the selected
+    controls, or every `source`-side control when none is given. Each pose is
+    mirrored relative to the control's own offset, so the result is symmetric
+    when the centre is."""
+    data = anim_data()
+    twin = {}
+    for left, right in data["mirror"]:
+        twin[left], twin[right] = right, left
+    lefts = {left for left, _ in data["mirror"]}
+    if names:
+        picked = [n for n in names if n in twin]
+        copies = [(n, twin[n]) for n in picked if twin[n] not in picked or (n in lefts) == (source == "left")]
+    else:
+        copies = [(l, r) if source == "left" else (r, l) for l, r in data["mirror"]]
+    flip = [[-1.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 0, 1.0, 0], [0, 0, 0, 1.0]]
+    poses = []
+    for src, dst in copies:
+        rotation = euler_matrix(*(cmds.getAttr(src + "." + c) for c in ("rx", "ry", "rz")))
+        local = with_translation(rotation, [cmds.getAttr(src + "." + c) for c in ("tx", "ty", "tz")])
+        attrs = {a: cmds.getAttr(src + "." + a) for a in ANIM_ATTRS if cmds.attributeQuery(a, node=src, exists=True)}
+        poses.append((src, dst, local, attrs))
+    for src, dst, local, attrs in poses:
+        # The bind frames of twins are mirror images up to an axis flip `f`;
+        # conjugating the source's local pose by it gives the twin's.
+        rs = with_translation(from_maya(data["bind"][src]), [0, 0, 0])
+        rd = with_translation(from_maya(data["bind"][dst]), [0, 0, 0])
+        f = mat_mul(mat_mul(mat_inv(rs), flip), rd)
+        set_local(dst, mat_mul(mat_mul(mat_inv(f), local), f))
+        for a, v in attrs.items():
+            if cmds.attributeQuery(a, node=dst, exists=True):
+                cmds.setAttr(dst + "." + a, v)
+    key_controls([dst for _, dst in copies])
+    return len(copies)
+
+
+def reset_pose(names=None):
+    """Put controls (all, or `names`) back to the bind pose and default settings."""
+    data = anim_data()
+    names = [n for n in (names or data["controls"]) if n in data["controls"]]
+    for n in names:
+        for ch in CHANNELS:
+            if settable(n + "." + ch):
+                cmds.setAttr(n + "." + ch, 0)
+        for a, v in data["defaults"].get(n, {}).items():
+            cmds.setAttr(n + "." + a, v)
+    key_controls(names)
+    return len(names)
+
+
+def selected_controls():
+    controls = set(anim_data()["controls"])
+    return [n for n in (cmds.ls(selection=True) or []) if n in controls]
+
+
+def select_controls():
+    names = anim_data()["controls"]
+    cmds.select(names, replace=True)
+    return len(names)
+
+
+def switch_space(ctrl, index):
+    """Change a control's space without moving it."""
+    keep = world(ctrl)
+    cmds.setAttr(ctrl + ".space", int(index))
+    set_world(ctrl, keep)
+    key_controls([ctrl])
 
 
 # --------------------------------------------------------------------------- guides
@@ -561,7 +867,7 @@ def _safe(fn, *args):
 def show_window():
     if cmds.window(WINDOW, exists=True):
         cmds.deleteUI(WINDOW)
-    cmds.window(WINDOW, title="Hive Rig: " + NAME, widthHeight=(220, 260))
+    cmds.window(WINDOW, title="Hive Rig: " + NAME, widthHeight=(240, 560))
     cmds.columnLayout(adjustableColumn=True, rowSpacing=4)
     cmds.button(label="Edit Guides", command=_safe(show_guides))
     cmds.button(label="Mirror Left to Right", command=_safe(mirror_guides))
@@ -581,7 +887,50 @@ def show_window():
     cmds.separator()
     keep = cmds.checkBox(label="Keep Weights", value=True)
     cmds.button(label="Rebuild Rig", command=lambda *_: _safe(rebuild, cmds.checkBox(keep, q=True, value=True))())
+    if cmds.attributeQuery("hiveAnim", node=TOP, exists=True):
+        animation_section()
     cmds.showWindow(WINDOW)
+
+
+def animation_section():
+    cmds.separator()
+    cmds.text(label="Animation")
+    for limb in anim_data()["limbs"]:
+        cmds.rowLayout(numberOfColumns=3, adjustableColumn=1)
+        cmds.text(label=limb["name"])
+        cmds.button(label="IK to FK", command=_safe(ik_to_fk, limb["name"]))
+        cmds.button(label="FK to IK", command=_safe(fk_to_ik, limb["name"]))
+        cmds.setParent("..")
+
+    def mirror(source):
+        return lambda *_: _safe(mirror_pose, selected_controls(), source)()
+
+    def reset(selected):
+        def call(*_):
+            names = selected_controls() if selected else None
+            if selected and not names:
+                cmds.warning("Select the controls to reset")
+                return
+            _safe(reset_pose, names)()
+        return call
+
+    def space(*_):
+        sel = [n for n in selected_controls() if n in anim_data()["spaces"]]
+        if not sel:
+            cmds.warning("Select a control that has spaces")
+            return
+        spaces = anim_data()["spaces"][sel[0]]
+        pick = cmds.confirmDialog(title="Switch Space", message="Follow which space? (%s keeps its place)" % sel[0],
+                                  button=spaces + ["Cancel"], cancelButton="Cancel", dismissString="Cancel")
+        if pick in spaces:
+            _safe(switch_space, sel[0], spaces.index(pick))()
+
+    cmds.button(label="Mirror Pose Left to Right", command=mirror("left"))
+    cmds.button(label="Mirror Pose Right to Left", command=mirror("right"))
+    cmds.button(label="Reset All Controls", command=reset(False))
+    cmds.button(label="Reset Selected Controls", command=reset(True))
+    cmds.button(label="Select All Controls", command=_safe(select_controls))
+    cmds.button(label="Switch Space Without Pop...", command=space)
 
 
 def main():

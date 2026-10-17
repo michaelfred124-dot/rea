@@ -153,6 +153,11 @@ jobs:
           EOF
           cargo run -q -- rebuild "$rig/hive_demo.hive.json"
           python tests/blender_check.py "$rig/hive_demo_blender.py" "$rig/hive_demo.glb"
+      - name: Animator tools - IK/FK matching, mirror, reset and space switching in Blender
+        run: |
+          for drop in 0 45; do
+            python tests/blender_anim_check.py "$RUNNER_TEMP/rig$drop/hive_demo_blender.py"
+          done
       - name: Eyes, jaw, face joints and fingers in Blender
         run: |
           rig="$RUNNER_TEMP/face"
@@ -166,6 +171,7 @@ jobs:
           cargo run -q -- naming "$rig/hive_demo.guides.json" prefix
           cargo run -q -- rebuild "$rig/hive_demo.hive.json"
           python tests/blender_check.py "$rig/hive_demo_blender.py" "$rig/hive_demo.glb"
+          python tests/blender_anim_check.py "$rig/hive_demo_blender.py"
           named="$RUNNER_TEMP/named_guides"
           cargo run -q -- demo -o "$named"
           cargo run -q -- naming "$named/hive_demo.guides.json" prefix
