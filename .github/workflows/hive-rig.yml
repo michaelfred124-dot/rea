@@ -74,6 +74,21 @@ jobs:
           cargo run --locked -q -- rebuild "$rig/hive_demo.hive.json"
           python3 -I tests/dcc_stub_run.py unreal "$rig/hive_demo_unreal.py"
           python3 -I tests/dcc_stub_run.py maya "$rig/hive_demo_maya.py" --guides
+      - name: Quadruped - the dog demo and hind legs on a biped, Maya and Unreal builders
+        run: |
+          dog="$RUNNER_TEMP/dog"
+          cargo run --locked -q -- demo --quadruped -o "$dog"
+          python3 -I tests/dcc_stub_run.py maya "$dog/hive_dog_maya.py" --guides
+          python3 -I tests/dcc_stub_run.py unreal "$dog/hive_dog_unreal.py"
+          # Swap a biped's legs for three-segment hind legs.
+          swap="$RUNNER_TEMP/swap"
+          cargo run --locked -q -- demo -o "$swap"
+          cargo run --locked -q -- remove "$swap/hive_demo.guides.json" leg_l
+          cargo run --locked -q -- remove "$swap/hive_demo.guides.json" leg_r
+          cargo run --locked -q -- add "$swap/hive_demo.guides.json" quad_legs
+          cargo run --locked -q -- rebuild "$swap/hive_demo.hive.json"
+          python3 -I tests/dcc_stub_run.py maya "$swap/hive_demo_maya.py"
+          python3 -I tests/dcc_stub_run.py unreal "$swap/hive_demo_unreal.py"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: hive-demo-rigs
@@ -127,6 +142,14 @@ jobs:
           for part in eyes jaw face fingers toes; do cargo run -q -- add "$rig/hive_demo.guides.json" "$part"; done
           cargo run -q -- rebuild "$rig/hive_demo.hive.json"
           python tests/blender_check.py "$rig/hive_demo_blender.py" "$rig/hive_demo.glb"
+      - name: Quadruped (dog) rig in Blender, default and side-first naming
+        run: |
+          dog="$RUNNER_TEMP/dog"
+          cargo run -q -- demo --quadruped -o "$dog"
+          python tests/blender_quad_check.py "$dog/hive_dog_blender.py" "$dog/hive_dog.glb"
+          cargo run -q -- naming "$dog/hive_dog.guides.json" prefix
+          cargo run -q -- rebuild "$dog/hive_dog.hive.json"
+          python tests/blender_quad_check.py "$dog/hive_dog_blender.py" "$dog/hive_dog.glb"
       - name: Side-first naming in Blender
         run: |
           rig="$RUNNER_TEMP/face"

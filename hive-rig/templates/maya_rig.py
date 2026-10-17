@@ -204,16 +204,27 @@ def build(RIG, geo=None):
         ctrl_of[c["name"]] = ctrl
         offset_of[c["name"]] = offset
 
-        if c["kind"] == "fk" and c["bone"] and copy_rule(bone_by_name[c["bone"]]) == "orient":
+        if c["kind"] == "hock" or (c["kind"] == "fk" and c["bone"] and copy_rule(bone_by_name[c["bone"]]) == "orient"):
             for attr in ("tx", "ty", "tz"):
                 cmds.setAttr(ctrl + "." + attr, lock=True, keyable=False, channelBox=False)
         for attr in ("sx", "sy", "sz", "v"):
             cmds.setAttr(ctrl + "." + attr, lock=True, keyable=False, channelBox=False)
 
     # --------------------------------------------------------------------------- FK for non-limb bones
+    def chain_bones(chain):
+        """The limb's bones from the top down; three-segment legs add the hock."""
+        hock = chain.get("hock")
+        return [chain["upper"], chain["lower"]] + ([hock["bone"]] if hock else []) + [chain["end"]]
+
+
+    def chain_fk_controls(chain):
+        fk, hock = chain["fk_controls"], chain.get("hock")
+        return fk[:2] + ([hock["fk_control"]] if hock else []) + fk[2:]
+
+
     limb_bones = set()
     for chain in CHAINS:
-        limb_bones.update((chain["upper"], chain["lower"], chain["end"]))
+        limb_bones.update(chain_bones(chain))
 
     for c in CONTROLS:
         if c["kind"] in ("fk", "root") and c["bone"] and c["bone"] not in limb_bones:
@@ -236,9 +247,9 @@ def build(RIG, geo=None):
     def duplicate_chain(chain, suffix):
         parent = cmds.listRelatives(joint_of[chain["upper"]], parent=True)[0]
         out = []
-        for key in ("upper", "lower", "end"):
-            src = joint_of[chain[key]]
-            j = cmds.createNode("joint", name=chain[key] + suffix, parent=out[-1] if out else parent)
+        for bone in chain_bones(chain):
+            src = joint_of[bone]
+            j = cmds.createNode("joint", name=bone + suffix, parent=out[-1] if out else parent)
             cmds.matchTransform(j, src, position=True, rotation=True)
             cmds.makeIdentity(j, apply=True, rotate=True)
             out.append(j)
@@ -255,7 +266,7 @@ def build(RIG, geo=None):
         for j in fk_chain + ik_chain:
             cmds.setAttr(j + ".visibility", 0)
 
-        for ctrl_name, j in zip(chain["fk_controls"], fk_chain):
+        for ctrl_name, j in zip(chain_fk_controls(chain), fk_chain):
             cmds.orientConstraint(ctrl_of[ctrl_name], j, maintainOffset=True)
 
         cmds.joint(ik_chain[0], edit=True, setPreferredAngles=True, children=True)
@@ -300,16 +311,26 @@ def build(RIG, geo=None):
             w_foot, w_flat = cmds.parentConstraint(con, query=True, weightAliasList=True)
             cmds.connectAttr(reverse + ".outputX", con + "." + w_foot)
             cmds.connectAttr(ik_ctrl + ".ikFk", con + "." + w_flat)
-        cmds.parent(handle, goal)
-        cmds.orientConstraint(goal, ik_chain[2], maintainOffset=True)
+        hock = chain.get("hock")
+        solve_to = goal
+        if hock:
+            # Three-segment leg: the hock control rides on the foot goal and carries a
+            # group at the hock point. The thigh and calf solve to it, the hock joint
+            # takes its rotation and the foot keeps the goal's.
+            cmds.parent(offset_of[hock["control"]], goal)
+            solve_to = cmds.group(empty=True, name=chain["name"] + "_hock_grp", parent=ctrl_of[hock["control"]])
+            cmds.matchTransform(solve_to, joint_of[hock["bone"]], position=True, rotation=True)
+            cmds.orientConstraint(goal, ik_chain[3], maintainOffset=True)
+        cmds.parent(handle, solve_to)
+        cmds.orientConstraint(solve_to, ik_chain[2], maintainOffset=True)
 
         # Stretch: scale the IK joints' lengths by how far the goal is beyond reach.
         cmds.addAttr(ik_ctrl, longName="stretch", attributeType="double", min=0, max=1,
                      defaultValue=chain["default_stretch"], keyable=True)
-        rest = [cmds.getAttr(j + ".translateX") for j in ik_chain[1:]]
+        rest = [cmds.getAttr(j + ".translateX") for j in ik_chain[1:3]]
         dist = cmds.createNode("distanceBetween", name=chain["name"] + "_stretch_dist")
         cmds.connectAttr(ik_chain[0] + ".worldMatrix[0]", dist + ".inMatrix1")
-        cmds.connectAttr(goal + ".worldMatrix[0]", dist + ".inMatrix2")
+        cmds.connectAttr(solve_to + ".worldMatrix[0]", dist + ".inMatrix2")
         ratio = cmds.createNode("multiplyDivide", name=chain["name"] + "_stretch_ratio")
         cmds.setAttr(ratio + ".operation", 2)
         cmds.connectAttr(dist + ".distance", ratio + ".input1X")
@@ -330,18 +351,20 @@ def build(RIG, geo=None):
             cmds.setAttr(scale + ".input2X", length)
             cmds.connectAttr(scale + ".outputX", j + ".translateX")
 
-        for key, ik_j, fk_j in zip(("upper", "lower", "end"), ik_chain, fk_chain):
+        for k, (bone, ik_j, fk_j) in enumerate(zip(chain_bones(chain), ik_chain, fk_chain)):
             # Lower joints also take position so stretching reaches the skin.
-            constrain = cmds.orientConstraint if key == "upper" else cmds.parentConstraint
-            con = constrain(ik_j, fk_j, joint_of[chain[key]], maintainOffset=False)[0]
+            constrain = cmds.orientConstraint if k == 0 else cmds.parentConstraint
+            con = constrain(ik_j, fk_j, joint_of[bone], maintainOffset=False)[0]
             w_ik, w_fk = constrain(con, query=True, weightAliasList=True)
             cmds.connectAttr(ik_ctrl + ".ikFk", con + "." + w_ik)
             cmds.connectAttr(reverse + ".outputX", con + "." + w_fk)
 
         # Show only the controls of the active mode.
-        for name in chain["fk_controls"]:
+        for name in chain_fk_controls(chain):
             cmds.connectAttr(reverse + ".outputX", offset_of[name] + ".visibility")
         cmds.connectAttr(ik_ctrl + ".ikFk", offset_of[chain["pole_control"]] + ".visibility")
+        if hock:
+            cmds.connectAttr(ik_ctrl + ".ikFk", offset_of[hock["control"]] + ".visibility")
 
     # --------------------------------------------------------------------------- twist helpers
     for b in BONES:

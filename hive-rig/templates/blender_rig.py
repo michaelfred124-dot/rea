@@ -226,6 +226,20 @@ def build(RIG, geo=None):
         chain["_flat"], chain["_ball_space"] = flat, ball_space
         chain["_pivots"] = (heel, toe, ball)
 
+    # Three-segment legs: the hock control rides on the foot goal (so it follows the
+    # roll) and carries a copy of the hock bone. The thigh and calf solve to that
+    # copy's head (the hock point) and the hock bone takes its rotation.
+    hock_target = {}
+    for chain in CHAINS:
+        hock = chain.get("hock")
+        if not hock:
+            continue
+        goal = foot_ik_target.get(chain["name"], chain["ik_control"])
+        edit[hock["control"]].parent = edit[goal]
+        # A stretching calf scales; the hock keeps its length so the paw lands on the goal.
+        edit[hock["bone"]].inherit_scale = "NONE"
+        hock_target[chain["name"]] = mch("MCH_%s_hock" % chain["name"], like=hock["bone"], parent=hock["control"])
+
 
     def signed_angle(u, v, normal):
         a = u.angle(v)
@@ -277,7 +291,9 @@ def build(RIG, geo=None):
             local = pb.bone.matrix_local.to_3x3().inverted() @ offset
             pb.custom_shape_translation = local
         pb.rotation_mode = "XYZ"
-        if c["kind"] == "fk" and c["bone"] and copy_rule(bone_by_name[c["bone"]]) == "COPY_ROTATION":
+        if c["kind"] == "hock" or (
+            c["kind"] == "fk" and c["bone"] and copy_rule(bone_by_name[c["bone"]]) == "COPY_ROTATION"
+        ):
             pb.lock_location = (True, True, True)
         if has_collections:
             ctrl_coll.assign(arm_data.bones[c["name"]])
@@ -338,11 +354,12 @@ def build(RIG, geo=None):
         add_property(ik_pb, "stretch", float(chain["default_stretch"]), 0.0, 1.0,
                      "Let the limb stretch to reach the IK control")
         goal = foot_ik_target.get(chain["name"], chain["ik_control"])
+        hock = chain.get("hock")
 
         ik = pose[chain["lower"]].constraints.new("IK")
         ik.name = "IK"
         ik.target = rig
-        ik.subtarget = goal
+        ik.subtarget = hock_target[chain["name"]] if hock else goal
         ik.use_stretch = True
         for bone in (chain["upper"], chain["lower"]):
             add_driver(pose[bone], "ik_stretch", chain["ik_control"], "stretch", "stretch * 0.1")
@@ -351,6 +368,13 @@ def build(RIG, geo=None):
         ik.pole_angle = pole_angles[chain["name"]]
         ik.chain_count = 2
         add_blend_driver(ik, chain["ik_control"])
+
+        if hock:
+            seg = pose[hock["bone"]].constraints.new("COPY_ROTATION")
+            seg.name = "IK Hock"
+            seg.target = rig
+            seg.subtarget = hock_target[chain["name"]]
+            add_blend_driver(seg, chain["ik_control"])
 
         rot = pose[chain["end"]].constraints.new("COPY_ROTATION")
         rot.name = "IK Rotation"

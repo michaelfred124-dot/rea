@@ -51,6 +51,7 @@ fn kind_label(k: Kind) -> &'static str {
         Kind::Head => "Head",
         Kind::Arm => "Arm",
         Kind::Leg => "Leg",
+        Kind::QuadLeg => "Hind leg",
         Kind::Chain => "Chain",
         Kind::Eyes => "Eyes",
         Kind::Jaw => "Jaw",
@@ -137,7 +138,7 @@ struct LibraryPart {
     once: Option<Kind>,
 }
 
-const LIBRARY: [LibraryPart; 10] = [
+const LIBRARY: [LibraryPart; 11] = [
     LibraryPart {
         art: Art::Face,
         title: "Face",
@@ -185,6 +186,14 @@ const LIBRARY: [LibraryPart; 10] = [
         category: Category::Body,
         add: Studio::add_toes,
         once: None,
+    },
+    LibraryPart {
+        art: Art::HindLegs,
+        title: "Hind legs",
+        text: "Thigh, calf, hock and paw with IK, for quadrupeds. Remove the legs first.",
+        category: Category::Body,
+        add: Studio::add_hind_legs,
+        once: Some(Kind::QuadLeg),
     },
     LibraryPart {
         art: Art::Tail,
@@ -1356,7 +1365,7 @@ impl Studio {
                     });
                 }
             }
-            Kind::Arm | Kind::Leg => {
+            Kind::Arm | Kind::Leg | Kind::QuadLeg => {
                 let mut twist = comp.options.twist;
                 ui.horizontal(|ui| {
                     if theme::pill(ui, &mut twist, "Twist bones").clicked() {
@@ -2964,6 +2973,7 @@ fn dock_icon(painter: &egui::Painter, c: Pos2, icon: Icon, color: Color32) {
 enum Art {
     Face,
     Toes,
+    HindLegs,
     Eyes,
     Jaw,
     Ears,
@@ -3141,7 +3151,7 @@ fn hot_chain(painter: &egui::Painter, pts: &[Pos2], width: f32, hot: bool) {
 fn illustration(painter: &egui::Painter, r: Rect, art: Art, hot: bool) {
     match art {
         Art::Face | Art::Eyes | Art::Jaw | Art::Ears | Art::Ponytail => bust(painter, r, art, hot),
-        Art::Fingers | Art::Toes | Art::Tail | Art::Prop | Art::Chain => {
+        Art::Fingers | Art::Toes | Art::HindLegs | Art::Tail | Art::Prop | Art::Chain => {
             figure(painter, r, art, hot)
         }
     }
@@ -3263,6 +3273,22 @@ fn figure(painter: &egui::Painter, r: Rect, art: Art, hot: bool) {
                     let mid = base.lerp(tip, 0.5);
                     hot_chain(painter, &[base, mid, tip], 1.0, hot);
                 }
+            }
+        }
+        Art::HindLegs => {
+            // A zigzag hind leg on each side: thigh, calf, hock and paw.
+            for s in [-1.0f32, 1.0] {
+                let pts: Vec<Pos2> = [
+                    (5.5, 52.0),
+                    (9.5, 67.0),
+                    (4.5, 82.0),
+                    (7.0, 93.0),
+                    (11.0, 97.0),
+                ]
+                .into_iter()
+                .map(|(x, y)| pt(x * s, y))
+                .collect();
+                hot_chain(painter, &pts, 2.0, hot);
             }
         }
         Art::Tail => {
@@ -3818,6 +3844,7 @@ fn kind_word(kind: ControlKind) -> &'static str {
         ControlKind::Fk => "FK",
         ControlKind::IkEffector => "IK",
         ControlKind::Pole => "Pole",
+        ControlKind::Hock => "Hock",
         _ => "Animator",
     }
 }

@@ -33,6 +33,9 @@ pub enum ControlKind {
     /// Look-at target: `bone`, if set, aims at the control (eyes). Without a bone it
     /// is the master that moves its aim targets together.
     Aim,
+    /// Hock control of a three-segment leg: sits at the ankle under the IK goal
+    /// and swings the hock about it, which sets where the two-bone IK aims.
+    Hock,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -83,6 +86,37 @@ pub struct IkChain {
     /// Reverse-foot pivots for legs, driven by a `roll` attribute on the IK control.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foot: Option<FootRoll>,
+    /// Three-segment (digitigrade) legs: the extra segment between `lower` and
+    /// `end`. The two-bone IK on `upper` and `lower` then reaches the hock point
+    /// instead of the goal, `hock.bone` follows the hock control and `end`
+    /// follows the IK goal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hock: Option<HockSegment>,
+}
+
+/// The extra segment of a three-segment leg (thigh, calf, hock, foot).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HockSegment {
+    /// The bone from the hock joint down to the ankle (the metatarsus).
+    pub bone: String,
+    /// Its FK control, between the lower and end FK controls.
+    pub fk_control: String,
+    /// The IK hock control (`ControlKind::Hock`), placed at the ankle. Its
+    /// parent in the data is the IK control; builders hang it under the
+    /// reverse-foot goal so it follows the foot roll.
+    pub control: String,
+}
+
+impl IkChain {
+    /// Bones of the chain from the hip or shoulder down, including the hock.
+    pub fn bones(&self) -> Vec<&str> {
+        let mut out = vec![self.upper.as_str(), self.lower.as_str()];
+        if let Some(h) = &self.hock {
+            out.push(&h.bone);
+        }
+        out.push(&self.end);
+        out
+    }
 }
 
 /// Reverse-foot setup. A negative `roll` rocks back on the heel; a positive roll

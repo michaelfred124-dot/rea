@@ -13,7 +13,8 @@ use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
 use crate::controls::{
-    Control, ControlKind, ControlParent, ControlRig, FootRoll, IkChain, Shape, ctrl_name, fk_name,
+    Control, ControlKind, ControlParent, ControlRig, FootRoll, HockSegment, IkChain, Shape,
+    ctrl_name, fk_name,
 };
 use crate::landmarks::{Landmarks, mirror};
 use crate::naming::Naming;
@@ -73,6 +74,9 @@ pub enum Kind {
     Head,
     Arm,
     Leg,
+    /// A three-segment hind leg for quadrupeds and creatures: thigh, calf, hock
+    /// (metatarsus) and a paw with a toe, with the knee in front and the hock behind.
+    QuadLeg,
     /// FK chain of any length: fingers, tails, ears, hair, props.
     Chain,
     /// Two eyes that look at a movable target.
@@ -105,6 +109,10 @@ pub const FACE_GUIDES: [&str; 17] = [
     "lip_corner_r",
 ];
 
+/// The quad leg's guides: hip, knee (stifle), hock, ankle (where the paw
+/// starts), ball (the pads), toe tip and heel (the back of the paw on the ground).
+pub const QUAD_LEG_GUIDES: [&str; 7] = ["hip", "knee", "hock", "ankle", "ball", "toe", "heel"];
+
 impl Kind {
     /// Guide names in order, or `None` for a chain (two or more guides, any names).
     pub fn guide_names(self) -> Option<&'static [&'static str]> {
@@ -114,6 +122,7 @@ impl Kind {
             Kind::Head => &["neck", "head", "head_top"],
             Kind::Arm => &["clavicle", "shoulder", "elbow", "wrist", "hand_tip"],
             Kind::Leg => &["hip", "knee", "ankle", "ball", "toe", "heel"],
+            Kind::QuadLeg => &QUAD_LEG_GUIDES,
             Kind::Eyes => &["eye_l", "eye_r", "target"],
             Kind::Jaw => &["jaw", "chin"],
             Kind::Face => &FACE_GUIDES,
@@ -310,6 +319,91 @@ pub fn biped(lm: &Landmarks) -> Guides {
     }
 }
 
+/// Guide points of a three-segment hind leg hanging from `hip` down to `floor`,
+/// in [`QUAD_LEG_GUIDES`] order. The proportions are fractions of the hip height:
+/// the knee sits forward, the hock back, and the paw rests on the floor facing +Z.
+pub fn quad_leg_points(hip: Vec3, floor: f32) -> [Vec3; 7] {
+    let len = (hip.y - floor).max(1e-3);
+    // (height above the floor, forward of the hip), as fractions of the hip height.
+    let at = |up: f32, fwd: f32| Vec3::new(hip.x, floor + up * len, hip.z + fwd * len);
+    [
+        hip,
+        at(0.655, 0.21),  // knee (stifle), forward
+        at(0.345, -0.10), // hock, back
+        at(0.07, -0.035), // ankle: the paw starts here
+        at(0.035, 0.10),  // ball: the pads
+        at(0.017, 0.21),  // toe tip
+        at(0.0, -0.085),  // heel: the back of the paw on the ground
+    ]
+}
+
+/// The built-in quadruped (dog) layout for a character `height` metres tall
+/// (floor to the top of the head), facing +Z: spine, neck and head, a tail, two
+/// front legs and two three-segment hind legs. Front legs are arm components
+/// (scapula, upper arm, forearm and a paw) whose elbows point back; the hind
+/// legs are [`Kind::QuadLeg`].
+pub fn quadruped(height: f32) -> Guides {
+    let h = height;
+    let v = |x: f32, y: f32, z: f32| Vec3::new(x, y, z) * h;
+    let chest_bone = spine_name(SPINE_JOINTS - 1);
+    let mut components = vec![
+        Component::new("root", Kind::Root, Side::Center, None).guide("root", Vec3::ZERO),
+        Component::new("spine", Kind::Spine, Side::Center, Some("root"))
+            .guide("pelvis", v(0.0, 0.6, -0.38))
+            .guide("chest", v(0.0, 0.64, 0.3)),
+        Component::new("head", Kind::Head, Side::Center, Some(&chest_bone))
+            .guide("neck", v(0.0, 0.68, 0.36))
+            .guide("head", v(0.0, 0.88, 0.52))
+            .guide("head_top", v(0.0, 0.84, 0.74)),
+    ];
+    for side in [Side::Left, Side::Right] {
+        let sx = side.sign();
+        let s = side.suffix();
+        components.push(
+            Component::new(format!("front_leg{s}"), Kind::Arm, side, Some(&chest_bone))
+                .guide("clavicle", v(0.05 * sx, 0.7, 0.26))
+                .guide("shoulder", v(0.1 * sx, 0.52, 0.34))
+                .guide("elbow", v(0.1 * sx, 0.32, 0.24))
+                .guide("wrist", v(0.1 * sx, 0.07, 0.29))
+                .guide("hand_tip", v(0.1 * sx, 0.015, 0.38)),
+        );
+    }
+    for side in [Side::Left, Side::Right] {
+        let s = side.suffix();
+        let mut leg = Component::new(format!("hind_leg{s}"), Kind::QuadLeg, side, Some("pelvis"));
+        let points = quad_leg_points(v(0.1 * side.sign(), 0.56, -0.38), 0.0);
+        for (name, p) in QUAD_LEG_GUIDES.iter().zip(points) {
+            leg = leg.guide(*name, p);
+        }
+        components.push(leg);
+    }
+    let mut tail = Component::new("tail", Kind::Chain, Side::Center, Some("pelvis"));
+    for k in 0..=5 {
+        let t = k as f32 / 5.0;
+        tail = tail.guide(
+            format!("j{}", k + 1),
+            v(0.0, 0.62 + 0.1 * t, -0.48 - 0.4 * t),
+        );
+    }
+    components.push(tail);
+    Guides {
+        format: GUIDES_FORMAT.into(),
+        version: GUIDES_VERSION,
+        body: Body {
+            floor: 0.0,
+            height: h,
+            center_x: 0.0,
+            // The belly line: below it the skin belongs to a leg.
+            crotch_y: 0.45 * h,
+            // Everything above the belly is body, however wide.
+            torso_half_width: 0.5 * h,
+        },
+        components,
+        naming: Naming::default(),
+        control_styles: BTreeMap::new(),
+    }
+}
+
 /// Premade components that can be added to an existing layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Preset {
@@ -327,6 +421,9 @@ pub enum Preset {
     Face,
     /// Five toes on each foot, from the ball of the foot (3 joints each).
     Toes,
+    /// Three-segment hind legs (thigh, calf, hock, paw) on the pelvis, left and right.
+    #[value(name = "quad_legs", alias = "quad_leg", alias = "quad-legs")]
+    QuadLegs,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -442,6 +539,45 @@ pub fn add_preset(g: &mut Guides, preset: Preset, opts: &AddOptions) -> Result<V
                     g.components.push(c);
                     added.push(id);
                 }
+            }
+        }
+        Preset::QuadLegs => {
+            let sides = match opts.side {
+                Some(Side::Center) => bail!("hind legs need --side left or right"),
+                Some(s) => vec![s],
+                None => vec![Side::Left, Side::Right],
+            };
+            let parent = opts.parent.clone().unwrap_or_else(|| "pelvis".into());
+            let pelvis = sk
+                .bone(&parent)
+                .with_context(|| format!("no bone named {parent}"))?
+                .head;
+            let floor = g.body.floor;
+            ensure!(
+                pelvis.y > floor + 0.05 * h,
+                "{parent} is too close to the floor for a hind leg"
+            );
+            for side in sides {
+                ensure!(
+                    !g.components
+                        .iter()
+                        .any(|c| matches!(c.kind, Kind::Leg | Kind::QuadLeg) && c.side == side),
+                    "the rig already has a {side:?} leg; remove it first"
+                );
+                let id = format!("hind_leg{}", side.suffix());
+                ensure!(g.component(&id).is_none(), "{id} already exists");
+                let len = pelvis.y - floor;
+                let hip = Vec3::new(
+                    g.body.center_x + side.sign() * 0.17 * len,
+                    pelvis.y,
+                    pelvis.z,
+                );
+                let mut c = Component::new(&id, Kind::QuadLeg, side, Some(&parent));
+                for (name, p) in QUAD_LEG_GUIDES.iter().zip(quad_leg_points(hip, floor)) {
+                    c = c.guide(*name, p);
+                }
+                g.components.push(c);
+                added.push(id);
             }
         }
         Preset::Eyes | Preset::Jaw => {
@@ -891,6 +1027,8 @@ struct Builder {
     arm_chest: HashMap<String, String>,
     head_chest: Option<String>,
     component: String,
+    /// The body's belly or crotch line: skin below it belongs to a leg.
+    crotch_y: f32,
 }
 
 impl Builder {
@@ -991,6 +1129,7 @@ pub fn build(g: &Guides) -> Result<Built> {
         arm_chest: HashMap::new(),
         head_chest: None,
         component: String::new(),
+        crotch_y: g.body.crotch_y,
     };
     for c in &g.components {
         b.component = c.id.clone();
@@ -1002,6 +1141,7 @@ pub fn build(g: &Guides) -> Result<Built> {
             Kind::Head => build_head(&mut b, parent, p("neck"), p("head"), p("head_top"))?,
             Kind::Arm => build_arm(&mut b, c, parent)?,
             Kind::Leg => build_leg(&mut b, c, parent)?,
+            Kind::QuadLeg => build_quad_leg(&mut b, c, parent)?,
             Kind::Chain => build_chain(&mut b, c, parent)?,
             Kind::Eyes => build_eyes(&mut b, c, parent)?,
             Kind::Jaw => build_jaw(&mut b, p("jaw"), p("chin"), parent)?,
@@ -1071,7 +1211,7 @@ fn validate(g: &Guides) -> Result<()> {
                 c.id
             ),
         }
-        if matches!(c.kind, Kind::Arm | Kind::Leg) {
+        if matches!(c.kind, Kind::Arm | Kind::Leg | Kind::QuadLeg) {
             ensure!(
                 c.side != Side::Center,
                 "component {}: arms and legs need a side (left or right)",
@@ -1234,8 +1374,11 @@ fn limb_region(kind: Kind, side: Side) -> Region {
 fn build_arm(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
     let side = c.side;
     let s = side.suffix();
-    let region = limb_region(Kind::Arm, side);
     let p = |n: &str| c.position(n).unwrap();
+    // A quadruped's front leg: elbow and wrist below the belly line. Its skin
+    // falls in the leg region, it starts in IK and its IK control stands upright.
+    let planted = p("elbow").y < b.crotch_y && p("wrist").y < b.crotch_y;
+    let region = limb_region(if planted { Kind::Leg } else { Kind::Arm }, side);
     let clav = format!("clavicle{s}");
     b.bone(
         &clav,
@@ -1278,8 +1421,11 @@ fn build_arm(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
         side,
         &names,
         ControlParent::Control(ctrl_name(&clav)),
-        0.0,
-        None,
+        Limb {
+            blend: if planted { 1.0 } else { 0.0 },
+            upright_ik: planted,
+            ..Limb::default()
+        },
     );
     Ok(())
 }
@@ -1305,14 +1451,30 @@ fn build_leg(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
         ball_control: ctrl_name(&ball),
         break_angle: 30.0,
     };
-    limb_controls(b, "leg", side, &names, fk_parent, 1.0, Some(foot));
+    limb_controls(
+        b,
+        "leg",
+        side,
+        &names,
+        fk_parent,
+        Limb {
+            blend: 1.0,
+            upright_ik: true,
+            foot: Some(foot),
+            hock: None,
+        },
+    );
+    toe_control(b, side, &names[2], ball);
+    Ok(())
+}
 
-    // Toes follow the foot in both IK and FK.
+/// The toe (ball) control: it follows the foot bone in both IK and FK.
+fn toe_control(b: &mut Builder, side: Side, foot: &str, ball: String) {
     let bb = b.sk.bone(&ball).unwrap().clone();
     b.control(
         ctrl_name(&ball),
         ControlKind::Fk,
-        ControlParent::Bone(names[2].clone()),
+        ControlParent::Bone(foot.to_string()),
         Some(&ball),
         bb.head,
         bb.direction(),
@@ -1321,6 +1483,50 @@ fn build_leg(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
         side_color(side),
     );
     b.blended.insert(ball);
+}
+
+/// A three-segment hind leg: thigh, calf and hock (twist helpers on the thigh
+/// and calf), then the paw (`foot`) and toes (`ball`). The thigh and calf solve
+/// as a two-bone IK aimed at the hock, which a hock control at the ankle swings;
+/// the paw keeps the biped leg's reverse-foot roll.
+fn build_quad_leg(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
+    let side = c.side;
+    let s = side.suffix();
+    let region = limb_region(Kind::Leg, side);
+    let p = |n: &str| c.position(n).unwrap();
+    b.link(parent, region);
+    let segments = [format!("thigh{s}"), format!("calf{s}"), format!("hock{s}")];
+    let points = [p("hip"), p("knee"), p("hock"), p("ankle")];
+    limb_bones(b, &segments, parent, &points, side, region, c.options.twist)?;
+    let foot = format!("foot{s}");
+    b.bone(&foot, &segments[2], p("ankle"), p("ball"), side, region)?;
+    let ball = format!("ball{s}");
+    b.bone(&ball, &foot, p("ball"), p("toe"), side, region)?;
+
+    let fk_parent = b.parent_control(parent);
+    let roll = FootRoll {
+        heel: p("heel"),
+        ball: p("ball"),
+        toe_tip: p("toe"),
+        ball_bone: ball.clone(),
+        ball_control: ctrl_name(&ball),
+        break_angle: 30.0,
+    };
+    let names = [segments[0].clone(), segments[1].clone(), foot.clone()];
+    limb_controls(
+        b,
+        "leg",
+        side,
+        &names,
+        fk_parent,
+        Limb {
+            blend: 1.0,
+            upright_ik: true,
+            foot: Some(roll),
+            hock: Some(segments[2].clone()),
+        },
+    );
+    toe_control(b, side, &foot, ball);
     Ok(())
 }
 
@@ -1365,19 +1571,31 @@ fn limb_bones(
     Ok(())
 }
 
+/// How a limb's IK is set up.
+#[derive(Default)]
+struct Limb {
+    /// Initial IK/FK blend: 1 = IK.
+    blend: f32,
+    /// The IK control stands upright (feet, paws) instead of following the upper bone.
+    upright_ik: bool,
+    foot: Option<FootRoll>,
+    /// The hock bone of a three-segment leg, between the lower and end bones.
+    hock: Option<String>,
+}
+
 fn limb_controls(
     b: &mut Builder,
     kind: &str,
     side: Side,
     names: &[String; 3],
     fk_parent: ControlParent,
-    blend: f32,
-    foot: Option<FootRoll>,
+    limb: Limb,
 ) {
     let h = b.h;
     let color = side_color(side);
     let s = side.suffix();
     let [up, lo, end] = names.clone().map(|n| b.sk.bone(&n).unwrap().clone());
+    let hock = limb.hock.as_ref().map(|n| b.sk.bone(n).unwrap().clone());
     let (size, bend_fallback) = if kind == "arm" {
         (0.045 * h, -Vec3::Z)
     } else {
@@ -1385,7 +1603,10 @@ fn limb_controls(
     };
 
     let mut parent = fk_parent;
-    for bone in [&up, &lo, &end] {
+    for bone in [Some(&up), Some(&lo), hock.as_ref(), Some(&end)]
+        .into_iter()
+        .flatten()
+    {
         b.control(
             fk_name(&bone.name),
             ControlKind::Fk,
@@ -1402,10 +1623,10 @@ fn limb_controls(
     }
 
     let ik = format!("{}_ik_ctrl", end.name);
-    let ik_axis = if kind == "arm" {
-        up.direction()
-    } else {
+    let ik_axis = if limb.upright_ik {
         Vec3::Y
+    } else {
+        up.direction()
     };
     let root = if b.has_control("root_ctrl") {
         ControlParent::Control("root_ctrl".into())
@@ -1426,12 +1647,14 @@ fn limb_controls(
 
     // The pole sits straight ahead of the knee (behind the elbow): forward or
     // back, square to the limb, at about half the limb's length. A sideways lean
-    // in the guides doesn't swing it out to the side.
-    let axis = (end.head - up.head).try_normalize().unwrap_or(Vec3::NEG_Y);
+    // in the guides doesn't swing it out to the side. On a three-segment leg the
+    // two-bone solve ends at the hock, so that is the limb it squares to.
+    let solve_end = hock.as_ref().map_or(end.head, |k| k.head);
+    let axis = (solve_end - up.head).try_normalize().unwrap_or(Vec3::NEG_Y);
     let bend = (bend_fallback - axis * bend_fallback.dot(axis))
         .try_normalize()
         .unwrap_or(bend_fallback);
-    let reach = 0.5 * (up.head.distance(lo.head) + lo.head.distance(end.head));
+    let reach = 0.5 * (up.head.distance(lo.head) + lo.head.distance(solve_end));
     let pole = format!("{}_pole_ctrl", lo.name);
     b.control(
         pole.clone(),
@@ -1445,6 +1668,28 @@ fn limb_controls(
         color,
     );
 
+    // The hock control stands at the ankle and points up the hock: turning it
+    // swings the hock about the ankle, which moves where the knee solve aims.
+    let hock_segment = hock.map(|k| {
+        let control = format!("{}_ik_ctrl", k.name);
+        b.control(
+            control.clone(),
+            ControlKind::Hock,
+            ControlParent::Control(ik.clone()),
+            None,
+            k.tail,
+            (k.head - k.tail).try_normalize().unwrap_or(Vec3::Y),
+            Shape::Diamond,
+            0.03 * h,
+            color,
+        );
+        HockSegment {
+            fk_control: fk_name(&k.name),
+            bone: k.name,
+            control,
+        }
+    });
+
     b.rig.ik_chains.push(IkChain {
         name: format!("{kind}{s}"),
         upper: up.name.clone(),
@@ -1453,9 +1698,10 @@ fn limb_controls(
         ik_control: ik,
         pole_control: pole,
         fk_controls: [fk_name(&up.name), fk_name(&lo.name), fk_name(&end.name)],
-        default_blend: blend,
+        default_blend: limb.blend,
         default_stretch: 0.0,
-        foot,
+        foot: limb.foot,
+        hock: hock_segment,
     });
 }
 
@@ -2142,6 +2388,202 @@ mod tests {
         assert!(attach(&mut dst, "tail", "hand_l").is_err());
         assert!(attach(&mut dst, "tail", &last).is_err());
         assert_eq!(dst.components.len(), before);
+    }
+
+    /// Control parents and spaces only name controls listed earlier, and every
+    /// bone a control or chain names exists.
+    fn assert_controls_consistent(built: &Built) {
+        let (sk, rig) = (&built.skeleton, &built.controls);
+        for (i, c) in rig.controls.iter().enumerate() {
+            match &c.parent {
+                ControlParent::Control(p) => {
+                    let pi = rig.controls.iter().position(|x| &x.name == p).expect(p);
+                    assert!(pi < i, "{} listed before parent {p}", c.name);
+                }
+                ControlParent::Bone(b) => assert!(sk.bone(b).is_some(), "{b}"),
+                ControlParent::None => assert_eq!(c.kind, ControlKind::Root),
+            }
+            if let Some(b) = &c.bone {
+                assert!(sk.bone(b).is_some(), "{b}");
+            }
+            for sp in &c.spaces {
+                let si = rig.controls.iter().position(|x| &x.name == sp).expect(sp);
+                assert!(si < i, "{} space {sp} comes later", c.name);
+            }
+        }
+        for k in &rig.ik_chains {
+            for b in k.bones() {
+                assert!(sk.bone(b).is_some(), "{b}");
+            }
+            let mut ctrls: Vec<&str> = vec![&k.ik_control, &k.pole_control];
+            ctrls.extend(k.fk_controls.iter().map(String::as_str));
+            if let Some(h) = &k.hock {
+                ctrls.extend([h.fk_control.as_str(), h.control.as_str()]);
+            }
+            for c in ctrls {
+                assert!(rig.control(c).is_some(), "{c}");
+            }
+        }
+    }
+
+    #[test]
+    fn quadruped_layout_builds_three_segment_hind_legs() {
+        let g = quadruped(0.8);
+        let built = build(&g).unwrap();
+        assert_controls_consistent(&built);
+        let Built {
+            skeleton: sk,
+            controls: rig,
+        } = &built;
+        let parent_of = |n: &str| sk.bones[sk.bone(n).unwrap().parent.unwrap()].name.clone();
+        for s in ["_l", "_r"] {
+            // thigh > calf > hock > foot (paw) > ball (toes), from the pelvis.
+            assert_eq!(parent_of(&format!("thigh{s}")), "pelvis");
+            assert_eq!(parent_of(&format!("calf{s}")), format!("thigh{s}"));
+            assert_eq!(parent_of(&format!("hock{s}")), format!("calf{s}"));
+            assert_eq!(parent_of(&format!("foot{s}")), format!("hock{s}"));
+            assert_eq!(parent_of(&format!("ball{s}")), format!("foot{s}"));
+            assert_eq!(
+                sk.bone(&format!("calf_twist_01{s}"))
+                    .unwrap()
+                    .twist
+                    .as_ref()
+                    .unwrap()
+                    .source,
+                format!("hock{s}")
+            );
+            // Front legs are planted arms: leg skin, IK by default.
+            assert_eq!(parent_of(&format!("hand{s}")), format!("lowerarm{s}"));
+        }
+        assert_eq!(sk.bone("lowerarm_l").unwrap().region, Region::LegL);
+        assert_eq!(sk.bone("hock_r").unwrap().region, Region::LegR);
+        assert!(sk.bone("tail_05").is_some() && sk.bone("head").is_some());
+        assert_eq!(rig.ik_chains.len(), 4);
+
+        let leg = rig.ik_chains.iter().find(|k| k.name == "leg_l").unwrap();
+        assert_eq!(leg.bones(), ["thigh_l", "calf_l", "hock_l", "foot_l"]);
+        assert_eq!(leg.default_blend, 1.0);
+        let hock = leg.hock.as_ref().unwrap();
+        assert_eq!(
+            (hock.bone.as_str(), hock.fk_control.as_str()),
+            ("hock_l", "hock_l_fk_ctrl")
+        );
+        let hc = rig.control(&hock.control).unwrap();
+        assert_eq!(hc.kind, ControlKind::Hock);
+        assert_eq!(hc.parent, ControlParent::Control(leg.ik_control.clone()));
+        assert_eq!(hc.position, sk.bone("foot_l").unwrap().head);
+        // FK runs thigh > calf > hock > paw.
+        assert_eq!(
+            rig.control("foot_l_fk_ctrl").unwrap().parent,
+            ControlParent::Control("hock_l_fk_ctrl".into())
+        );
+        assert_eq!(
+            rig.control("hock_l_fk_ctrl").unwrap().parent,
+            ControlParent::Control("calf_l_fk_ctrl".into())
+        );
+        let f = leg.foot.as_ref().unwrap();
+        assert!(f.heel.z < f.ball.z && f.ball.z < f.toe_tip.z);
+        assert_eq!(f.ball_bone, "ball_l");
+
+        // The knee points forward and the hock back, and the pole sits straight
+        // ahead of the knee, square to the hip-to-hock line.
+        let (hip, knee, hk) = (
+            sk.bone("thigh_l").unwrap().head,
+            sk.bone("calf_l").unwrap().head,
+            sk.bone("hock_l").unwrap().head,
+        );
+        assert!(knee.z > hip.lerp(hk, 0.5).z && hk.z < sk.bone("foot_l").unwrap().tail.z);
+        let off = rig.control(&leg.pole_control).unwrap().position - knee;
+        assert!(off.z > 0.0 && off.x.abs() < 0.05 * off.length(), "{off}");
+        assert!(off.normalize().dot((hk - hip).normalize()).abs() < 1e-4);
+
+        let front = rig.ik_chains.iter().find(|k| k.name == "arm_l").unwrap();
+        assert!(front.hock.is_none() && front.foot.is_none());
+        assert_eq!(front.default_blend, 1.0);
+        let elbow = sk.bone("lowerarm_l").unwrap().head;
+        assert!(rig.control(&front.pole_control).unwrap().position.z < elbow.z);
+        assert_eq!(rig.control(&front.ik_control).unwrap().axis, Vec3::Y);
+        // A biped's arm is unchanged: FK by default, IK control along the arm.
+        let biped_rig = build(&demo_guides()).unwrap().controls;
+        let arm = biped_rig
+            .ik_chains
+            .iter()
+            .find(|k| k.name == "arm_l")
+            .unwrap();
+        assert_eq!(arm.default_blend, 0.0);
+        assert!(arm.hock.is_none());
+
+        // Guides round-trip, mirror and keep their kind's guide names.
+        let json = serde_json::to_string(&g).unwrap();
+        assert!(json.contains("\"quad_leg\""));
+        let mut back: Guides = serde_json::from_str(&json).unwrap();
+        let i = back
+            .components
+            .iter()
+            .position(|c| c.id == "hind_leg_l")
+            .unwrap();
+        back.components[i].guides[2].position.z -= 0.02;
+        assert_eq!(mirror_side(&mut back, Side::Left), 2);
+        let (l, r) = (
+            back.component("hind_leg_l").unwrap().guides[2].position,
+            back.component("hind_leg_r").unwrap().guides[2].position,
+        );
+        assert!((mirror_point(&back, l) - r).length() < 1e-6);
+        assert!(build(&back).is_ok());
+    }
+
+    #[test]
+    fn quad_legs_preset_and_naming() {
+        // Swap a biped's legs for hind legs.
+        let mut g = demo_guides();
+        assert!(add_preset(&mut g, Preset::QuadLegs, &AddOptions::default()).is_err());
+        remove(&mut g, "leg_l").unwrap();
+        remove(&mut g, "leg_r").unwrap();
+        let ids = add_preset(&mut g, Preset::QuadLegs, &AddOptions::default()).unwrap();
+        assert_eq!(ids, ["hind_leg_l", "hind_leg_r"]);
+        let built = build(&g).unwrap();
+        assert_controls_consistent(&built);
+        let sk = &built.skeleton;
+        let floor = g.body.floor;
+        let toe = sk.bone("ball_l").unwrap().tail;
+        assert!(
+            (toe.y - floor).abs() < 0.05 * g.body.height,
+            "the paw reaches the floor"
+        );
+        assert!(sk.bone("hock_l").unwrap().head.x > g.body.center_x);
+        assert!(sk.bone("hock_r").unwrap().head.x < g.body.center_x);
+        assert!(
+            add_preset(
+                &mut g,
+                Preset::QuadLegs,
+                &AddOptions {
+                    side: Some(Side::Center),
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+
+        // Another naming convention renames the hock parts with everything else.
+        let mut q = quadruped(0.8);
+        q.naming = crate::naming::Preset::Prefix.naming();
+        let rig = crate::rig::build_rig(
+            crate::demo::demo_quadruped(),
+            "dog",
+            q,
+            crate::RigOptions::default(),
+        )
+        .unwrap();
+        let built = Built {
+            skeleton: rig.skeleton,
+            controls: rig.controls,
+        };
+        assert_controls_consistent(&built);
+        let hock = built.controls.ik_chains[2].hock.as_ref().unwrap();
+        assert_eq!(
+            (hock.bone.as_str(), hock.control.as_str()),
+            ("L_hock_jnt", "L_hock_ik_ctrl")
+        );
     }
 
     #[test]

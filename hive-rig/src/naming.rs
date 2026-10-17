@@ -296,6 +296,11 @@ impl Naming {
                 bone(&mut f.ball_bone);
                 ctrl(&mut f.ball_control);
             }
+            if let Some(h) = &mut k.hock {
+                bone(&mut h.bone);
+                ctrl(&mut h.fk_control);
+                ctrl(&mut h.control);
+            }
         }
         Ok(())
     }

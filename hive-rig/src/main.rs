@@ -45,8 +45,12 @@ enum Command {
         #[arg(short, long, default_value = "hive_demo")]
         out: PathBuf,
         /// Lower the demo character's arms by this many degrees (45 = A-pose).
-        #[arg(long, default_value_t = 0.0)]
+        #[arg(long, default_value_t = 0.0, conflicts_with = "quadruped")]
         arm_drop: f32,
+        /// Rig the built-in dog instead: spine, neck and head, tail, two front
+        /// legs and two three-segment hind legs (written as `hive_dog`).
+        #[arg(long)]
+        quadruped: bool,
         #[command(flatten)]
         common: Common,
     },
@@ -336,7 +340,17 @@ fn main() -> Result<()> {
         }
         Command::Demo {
             out,
+            arm_drop: _,
+            quadruped: true,
+            common,
+        } => {
+            let guides = components::quadruped(demo::DOG_HEIGHT);
+            run(demo::demo_quadruped(), "hive_dog", guides, &out, &common)
+        }
+        Command::Demo {
+            out,
             arm_drop,
+            quadruped: false,
             common,
         } => {
             let mesh = demo::humanoid(arm_drop);
@@ -419,7 +433,7 @@ fn main() -> Result<()> {
                     ),
                     _ => String::new(),
                 };
-                println!("{:<12} {:<6} on {:<12} {extra}", c.id, kind, parent);
+                println!("{:<12} {:<7} on {:<12} {extra}", c.id, kind, parent);
             }
             Ok(())
         }

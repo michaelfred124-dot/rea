@@ -12,6 +12,7 @@ cargo run --release -- rig path/to/character.glb -o out/
 # or try it without an asset:
 cargo run --release -- demo -o out/            # T-pose test character
 cargo run --release -- demo -o out/ --arm-drop 45   # A-pose
+cargo run --release -- demo -o out/ --quadruped     # a dog: spine, head, tail, four legs
 ```
 
 ## The Hive Rig app
@@ -32,7 +33,8 @@ a joint; with Symmetry on, its twin on the other side follows.
   bones will export as. Click a panel's title to fold it away.
 * **The rigging window** (Add, or Shift+A) is the library of premade parts, each
   with an illustration: face joints, eyes with a look-at control, a jaw, ears, fingers, toes, a
-  tail, a ponytail, a prop socket in the right hand, and a custom chain.
+  tail, a ponytail, a prop socket in the right hand, three-segment hind legs
+  for quadrupeds, and a custom chain.
 * **The export window** (Ctrl+E) picks the programs, the naming convention, the
   file name and the folder.
 
@@ -139,6 +141,7 @@ A rig is a list of components, each placed by a few guide points:
 | head | neck, head, head_top | `neck_01`, `head`, controls with space switching |
 | arm | clavicle, shoulder, elbow, wrist, hand_tip | clavicle, IK/FK arm, stretch, spaces, twist bones |
 | leg | hip, knee, ankle, ball, toe, heel | IK/FK leg, reverse foot, stretch, spaces, twist bones |
+| quad_leg | hip, knee, hock, ankle, ball, toe, heel | three-segment hind leg (`thigh`, `calf`, `hock`, `foot`, `ball`): IK with a hock control, reverse paw roll, FK, stretch, spaces, twist bones |
 | chain | two or more | an FK chain: fingers, tails, ears, hair, props |
 | eyes | eye_l, eye_r, target | `eye_l`, `eye_r` aimed by a look-at control that follows the head or stays in the world |
 | jaw | jaw, chin | `jaw` with a rotate control |
@@ -158,6 +161,37 @@ hive-rig remove out/hero.guides.json tail           # also removes anything atta
 hive-rig components out/hero.guides.json            # list the layout
 hive-rig rebuild out/hero.hive.json                 # rebuild from the edited guides
 hive-rig rig other_character.glb --guides out/hero.guides.json   # reuse a layout
+```
+
+### Quadrupeds: the dog layout and hind legs
+
+`hive-rig demo --quadruped` rigs a built-in dog (written as `hive_dog`): spine,
+neck and head, a six-joint tail, two front legs and two three-segment hind legs.
+Its guides are in proportion to the body height, so they move like any other
+layout's.
+
+* **Hind legs** (`quad_leg`) run thigh, calf, hock (the long bone below the
+  hock joint) and paw, with the toes on the paw. In IK the thigh and calf solve
+  as a two-bone chain aimed at the hock, the pole sits straight ahead of the
+  knee, and `hock_l_ik_ctrl` at the ankle swings the hock about the paw to set
+  the leg's shape. The paw has the biped foot's `roll` (heel, pads, then toe
+  tip), and `stretch`, FK controls (thigh, calf, hock, paw) and `ik_fk` work as
+  on a leg. Legs start in IK.
+* **Front legs** are arm components laid out as a leg: the clavicle is the
+  shoulder blade and the elbow points back. An arm whose elbow and wrist sit
+  below the belly line (`crotch_y`) skins as a leg, starts in IK and gets an
+  upright IK control.
+
+Body detection only knows bipeds. To rig your own four-legged mesh, start from
+the dog's guides and move them onto it (in the app, or Edit Guides in Blender
+or Maya): `hive-rig rig my_dog.glb --guides out/hive_dog.guides.json`.
+
+Hind legs can also replace a biped's legs:
+
+```bash
+hive-rig remove out/hero.guides.json leg_l
+hive-rig remove out/hero.guides.json leg_r
+hive-rig add out/hero.guides.json quad_legs          # hind_leg_l and hind_leg_r on the pelvis
 ```
 
 ### Face joints in Blender, Maya and Unreal
@@ -284,6 +318,7 @@ python3 tests/dcc_stub_run.py maya out/hive_demo_maya.py      # Python-level che
 python3 tests/dcc_stub_run.py unreal out/hive_demo_unreal.py  # Python-level check
 pip install bpy && python tests/blender_check.py out/hive_demo_blender.py out/hive_demo.glb
 python tests/blender_guides_check.py out/hive_demo_blender.py           # guides and rebuild
+python tests/blender_quad_check.py dog/hive_dog_blender.py dog/hive_dog.glb   # after demo --quadruped -o dog
 python3 tests/dcc_stub_run.py maya out/hive_demo_maya.py --guides       # Maya guide tools
 ```
 
@@ -299,6 +334,12 @@ mesh deforms, and the `.glb` re-imports with weights on every bone.
 mirrors it, paints a weight, adds fingers and a tail, and rebuilds. Then it
 checks that the bones moved, the painted weight survived, the new fingers got
 weights and controls, and a finger control bends the finger.
+`blender_quad_check.py` builds the dog in real Blender. It checks that the paws
+reach their IK goals with the hock joined to the paw, the knee folds forward
+and the front elbows fold back, the poles stand straight ahead of the knees,
+the hock control swings the hock while the paw stays planted, FK moves the
+legs, the paw rolls on its heel, pads and toe tip, stretch reaches a far goal,
+lifting a hind paw leaves the front paw's skin alone, and the `.glb` re-imports.
 The app's editing operations (add, remove, mirror, symmetric moves, undo, build,
 export and reopening a rig) have unit tests in `src/studio/app.rs`, and CI opens
 the app on a virtual screen and screenshots it after building the demo rig.
@@ -312,7 +353,7 @@ as intended. They haven't been run inside Maya or Unreal yet.
 ## Not yet included
 
 See [the gap list](docs/hive-gaps.md)
-for what's planned. In short: corrective shapes, quadruped and creature templates, extra arms or legs on the same
+for what's planned. In short: corrective shapes, creature templates beyond the dog (horse, spider, dinosaur), extra arms or legs on the same
 side, guide editing in Unreal (rebuild with the CLI and rerun the script), IK/FK
 and space *matching* (snapping without a pop when switching mid-animation), and
 FBX output.
