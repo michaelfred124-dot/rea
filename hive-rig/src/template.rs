@@ -564,6 +564,11 @@ pub fn built_in() -> &'static [Template] {
                 "biped_face_fingers",
                 "The biped with eyes, a jaw, face joints and five fingers a hand.",
             ),
+            make(
+                &components::quadruped(crate::demo::DOG_HEIGHT),
+                "dog",
+                "Four legs with three-segment hind legs, a neck, head and tail.",
+            ),
         ]
     })
 }
