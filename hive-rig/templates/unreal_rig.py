@@ -10,6 +10,7 @@ from the Output Log in Python mode: py "<path to this file>"
 """
 
 import json
+import math as _math
 import os
 
 import unreal
@@ -171,14 +172,106 @@ for c in CONTROLS:
     scale = c["size"] * 100.0 / SHAPE_UNIT_CM
     hierarchy.set_control_shape_transform(k, unreal.Transform(scale=unreal.Vector(scale, scale, scale)), True)
 
-for chain in CHAINS:
+def add_float(name, parent, lo, hi, value):
     settings = unreal.RigControlSettings()
     settings.control_type = unreal.RigControlType.FLOAT
-    settings.minimum_value = unreal.RigHierarchy.make_control_value_from_float(0.0)
-    settings.maximum_value = unreal.RigHierarchy.make_control_value_from_float(1.0)
+    settings.minimum_value = unreal.RigHierarchy.make_control_value_from_float(lo)
+    settings.maximum_value = unreal.RigHierarchy.make_control_value_from_float(hi)
     settings.shape_visible = False
-    add_control(chain["name"] + "_ik_fk", control_key(chain["ik_control"]), settings,
-                unreal.RigHierarchy.make_control_value_from_float(float(chain["default_blend"])))
+    add_control(name, parent, settings, unreal.RigHierarchy.make_control_value_from_float(float(value)))
+
+
+for chain in CHAINS:
+    owner = control_key(chain["ik_control"])
+    add_float(chain["name"] + "_ik_fk", owner, 0.0, 1.0, chain["default_blend"])
+    add_float(chain["name"] + "_stretch", owner, 0.0, 1.0, chain["default_stretch"])
+    if chain.get("foot"):
+        add_float(chain["name"] + "_roll", owner, -90.0, 120.0, 0.0)
+
+# Space switching uses Control Rig's own "available spaces" (UE 5.4+), which
+# animators switch from the Sequencer with automatic compensation.
+for c in CONTROLS:
+    for space in c.get("spaces", [])[1:]:
+        try:
+            hc.add_available_space(control_key(c["name"]), control_key(space))
+        except AttributeError:
+            unreal.log_warning("hive-rig: this engine version has no control spaces; skipped %s" % c["name"])
+            break
+
+
+# ----------------------------------------------------------------------- hive -> Unreal space
+# The importer converts axes and units; recover that mapping from four imported
+# bones instead of assuming it, so pivot placement holds for any import settings.
+def hive_head(name):
+    return next(b["head"] for b in BONES if b["name"] == name)
+
+
+def solve_basis():
+    names = ("pelvis", "hand_l", "head", "ball_l")
+    hp = [hive_head(n) for n in names]
+    up = [bone_location(n) for n in names]
+    u = [[hp[i][k] - hp[0][k] for k in range(3)] for i in (1, 2, 3)]  # hive columns
+    v = [[up[i].x - up[0].x, up[i].y - up[0].y, up[i].z - up[0].z] for i in (1, 2, 3)]
+    # M = V * U^-1, with U's columns u[0..2].
+    a, b, c = u
+    det = (a[0] * (b[1] * c[2] - b[2] * c[1]) - b[0] * (a[1] * c[2] - a[2] * c[1])
+           + c[0] * (a[1] * b[2] - a[2] * b[1]))
+    inv_rows = [
+        [(b[1] * c[2] - b[2] * c[1]) / det, (b[2] * c[0] - b[0] * c[2]) / det, (b[0] * c[1] - b[1] * c[0]) / det],
+        [(a[2] * c[1] - a[1] * c[2]) / det, (a[0] * c[2] - a[2] * c[0]) / det, (a[1] * c[0] - a[0] * c[1]) / det],
+        [(a[1] * b[2] - a[2] * b[1]) / det, (a[2] * b[0] - a[0] * b[2]) / det, (a[0] * b[1] - a[1] * b[0]) / det],
+    ]
+    m = [[sum(v[k][r] * inv_rows[k][col] for k in range(3)) for col in range(3)] for r in range(3)]
+    return m, hp[0], up[0]
+
+
+BASIS, HIVE_ORIGIN, UE_ORIGIN = solve_basis()
+
+
+def to_ue_dir(d):
+    return unreal.Vector(*[sum(BASIS[r][k] * d[k] for k in range(3)) for r in range(3)])
+
+
+def to_ue(p):
+    return UE_ORIGIN + to_ue_dir([p[k] - HIVE_ORIGIN[k] for k in range(3)])
+
+
+def rotate(vec, axis, angle):
+    """Rodrigues rotation, matching FQuat(axis, angle).RotateVector."""
+    cos, sin = _math.cos(angle), _math.sin(angle)
+    cross = unreal.Vector(axis.y * vec.z - axis.z * vec.y, axis.z * vec.x - axis.x * vec.z, axis.x * vec.y - axis.y * vec.x)
+    dot = axis.x * vec.x + axis.y * vec.y + axis.z * vec.z
+    return vec * cos + cross * sin + axis * (dot * (1 - cos))
+
+
+# Reverse-foot nulls: heel > toe tip > ball > ankle under each foot's IK control.
+# Pivots copy the control's rotation so their local rotation starts at zero.
+foot_rig = {}
+for chain in CHAINS:
+    foot = chain.get("foot")
+    if not foot:
+        continue
+    n = chain["name"]
+    ctrl_key = control_key(chain["ik_control"])
+    ctrl_rot = initial(ctrl_key).rotation
+    pivots = []
+    parent = ctrl_key
+    for label in ("heel", "toe_tip", "ball"):
+        t = unreal.Transform(location=to_ue(foot[label]), rotation=ctrl_rot.rotator())
+        parent = hc.add_null("%s_%s_piv" % (n, label), parent, t, True, True, False)
+        pivots.append(parent)
+    ankle = hc.add_null(n + "_ankle", parent, initial(bone_key(chain["end"])), True, True, False)
+    flat = hc.add_null(n + "_toe_flat", pivots[1], initial(bone_key(foot["ball_bone"])), True, True, False)
+    # Pitch axis (hive +X) in the pivots' local frame, and the angle sign that lifts
+    # the toes for a negative roll whatever the handedness of the conversion.
+    lateral = to_ue_dir([1.0, 0.0, 0.0]).normal()
+    forward, up = to_ue_dir([0.0, 0.0, 1.0]).normal(), to_ue_dir([0.0, 1.0, 0.0]).normal()
+    lifted = rotate(forward, lateral, -0.3)
+    sign = 1.0 if (lifted.x * up.x + lifted.y * up.y + lifted.z * up.z) > 0 else -1.0
+    local_axis = ctrl_rot.unrotate_vector(lateral)
+    foot_rig[n] = dict(pivots=pivots, ankle=ankle, flat=flat, axis=local_axis, sign=sign,
+                       brk=float(foot["break_angle"]), ball_bone=foot["ball_bone"],
+                       ball_control=foot["ball_control"])
 
 # ----------------------------------------------------------------------- forward solve graph
 def find_begin_node():
@@ -197,7 +290,8 @@ column = [0]
 
 def unit(struct, name, pins):
     column[0] += 1
-    node = vm.add_unit_node_from_struct_path("/Script/ControlRig." + struct, "Execute",
+    path = struct if struct.startswith("/") else "/Script/ControlRig." + struct
+    node = vm.add_unit_node_from_struct_path(path, "Execute",
                                              unreal.Vector2D(column[0] * 320, 0), name)
     path = node.get_node_path()
     for pin, value in pins.items():
@@ -213,6 +307,22 @@ def chain_exec(node):
 def get_control(name):
     return unit("RigUnit_GetTransform", "Get_" + name,
                 {"Item": item_pin("Control", name), "Space": "GlobalSpace"})
+
+
+def get_null(key, space="GlobalSpace"):
+    return unit("RigUnit_GetTransform", "Get_" + str(key.name),
+                {"Item": item_pin("Null", key.name), "Space": space})
+
+
+def get_float(name):
+    return unit("RigUnit_GetControlFloat", "Get_" + name, {"Control": name})
+
+
+math_pi = _math.pi
+
+
+def math(op, name, pins):
+    return unit("/Script/RigVM.RigVMFunction_Math" + op, name, pins)
 
 
 limb_ctrls = {}
@@ -243,10 +353,38 @@ for chain in CHAINS:
     bend = m - (a + e) * 0.5
     secondary = upper.inverse_transform_direction(bend.normal() if bend.length() > 1e-3 else unreal.Vector(0, 1, 0))
 
-    blend = unit("RigUnit_GetControlFloat", "Get_" + chain["name"] + "_ik_fk",
-                 {"Control": chain["name"] + "_ik_fk"})
-    effector = get_control(chain["ik_control"])
+    blend = get_float(chain["name"] + "_ik_fk")
+    rig_foot = foot_rig.get(chain["name"])
+    if rig_foot:
+        # Roll: heel takes min(roll, 0), ball clamp(roll, 0, break), toe max(roll - break, 0).
+        roll = get_float(chain["name"] + "_roll")
+        n, brk = chain["name"], rig_foot["brk"]
+        heel_a = math("FloatMin", n + "_heel_angle", {"B": "0.0"})
+        ball_a = math("FloatClamp", n + "_ball_angle", {"Minimum": "0.0", "Maximum": str(brk)})
+        toe_sub = math("FloatSub", n + "_toe_sub", {"B": str(brk)})
+        toe_a = math("FloatMax", n + "_toe_angle", {"B": "0.0"})
+        vm.add_link(roll + ".FloatValue", heel_a + ".A")
+        vm.add_link(roll + ".FloatValue", ball_a + ".Value")
+        vm.add_link(roll + ".FloatValue", toe_sub + ".A")
+        vm.add_link(toe_sub + ".Result", toe_a + ".A")
+        angles = {"heel": heel_a + ".Result", "toe_tip": toe_a + ".Result", "ball": ball_a + ".Result"}
+        for label, piv in zip(("heel", "toe_tip", "ball"), rig_foot["pivots"]):
+            rad = math("FloatMul", "%s_%s_rad" % (n, label), {"B": str(rig_foot["sign"] * math_pi / 180.0)})
+            vm.add_link(angles[label], rad + ".A")
+            quat = math("QuaternionFromAxisAndAngle", "%s_%s_quat" % (n, label),
+                        {"Axis": vector_text(rig_foot["axis"])})
+            vm.add_link(rad + ".Result", quat + ".Angle")
+            spin = unit("RigUnit_SetRotation", "Roll_%s_%s" % (n, label),
+                        {"Item": item_pin("Null", piv.name), "Space": "LocalSpace", "bPropagateToChildren": "True"})
+            vm.add_link(quat + ".Result", spin + ".Value")
+            chain_exec(spin)
+        effector = get_null(rig_foot["ankle"])
+    else:
+        effector = get_control(chain["ik_control"])
     pole = get_control(chain["pole_control"])
+    stretch = get_float(chain["name"] + "_stretch")
+    max_ratio = math("FloatAdd", chain["name"] + "_stretch_ratio", {"A": "1.0"})
+    vm.add_link(stretch + ".FloatValue", max_ratio + ".B")
     ik = unit("RigUnit_TwoBoneIKSimplePerItem", "IK_" + chain["name"], {
         "ItemA": item_pin("Bone", chain["upper"]),
         "ItemB": item_pin("Bone", chain["lower"]),
@@ -254,8 +392,11 @@ for chain in CHAINS:
         "PrimaryAxis": vector_text(primary),
         "SecondaryAxis": vector_text(secondary),
         "PoleVectorKind": "Location",
+        "bEnableStretch": "True",
+        "StretchStartRatio": "1.0",
         "bPropagateToChildren": "True",
     })
+    vm.add_link(max_ratio + ".Result", ik + ".StretchMaximumRatio")
     vm.add_link(effector + ".Transform", ik + ".Effector")
     vm.add_link(pole + ".Transform.Translation", ik + ".PoleVector")
     vm.add_link(blend + ".FloatValue", ik + ".Weight")
@@ -266,6 +407,21 @@ for chain in CHAINS:
     vm.add_link(effector + ".Transform.Rotation", hand + ".Value")
     vm.add_link(blend + ".FloatValue", hand + ".Weight")
     chain_exec(hand)
+
+    if rig_foot:
+        # In IK the toes stay planted on the toe pivot, keeping the toe control's tweak.
+        flat = get_null(rig_foot["flat"])
+        tweak = unit("RigUnit_GetTransform", "Get_" + rig_foot["ball_control"] + "_local",
+                     {"Item": item_pin("Control", rig_foot["ball_control"]), "Space": "LocalSpace"})
+        combined = math("QuaternionMul", chain["name"] + "_toe_rot", {})
+        vm.add_link(flat + ".Transform.Rotation", combined + ".A")
+        vm.add_link(tweak + ".Transform.Rotation", combined + ".B")
+        toe = unit("RigUnit_SetRotation", "IKRot_" + rig_foot["ball_bone"],
+                   {"Item": item_pin("Bone", rig_foot["ball_bone"]), "Space": "GlobalSpace",
+                    "bPropagateToChildren": "True"})
+        vm.add_link(combined + ".Result", toe + ".Value")
+        vm.add_link(blend + ".FloatValue", toe + ".Weight")
+        chain_exec(toe)
 
 unreal.ControlRigBlueprintLibrary.recompile_vm(blueprint)
 unreal.EditorAssetLibrary.save_loaded_asset(blueprint)

@@ -29,6 +29,9 @@ class Vec:
     def __xor__(self, o):
         return Vec(self.y * o.z - self.z * o.y, self.z * o.x - self.x * o.z, self.x * o.y - self.y * o.x)
 
+    def __truediv__(self, k):
+        return Vec(self.x / k, self.y / k, self.z / k)
+
     def length(self):
         return (self.x ** 2 + self.y ** 2 + self.z ** 2) ** 0.5
 
@@ -54,10 +57,16 @@ def stub_maya():
                 return ["parent_or_shape"]
             if name in ("skinCluster", "ikHandle", "orientConstraint", "parentConstraint", "poleVectorConstraint"):
                 if kwargs.get("query") and kwargs.get("weightAliasList"):
-                    return ["a_W0", "b_W1"]
+                    targets = [a for a in args if isinstance(a, str)]
+                    return ["t%d_W%d" % (i, i) for i in range(max(2, len(targets)))]
+                if kwargs.get("query") and kwargs.get("name"):
+                    return name + "_constraint"
+                calls.append((name, args))
                 return [kwargs.get("name", name + "1")]
             if name == "xform" and kwargs.get("q"):
                 return [0.0, 0.0, 0.0]
+            if name == "getAttr":
+                return 10.0
             if name in ("group", "curve", "createNode", "rename"):
                 return node(*args, **kwargs) if name != "rename" else args[1]
             return None
@@ -67,7 +76,7 @@ def stub_maya():
     for n in ["about", "group", "rename", "parent", "listRelatives", "sets", "polySoftEdge", "createNode", "xform",
               "joint", "setAttr", "skinCluster", "curve", "matchTransform", "move", "parentConstraint",
               "orientConstraint", "addAttr", "makeIdentity", "ikHandle", "poleVectorConstraint", "connectAttr",
-              "select", "file"]:
+              "select", "file", "getAttr", "expression"]:
         setattr(cmds, n, generic(n))
 
     om = types.ModuleType("maya.api.OpenMaya")
@@ -129,9 +138,17 @@ def stub_unreal():
     unreal.load_asset = lambda path: unreal.SkeletalMesh()
     unreal.AssetImportTask.return_value.imported_object_paths = ["/Game/HiveRig/mesh"]
 
+    class Q:
+        def rotator(self):
+            return self
+
+        def unrotate_vector(self, v):
+            return v
+
     class T:
-        def __init__(self, location=None, scale=None):
+        def __init__(self, location=None, scale=None, rotation=None):
             self.translation = location or Vec()
+            self.rotation = Q()
 
         def make_relative(self, other):
             return T(self.translation - other.translation)

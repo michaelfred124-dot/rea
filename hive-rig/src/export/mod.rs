@@ -92,7 +92,7 @@ pub fn script(rig: &Rig, target: Target, glb_path: &Path) -> Result<String> {
                 .skeleton
                 .bones
                 .iter()
-                .map(|b| json!({ "name": b.name, "parent": b.parent, "deform": b.deform }))
+                .map(|b| json!({ "name": b.name, "parent": b.parent, "deform": b.deform, "head": b.head }))
                 .collect();
             let data = json!({
                 "name": rig.name,

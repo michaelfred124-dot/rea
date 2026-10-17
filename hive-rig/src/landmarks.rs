@@ -62,6 +62,8 @@ pub struct Landmarks {
     pub ankle_l: Vec3,
     pub ball_l: Vec3,
     pub toe_l: Vec3,
+    /// Back of the left heel on the floor: the pivot for rolling back.
+    pub heel_l: Vec3,
     /// Half-width of the torso, used to classify arm vs. body geometry.
     pub torso_half_width: f32,
     pub crotch_y: f32,
@@ -320,6 +322,14 @@ pub fn detect(mesh: &Mesh) -> Landmarks {
         .map(|v| v.z)
         .fold(ankle_l.z + 0.1 * h, f32::max);
     let toe_l = Vec3::new(ankle_l.x, floor + 0.01 * h, toe_z);
+    let heel_z = mesh
+        .positions
+        .iter()
+        // Only the sole: higher up, the calf can bulge further back than the heel.
+        .filter(|v| v.y < at(0.03) && (v.x - center_x) > 0.0)
+        .map(|v| v.z)
+        .fold(ankle_l.z, f32::min);
+    let heel_l = Vec3::new(ankle_l.x, floor, heel_z);
     let ball_l = Vec3::new(
         ankle_l.x,
         floor + 0.02 * h,
@@ -344,6 +354,7 @@ pub fn detect(mesh: &Mesh) -> Landmarks {
         ankle_l,
         ball_l,
         toe_l,
+        heel_l,
         torso_half_width,
         crotch_y,
         detected: Detected {
@@ -417,5 +428,7 @@ mod tests {
         assert!(lm.knee_l.y < lm.hip_l.y && lm.ankle_l.y < lm.knee_l.y);
         assert!(lm.elbow_l.x > lm.shoulder_l.x && lm.wrist_l.x > lm.elbow_l.x);
         assert!(lm.toe_l.z > lm.ankle_l.z);
+        // Demo feet run from z = -0.05 (heel) to 0.2 (toe).
+        assert!((lm.heel_l.z + 0.05).abs() < 0.01 && lm.heel_l.y.abs() < 1e-5);
     }
 }

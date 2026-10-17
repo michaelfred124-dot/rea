@@ -60,6 +60,10 @@ pub struct Control {
     /// Radius / half-extent in metres.
     pub size: f32,
     pub color: [f32; 3],
+    /// Space-switch targets. When non-empty, the first entry is the default
+    /// parent and the animator can switch the control to follow any of the others.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spaces: Vec<String>,
 }
 
 /// A two-bone limb with IK and FK controls and a blend between them.
@@ -74,6 +78,25 @@ pub struct IkChain {
     pub fk_controls: [String; 3],
     /// Initial value of the `ik_fk` attribute: 1 = IK, 0 = FK.
     pub default_blend: f32,
+    /// Initial value of the `stretch` attribute: 0 = rigid, 1 = the limb stretches
+    /// to reach an IK goal beyond its length.
+    pub default_stretch: f32,
+    /// Reverse-foot pivots for legs, driven by a `roll` attribute on the IK control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foot: Option<FootRoll>,
+}
+
+/// Reverse-foot setup. A negative `roll` rocks back on the heel; a positive roll
+/// lifts the heel around the ball, then (past `break_angle`) around the toe tip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FootRoll {
+    pub heel: Vec3,
+    pub ball: Vec3,
+    pub toe_tip: Vec3,
+    pub ball_bone: String,
+    pub ball_control: String,
+    /// Degrees of ball roll before the toe pivot takes over.
+    pub break_angle: f32,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -133,6 +156,7 @@ pub fn build(sk: &Skeleton, lm: &Landmarks) -> ControlRig {
             shape,
             size,
             color,
+            spaces: Vec::new(),
         });
     };
     let pc = |n: &str| ControlParent::Control(n.to_string());
@@ -306,6 +330,23 @@ pub fn build(sk: &Skeleton, lm: &Landmarks) -> ControlRig {
                     fk_name(&names.end),
                 ],
                 default_blend: blend,
+                default_stretch: 0.0,
+                foot: (kind == "leg").then(|| {
+                    let ball = bone(&format!("ball{s}"));
+                    let heel = if side == Side::Left {
+                        lm.heel_l
+                    } else {
+                        crate::landmarks::mirror(lm.heel_l, lm.center_x)
+                    };
+                    FootRoll {
+                        heel,
+                        ball: ball.head,
+                        toe_tip: ball.tail,
+                        ball_bone: ball.name.clone(),
+                        ball_control: ctrl_name(&ball.name),
+                        break_angle: 30.0,
+                    }
+                }),
             });
         }
 
@@ -324,6 +365,37 @@ pub fn build(sk: &Skeleton, lm: &Landmarks) -> ControlRig {
             color,
         );
     }
+
+    // Space switching, as animators expect from production rigs: hands can follow
+    // the world, body, chest or head; feet the world or body; poles their goal.
+    let chest = ctrl_name(&biped::spine_name(SPINE_COUNT - 1));
+    let chains = rig.ik_chains.clone();
+    let set_spaces = |rig: &mut ControlRig, name: &str, spaces: &[&str]| {
+        if let Some(c) = rig.controls.iter_mut().find(|c| c.name == name) {
+            c.spaces = spaces.iter().map(|s| s.to_string()).collect();
+        }
+    };
+    for chain in &chains {
+        if chain.name.starts_with("arm") {
+            set_spaces(
+                &mut rig,
+                &chain.ik_control,
+                &["root_ctrl", "cog_ctrl", &chest, "head_ctrl"],
+            );
+        } else {
+            set_spaces(&mut rig, &chain.ik_control, &["root_ctrl", "cog_ctrl"]);
+        }
+        set_spaces(
+            &mut rig,
+            &chain.pole_control,
+            &["root_ctrl", &chain.ik_control],
+        );
+    }
+    set_spaces(
+        &mut rig,
+        "head_ctrl",
+        &["neck_01_ctrl", &chest, "cog_ctrl", "root_ctrl"],
+    );
     rig
 }
 
@@ -351,6 +423,25 @@ mod tests {
             }
         }
         assert_eq!(rig.ik_chains.len(), 4);
+        // Spaces start with the control's parent and only name earlier controls.
+        for (i, c) in rig.controls.iter().enumerate() {
+            if let Some(first) = c.spaces.first() {
+                assert_eq!(
+                    &c.parent,
+                    &ControlParent::Control(first.clone()),
+                    "{}",
+                    c.name
+                );
+            }
+            for sp in &c.spaces {
+                let si = rig.controls.iter().position(|x| &x.name == sp).expect(sp);
+                assert!(si < i, "{} space {sp} comes later", c.name);
+            }
+        }
+        let legs: Vec<_> = rig.ik_chains.iter().filter(|c| c.foot.is_some()).collect();
+        assert_eq!(legs.len(), 2);
+        let f = legs[0].foot.as_ref().unwrap();
+        assert!(f.heel.z < f.ball.z && f.ball.z < f.toe_tip.z);
         // Poles sit in front of knees and behind elbows.
         assert!(
             rig.control("calf_l_pole_ctrl").unwrap().position.z > sk.bone("calf_l").unwrap().head.z

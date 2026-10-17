@@ -33,6 +33,19 @@ that Blender and Unreal import natively.
 * FK controls for pelvis, three spine joints, neck, head, clavicles and toes
 * Arms and legs have FK controls, an IK control, a pole-vector control and an
   `ik_fk` blend (0 = FK, 1 = IK). Legs start in IK and arms start in FK.
+* `stretch` on every limb's IK control (0 = rigid, 1 = reaches any goal)
+* Reverse foot: `roll` on each foot's IK control. Negative values rock back on
+  the heel. Positive values lift the heel around the ball, then around the toe
+  tip once the roll passes 30°. The toe control stays usable in both modes.
+* Space switching via `space` on the IK hands (world, body, chest or head), the
+  IK feet (world or body), the poles (world or their IK goal) and the head
+  (neck, chest, body or world). Unreal uses Control Rig's built-in control
+  spaces (UE 5.4+).
+* Twist bones (`upperarm_twist_01_l`, `lowerarm_twist_01_l`, `thigh_twist_01_l`,
+  `calf_twist_01_l`…) take the far half of each limb's skin. Upper twists cancel
+  half of their own twist and lower twists carry half of the hand or foot twist.
+  Blender and Maya drive them. In Unreal they are skinned but follow their
+  parents, so drive them in a post-process Anim Blueprint as you would for the mannequin.
 * Colour coding: left limbs are blue, right limbs are red and the centre is yellow.
 
 Bone names follow the Unreal mannequin (`pelvis`, `spine_01`, `upperarm_l`,
@@ -68,8 +81,8 @@ back to average human proportions and prints a warning.
    Joints are then pulled to the centroid of the nearby geometry so they sit
    inside the limbs. Elbows get a slight backward bend and knees a slight
    forward bend, which tells IK solvers which way to fold.
-2. **Skeleton** (`src/biped.rs`): 23 bones built from the landmarks and mirrored
-   for the right side.
+2. **Skeleton** (`src/biped.rs`): 31 bones, including 8 twist helpers, built from
+   the landmarks and mirrored for the right side.
 3. **Skin** (`src/skin.rs`): every vertex is assigned to a body region (torso,
    left/right arm or leg), so weights can't bleed between limbs that are close
    together. Weights fall off with inverse distance to each bone, are limited
@@ -90,8 +103,12 @@ pip install bpy && python tests/blender_check.py out/hive_demo_blender.py out/hi
 
 `blender_check.py` builds the rig in real Blender and checks that it works as
 a rig: the rest pose is unchanged, feet and hands reach their IK goals, knees
-bend forward and elbows bend back, FK rotates the limbs, the COG moves the
-body, the mesh deforms, and the `.glb` re-imports with weights on every bone.
+bend forward and elbows bend back, and FK rotates the limbs. It checks the heel,
+ball and toe roll stages, stretchy IK, the forearm twist share, and space
+switching (no pop at rest, and the IK hand follows the chest only in chest
+space). It also checks that every driver uses a simple expression, so the rig
+works without enabling Python auto-run. Finally, the COG moves the body, the
+mesh deforms, and the `.glb` re-imports with weights on every bone.
 CI runs all of this (`.github/workflows/hive-rig.yml`).
 
 The Maya and Unreal builders are checked against stub APIs, which catches
@@ -100,4 +117,6 @@ They haven't been run inside Maya or Unreal yet.
 
 ## Not yet included
 
-Fingers, facial bones, twist bones, stretchy IK, quadrupeds and FBX output.
+Fingers, facial bones, editable guides with rebuilds, quadruped and creature
+templates, IK/FK and space *matching* (snapping without a pop when switching
+mid-animation), and FBX output.

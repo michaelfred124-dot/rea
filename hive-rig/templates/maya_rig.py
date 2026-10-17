@@ -73,7 +73,9 @@ for i, j in enumerate(joints):
         # Aim X at the first child (spine before limbs), keep children in place.
         cmds.joint(j, edit=True, orientJoint="xyz", secondaryAxisOrient="zup", zeroScaleOrient=True, children=False)
     else:
-        cmds.joint(j, edit=True, orientJoint="none", zeroScaleOrient=True)
+        # End joints (head, hands, toes, twist helpers) inherit their parent's axes,
+        # so X still runs down the limb.
+        cmds.setAttr(j + ".jointOrient", 0, 0, 0)
     cmds.setAttr(j + ".radius", 2.0)
 
 joint_of = {b["name"]: joints[i] for i, b in enumerate(BONES)}
@@ -149,7 +151,7 @@ for c in CONTROLS:
     cmds.parent(ctrl, offset, relative=True)
 
     parent = c["parent"]
-    if parent["type"] == "control":
+    if parent["type"] == "control" and not c.get("spaces"):
         cmds.parent(offset, ctrl_of[parent["name"]], relative=True)
     else:
         cmds.parent(offset, ctrl_grp, relative=True)
@@ -166,6 +168,17 @@ for c in CONTROLS:
         cmds.xform(offset, worldSpace=True, matrix=axis_matrix(c["axis"], c["position"]))
     if parent["type"] == "bone":
         cmds.parentConstraint(joint_of[parent["name"]], offset, maintainOffset=True)
+    if c.get("spaces"):
+        # Space switching: the offset follows whichever space the enum selects.
+        cmds.addAttr(ctrl, longName="space", attributeType="enum", enumName=":".join(c["spaces"]), keyable=True)
+        con = cmds.parentConstraint(*[ctrl_of[s] for s in c["spaces"]] + [offset], maintainOffset=True)[0]
+        for i, alias in enumerate(cmds.parentConstraint(con, query=True, weightAliasList=True)):
+            pick = cmds.createNode("condition", name="%s_space%d_cond" % (c["name"], i))
+            cmds.setAttr(pick + ".secondTerm", i)
+            cmds.setAttr(pick + ".colorIfTrueR", 1)
+            cmds.setAttr(pick + ".colorIfFalseR", 0)
+            cmds.connectAttr(ctrl + ".space", pick + ".firstTerm")
+            cmds.connectAttr(pick + ".outColorR", con + "." + alias)
 
     ctrl_of[c["name"]] = ctrl
     offset_of[c["name"]] = offset
@@ -218,16 +231,80 @@ for chain in CHAINS:
     cmds.joint(ik_chain[0], edit=True, setPreferredAngles=True, children=True)
     handle = cmds.ikHandle(startJoint=ik_chain[0], endEffector=ik_chain[2], solver="ikRPsolver",
                            name=chain["name"] + "_ikHandle")[0]
-    cmds.parent(handle, ik_ctrl)
     cmds.setAttr(handle + ".visibility", 0)
     cmds.poleVectorConstraint(ctrl_of[chain["pole_control"]], handle)
-    cmds.orientConstraint(ik_ctrl, ik_chain[2], maintainOffset=True)
 
     reverse = cmds.createNode("reverse", name=chain["name"] + "_ikFk_reverse")
     cmds.connectAttr(ik_ctrl + ".ikFk", reverse + ".inputX")
+
+    goal = ik_ctrl
+    foot = chain.get("foot")
+    if foot:
+        # Reverse foot: heel > toe tip > ball pivots under the IK control. Each pivot
+        # sits under a world-aligned zero group so its rotateX pitches the foot.
+        def pivot(name, position, parent):
+            zero = cmds.group(empty=True, name=name + "_zero", parent=parent)
+            p = mpos(position)
+            cmds.xform(zero, worldSpace=True, matrix=[1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, p[0], p[1], p[2], 1])
+            return cmds.group(empty=True, name=name, parent=zero)
+
+        n = chain["name"]
+        heel = pivot(n + "_heel_piv", foot["heel"], ik_ctrl)
+        toe = pivot(n + "_toe_piv", foot["toe_tip"], heel)
+        ball = pivot(n + "_ball_piv", foot["ball"], toe)
+        goal = cmds.group(empty=True, name=n + "_ankle_grp", parent=ball)
+        cmds.matchTransform(goal, joint_of[chain["end"]], position=True, rotation=True)
+        cmds.addAttr(ik_ctrl, longName="roll", attributeType="double", min=-90, max=120, defaultValue=0, keyable=True)
+        brk = foot["break_angle"]
+        cmds.expression(name=n + "_roll_expr", string=(
+            "{h}.rotateX = min({c}.roll, 0);\n"
+            "{b}.rotateX = min(max({c}.roll, 0), {k});\n"
+            "{t}.rotateX = max({c}.roll - {k}, 0);"
+        ).format(h=heel, b=ball, t=toe, c=ik_ctrl, k=brk))
+        # Toes stay planted on the toe pivot in IK and follow the foot in FK.
+        flat = cmds.group(empty=True, name=n + "_toe_flat_grp", parent=toe)
+        cmds.matchTransform(flat, joint_of[foot["ball_bone"]], position=True, rotation=True)
+        ball_offset = offset_of[foot["ball_control"]]
+        cmds.parentConstraint(flat, ball_offset, maintainOffset=True)
+        con = cmds.parentConstraint(ball_offset, query=True, name=True)
+        w_foot, w_flat = cmds.parentConstraint(con, query=True, weightAliasList=True)
+        cmds.connectAttr(reverse + ".outputX", con + "." + w_foot)
+        cmds.connectAttr(ik_ctrl + ".ikFk", con + "." + w_flat)
+    cmds.parent(handle, goal)
+    cmds.orientConstraint(goal, ik_chain[2], maintainOffset=True)
+
+    # Stretch: scale the IK joints' lengths by how far the goal is beyond reach.
+    cmds.addAttr(ik_ctrl, longName="stretch", attributeType="double", min=0, max=1,
+                 defaultValue=chain["default_stretch"], keyable=True)
+    rest = [cmds.getAttr(j + ".translateX") for j in ik_chain[1:]]
+    dist = cmds.createNode("distanceBetween", name=chain["name"] + "_stretch_dist")
+    cmds.connectAttr(ik_chain[0] + ".worldMatrix[0]", dist + ".inMatrix1")
+    cmds.connectAttr(goal + ".worldMatrix[0]", dist + ".inMatrix2")
+    ratio = cmds.createNode("multiplyDivide", name=chain["name"] + "_stretch_ratio")
+    cmds.setAttr(ratio + ".operation", 2)
+    cmds.connectAttr(dist + ".distance", ratio + ".input1X")
+    cmds.setAttr(ratio + ".input2X", sum(abs(r) for r in rest))
+    over = cmds.createNode("condition", name=chain["name"] + "_stretch_cond")
+    cmds.setAttr(over + ".operation", 2)  # greater than
+    cmds.connectAttr(ratio + ".outputX", over + ".firstTerm")
+    cmds.setAttr(over + ".secondTerm", 1)
+    cmds.connectAttr(ratio + ".outputX", over + ".colorIfTrueR")
+    cmds.setAttr(over + ".colorIfFalseR", 1)
+    amount = cmds.createNode("blendTwoAttr", name=chain["name"] + "_stretch_blend")
+    cmds.setAttr(amount + ".input[0]", 1)
+    cmds.connectAttr(over + ".outColorR", amount + ".input[1]")
+    cmds.connectAttr(ik_ctrl + ".stretch", amount + ".attributesBlender")
+    for j, length in zip(ik_chain[1:], rest):
+        scale = cmds.createNode("multiplyDivide", name=j + "_stretch_len")
+        cmds.connectAttr(amount + ".output", scale + ".input1X")
+        cmds.setAttr(scale + ".input2X", length)
+        cmds.connectAttr(scale + ".outputX", j + ".translateX")
+
     for key, ik_j, fk_j in zip(("upper", "lower", "end"), ik_chain, fk_chain):
-        con = cmds.orientConstraint(ik_j, fk_j, joint_of[chain[key]], maintainOffset=False)[0]
-        w_ik, w_fk = cmds.orientConstraint(con, query=True, weightAliasList=True)
+        # Lower joints also take position so stretching reaches the skin.
+        constrain = cmds.orientConstraint if key == "upper" else cmds.parentConstraint
+        con = constrain(ik_j, fk_j, joint_of[chain[key]], maintainOffset=False)[0]
+        w_ik, w_fk = constrain(con, query=True, weightAliasList=True)
         cmds.connectAttr(ik_ctrl + ".ikFk", con + "." + w_ik)
         cmds.connectAttr(reverse + ".outputX", con + "." + w_fk)
 
@@ -235,6 +312,16 @@ for chain in CHAINS:
     for name in chain["fk_controls"]:
         cmds.connectAttr(reverse + ".outputX", offset_of[name] + ".visibility")
     cmds.connectAttr(ik_ctrl + ".ikFk", offset_of[chain["pole_control"]] + ".visibility")
+
+# --------------------------------------------------------------------------- twist helpers
+for b in BONES:
+    twist = b.get("twist")
+    if not twist:
+        continue
+    share = cmds.createNode("multiplyDivide", name=b["name"] + "_twist_share")
+    cmds.connectAttr(joint_of[twist["source"]] + ".rotateX", share + ".input1X")
+    cmds.setAttr(share + ".input2X", twist["factor"])
+    cmds.connectAttr(share + ".outputX", joint_of[b["name"]] + ".rotateX")
 
 cmds.select(clear=True)
 print("hive-rig: built %s with %d joints and %d controls" % (NAME, len(joints), len(CONTROLS)))

@@ -3,7 +3,7 @@
 use glam::Vec3;
 
 use crate::landmarks::{Landmarks, mirror};
-use crate::skeleton::{Region, Side, Skeleton};
+use crate::skeleton::{Region, Side, Skeleton, Twist};
 
 pub const SPINE_COUNT: usize = 3;
 
@@ -178,8 +178,39 @@ pub fn build(lm: &Landmarks) -> Skeleton {
             side,
             leg_region,
         );
+
+        // Twist helpers on the far half of each limb segment (mannequin names).
+        // Upper segments counter half of their own twist so the shoulder and hip
+        // don't candy-wrap; lower segments carry half of the hand or foot twist.
+        let twists = [
+            (&arm.upper, -0.5, arm.upper.clone(), arm_region),
+            (&arm.lower, 0.5, arm.end.clone(), arm_region),
+            (&leg.upper, -0.5, leg.upper.clone(), leg_region),
+            (&leg.lower, 0.5, leg.end.clone(), leg_region),
+        ];
+        for (seg, factor, source, region) in twists {
+            let b = sk.bone(seg).expect("limb bone").clone();
+            let name = twist_name(seg);
+            let i = sk.add(
+                name,
+                Some(seg),
+                b.head.lerp(b.tail, 0.5),
+                b.tail,
+                side,
+                region,
+            );
+            sk.bones[i].twist = Some(Twist { source, factor });
+        }
     }
     sk
+}
+
+/// `upperarm_l` -> `upperarm_twist_01_l`.
+pub fn twist_name(bone: &str) -> String {
+    match bone.rsplit_once('_') {
+        Some((base, side)) => format!("{base}_twist_01_{side}"),
+        None => format!("{bone}_twist_01"),
+    }
 }
 
 #[cfg(test)]
@@ -190,7 +221,10 @@ mod tests {
     #[test]
     fn builds_a_symmetric_connected_skeleton() {
         let sk = build(&detect(&demo_humanoid()));
-        assert_eq!(sk.bones.len(), 1 + 1 + SPINE_COUNT + 2 + 2 * (4 + 4));
+        assert_eq!(sk.bones.len(), 1 + 1 + SPINE_COUNT + 2 + 2 * (4 + 4 + 4));
+        let t = sk.bone("lowerarm_twist_01_l").unwrap();
+        assert_eq!(t.twist.as_ref().unwrap().source, "hand_l");
+        assert_eq!(twist_name("calf_r"), "calf_twist_01_r");
         assert_eq!(sk.bones.iter().filter(|b| b.parent.is_none()).count(), 1);
         let l = sk.bone("hand_l").unwrap();
         let r = sk.bone("hand_r").unwrap();

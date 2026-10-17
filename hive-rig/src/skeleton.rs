@@ -55,6 +55,18 @@ pub struct Bone {
     pub deform: bool,
     pub side: Side,
     pub region: Region,
+    /// Twist helper: rotates about its own length by `factor` times the twist of `source`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub twist: Option<Twist>,
+}
+
+/// Twist distribution for forearm / upper-arm style helper bones.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Twist {
+    /// Bone whose twist (local rotation about its length) is copied.
+    pub source: String,
+    /// Fraction of that twist to apply; negative counter-rotates.
+    pub factor: f32,
 }
 
 impl Bone {
@@ -115,6 +127,7 @@ impl Skeleton {
             deform: true,
             side,
             region,
+            twist: None,
         });
         self.bones.len() - 1
     }
@@ -125,6 +138,19 @@ impl Skeleton {
             .enumerate()
             .filter(move |(_, b)| b.parent == Some(index))
             .map(|(i, _)| i)
+    }
+
+    /// The part of the bone that receives skin weights: up to its twist helper if it
+    /// has one, so the helper takes over the far half of the limb.
+    pub fn skin_segment(&self, index: usize) -> (Vec3, Vec3) {
+        let bone = &self.bones[index];
+        let twist_child = self
+            .children(index)
+            .find(|&c| self.bones[c].twist.is_some() && self.bones[c].head != bone.head);
+        match twist_child {
+            Some(c) => (bone.head, self.bones[c].head),
+            None => (bone.head, bone.tail),
+        }
     }
 
     /// Bone head relative to its parent's head (the glTF / Maya joint translation).

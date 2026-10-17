@@ -149,6 +149,53 @@ for c in CONTROLS:
     if parent["type"] in ("control", "bone"):
         edit[c["name"]].parent = edit[parent["name"]]
 
+MCH = []  # helper bones: hidden, never animated directly
+
+
+def mch(name, like=None, head=None, parent=None):
+    """Helper bone copying `like`'s rest geometry, or standing upright at `head`."""
+    eb = edit.new(name)
+    eb.use_deform = False
+    if like is not None:
+        src = edit[like]
+        eb.head, eb.tail, eb.roll = src.head.copy(), src.tail.copy(), src.roll
+    else:
+        # Upright with zero roll, so local X is world X: rotating about X pitches the foot.
+        eb.head = head
+        eb.tail = head + Vector((0.0, 0.0, 0.05))
+        eb.roll = 0.0
+    if parent is not None:
+        eb.parent = edit[parent]
+    MCH.append(name)
+    return name
+
+
+# Space switching: each switchable control hangs under a parentless helper that an
+# Armature constraint binds to whichever space is selected.
+space_bone = {}
+for c in CONTROLS:
+    if c.get("spaces"):
+        space_bone[c["name"]] = mch("MCH_%s_space" % c["name"], like=c["name"])
+        edit[c["name"]].parent = edit[space_bone[c["name"]]]
+
+# Reverse foot: heel > toe tip > ball > ankle under the foot IK control.
+foot_ik_target = {}
+for chain in CHAINS:
+    foot = chain.get("foot")
+    if not foot:
+        continue
+    n = chain["name"]
+    heel = mch("MCH_%s_heel" % n, head=to_blender(foot["heel"]), parent=chain["ik_control"])
+    toe = mch("MCH_%s_toe" % n, head=to_blender(foot["toe_tip"]), parent=heel)
+    ball = mch("MCH_%s_ball" % n, head=to_blender(foot["ball"]), parent=toe)
+    foot_ik_target[n] = mch("MCH_%s_ankle" % n, like=chain["end"], parent=ball)
+    # The toe control follows the foot in FK and stays planted on the toe pivot in IK.
+    flat = mch("MCH_%s_toe_flat" % n, like=foot["ball_bone"], parent=toe)
+    ball_space = mch("MCH_%s_ball_space" % n, like=foot["ball_bone"], parent=chain["end"])
+    edit[foot["ball_control"]].parent = edit[ball_space]
+    chain["_flat"], chain["_ball_space"] = flat, ball_space
+    chain["_pivots"] = (heel, toe, ball)
+
 
 def signed_angle(u, v, normal):
     a = u.angle(v)
@@ -181,6 +228,13 @@ pose = rig.pose.bones
 for b in BONES:
     if has_collections:
         def_coll.assign(arm_data.bones[b["name"]])
+if has_collections:
+    mch_coll = arm_data.collections.new("MCH")
+    mch_coll.is_visible = False
+    for name in MCH:
+        mch_coll.assign(arm_data.bones[name])
+for name in MCH:
+    pose[name].rotation_mode = "XYZ"
 
 for c in CONTROLS:
     pb = pose[c["name"]]
@@ -205,15 +259,31 @@ for c in CONTROLS:
         pb.color.custom.active = (1.0, 1.0, 1.0)
 
 # --------------------------------------------------------------------------- constraints
-def add_blend_driver(con, ik_control):
-    fcurve = con.driver_add("influence")
+def add_driver(owner, path, control, prop, expression, index=-1):
+    """Drive owner.path from a custom property on a control (simple expressions only,
+    so it works without enabling Python auto-run)."""
+    fcurve = owner.driver_add(path, index) if index >= 0 else owner.driver_add(path)
     drv = fcurve.driver
-    drv.type = "AVERAGE"
+    drv.type = "SCRIPTED"
     var = drv.variables.new()
-    var.name = "ik_fk"
+    var.name = prop
     var.type = "SINGLE_PROP"
     var.targets[0].id = rig
-    var.targets[0].data_path = 'pose.bones["%s"]["ik_fk"]' % ik_control
+    var.targets[0].data_path = 'pose.bones["%s"]["%s"]' % (control, prop)
+    drv.expression = expression
+    return fcurve
+
+
+def add_blend_driver(con, ik_control):
+    add_driver(con, "influence", ik_control, "ik_fk", "ik_fk")
+
+
+def add_property(pb, name, value, lo, hi, description):
+    pb[name] = value
+    try:
+        pb.id_properties_ui(name).update(min=lo, max=hi, soft_min=lo, soft_max=hi, description=description)
+    except AttributeError:
+        pass
 
 
 for c in CONTROLS:
@@ -225,16 +295,18 @@ for c in CONTROLS:
 
 for chain in CHAINS:
     ik_pb = pose[chain["ik_control"]]
-    ik_pb["ik_fk"] = float(chain["default_blend"])
-    try:
-        ik_pb.id_properties_ui("ik_fk").update(min=0.0, max=1.0, soft_min=0.0, soft_max=1.0, description="0 = FK, 1 = IK")
-    except AttributeError:
-        pass
+    add_property(ik_pb, "ik_fk", float(chain["default_blend"]), 0.0, 1.0, "0 = FK, 1 = IK")
+    add_property(ik_pb, "stretch", float(chain["default_stretch"]), 0.0, 1.0,
+                 "Let the limb stretch to reach the IK control")
+    goal = foot_ik_target.get(chain["name"], chain["ik_control"])
 
     ik = pose[chain["lower"]].constraints.new("IK")
     ik.name = "IK"
     ik.target = rig
-    ik.subtarget = chain["ik_control"]
+    ik.subtarget = goal
+    ik.use_stretch = True
+    for bone in (chain["upper"], chain["lower"]):
+        add_driver(pose[bone], "ik_stretch", chain["ik_control"], "stretch", "stretch * 0.1")
     ik.pole_target = rig
     ik.pole_subtarget = chain["pole_control"]
     ik.pole_angle = pole_angles[chain["name"]]
@@ -244,8 +316,58 @@ for chain in CHAINS:
     rot = pose[chain["end"]].constraints.new("COPY_ROTATION")
     rot.name = "IK Rotation"
     rot.target = rig
-    rot.subtarget = chain["ik_control"]
+    rot.subtarget = goal
     add_blend_driver(rot, chain["ik_control"])
+
+    foot = chain.get("foot")
+    if foot:
+        add_property(ik_pb, "roll", 0.0, -90.0, 120.0,
+                     "Negative rocks back on the heel; positive rolls through the ball, then the toe")
+        brk = float(foot["break_angle"])
+        heel, toe, ball = chain["_pivots"]
+        d2r = "0.0174533"
+        add_driver(pose[heel], "rotation_euler", chain["ik_control"], "roll", "min(roll, 0) * " + d2r, 0)
+        add_driver(pose[ball], "rotation_euler", chain["ik_control"], "roll",
+                   "min(max(roll, 0), %g) * %s" % (brk, d2r), 0)
+        add_driver(pose[toe], "rotation_euler", chain["ik_control"], "roll",
+                   "max(roll - %g, 0) * %s" % (brk, d2r), 0)
+        follow = pose[chain["_ball_space"]].constraints.new("COPY_TRANSFORMS")
+        follow.name = "IK Toe"
+        follow.target = rig
+        follow.subtarget = chain["_flat"]
+        add_blend_driver(follow, chain["ik_control"])
+
+# Twist helpers take a share of their source bone's twist (rotation about its length).
+for b in BONES:
+    twist = b.get("twist")
+    if not twist:
+        continue
+    con = pose[b["name"]].constraints.new("COPY_ROTATION")
+    con.name = "Twist"
+    con.target = rig
+    con.subtarget = twist["source"]
+    con.use_x = con.use_z = False
+    con.use_y = True
+    con.invert_y = twist["factor"] < 0
+    con.owner_space = con.target_space = "LOCAL"
+    con.mix_mode = "ADD"
+    con.influence = abs(twist["factor"])
+
+# Space switching.
+for c in CONTROLS:
+    if not c.get("spaces"):
+        continue
+    pb = pose[c["name"]]
+    add_property(pb, "space", 0, 0, len(c["spaces"]) - 1,
+                 "Follow: " + ", ".join("%d = %s" % (i, s) for i, s in enumerate(c["spaces"])))
+    con = pose[space_bone[c["name"]]].constraints.new("ARMATURE")
+    con.name = "Space"
+    for i, space in enumerate(c["spaces"]):
+        t = con.targets.new()
+        t.target = rig
+        t.subtarget = space
+        t.weight = 1.0 if i == 0 else 0.0
+        add_driver(t, "weight", c["name"], "space", "1 - min(abs(space - %d), 1)" % i)
 
 bpy.ops.object.mode_set(mode="OBJECT")
 

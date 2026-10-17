@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::landmarks::Landmarks;
 use crate::mesh::Mesh;
-use crate::skeleton::{Region, Skeleton};
+use crate::skeleton::{Bone, Region, Skeleton};
 
 pub const MAX_INFLUENCES: usize = 4;
 
@@ -92,6 +92,17 @@ pub fn compute(mesh: &Mesh, sk: &Skeleton, lm: &Landmarks, opts: SkinOptions) ->
     let allowed: Vec<Vec<usize>> = regions.iter().map(|r| allowed_bones(sk, *r)).collect();
     let n_bones = sk.bones.len();
     let eps = (lm.height * 0.005).powi(2);
+    // Distance is measured to each bone's skinned segment (see Skeleton::skin_segment).
+    let segments: Vec<Bone> = (0..n_bones)
+        .map(|i| {
+            let (head, tail) = sk.skin_segment(i);
+            Bone {
+                head,
+                tail,
+                ..sk.bones[i].clone()
+            }
+        })
+        .collect();
 
     // Dense per-vertex weights keep smoothing simple; skeletons are small.
     let mut dense: Vec<Vec<f32>> = mesh
@@ -102,7 +113,7 @@ pub fn compute(mesh: &Mesh, sk: &Skeleton, lm: &Landmarks, opts: SkinOptions) ->
             let ri = regions.iter().position(|x| *x == r).unwrap();
             let mut w = vec![0.0f32; n_bones];
             for &b in &allowed[ri] {
-                let d = sk.bones[b].distance_to(*p);
+                let d = segments[b].distance_to(*p);
                 w[b] = 1.0 / (d * d + eps).powi(2);
             }
             keep_top(&mut w);
