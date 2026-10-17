@@ -130,6 +130,12 @@ pub fn script(rig: &Rig, target: Target, glb_path: &Path) -> Result<String> {
 /// Write `<name>.glb`, `<name>.hive.json`, `<name>.guides.json` and one builder
 /// script per target.
 pub fn write_all(rig: &Rig, out_dir: &Path, targets: &[Target]) -> Result<Vec<PathBuf>> {
+    // A bare file name's parent is the empty path: that's the current folder.
+    let out_dir = if out_dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        out_dir
+    };
     std::fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
     // `absolute` rather than `canonicalize`: on Windows the latter adds a `\\?\` prefix
     // that DCC importers such as Unreal's may not accept in the embedded .glb path.
