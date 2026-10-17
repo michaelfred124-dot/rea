@@ -6,17 +6,18 @@
 
 use std::path::{Path, PathBuf};
 
-use eframe::egui::{self, Color32, Key, PointerButton, Pos2, RichText, Sense, Stroke};
+use eframe::egui::Color32;
 use glam::Vec3;
 
-use hive_rig::components::{self, AddOptions, Built, Guides, Kind, Preset};
+use hive_rig::components::{
+    self, AddOptions, Built, Component, Guide, Guides, Kind, Options, Preset,
+};
 use hive_rig::rig::detect_guides;
 use hive_rig::skeleton::Side;
 use hive_rig::{Rig, RigOptions, Target, build_rig, demo, export, import, mesh::Mesh};
 
-use crate::view::{self, Camera, Projector};
+use crate::view::{self, Camera};
 
-const PICK_RADIUS: f32 = 9.0;
 const UNDO_LIMIT: usize = 100;
 
 /// The character being rigged.
@@ -29,7 +30,10 @@ pub struct Doc {
     /// The full rig with skin weights, from the last "Build Rig". Cleared by edits.
     pub rig: Option<Rig>,
     pub out_dir: PathBuf,
+    /// Whether the current rig has been exported.
+    pub exported: bool,
     undo: Vec<Guides>,
+    redo: Vec<Guides>,
 }
 
 impl Doc {
@@ -41,7 +45,9 @@ impl Doc {
             preview: Err(String::new()),
             rig: None,
             out_dir,
+            exported: false,
             undo: Vec::new(),
+            redo: Vec::new(),
         };
         doc.refresh();
         doc
@@ -50,6 +56,7 @@ impl Doc {
     fn refresh(&mut self) {
         self.preview = components::build(&self.guides).map_err(|e| format!("{e:#}"));
         self.rig = None;
+        self.exported = false;
     }
 
     fn bone_names(&self) -> Vec<String> {
@@ -67,6 +74,23 @@ pub enum FingerSides {
     Right,
 }
 
+/// What the viewport shows, after Hive's guides / skeleton / rig stages.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mode {
+    /// Guides to place, with the bones they make.
+    Guides,
+    /// The deform skeleton.
+    Skeleton,
+    /// The animator controls on the skeleton.
+    Rig,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tab {
+    Components,
+    Library,
+}
+
 struct Drag {
     comp: usize,
     guide: usize,
@@ -78,16 +102,17 @@ pub struct Studio {
     /// Selected component and, optionally, one of its guides.
     pub selected: Option<(usize, Option<usize>)>,
     pub symmetry: bool,
+    pub mode: Mode,
+    pub tab: Tab,
     pub show_mesh: bool,
-    pub show_guides: bool,
-    pub show_bones: bool,
-    pub show_controls: bool,
-    pub mesh_opacity: f32,
+    pub xray: bool,
     /// Deform bone whose weights colour the mesh (needs a built rig).
     pub weights_bone: Option<String>,
     pub targets: [bool; 3],
     pub status: String,
     pub error: bool,
+    /// Bumped on every status change, so the UI can show it as a notification.
+    pub status_serial: u64,
     pub finger_sides: FingerSides,
     pub tail_joints: usize,
     pub chain_parent: String,
@@ -104,17 +129,15 @@ impl Default for Studio {
             camera: Camera::default(),
             selected: None,
             symmetry: true,
+            mode: Mode::Guides,
+            tab: Tab::Components,
             show_mesh: true,
-            show_guides: true,
-            show_bones: true,
-            show_controls: true,
-            mesh_opacity: 1.0,
+            xray: false,
             weights_bone: None,
             targets: [true; 3],
-            status:
-                "Open a character to start: File > Open Character, or drop a file on the window."
-                    .into(),
+            status: "Open a character to start, or try the demo.".into(),
             error: false,
+            status_serial: 0,
             finger_sides: FingerSides::Both,
             tail_joints: 5,
             chain_parent: String::new(),
@@ -132,11 +155,13 @@ impl Studio {
     fn info(&mut self, msg: impl Into<String>) {
         self.status = msg.into();
         self.error = false;
+        self.status_serial += 1;
     }
 
     fn fail(&mut self, msg: impl Into<String>) {
         self.status = msg.into();
         self.error = true;
+        self.status_serial += 1;
     }
 
     fn set_doc(&mut self, doc: Doc) {
@@ -271,6 +296,7 @@ impl Studio {
         match result {
             Ok(msg) => {
                 push_undo(&mut doc.undo, &before);
+                doc.redo.clear();
                 doc.refresh();
                 let n = doc.guides.components.len();
                 if self.selected.is_some_and(|(c, _)| c >= n) {
@@ -292,7 +318,8 @@ impl Studio {
         let Some(doc) = &mut self.doc else { return };
         match doc.undo.pop() {
             Some(g) => {
-                doc.guides = g;
+                let current = std::mem::replace(&mut doc.guides, g);
+                doc.redo.push(current);
                 doc.refresh();
                 self.selected = None;
                 self.weight_colors = None;
@@ -300,6 +327,29 @@ impl Studio {
             }
             None => self.info("Nothing to undo."),
         }
+    }
+
+    pub fn redo(&mut self) {
+        let Some(doc) = &mut self.doc else { return };
+        match doc.redo.pop() {
+            Some(g) => {
+                let current = std::mem::replace(&mut doc.guides, g);
+                push_undo(&mut doc.undo, &current);
+                doc.refresh();
+                self.selected = None;
+                self.weight_colors = None;
+                self.info("Redone.");
+            }
+            None => self.info("Nothing to redo."),
+        }
+    }
+
+    pub fn can_undo(&self) -> bool {
+        self.doc.as_ref().is_some_and(|d| !d.undo.is_empty())
+    }
+
+    pub fn can_redo(&self) -> bool {
+        self.doc.as_ref().is_some_and(|d| !d.redo.is_empty())
     }
 
     /// Move one guide (and its mirror twin when symmetry is on) without an undo
@@ -369,6 +419,86 @@ impl Studio {
         }
     }
 
+    /// A pair of ears on the head, two bones each.
+    pub fn add_ears(&mut self) {
+        self.add_custom("add ears", |g| {
+            let (head, top, h) = head_frame(g)?;
+            let mut ids = Vec::new();
+            for side in [Side::Left, Side::Right] {
+                let s = side.sign();
+                let start = head.lerp(top, 0.45) + Vec3::X * (0.055 * h * s);
+                let dir = Vec3::new(0.45 * s, 1.0, -0.15).normalize();
+                let id = format!("ear{}", side.suffix());
+                g.components
+                    .push(chain(&id, side, "head", start, dir, 0.07 * h, 2));
+                ids.push(id);
+            }
+            Ok(ids)
+        });
+    }
+
+    /// A ponytail hanging from the back of the head.
+    pub fn add_ponytail(&mut self) {
+        self.add_custom("add a ponytail", |g| {
+            let (head, top, h) = head_frame(g)?;
+            let start = head.lerp(top, 0.6) - Vec3::Z * (0.06 * h);
+            let dir = Vec3::new(0.0, -0.7, -1.0).normalize();
+            g.components.push(chain(
+                "ponytail",
+                Side::Center,
+                "head",
+                start,
+                dir,
+                0.22 * h,
+                4,
+            ));
+            Ok(vec!["ponytail".into()])
+        });
+    }
+
+    /// A one-bone prop (weapon, tool) socket in the right hand.
+    pub fn add_prop(&mut self) {
+        self.add_custom("add a prop bone", |g| {
+            let built = components::build(g)?;
+            let hand = built
+                .skeleton
+                .bone("hand_r")
+                .ok_or_else(|| anyhow::anyhow!("the rig has no right hand (hand_r)"))?;
+            let h = g.body.height;
+            let start = hand.head.lerp(hand.tail, 0.5);
+            g.components.push(chain(
+                "prop_r",
+                Side::Right,
+                "hand_r",
+                start,
+                Vec3::Z,
+                0.12 * h,
+                1,
+            ));
+            Ok(vec!["prop_r".into()])
+        });
+    }
+
+    fn add_custom(
+        &mut self,
+        what: &str,
+        change: impl FnOnce(&mut Guides) -> anyhow::Result<Vec<String>>,
+    ) {
+        let added = self.edit(what, |g| {
+            let ids = change(g)?;
+            for id in &ids {
+                anyhow::ensure!(
+                    g.components.iter().filter(|c| &c.id == id).count() == 1,
+                    "{id} already exists"
+                );
+            }
+            Ok(format!("Added {}.", ids.join(", ")))
+        });
+        if added && let Some(doc) = &self.doc {
+            self.selected = Some((doc.guides.components.len() - 1, None));
+        }
+    }
+
     pub fn remove_selected(&mut self) {
         let Some((c, _)) = self.selected else { return };
         let Some(id) = self.doc.as_ref().map(|d| d.guides.components[c].id.clone()) else {
@@ -424,6 +554,7 @@ impl Studio {
                 );
                 doc.rig = Some(rig);
                 self.weight_colors = None;
+                self.mode = Mode::Rig;
                 self.info(msg);
                 true
             }
@@ -452,6 +583,7 @@ impl Studio {
         rig.name = doc.name.clone();
         let files = export::write_all(rig, dir, &targets)?;
         doc.out_dir = dir.to_path_buf();
+        doc.exported = true;
         Ok(files)
     }
 
@@ -498,6 +630,45 @@ impl Studio {
     }
 }
 
+/// The head component's head and head-top guides, and the body height.
+fn head_frame(g: &Guides) -> anyhow::Result<(Vec3, Vec3, f32)> {
+    let head = g
+        .components
+        .iter()
+        .find(|c| c.kind == Kind::Head)
+        .ok_or_else(|| anyhow::anyhow!("the rig has no head component"))?;
+    Ok((
+        head.position("head").unwrap(),
+        head.position("head_top").unwrap(),
+        g.body.height,
+    ))
+}
+
+/// An FK chain component of `joints` bones from `start` along `dir`.
+fn chain(
+    id: &str,
+    side: Side,
+    parent: &str,
+    start: Vec3,
+    dir: Vec3,
+    length: f32,
+    joints: usize,
+) -> Component {
+    Component {
+        id: id.into(),
+        kind: Kind::Chain,
+        side,
+        parent: Some(parent.into()),
+        guides: (0..=joints)
+            .map(|k| Guide {
+                name: format!("j{}", k + 1),
+                position: start + dir * (length * k as f32 / joints as f32),
+            })
+            .collect(),
+        options: Options::default(),
+    }
+}
+
 fn push_undo(undo: &mut Vec<Guides>, g: &Guides) {
     undo.push(g.clone());
     if undo.len() > UNDO_LIMIT {
@@ -505,829 +676,7 @@ fn push_undo(undo: &mut Vec<Guides>, g: &Guides) {
     }
 }
 
-fn kind_label(k: Kind) -> &'static str {
-    match k {
-        Kind::Root => "root",
-        Kind::Spine => "spine",
-        Kind::Head => "head",
-        Kind::Arm => "arm",
-        Kind::Leg => "leg",
-        Kind::Chain => "chain",
-    }
-}
-
-fn side_color(side: Side) -> Color32 {
-    match side {
-        Side::Center => Color32::from_rgb(250, 210, 40),
-        Side::Left => Color32::from_rgb(60, 140, 255),
-        Side::Right => Color32::from_rgb(255, 70, 70),
-    }
-}
-
-fn rgb(c: [f32; 3]) -> Color32 {
-    Color32::from_rgb(
-        (c[0] * 255.0) as u8,
-        (c[1] * 255.0) as u8,
-        (c[2] * 255.0) as u8,
-    )
-}
-
-fn open_folder(dir: &Path) {
-    let program = if cfg!(windows) {
-        "explorer"
-    } else if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
-    let _ = std::process::Command::new(program).arg(dir).spawn();
-}
-
-fn character_dialog() -> rfd::FileDialog {
-    rfd::FileDialog::new()
-        .set_title("Open a character")
-        .add_filter("Characters and rigs", &["glb", "gltf", "obj", "json"])
-}
-
-// --------------------------------------------------------------------------- UI
-
-impl Studio {
-    pub fn ui(&mut self, ui: &mut egui::Ui) {
-        let ctx = ui.ctx().clone();
-        let dropped: Vec<PathBuf> = ctx.input(|i| {
-            i.raw
-                .dropped_files
-                .iter()
-                .map(|f| f.path().to_path_buf())
-                .collect()
-        });
-        if let Some(path) = dropped.first() {
-            self.open(path);
-        }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::Z)) {
-            self.undo();
-        }
-
-        egui::Panel::top("menu").show(ui, |ui| self.top_bar(ui));
-        egui::Panel::bottom("status").show(ui, |ui| {
-            let color = if self.error {
-                ui.visuals().warn_fg_color
-            } else {
-                ui.visuals().text_color()
-            };
-            ui.label(RichText::new(&self.status).color(color));
-        });
-        if self.doc.is_some() {
-            egui::Panel::left("components")
-                .resizable(true)
-                .default_size(270.0)
-                .min_size(220.0)
-                .show(ui, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| self.components_panel(ui));
-                });
-            egui::Panel::right("rig")
-                .resizable(true)
-                .default_size(250.0)
-                .min_size(210.0)
-                .show(ui, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| self.rig_panel(ui));
-                });
-        }
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(Color32::from_rgb(38, 40, 46)))
-            .show(ui, |ui| {
-                if self.doc.is_some() {
-                    self.viewport(ui);
-                } else {
-                    self.welcome(ui);
-                }
-            });
-    }
-
-    fn top_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.menu_button("File", |ui| {
-                if ui.button("Open Character…").clicked() {
-                    ui.close();
-                    if let Some(p) = character_dialog().pick_file() {
-                        self.open(&p);
-                    }
-                }
-                if ui.button("Demo Character").clicked() {
-                    ui.close();
-                    self.load_demo();
-                }
-                ui.separator();
-                let has_doc = self.doc.is_some();
-                if ui
-                    .add_enabled(has_doc, egui::Button::new("Load Guides…"))
-                    .clicked()
-                {
-                    ui.close();
-                    if let Some(p) = rfd::FileDialog::new()
-                        .add_filter("Hive guides", &["json"])
-                        .pick_file()
-                    {
-                        self.open(&p);
-                    }
-                }
-                if ui
-                    .add_enabled(has_doc, egui::Button::new("Save Guides…"))
-                    .clicked()
-                {
-                    ui.close();
-                    let name = self
-                        .doc
-                        .as_ref()
-                        .map(|d| d.name.clone())
-                        .unwrap_or_default();
-                    if let Some(p) = rfd::FileDialog::new()
-                        .set_file_name(format!("{name}.guides.json"))
-                        .add_filter("Hive guides", &["json"])
-                        .save_file()
-                    {
-                        self.save_guides(&p);
-                    }
-                }
-                ui.separator();
-                if ui.button("Quit").clicked() {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            });
-            ui.menu_button("Edit", |ui| {
-                if ui.button("Undo   Ctrl+Z").clicked() {
-                    ui.close();
-                    self.undo();
-                }
-                if ui
-                    .add_enabled(
-                        self.doc.is_some(),
-                        egui::Button::new("Reset Guides to Body"),
-                    )
-                    .clicked()
-                {
-                    ui.close();
-                    self.redetect();
-                }
-            });
-            ui.menu_button("View", |ui| {
-                if ui.button("Frame Character   F").clicked() {
-                    ui.close();
-                    self.frame();
-                }
-                ui.checkbox(&mut self.show_mesh, "Mesh");
-                ui.checkbox(&mut self.show_guides, "Guides");
-                ui.checkbox(&mut self.show_bones, "Bones");
-                ui.checkbox(&mut self.show_controls, "Controls");
-            });
-            ui.separator();
-            ui.label(
-                RichText::new("HIVE RIG")
-                    .strong()
-                    .color(Color32::from_rgb(250, 190, 40)),
-            );
-            if let Some(doc) = &self.doc {
-                ui.label(format!("· {}", doc.name));
-            }
-        });
-    }
-
-    fn frame(&mut self) {
-        if let Some(doc) = &self.doc {
-            let (min, max) = doc.mesh.bounds();
-            self.camera.frame(min, max);
-        }
-    }
-
-    fn welcome(&mut self, ui: &mut egui::Ui) {
-        ui.vertical_centered(|ui| {
-            ui.add_space((ui.available_height() * 0.3).max(20.0));
-            ui.label(
-                RichText::new("HIVE RIG")
-                    .size(40.0)
-                    .strong()
-                    .color(Color32::from_rgb(250, 190, 40)),
-            );
-            ui.label(
-                RichText::new("Automatic character rigging for Blender, Maya and Unreal")
-                    .size(16.0),
-            );
-            ui.add_space(24.0);
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("Open Character…").size(18.0))
-                        .min_size(egui::vec2(240.0, 40.0)),
-                )
-                .clicked()
-                && let Some(p) = character_dialog().pick_file()
-            {
-                self.open(&p);
-            }
-            ui.add_space(8.0);
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("Try the Demo Character").size(18.0))
-                        .min_size(egui::vec2(240.0, 40.0)),
-                )
-                .clicked()
-            {
-                self.load_demo();
-            }
-            ui.add_space(16.0);
-            ui.label("or drop a .glb, .gltf or .obj file on this window");
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new("Characters should stand in a T- or A-pose, Y-up, facing forward.")
-                    .weak(),
-            );
-        });
-    }
-
-    fn components_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Components");
-        let Some(doc) = &self.doc else { return };
-        let rows: Vec<(String, Kind, Side, Option<String>)> = doc
-            .guides
-            .components
-            .iter()
-            .map(|c| (c.id.clone(), c.kind, c.side, c.parent.clone()))
-            .collect();
-        for (i, (id, kind, side, parent)) in rows.iter().enumerate() {
-            let selected = self.selected.is_some_and(|(c, _)| c == i);
-            let text =
-                RichText::new(format!("{id}  ·  {}", kind_label(*kind))).color(side_color(*side));
-            let r = ui.selectable_label(selected, text);
-            let r = match parent {
-                Some(p) => r.on_hover_text(format!("attached to {p}")),
-                None => r,
-            };
-            if r.clicked() {
-                self.selected = Some((i, None));
-            }
-        }
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut self.symmetry, "Symmetry")
-                .on_hover_text("Moving a left or right guide moves its twin too");
-        });
-        ui.horizontal(|ui| {
-            if ui.button("Mirror Left to Right").clicked() {
-                self.mirror(Side::Left);
-            }
-            if ui.button("Mirror Right to Left").clicked() {
-                self.mirror(Side::Right);
-            }
-        });
-
-        if let Some((c, guide)) = self.selected {
-            ui.separator();
-            self.component_details(ui, c, guide);
-        }
-
-        ui.separator();
-        ui.heading("Add Component");
-        ui.horizontal(|ui| {
-            if ui.button("Fingers").clicked() {
-                self.add_fingers();
-            }
-            egui::ComboBox::from_id_salt("finger_sides")
-                .selected_text(match self.finger_sides {
-                    FingerSides::Both => "both hands",
-                    FingerSides::Left => "left hand",
-                    FingerSides::Right => "right hand",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.finger_sides, FingerSides::Both, "both hands");
-                    ui.selectable_value(&mut self.finger_sides, FingerSides::Left, "left hand");
-                    ui.selectable_value(&mut self.finger_sides, FingerSides::Right, "right hand");
-                });
-        });
-        ui.horizontal(|ui| {
-            if ui.button("Tail").clicked() {
-                self.add_tail();
-            }
-            ui.add(
-                egui::DragValue::new(&mut self.tail_joints)
-                    .range(2..=24)
-                    .suffix(" bones"),
-            );
-        });
-        ui.add_space(4.0);
-        ui.label("Chain (ears, hair, props…)");
-        let bones = self.doc.as_ref().map(Doc::bone_names).unwrap_or_default();
-        if !bones.contains(&self.chain_parent) {
-            self.chain_parent = bones
-                .iter()
-                .find(|b| b.as_str() == "head")
-                .or(bones.first())
-                .cloned()
-                .unwrap_or_default();
-        }
-        ui.horizontal(|ui| {
-            ui.label("on");
-            egui::ComboBox::from_id_salt("chain_parent")
-                .selected_text(self.chain_parent.as_str())
-                .height(320.0)
-                .show_ui(ui, |ui| {
-                    for b in &bones {
-                        ui.selectable_value(&mut self.chain_parent, b.clone(), b);
-                    }
-                });
-            ui.add(
-                egui::DragValue::new(&mut self.chain_joints)
-                    .range(1..=24)
-                    .suffix(" bones"),
-            );
-        });
-        ui.horizontal(|ui| {
-            ui.label("name");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.chain_id)
-                    .hint_text("auto")
-                    .desired_width(110.0),
-            );
-            if ui.button("Add Chain").clicked() {
-                self.add_chain();
-            }
-        });
-    }
-
-    fn component_details(&mut self, ui: &mut egui::Ui, c: usize, guide: Option<usize>) {
-        let Some(doc) = &self.doc else { return };
-        let Some(comp) = doc.guides.components.get(c).cloned() else {
-            return;
-        };
-        let own: Vec<String> = match &doc.preview {
-            Ok(b) => b
-                .skeleton
-                .bones
-                .iter()
-                .filter(|b| b.component == comp.id)
-                .map(|b| b.name.clone())
-                .collect(),
-            Err(_) => Vec::new(),
-        };
-        let parents: Vec<String> = doc
-            .bone_names()
-            .into_iter()
-            .filter(|b| !own.contains(b))
-            .collect();
-
-        ui.heading(&comp.id);
-        ui.label(format!(
-            "{} component, {} bones",
-            kind_label(comp.kind),
-            own.len()
-        ));
-
-        if let Some(parent) = &comp.parent {
-            let mut chosen = parent.clone();
-            ui.horizontal(|ui| {
-                ui.label("Attached to");
-                egui::ComboBox::from_id_salt("parent")
-                    .selected_text(chosen.as_str())
-                    .height(320.0)
-                    .show_ui(ui, |ui| {
-                        for b in &parents {
-                            ui.selectable_value(&mut chosen, b.clone(), b);
-                        }
-                    });
-            });
-            if &chosen != parent {
-                let id = comp.id.clone();
-                self.edit("re-attach it", |g| {
-                    let target = g.components.iter_mut().find(|x| x.id == id).unwrap();
-                    target.parent = Some(chosen.clone());
-                    Ok(format!("{id} now hangs from {chosen}."))
-                });
-            }
-        }
-        match comp.kind {
-            Kind::Spine => {
-                let mut joints = comp.options.joints.unwrap_or(components::SPINE_JOINTS);
-                let before = joints;
-                ui.horizontal(|ui| {
-                    ui.label("Spine joints");
-                    ui.add(egui::DragValue::new(&mut joints).range(1..=16));
-                });
-                if joints != before {
-                    let id = comp.id.clone();
-                    self.edit("change the spine", |g| {
-                        components::set_spine_joints(g, &id, joints)?;
-                        Ok(format!("Spine now has {joints} joints."))
-                    });
-                }
-            }
-            Kind::Arm | Kind::Leg => {
-                let mut twist = comp.options.twist;
-                if ui.checkbox(&mut twist, "Twist bones").changed() {
-                    let id = comp.id.clone();
-                    self.edit("change twist bones", |g| {
-                        g.components
-                            .iter_mut()
-                            .find(|x| x.id == id)
-                            .unwrap()
-                            .options
-                            .twist = twist;
-                        Ok(format!(
-                            "Twist bones {} on {id}.",
-                            if twist { "on" } else { "off" }
-                        ))
-                    });
-                }
-            }
-            _ => {}
-        }
-
-        ui.add_space(4.0);
-        ui.label(RichText::new("Guides").strong());
-        egui::Grid::new("guides")
-            .num_columns(4)
-            .spacing([4.0, 2.0])
-            .show(ui, |ui| {
-                for (gi, g) in comp.guides.iter().enumerate() {
-                    let is_sel = guide == Some(gi);
-                    if ui.selectable_label(is_sel, &g.name).clicked() {
-                        self.selected = Some((c, Some(gi)));
-                    }
-                    let mut p = g.position;
-                    let mut changed = false;
-                    for v in [&mut p.x, &mut p.y, &mut p.z] {
-                        changed |= ui
-                            .add(egui::DragValue::new(v).speed(0.002).max_decimals(3))
-                            .changed();
-                    }
-                    if changed {
-                        self.selected = Some((c, Some(gi)));
-                        self.begin_change();
-                        self.move_guide(c, gi, p);
-                    }
-                    ui.end_row();
-                }
-            });
-        ui.add_space(4.0);
-        if comp.kind != Kind::Root && ui.button("Remove Component").clicked() {
-            self.remove_selected();
-        }
-    }
-
-    /// Record an undo step for a guide move unless one is already in progress.
-    fn begin_change(&mut self) {
-        if self.drag.is_none()
-            && let Some(doc) = &mut self.doc
-            && doc.undo.last().is_none_or(|u| !same_layout(u, &doc.guides))
-        {
-            push_undo(&mut doc.undo, &doc.guides);
-        }
-    }
-
-    fn rig_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Rig");
-        let build = egui::Button::new(RichText::new("Build Rig").size(18.0).strong())
-            .min_size(egui::vec2(ui.available_width(), 36.0));
-        if ui.add(build).clicked() {
-            self.build();
-        }
-        let Some(doc) = &self.doc else { return };
-        match (&doc.preview, &doc.rig) {
-            (Err(e), _) => {
-                ui.colored_label(
-                    ui.visuals().warn_fg_color,
-                    format!("Guides don't build: {e}"),
-                );
-            }
-            (Ok(b), rig) => {
-                ui.label(format!(
-                    "{} bones · {} controls · {} IK limbs",
-                    b.skeleton.bones.len(),
-                    b.controls.controls.len(),
-                    b.controls.ik_chains.len()
-                ));
-                if rig.is_some() {
-                    ui.label(
-                        RichText::new("Built, with skin weights")
-                            .color(Color32::from_rgb(110, 210, 120)),
-                    );
-                } else {
-                    ui.label(RichText::new("Press Build Rig to compute the skin weights.").weak());
-                }
-            }
-        }
-
-        ui.separator();
-        ui.heading("View");
-        ui.checkbox(&mut self.show_mesh, "Mesh");
-        if self.show_mesh {
-            ui.add(egui::Slider::new(&mut self.mesh_opacity, 0.15..=1.0).text("opacity"));
-        }
-        ui.checkbox(&mut self.show_guides, "Guides");
-        ui.checkbox(&mut self.show_bones, "Bones");
-        ui.checkbox(&mut self.show_controls, "Controls");
-        ui.add_space(4.0);
-        let deform: Vec<String> = doc
-            .rig
-            .as_ref()
-            .map(|r| {
-                r.skeleton
-                    .bones
-                    .iter()
-                    .filter(|b| b.deform)
-                    .map(|b| b.name.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
-        ui.add_enabled_ui(!deform.is_empty(), |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Weights");
-                egui::ComboBox::from_id_salt("weights")
-                    .selected_text(self.weights_bone.as_deref().unwrap_or("off"))
-                    .height(360.0)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.weights_bone, None, "off");
-                        for b in &deform {
-                            ui.selectable_value(&mut self.weights_bone, Some(b.clone()), b);
-                        }
-                    });
-            });
-        });
-        if deform.is_empty() {
-            ui.label(RichText::new("Build the rig to see its weights.").weak());
-        }
-
-        ui.separator();
-        ui.heading("Export");
-        let Some(doc) = &mut self.doc else { return };
-        ui.horizontal(|ui| {
-            ui.label("Name");
-            let mut name = doc.name.clone();
-            if ui.text_edit_singleline(&mut name).changed() {
-                doc.name = export::sanitize_name(&name);
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut self.targets[0], "Blender");
-            ui.checkbox(&mut self.targets[1], "Maya");
-            ui.checkbox(&mut self.targets[2], "Unreal");
-        });
-        ui.label(
-            RichText::new(doc.out_dir.display().to_string())
-                .small()
-                .weak(),
-        );
-        let out_dir = doc.out_dir.clone();
-        ui.horizontal(|ui| {
-            if ui.button("Export").clicked() {
-                self.do_export(out_dir.clone());
-            }
-            if ui.button("Export To…").clicked()
-                && let Some(dir) = rfd::FileDialog::new()
-                    .set_directory(out_dir.parent().unwrap_or(&out_dir))
-                    .pick_folder()
-            {
-                self.do_export(dir);
-            }
-            if ui
-                .add_enabled(out_dir.is_dir(), egui::Button::new("Open Folder"))
-                .clicked()
-            {
-                open_folder(&out_dir);
-            }
-        });
-        ui.add_space(6.0);
-        egui::CollapsingHeader::new("Using the export").show(ui, |ui| {
-            ui.label("Blender: Scripting tab > Open the _blender.py > Run. Edit and rebuild later from the Hive tab in the N panel.");
-            ui.label("Maya: Script Editor > Python > open the _maya.py > Run. The Hive Rig window rebuilds it.");
-            ui.label("Unreal: Tools > Execute Python Script > the _unreal.py (needs the Python and Control Rig plugins).");
-            ui.label("Keep HiveRig.exe and hive-rig.exe together: Blender and Maya call hive-rig.exe to rebuild.");
-        });
-    }
-
-    fn viewport(&mut self, ui: &mut egui::Ui) {
-        let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
-        let rect = response.rect;
-
-        // Camera controls.
-        if response.hovered() {
-            let scroll = ui.input(|i| i.smooth_scroll_delta().y);
-            if scroll != 0.0 {
-                self.camera.zoom(scroll);
-            }
-            if ui.input(|i| i.key_pressed(Key::F)) && !ui.ctx().egui_wants_keyboard_input() {
-                self.frame();
-            }
-            if ui.input(|i| i.key_pressed(Key::Delete)) && !ui.ctx().egui_wants_keyboard_input() {
-                self.remove_selected();
-            }
-        }
-        let pr = self.camera.projector(rect);
-        let pointer = response.interact_pointer_pos().or(response.hover_pos());
-
-        // Pick where the button went down: a drag only starts once the pointer has moved.
-        let press = ui.input(|i| i.pointer.press_origin());
-        if response.drag_started_by(PointerButton::Primary)
-            && let Some(p) = press.or(pointer)
-            && let Some((c, g)) = self.pick_guide(&pr, p)
-        {
-            self.selected = Some((c, Some(g)));
-            self.begin_change();
-            self.drag = Some(Drag { comp: c, guide: g });
-        }
-        if response.dragged_by(PointerButton::Primary) {
-            match (&self.drag, pointer) {
-                (Some(d), Some(p)) => {
-                    let (c, g) = (d.comp, d.guide);
-                    let current =
-                        self.doc.as_ref().unwrap().guides.components[c].guides[g].position;
-                    let to = pr.drag_point(p, current);
-                    self.move_guide(c, g, to);
-                }
-                _ => self.camera.orbit(response.drag_delta()),
-            }
-        }
-        if response.dragged_by(PointerButton::Secondary)
-            || response.dragged_by(PointerButton::Middle)
-        {
-            self.camera.pan(response.drag_delta(), rect.height());
-        }
-        if response.drag_stopped() {
-            self.drag = None;
-        }
-        if response.clicked()
-            && let Some(p) = pointer
-        {
-            self.selected = self.pick_guide(&pr, p).map(|(c, g)| (c, Some(g)));
-        }
-        let pr = self.camera.projector(rect);
-        let painter = painter.with_clip_rect(rect);
-        self.paint(&painter, &pr, pointer);
-
-        painter.text(
-            rect.left_bottom() + egui::vec2(10.0, -10.0),
-            egui::Align2::LEFT_BOTTOM,
-            "Left-drag: orbit / move guide   Right-drag: pan   Wheel: zoom   F: frame   Del: remove component",
-            egui::FontId::proportional(12.0),
-            Color32::from_gray(150),
-        );
-    }
-
-    fn pick_guide(&self, pr: &Projector, at: Pos2) -> Option<(usize, usize)> {
-        if !self.show_guides {
-            return None;
-        }
-        let doc = self.doc.as_ref()?;
-        let mut best: Option<(f32, f32, usize, usize)> = None;
-        for (ci, c) in doc.guides.components.iter().enumerate() {
-            for (gi, g) in c.guides.iter().enumerate() {
-                let Some((s, depth)) = pr.project(g.position) else {
-                    continue;
-                };
-                let d = s.distance(at);
-                // Nearest on screen; ties (overlapping guides) go to the nearer one.
-                if d <= PICK_RADIUS && best.is_none_or(|b| (d, depth) < (b.0, b.1)) {
-                    best = Some((d, depth, ci, gi));
-                }
-            }
-        }
-        best.map(|b| (b.2, b.3))
-    }
-
-    fn paint(&mut self, painter: &egui::Painter, pr: &Projector, pointer: Option<Pos2>) {
-        let weights = self.weights_bone.clone();
-        let colors = match &weights {
-            Some(b) if self.show_mesh => self.weights_for(b).map(<[Color32]>::to_vec),
-            _ => None,
-        };
-        let Some(doc) = &self.doc else { return };
-        if self.show_mesh {
-            let alpha = if colors.is_some() {
-                1.0
-            } else {
-                self.mesh_opacity
-            };
-            let base = Color32::from_rgb(170, 172, 180);
-            view::draw_mesh(painter, pr, &doc.mesh, base, colors.as_deref(), alpha);
-        }
-        let Ok(built) = &doc.preview else { return };
-        let bones = &built.skeleton.bones;
-
-        if self.show_controls {
-            for c in &built.controls.controls {
-                let stroke = Stroke::new(1.5, rgb(c.color));
-                view::ring(painter, pr, c.position, c.axis, c.size.max(0.01), stroke);
-            }
-        }
-        if self.show_bones {
-            for b in bones {
-                let (Some(h), Some(t)) = (pr.pos(b.head), pr.pos(b.tail)) else {
-                    continue;
-                };
-                let color = if weights.as_deref() == Some(b.name.as_str()) {
-                    Color32::WHITE
-                } else if b.deform {
-                    Color32::from_rgb(225, 225, 235)
-                } else {
-                    Color32::from_rgb(130, 130, 150)
-                };
-                bone_shape(painter, h, t, color);
-            }
-        }
-        if self.show_guides {
-            let hover = pointer.and_then(|p| self.pick_guide(pr, p));
-            for (ci, c) in doc.guides.components.iter().enumerate() {
-                let comp_sel = self.selected.is_some_and(|(s, _)| s == ci);
-                let color = side_color(c.side);
-                let pts: Vec<Option<Pos2>> = c.guides.iter().map(|g| pr.pos(g.position)).collect();
-                // Link the component to the bone it hangs from.
-                if let (Some(parent), Some(Some(first))) = (&c.parent, pts.first())
-                    && let Some(pb) = bones.iter().find(|b| &b.name == parent)
-                    && let Some(ph) = pr.pos(pb.tail)
-                {
-                    dashed(
-                        painter,
-                        ph,
-                        *first,
-                        Stroke::new(1.0, Color32::from_gray(120)),
-                    );
-                }
-                let line = Stroke::new(
-                    if comp_sel { 2.5 } else { 1.5 },
-                    color.gamma_multiply(if comp_sel { 1.0 } else { 0.7 }),
-                );
-                for w in pts.windows(2) {
-                    if let [Some(a), Some(b)] = w {
-                        painter.line_segment([*a, *b], line);
-                    }
-                }
-                for (gi, p) in pts.iter().enumerate() {
-                    let Some(p) = p else { continue };
-                    let sel = self.selected == Some((ci, Some(gi)));
-                    let hot = hover == Some((ci, gi));
-                    let r = if sel || hot {
-                        7.0
-                    } else if comp_sel {
-                        5.5
-                    } else {
-                        4.5
-                    };
-                    painter.circle_filled(*p, r, color);
-                    painter.circle_stroke(
-                        *p,
-                        r,
-                        Stroke::new(
-                            if sel { 2.0 } else { 1.0 },
-                            if sel { Color32::WHITE } else { Color32::BLACK },
-                        ),
-                    );
-                    if sel || hot {
-                        painter.text(
-                            *p + egui::vec2(10.0, -10.0),
-                            egui::Align2::LEFT_BOTTOM,
-                            format!("{} · {}", c.id, c.guides[gi].name),
-                            egui::FontId::proportional(13.0),
-                            Color32::WHITE,
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Whether two layouts have identical guide positions and components.
-fn same_layout(a: &Guides, b: &Guides) -> bool {
-    a.components.len() == b.components.len()
-        && a.components.iter().zip(&b.components).all(|(x, y)| {
-            x.id == y.id
-                && x.guides.len() == y.guides.len()
-                && x.guides
-                    .iter()
-                    .zip(&y.guides)
-                    .all(|(p, q)| p.position == q.position)
-        })
-}
-
-/// A bone as a thin diamond from head to tail.
-fn bone_shape(painter: &egui::Painter, head: Pos2, tail: Pos2, color: Color32) {
-    let d = tail - head;
-    let len = d.length();
-    if len < 1.0 {
-        painter.circle_filled(head, 2.0, color);
-        return;
-    }
-    let n = egui::vec2(-d.y, d.x) / len * (len * 0.1).clamp(1.5, 6.0);
-    let mid = head + d * 0.2;
-    let outline = vec![head, mid + n, tail, mid - n];
-    painter.add(egui::Shape::convex_polygon(
-        outline,
-        color.gamma_multiply(0.35),
-        Stroke::new(1.2, color),
-    ));
-    painter.circle_filled(head, 2.5, color);
-}
-
-fn dashed(painter: &egui::Painter, a: Pos2, b: Pos2, stroke: Stroke) {
-    painter.extend(egui::Shape::dashed_line(&[a, b], stroke, 4.0, 4.0));
-}
+mod ui;
 
 #[cfg(test)]
 mod tests {
@@ -1444,6 +793,39 @@ mod tests {
         assert!(t.doc.as_ref().unwrap().guides.component("tail").is_some());
         assert!(t.doc.as_ref().unwrap().rig.is_some());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn library_presets_and_redo() {
+        let mut s = demo_studio();
+        s.add_ears();
+        s.add_ponytail();
+        s.add_prop();
+        assert!(!s.error, "{}", s.status);
+        assert!(s.build(), "{}", s.status);
+        let rig = s.doc.as_ref().unwrap().rig.as_ref().unwrap();
+        for b in ["ear_01_l", "ear_02_r", "ponytail_04", "prop_01_r"] {
+            assert!(rig.skeleton.bone(b).is_some(), "missing {b}");
+        }
+        // Ears are a mirrored pair.
+        let g = &s.doc.as_ref().unwrap().guides;
+        let (l, r) = (g.component("ear_l").unwrap(), g.component("ear_r").unwrap());
+        assert!(
+            (components::mirror_point(g, l.guides[1].position) - r.guides[1].position).length()
+                < 1e-5
+        );
+        // Adding them twice is refused and changes nothing.
+        let n = g.components.len();
+        s.add_ears();
+        assert!(s.error);
+        assert_eq!(s.doc.as_ref().unwrap().guides.components.len(), n);
+        // Undo and redo step through the additions.
+        s.undo();
+        assert!(s.doc.as_ref().unwrap().guides.component("prop_r").is_none());
+        assert!(s.can_redo());
+        s.redo();
+        assert!(s.doc.as_ref().unwrap().guides.component("prop_r").is_some());
+        assert!(!s.can_redo());
     }
 
     #[test]

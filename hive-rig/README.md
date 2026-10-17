@@ -22,8 +22,11 @@ view. Drag a guide to move a joint; with Symmetry on, its twin on the other
 side follows. The component list lets you type exact guide positions, change
 spine joints, twist bones and what a component is attached to, remove
 components, mirror one side onto the other, and add fingers, a tail or a chain
-on any bone. Every change rebuilds the bone and control preview at once, and
-Ctrl+Z undoes it. Build Rig computes the skin weights, which you can inspect per
+on any bone. The "Add components" tab is a library of premade parts:
+fingers, a tail, a pair of ears, a ponytail, a prop socket in the right hand,
+and a custom chain. Every change rebuilds the bone and control preview at once;
+Ctrl+Z and Ctrl+Y undo and redo. The view switches between Guides, Skeleton and
+Controls, and the top bar tracks the steps from character to export. Build Rig computes the skin weights, which you can inspect per
 bone. Export writes the files below for the programs you tick. It can also open
 a `.hive.json` to keep editing an exported rig, or a `.guides.json` to apply a
 saved layout.

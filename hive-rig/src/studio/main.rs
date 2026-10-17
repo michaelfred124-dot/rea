@@ -8,6 +8,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod app;
+mod theme;
 mod view;
 
 use std::path::PathBuf;
@@ -111,8 +112,7 @@ fn main() -> eframe::Result {
         "Hive Rig",
         options,
         Box::new(move |cc| {
-            // The side colours (yellow centre, blue left, red right) need a dark background.
-            cc.egui_ctx.set_theme(egui::Theme::Dark);
+            theme::apply(&cc.egui_ctx);
             Ok(Box::new(HiveRig {
                 studio,
                 screenshot: launch.screenshot,

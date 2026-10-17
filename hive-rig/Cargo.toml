@@ -13,11 +13,13 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 eframe = { version = "0.37.0", optional = true, default-features = false, features = ["glow", "default_fonts", "x11", "wayland", "accesskit", "clipboard", "links"] }
 rfd = { version = "0.17.2", optional = true }
+# Only to bundle the monochrome emoji/icon fonts the app uses for icons.
+egui = { version = "0.37.0", optional = true, default-features = false, features = ["monochrome_emoji_fonts"] }
 
 [features]
 default = ["studio"]
 # The Hive Rig desktop app (`HiveRig`). The command-line `hive-rig` doesn't need it.
-studio = ["dep:eframe", "dep:rfd"]
+studio = ["dep:eframe", "dep:rfd", "dep:egui"]
 
 [[bin]]
 name = "hive-rig"
