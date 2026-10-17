@@ -53,7 +53,10 @@ pub fn auto_rig(mesh: Mesh, name: &str, opts: RigOptions) -> anyhow::Result<Rig>
 pub fn build_rig(mesh: Mesh, name: &str, guides: Guides, opts: RigOptions) -> anyhow::Result<Rig> {
     mesh.validate()?;
     let name = export::sanitize_name(name);
-    let built = components::build(&guides)?;
+    let mut built = components::build(&guides)?;
+    guides
+        .naming
+        .apply(&mut built.skeleton, &mut built.controls)?;
     let skin = skin::compute(&mesh, &built.skeleton, &guides.body, opts.skin);
     Ok(Rig {
         format: FORMAT.into(),

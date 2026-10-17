@@ -108,20 +108,6 @@ fn shadow() -> Shadow {
     }
 }
 
-/// A rounded panel section.
-pub fn card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
-    egui::Frame::new()
-        .fill(CARD)
-        .stroke(Stroke::new(1.0, BORDER))
-        .corner_radius(12)
-        .inner_margin(14)
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            add(ui)
-        })
-        .inner
-}
-
 /// A small, spaced-out, upper-case section label.
 pub fn label_caps(ui: &mut Ui, text: &str) {
     ui.label(
@@ -131,18 +117,6 @@ pub fn label_caps(ui: &mut Ui, text: &str) {
             .color(TEXT_FAINT)
             .extra_letter_spacing(1.2),
     );
-}
-
-/// Card title with an optional right-aligned note.
-pub fn card_title(ui: &mut Ui, title: &str, note: Option<RichText>) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(title).size(15.0).strong().color(TEXT));
-        if let Some(note) = note {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(note);
-            });
-        }
-    });
 }
 
 /// The main call to action: honey fill, dark text.

@@ -112,12 +112,15 @@ pub fn script(rig: &Rig, target: Target, glb_path: &Path) -> Result<String> {
                 .iter()
                 .map(|b| json!({ "name": b.name, "parent": b.parent, "deform": b.deform, "head": b.head }))
                 .collect();
+            // Bones that recover the import's axes; the first also places the COG.
+            let basis = ["pelvis", "hand_l", "head", "ball_l"].map(|b| rig.guides.naming.bone(b));
             let data = json!({
                 "name": rig.name,
                 "height": rig.guides.body.height,
                 "bones": bones,
                 "controls": rig.controls.controls,
                 "ik_chains": rig.controls.ik_chains,
+                "basis": basis,
             });
             fill(UNREAL_TEMPLATE, &serde_json::to_string(&data)?, &glb)
         }

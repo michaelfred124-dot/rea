@@ -21,6 +21,7 @@ NAME = RIG["name"]
 BONES = RIG["bones"]
 CONTROLS = RIG["controls"]
 CHAINS = RIG["ik_chains"]
+BASIS_BONES = RIG["basis"]  # pelvis, left hand, head, left ball in this rig's naming
 
 # The .glb written next to this script. Edit if you moved it.
 GLB_PATH = r"""__HIVE_GLB_PATH__"""
@@ -127,7 +128,7 @@ def hive_head(name):
 
 
 def solve_basis():
-    names = ("pelvis", "hand_l", "head", "ball_l")
+    names = BASIS_BONES
     hp = [hive_head(n) for n in names]
     up = [bone_location(n) for n in names]
     u = [[hp[i][k] - hp[0][k] for k in range(3)] for i in (1, 2, 3)]  # hive columns
@@ -176,7 +177,7 @@ def target_transform(c):
     if c["kind"] == "ik_effector":
         return initial(bone_key(chain_end_ik[c["name"]]))
     if c["kind"] == "cog":
-        return initial(bone_key("pelvis"))
+        return initial(bone_key(BASIS_BONES[0]))
     if c["kind"] == "aim":
         return unreal.Transform(location=to_ue(c["position"]))
     if c["kind"] == "pole":

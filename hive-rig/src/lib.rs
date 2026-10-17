@@ -19,6 +19,7 @@ pub mod export;
 pub mod import;
 pub mod landmarks;
 pub mod mesh;
+pub mod naming;
 pub mod rig;
 pub mod skeleton;
 pub mod skin;

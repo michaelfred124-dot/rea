@@ -15,6 +15,9 @@ import sys
 import bpy
 from mathutils import Vector
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import hive_names  # noqa: E402
+
 script = (sys.argv[sys.argv.index("--") + 1 :] if "--" in sys.argv else sys.argv[1:])[0]
 
 bpy.ops.wm.read_factory_settings(use_empty=True)
@@ -51,6 +54,12 @@ check(len([o for o in bpy.data.objects if o.type == "ARMATURE"]) == 1, "re-runni
 hive["show_guides"](rig)
 guides = hive["guide_objects"](rig)
 data = json.loads(rig["hive_guides"])
+
+
+def N(internal):
+    return hive_names.final(data.get("naming"), internal)
+
+
 total = sum(len(c["guides"]) for c in data["components"])
 check(len(guides) == total and total > 20, "edit guides puts out an empty for each of the %d guides" % total)
 check(rig.hide_get(), "the rig is hidden while editing guides")
@@ -72,7 +81,7 @@ chest_v = min(
 ).index
 for vg in geo.vertex_groups:
     vg.remove([chest_v])
-groups["spine_02"].add([chest_v], 1.0, "REPLACE")
+groups[N("spine_02")].add([chest_v], 1.0, "REPLACE")
 
 # Add fingers and a tail, then rebuild.
 msg = hive["change_components"](rig, "add", "fingers")
@@ -84,25 +93,25 @@ rig = hive["rebuild"](rig, keep_weights=True)
 geo = hive["rig_mesh"](rig)
 bones = rig.data.bones
 check(not hive["guide_objects"](rig) and not rig.hide_get(), "rebuild clears the guides and shows the rig")
-check((bones["lowerarm_l"].head_local - target).length < 1e-4, "the rebuilt elbow sits on the moved guide")
-check((bones["lowerarm_r"].head_local.x + target.x) < 1e-4, "the mirrored right elbow was rebuilt too")
+check((bones[N("lowerarm_l")].head_local - target).length < 1e-4, "the rebuilt elbow sits on the moved guide")
+check((bones[N("lowerarm_r")].head_local.x + target.x) < 1e-4, "the mirrored right elbow was rebuilt too")
 for b in ("thumb_01_l", "index_03_r", "tail_05"):
-    check(b in bones, "rebuilt rig has %s" % b)
-check("index_01_l_ctrl" in rig.pose.bones and "tail_01_ctrl" in rig.pose.bones, "new components get controls")
+    check(N(b) in bones, "rebuilt rig has %s" % b)
+check(N("index_01_l_ctrl") in rig.pose.bones and N("tail_01_ctrl") in rig.pose.bones, "new components get controls")
 
 w = {geo.vertex_groups[g.group].name: g.weight for g in geo.data.vertices[chest_v].groups if g.weight > 0}
-check(w == {"spine_02": 1.0}, "the painted weight survives the rebuild (%s)" % w)
+check(w == {N("spine_02"): 1.0}, "the painted weight survives the rebuild (%s)" % w)
 finger_weighted = sum(
-    1 for v in geo.data.vertices if any(geo.vertex_groups[g.group].name.startswith("middle_") and g.weight > 0 for g in v.groups)
+    1 for v in geo.data.vertices if any("middle" in geo.vertex_groups[g.group].name and g.weight > 0 for g in v.groups)
 )
 check(finger_weighted > 0, "new finger bones get automatic weights (%d vertices)" % finger_weighted)
 
 # The rebuilt rig still works: a finger control bends the finger, the arm still reaches IK.
 pb = rig.pose.bones
-tip0 = (rig.matrix_world @ pb["index_03_l"].tail).copy()
-pb["index_01_l_ctrl"].rotation_euler = (0.0, 0.0, 0.8)
+tip0 = (rig.matrix_world @ pb[N("index_03_l")].tail).copy()
+pb[N("index_01_l_ctrl")].rotation_euler = (0.0, 0.0, 0.8)
 bpy.context.view_layer.update()
-tip1 = rig.matrix_world @ pb["index_03_l"].tail
+tip1 = rig.matrix_world @ pb[N("index_03_l")].tail
 check((tip1 - tip0).length > 0.01, "the finger control bends the finger")
 
 check(os.path.isfile(os.path.join(rig["hive_dir"], name + ".guides.json")), "guides are saved next to the rig")

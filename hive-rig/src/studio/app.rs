@@ -12,6 +12,7 @@ use glam::Vec3;
 use hive_rig::components::{
     self, AddOptions, Built, Component, Guide, Guides, Kind, Options, Preset,
 };
+use hive_rig::naming::Naming;
 use hive_rig::rig::detect_guides;
 use hive_rig::skeleton::Side;
 use hive_rig::{Rig, RigOptions, Target, build_rig, demo, export, import, mesh::Mesh};
@@ -85,10 +86,13 @@ pub enum Mode {
     Rig,
 }
 
+/// The rigging window's filter.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Tab {
-    Components,
-    Library,
+pub enum Category {
+    All,
+    Face,
+    Body,
+    Extras,
 }
 
 struct Drag {
@@ -103,7 +107,16 @@ pub struct Studio {
     pub selected: Option<(usize, Option<usize>)>,
     pub symmetry: bool,
     pub mode: Mode,
-    pub tab: Tab,
+    /// The floating outliner and properties panels are expanded.
+    pub outliner_open: bool,
+    pub properties_open: bool,
+    /// The rigging window (component library) is open.
+    pub library_open: bool,
+    pub category: Category,
+    /// The export window is open.
+    pub export_open: bool,
+    /// Custom naming being edited in the export window, before it's applied.
+    pub naming_draft: Option<Naming>,
     pub show_mesh: bool,
     pub xray: bool,
     /// Deform bone whose weights colour the mesh (needs a built rig).
@@ -130,7 +143,12 @@ impl Default for Studio {
             selected: None,
             symmetry: true,
             mode: Mode::Guides,
-            tab: Tab::Components,
+            outliner_open: true,
+            properties_open: true,
+            library_open: false,
+            category: Category::All,
+            export_open: false,
+            naming_draft: None,
             show_mesh: true,
             xray: false,
             weights_bone: None,
@@ -575,6 +593,19 @@ impl Studio {
         self.selected = None;
     }
 
+    /// Change how exported joints and controls are named (one undo step).
+    pub fn set_naming(&mut self, naming: Naming) -> bool {
+        let label = naming.preset().map_or("custom", |p| p.label()).to_string();
+        let example = naming.bone("upperarm_l");
+        self.edit("change the naming", move |g| {
+            naming.validate()?;
+            g.naming = naming;
+            Ok(format!(
+                "Naming set to {label}: upperarm_l exports as {example}."
+            ))
+        })
+    }
+
     pub fn build(&mut self) -> bool {
         let Some(doc) = &mut self.doc else {
             return false;
@@ -834,6 +865,30 @@ mod tests {
         assert!(t.doc.as_ref().unwrap().guides.component("tail").is_some());
         assert!(t.doc.as_ref().unwrap().rig.is_some());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn naming_is_undoable_and_reaches_the_export() {
+        use hive_rig::naming::Preset;
+        let mut s = demo_studio();
+        assert!(s.set_naming(Preset::Prefix.naming()), "{}", s.status);
+        assert!(s.build());
+        let rig = s.doc.as_ref().unwrap().rig.as_ref().unwrap();
+        assert!(rig.skeleton.bone("L_upperarm_jnt").is_some());
+        assert!(rig.controls.control("L_hand_ik_ctrl").is_some());
+        // Weights are looked up by the exported name.
+        assert!(s.weights_for("L_upperarm_jnt").is_some());
+
+        let mut bad = Preset::Prefix.naming();
+        bad.joint = "{name}".into();
+        assert!(!s.set_naming(bad) && s.error);
+        assert_eq!(
+            s.doc.as_ref().unwrap().guides.naming,
+            Preset::Prefix.naming()
+        );
+
+        s.undo();
+        assert!(s.doc.as_ref().unwrap().guides.naming.is_default());
     }
 
     #[test]

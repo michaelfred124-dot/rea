@@ -62,6 +62,12 @@ jobs:
           cargo run --locked -q -- rebuild "$rig/hive_demo.hive.json"
           python3 -I tests/dcc_stub_run.py unreal "$rig/hive_demo_unreal.py"
           python3 -I tests/dcc_stub_run.py maya "$rig/hive_demo_maya.py" --guides
+          # Again with another naming convention (the guide tools add stub_ear each run).
+          cargo run --locked -q -- remove "$rig/hive_demo.guides.json" stub_ear
+          cargo run --locked -q -- naming "$rig/hive_demo.guides.json" suffix
+          cargo run --locked -q -- rebuild "$rig/hive_demo.hive.json"
+          python3 -I tests/dcc_stub_run.py unreal "$rig/hive_demo_unreal.py"
+          python3 -I tests/dcc_stub_run.py maya "$rig/hive_demo_maya.py" --guides
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: hive-demo-rigs
@@ -115,6 +121,17 @@ jobs:
           for part in eyes jaw fingers; do cargo run -q -- add "$rig/hive_demo.guides.json" "$part"; done
           cargo run -q -- rebuild "$rig/hive_demo.hive.json"
           python tests/blender_check.py "$rig/hive_demo_blender.py" "$rig/hive_demo.glb"
+      - name: Side-first naming in Blender
+        run: |
+          rig="$RUNNER_TEMP/face"
+          cargo run -q -- naming "$rig/hive_demo.guides.json" prefix
+          cargo run -q -- rebuild "$rig/hive_demo.hive.json"
+          python tests/blender_check.py "$rig/hive_demo_blender.py" "$rig/hive_demo.glb"
+          named="$RUNNER_TEMP/named_guides"
+          cargo run -q -- demo -o "$named"
+          cargo run -q -- naming "$named/hive_demo.guides.json" prefix
+          cargo run -q -- rebuild "$named/hive_demo.hive.json"
+          python tests/blender_guides_check.py "$named/hive_demo_blender.py"
       - name: Edit guides, add fingers and a tail, and rebuild in Blender
         run: |
           cargo run -q -- demo -o "$RUNNER_TEMP/guides"

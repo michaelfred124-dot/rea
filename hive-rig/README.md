@@ -17,19 +17,30 @@ cargo run --release -- demo -o out/ --arm-drop 45   # A-pose
 ## The Hive Rig app
 
 `HiveRig` (`HiveRig.exe` on Windows) is a desktop rigging app built on the same
-library. Open a character (or the demo), and the guides appear on it in a 3D
-view. Drag a guide to move a joint; with Symmetry on, its twin on the other
-side follows. The component list lets you type exact guide positions, change
-spine joints, twist bones and what a component is attached to, remove
-components, mirror one side onto the other, and add fingers, a tail or a chain
-on any bone. The "Add components" tab is a library of premade parts:
-eyes with a look-at control, a jaw, fingers, a tail, a pair of ears, a ponytail, a prop socket in the right hand,
-and a custom chain. Every change rebuilds the bone and control preview at once;
-Ctrl+Z and Ctrl+Y undo and redo. The view switches between Guides, Skeleton and
-Controls, and the top bar tracks the steps from character to export. Build Rig computes the skin weights, which you can inspect per
-bone. Export writes the files below for the programs you tick. It can also open
-a `.hive.json` to keep editing an exported rig, or a `.guides.json` to apply a
-saved layout.
+library. The 3D view fills the window and everything else floats over it. Open a
+character (or the demo) and the guides appear on it as coloured joint dots:
+yellow for the centre, blue for the left, red for the right. Drag a guide to move
+a joint; with Symmetry on, its twin on the other side follows.
+
+* **The dock** along the bottom holds the tools: Move, Add, Mirror (right-click
+  for right to left), Symmetry, the Guides / Skeleton / Controls views, Mesh,
+  X-ray, Weights, Undo, Redo, Frame and Export. The honeycomb button in the
+  middle builds the rig.
+* **The outliner** (left) lists the components as a tree. **Properties** (right)
+  shows the rig summary, skin weights and naming, or, with a component
+  selected, its attachment, options, exact guide positions and the names its
+  bones will export as. Click a panel's title to fold it away.
+* **The rigging window** (Add, or Shift+A) is the library of premade parts, each
+  with an illustration: eyes with a look-at control, a jaw, ears, fingers, a
+  tail, a ponytail, a prop socket in the right hand, and a custom chain.
+* **The export window** (Ctrl+E) picks the programs, the naming convention, the
+  file name and the folder.
+
+Every change rebuilds the bone and control preview at once; Ctrl+Z and Ctrl+Y
+undo and redo, Ctrl+B builds, 1/2/3 switch views and F frames the character.
+Building computes the skin weights, which you can inspect per bone. The app can
+also open a `.hive.json` to keep editing an exported rig, or a `.guides.json` to
+apply a saved layout.
 
 ```bash
 cargo run --release --bin HiveRig               # or: HiveRig character.glb / HiveRig --demo
@@ -81,8 +92,30 @@ that Blender and Unreal import natively.
   parents, so drive them in a post-process Anim Blueprint as you would for the mannequin.
 * Colour coding: left limbs are blue, right limbs are red and the centre is yellow.
 
-Bone names follow the Unreal mannequin (`pelvis`, `spine_01`, `upperarm_l`,
-`calf_r`, `ball_l`…), so the skeleton retargets cleanly in Unreal.
+### Naming conventions
+
+By default bone names follow the Unreal mannequin (`pelvis`, `spine_01`,
+`upperarm_l`, `calf_r`, `ball_l`…), so the skeleton retargets cleanly in Unreal,
+and controls add `_ctrl` (`upperarm_l_fk_ctrl`). Pick another convention in the
+app's export window or with the command line:
+
+| Preset | Joint | Control |
+| --- | --- | --- |
+| `game` (default) | `upperarm_l`, `spine_01` | `hand_l_ik_ctrl`, `root_ctrl` |
+| `prefix` | `L_upperarm_jnt`, `C_spine_01_jnt` | `L_hand_ik_ctrl`, `C_root_ctrl` |
+| `suffix` | `upperarm_L_JNT`, `spine_01_M_JNT` | `hand_L_ik_CTRL`, `root_M_CTRL` |
+
+```bash
+hive-rig naming out/hero.guides.json prefix
+hive-rig naming out/hero.guides.json --joint "{side}_{name}_{desc}_bnd" --left Lf --right Rt --center Ct
+hive-rig rebuild out/hero.hive.json
+```
+
+Patterns place `{name}` (the part, such as `upperarm` or `index`), `{side}` and
+`{desc}` (`fk`, `ik`, `pole`, `aim`, chain numbers); empty parts and their
+underscores drop out. The convention is stored in the guides file, so rebuilds
+from Blender, Maya or the command line keep it, and the guides themselves keep
+the internal names. Names that would collide are refused.
 
 ### Running the builder scripts
 
@@ -213,7 +246,8 @@ as intended. They haven't been run inside Maya or Unreal yet.
 
 ## Not yet included
 
-Facial bones, quadruped and creature templates, extra arms or legs on the same
+See [the gap list](docs/hive-gaps.md)
+for what's planned. In short: facial bones beyond eyes and jaw, quadruped and creature templates, extra arms or legs on the same
 side, guide editing in Unreal (rebuild with the CLI and rerun the script), IK/FK
 and space *matching* (snapping without a pop when switching mid-animation), and
 FBX output.

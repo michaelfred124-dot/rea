@@ -1,23 +1,36 @@
 //! Layout and drawing of the Hive Rig window. Everything here calls the
 //! operations in the parent module; nothing here changes the rig directly.
+//!
+//! The 3D canvas fills the window. Everything else floats over it: the title and
+//! camera pills at the top, the outliner and properties panels at the sides, and
+//! the dock along the bottom with the honeycomb Build button in its middle. The
+//! rigging window (Shift+A) and the export window open as dialogs.
 
 use std::path::{Path, PathBuf};
 
 use eframe::egui::{
-    self, Align, Align2, Color32, FontId, Key, Layout, Margin, PointerButton, Pos2, Rect, RichText,
-    Sense, Stroke, Ui, UiBuilder, Vec2,
+    self, Align, Align2, Color32, FontId, Key, Layout, Margin, Modifiers, PointerButton, Pos2,
+    Rect, RichText, Sense, Shadow, Stroke, Ui, UiBuilder, Vec2,
 };
 use glam::Vec3;
 
 use hive_rig::components::{self, Guides, Kind};
+use hive_rig::naming::{Naming, Preset};
 use hive_rig::skeleton::Side;
 
-use super::{Doc, Drag, FingerSides, Mode, Studio, Tab, push_undo};
+use super::{Category, Doc, Drag, FingerSides, Mode, Studio, push_undo};
 use crate::theme::{self, ACCENT, BORDER, CARD, CARD_HI, ERR, OK, TEXT, TEXT_DIM, TEXT_FAINT};
 use crate::view::{self, Projector};
 
 const PICK_RADIUS: f32 = 10.0;
 const TOAST_SECONDS: f64 = 5.0;
+const EDGE: f32 = 16.0;
+/// Where the side panels start, below the top pills.
+const PANEL_TOP: f32 = 72.0;
+/// Space the dock takes at the bottom of the window.
+const DOCK_CLEARANCE: f32 = 118.0;
+const OUTLINER_WIDTH: f32 = 252.0;
+const PROPERTIES_WIDTH: f32 = 300.0;
 
 fn kind_label(k: Kind) -> &'static str {
     match k {
@@ -93,6 +106,91 @@ struct Toast {
     since: f64,
 }
 
+/// The naming choices in the export window.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NamingChoice {
+    Preset(Preset),
+    Custom,
+}
+
+/// A premade part in the rigging window.
+struct LibraryPart {
+    art: Art,
+    title: &'static str,
+    text: &'static str,
+    category: Category,
+    add: fn(&mut Studio),
+    /// Parts a rig can only have one of.
+    once: Option<Kind>,
+}
+
+const LIBRARY: [LibraryPart; 8] = [
+    LibraryPart {
+        art: Art::Eyes,
+        title: "Eyes",
+        text: "Both eyes aim at one look-at control.",
+        category: Category::Face,
+        add: Studio::add_eyes,
+        once: Some(Kind::Eyes),
+    },
+    LibraryPart {
+        art: Art::Jaw,
+        title: "Jaw",
+        text: "A hinge that opens the mouth.",
+        category: Category::Face,
+        add: Studio::add_jaw,
+        once: Some(Kind::Jaw),
+    },
+    LibraryPart {
+        art: Art::Ears,
+        title: "Ears",
+        text: "A two-bone chain on each side of the head.",
+        category: Category::Face,
+        add: Studio::add_ears,
+        once: None,
+    },
+    LibraryPart {
+        art: Art::Fingers,
+        title: "Fingers",
+        text: "Thumb to pinky, three joints each.",
+        category: Category::Body,
+        add: Studio::add_fingers,
+        once: None,
+    },
+    LibraryPart {
+        art: Art::Tail,
+        title: "Tail",
+        text: "An FK tail from the pelvis.",
+        category: Category::Body,
+        add: Studio::add_tail,
+        once: None,
+    },
+    LibraryPart {
+        art: Art::Ponytail,
+        title: "Ponytail",
+        text: "Hair that swings from the back of the head.",
+        category: Category::Extras,
+        add: Studio::add_ponytail,
+        once: None,
+    },
+    LibraryPart {
+        art: Art::Prop,
+        title: "Prop",
+        text: "A weapon socket in the right hand.",
+        category: Category::Extras,
+        add: Studio::add_prop,
+        once: None,
+    },
+    LibraryPart {
+        art: Art::Chain,
+        title: "Chain",
+        text: "An FK chain on any bone. Set it up below.",
+        category: Category::Extras,
+        add: Studio::add_chain,
+        once: None,
+    },
+];
+
 impl Studio {
     pub fn ui(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
@@ -107,63 +205,10 @@ impl Studio {
         if let Some(path) = dropped.first() {
             self.open(path);
         }
-        if ctx
-            .input_mut(|i| i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::Z))
-            || ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::Y))
-        {
-            self.redo();
-        }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::Z)) {
-            self.undo();
-        }
+        self.shortcuts(&ctx);
 
-        egui::Panel::top("appbar")
-            .exact_size(58.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::BG)
-                    .inner_margin(Margin::symmetric(16, 0)),
-            )
-            .show(ui, |ui| self.app_bar(ui));
-        egui::Panel::bottom("statusbar")
-            .exact_size(28.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::BG)
-                    .inner_margin(Margin::symmetric(16, 0)),
-            )
-            .show(ui, |ui| self.status_bar(ui));
-        if self.doc.is_some() {
-            let side_frame = egui::Frame::new().fill(theme::BG).inner_margin(Margin {
-                left: 12,
-                right: 12,
-                top: 4,
-                bottom: 12,
-            });
-            egui::Panel::left("sidebar")
-                .resizable(true)
-                .default_size(318.0)
-                .min_size(280.0)
-                .frame(side_frame)
-                .show(ui, |ui| self.sidebar(ui));
-            egui::Panel::right("inspector")
-                .resizable(true)
-                .default_size(300.0)
-                .min_size(270.0)
-                .frame(side_frame)
-                .show(ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .auto_shrink(false)
-                        .show(ui, |ui| self.rig_panel(ui));
-                });
-        }
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(theme::BG).inner_margin(Margin {
-                left: 0,
-                right: 0,
-                top: 4,
-                bottom: 12,
-            }))
+            .frame(egui::Frame::new().fill(theme::BG))
             .show(ui, |ui| {
                 if self.doc.is_some() {
                     self.viewport(ui);
@@ -171,59 +216,72 @@ impl Studio {
                     self.welcome(ui);
                 }
             });
+
+        self.title_pill(&ctx);
+        if self.doc.is_some() {
+            self.steps_pill(&ctx);
+            self.camera_pill(&ctx);
+            self.outliner(&ctx);
+            self.properties(&ctx);
+            self.dock(&ctx);
+            self.library_window(&ctx);
+            self.export_window(&ctx);
+        }
         self.toast(&ctx);
         self.drop_overlay(&ctx);
     }
 
-    // ----------------------------------------------------------------------- app bar
-
-    fn app_bar(&mut self, ui: &mut Ui) {
-        ui.horizontal_centered(|ui| {
-            let (r, _) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::hover());
-            theme::logo(ui.painter(), r.center(), 14.0);
-            ui.label(RichText::new("Hive Rig").size(18.0).strong().color(TEXT));
-            if let Some(doc) = &self.doc {
-                ui.label(RichText::new("/").size(18.0).color(TEXT_FAINT));
-                ui.label(RichText::new(&doc.name).size(15.0).color(TEXT_DIM));
+    fn shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z))
+            || ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Y))
+        {
+            self.redo();
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Z)) {
+            self.undo();
+        }
+        if self.doc.is_none() || ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::A)) {
+            self.library_open = true;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::E)) {
+            self.export_open = true;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::B)) {
+            self.build();
+        }
+        if self.library_open || self.export_open {
+            return;
+        }
+        for (key, mode) in [
+            (Key::Num1, Mode::Guides),
+            (Key::Num2, Mode::Skeleton),
+            (Key::Num3, Mode::Rig),
+        ] {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, key)) {
+                self.mode = mode;
             }
-            ui.add_space(12.0);
-            self.file_menu(ui);
+        }
+    }
 
-            // Right side, laid out right to left.
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let has_doc = self.doc.is_some();
-                if has_doc {
-                    let out_dir = self
-                        .doc
-                        .as_ref()
-                        .map(|d| d.out_dir.clone())
-                        .unwrap_or_default();
-                    if theme::secondary(ui, "Export", 0.0).clicked() {
-                        self.do_export(out_dir);
+    // ----------------------------------------------------------------------- top pills
+
+    fn title_pill(&mut self, ctx: &egui::Context) {
+        floating_area("title", Align2::LEFT_TOP, Vec2::new(EDGE, EDGE)).show(ctx, |ui| {
+            pill_frame().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(Vec2::splat(26.0), Sense::hover());
+                    theme::logo(ui.painter(), r.center(), 12.0);
+                    ui.label(RichText::new("Hive Rig").size(15.0).strong().color(TEXT));
+                    if let Some(doc) = &self.doc {
+                        ui.label(RichText::new("/").color(TEXT_FAINT));
+                        ui.label(RichText::new(&doc.name).color(TEXT_DIM));
                     }
-                    let built = self.doc.as_ref().is_some_and(|d| d.rig.is_some());
-                    let label = if built { "Rebuild Rig" } else { "Build Rig" };
-                    if theme::primary(ui, label, 120.0, true).clicked() {
-                        self.build();
-                    }
-                    ui.add_space(6.0);
-                    if theme::icon(ui, "⟳", "Redo (Ctrl+Y)", self.can_redo()).clicked() {
-                        self.redo();
-                    }
-                    if theme::icon(ui, "⟲", "Undo (Ctrl+Z)", self.can_undo()).clicked() {
-                        self.undo();
-                    }
-                    ui.add_space(12.0);
-                    // Centre: the steps from character to export.
-                    let remaining = ui.available_width();
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(remaining, 40.0),
-                        Layout::centered_and_justified(egui::Direction::LeftToRight),
-                        |ui| {
-                            ui.horizontal_centered(|ui| self.steps(ui));
-                        },
-                    );
-                }
+                    ui.add_space(2.0);
+                    self.file_menu(ui);
+                });
             });
         });
     }
@@ -231,7 +289,7 @@ impl Studio {
     fn file_menu(&mut self, ui: &mut Ui) {
         let has_doc = self.doc.is_some();
         ui.menu_button(RichText::new("File").color(TEXT_DIM), |ui| {
-            ui.set_min_width(200.0);
+            ui.set_min_width(210.0);
             if ui.button("Open character or rig…").clicked() {
                 ui.close();
                 if let Some(p) = character_dialog().pick_file() {
@@ -281,9 +339,24 @@ impl Studio {
                 self.redetect();
             }
             ui.separator();
+            if ui
+                .add_enabled(has_doc, egui::Button::new("Export…    Ctrl+E"))
+                .clicked()
+            {
+                ui.close();
+                self.export_open = true;
+            }
             if ui.button("Quit").clicked() {
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             }
+        });
+    }
+
+    fn steps_pill(&mut self, ctx: &egui::Context) {
+        floating_area("steps", Align2::CENTER_TOP, Vec2::new(0.0, EDGE)).show(ctx, |ui| {
+            pill_frame().show(ui, |ui| {
+                ui.horizontal(|ui| self.steps(ui));
+            });
         });
     }
 
@@ -292,15 +365,15 @@ impl Studio {
         let built = doc.rig.is_some();
         let exported = doc.exported;
         let steps = [
-            ("Character", true, false),
             ("Guides", true, !built),
             ("Build", built, false),
             ("Export", exported, built && !exported),
         ];
         let mut clicked = None;
+        ui.spacing_mut().item_spacing.x = 4.0;
         for (i, (name, done, active)) in steps.into_iter().enumerate() {
             if i > 0 {
-                let (r, _) = ui.allocate_exact_size(Vec2::new(22.0, 2.0), Sense::hover());
+                let (r, _) = ui.allocate_exact_size(Vec2::new(18.0, 2.0), Sense::hover());
                 let c = if done {
                     ACCENT.gamma_multiply(0.6)
                 } else {
@@ -309,12 +382,12 @@ impl Studio {
                 ui.painter()
                     .line_segment([r.left_center(), r.right_center()], Stroke::new(2.0, c));
             }
-            let (fill, text, ring) = if active {
-                (ACCENT.gamma_multiply(0.15), ACCENT, ACCENT)
+            let (fill, text) = if active {
+                (ACCENT.gamma_multiply(0.18), ACCENT)
             } else if done {
-                (Color32::TRANSPARENT, TEXT, ACCENT.gamma_multiply(0.5))
+                (Color32::TRANSPARENT, TEXT)
             } else {
-                (Color32::TRANSPARENT, TEXT_FAINT, BORDER)
+                (Color32::TRANSPARENT, TEXT_FAINT)
             };
             let mark = if done && !active {
                 "✔".to_string()
@@ -327,50 +400,51 @@ impl Studio {
                     .color(text),
             )
             .fill(fill)
-            .stroke(Stroke::new(1.0, ring))
-            .corner_radius(14)
-            .min_size(Vec2::new(0.0, 28.0));
+            .stroke(Stroke::NONE)
+            .corner_radius(12)
+            .min_size(Vec2::new(0.0, 26.0));
             if ui.add(b).clicked() {
                 clicked = Some(i);
             }
         }
         match clicked {
-            Some(0) => {
-                if let Some(p) = character_dialog().pick_file() {
-                    self.open(&p);
-                }
-            }
-            Some(1) => self.mode = Mode::Guides,
-            Some(2) => {
+            Some(0) => self.mode = Mode::Guides,
+            Some(1) => {
                 self.build();
             }
-            Some(3) => {
-                let dir = self
-                    .doc
-                    .as_ref()
-                    .map(|d| d.out_dir.clone())
-                    .unwrap_or_default();
-                self.do_export(dir);
-            }
+            Some(2) => self.export_open = true,
             _ => {}
         }
     }
 
-    fn status_bar(&mut self, ui: &mut Ui) {
-        ui.horizontal_centered(|ui| {
-            theme::dot(ui, if self.error { ERR } else { OK });
-            ui.add(
-                egui::Label::new(RichText::new(&self.status).size(12.0).color(TEXT_DIM)).truncate(),
-            );
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(
-                    RichText::new("Ctrl+Z undo  ·  Ctrl+Y redo  ·  F frame  ·  Del remove")
-                        .size(12.0)
-                        .color(TEXT_FAINT),
-                );
+    fn camera_pill(&mut self, ctx: &egui::Context) {
+        floating_area("camera", Align2::RIGHT_TOP, Vec2::new(-EDGE, EDGE)).show(ctx, |ui| {
+            pill_frame().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    for (name, yaw, pitch) in [
+                        ("Front", 0.0, 0.05),
+                        ("Side", std::f32::consts::FRAC_PI_2, 0.05),
+                        ("Persp", 0.55, 0.22),
+                    ] {
+                        let b = egui::Button::new(RichText::new(name).size(13.0).color(TEXT_DIM))
+                            .frame_when_inactive(false)
+                            .corner_radius(10)
+                            .min_size(Vec2::new(0.0, 26.0));
+                        if ui.add(b).clicked() {
+                            self.camera.yaw = yaw;
+                            self.camera.pitch = pitch;
+                        }
+                    }
+                    if theme::icon(ui, "⛶", "Frame the character (F)", true).clicked() {
+                        self.frame_camera();
+                    }
+                });
             });
         });
     }
+
+    // ----------------------------------------------------------------------- notifications
 
     fn toast(&mut self, ctx: &egui::Context) {
         let now = ctx.input(|i| i.time);
@@ -389,9 +463,17 @@ impl Studio {
         }
         ctx.request_repaint_after(std::time::Duration::from_millis(200));
         let color = if self.error { ERR } else { OK };
+        // Above the dock, or under the top pills while a dialog covers the middle.
+        let (anchor, offset) = if self.library_open || self.export_open {
+            (Align2::CENTER_TOP, Vec2::new(0.0, PANEL_TOP - 8.0))
+        } else if self.doc.is_some() {
+            (Align2::CENTER_BOTTOM, Vec2::new(0.0, -DOCK_CLEARANCE))
+        } else {
+            (Align2::CENTER_BOTTOM, Vec2::new(0.0, -24.0))
+        };
         egui::Area::new(id)
-            .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 124.0))
-            .order(egui::Order::Foreground)
+            .anchor(anchor, offset)
+            .order(egui::Order::Tooltip)
             .interactable(false)
             .show(ctx, |ui| {
                 egui::Frame::new()
@@ -401,7 +483,7 @@ impl Studio {
                     .shadow(ui.visuals().popup_shadow)
                     .inner_margin(Margin::symmetric(14, 10))
                     .show(ui, |ui| {
-                        ui.set_max_width(420.0);
+                        ui.set_max_width(460.0);
                         ui.horizontal(|ui| {
                             theme::dot(ui, color);
                             ui.add(
@@ -438,8 +520,10 @@ impl Studio {
     fn welcome(&mut self, ui: &mut Ui) {
         let rect = ui.max_rect();
         paint_backdrop(ui.painter(), rect);
+        let pr = view::Camera::default().projector(rect);
+        paint_grid(ui.painter(), &pr, 0.0, 1.0);
         let width = 760f32.min(rect.width() - 48.0);
-        let top = rect.top() + (rect.height() * 0.14).max(24.0);
+        let top = rect.top() + (rect.height() * 0.14).max(80.0);
         let area = Rect::from_min_size(
             Pos2::new(rect.center().x - width / 2.0, top),
             Vec2::new(width, rect.bottom() - top),
@@ -504,10 +588,10 @@ impl Studio {
                     (
                         "2",
                         "Place guides",
-                        "Drag the joints. Add fingers, tails, ears, props.",
+                        "Drag the joints. Shift+A adds eyes, fingers, tails.",
                     ),
                     ("3", "Build", "Bones, IK/FK controls and skin weights."),
-                    ("4", "Export", "Blender, Maya and Unreal, with controls."),
+                    ("4", "Export", "Blender, Maya and Unreal, named your way."),
                 ] {
                     step_card(ui, step_w, n, title, text);
                 }
@@ -515,32 +599,9 @@ impl Studio {
         });
     }
 
-    // ----------------------------------------------------------------------- left sidebar
+    // ----------------------------------------------------------------------- outliner
 
-    fn sidebar(&mut self, ui: &mut Ui) {
-        ui.add_space(4.0);
-        let mut tab = self.tab;
-        ui.horizontal(|ui| {
-            theme::segmented(
-                ui,
-                &mut tab,
-                &[
-                    (Tab::Components, "Components"),
-                    (Tab::Library, "Add components"),
-                ],
-            );
-        });
-        self.tab = tab;
-        ui.add_space(6.0);
-        egui::ScrollArea::vertical()
-            .auto_shrink(false)
-            .show(ui, |ui| match self.tab {
-                Tab::Components => self.components_tab(ui),
-                Tab::Library => self.library_tab(ui),
-            });
-    }
-
-    fn components_tab(&mut self, ui: &mut Ui) {
+    fn outliner(&mut self, ctx: &egui::Context) {
         let Some(doc) = &self.doc else { return };
         // Depth of each component in the attachment tree, for indenting.
         let owner = |bone: &str| -> Option<&str> {
@@ -566,334 +627,91 @@ impl Studio {
                 depth[i] = depth[j] + 1;
             }
         }
-        let rows: Vec<(String, Kind, Side, usize, usize)> = doc
+        let rows: Vec<(String, Kind, Side, usize)> = doc
             .guides
             .components
             .iter()
             .zip(&depth)
-            .map(|(c, d)| (c.id.clone(), c.kind, c.side, c.guides.len(), *d))
+            .map(|(c, d)| (c.id.clone(), c.kind, c.side, *d))
             .collect();
+        let max_h = ctx.content_rect().height() - PANEL_TOP - DOCK_CLEARANCE - 70.0;
 
-        theme::card(ui, |ui| {
-            theme::card_title(
-                ui,
-                "Rig components",
-                Some(RichText::new(format!("{}", rows.len())).color(TEXT_FAINT)),
-            );
-            ui.add_space(2.0);
-            ui.spacing_mut().item_spacing.y = 2.0;
-            for (i, (id, kind, side, _, depth)) in rows.iter().enumerate() {
-                let selected = self.selected.is_some_and(|(c, _)| c == i);
-                if component_row(ui, id, *kind, *side, (*depth).min(4), selected).clicked() {
-                    self.selected = Some((i, None));
-                    self.mode = Mode::Guides;
+        floating_area("outliner", Align2::LEFT_TOP, Vec2::new(EDGE, PANEL_TOP)).show(ctx, |ui| {
+            room(ui, OUTLINER_WIDTH, max_h + 70.0);
+            panel_frame().show(ui, |ui| {
+                ui.set_width(OUTLINER_WIDTH);
+                let mut open = self.outliner_open;
+                panel_header(ui, "Outliner", &rows.len().to_string(), &mut open);
+                self.outliner_open = open;
+                if !open {
+                    return;
                 }
-            }
-        });
-        ui.add_space(4.0);
-        theme::card(ui, |ui| {
-            theme::card_title(ui, "Symmetry", None);
-            ui.horizontal(|ui| {
-                theme::pill(ui, &mut self.symmetry, "Mirror moves")
-                    .on_hover_text("Moving a left or right guide moves its twin too");
-            });
-            ui.horizontal(|ui| {
-                let w = (ui.available_width() - 8.0) / 2.0;
-                if theme::secondary(ui, "Left to right", w).clicked() {
-                    self.mirror(Side::Left);
-                }
-                if theme::secondary(ui, "Right to left", w).clicked() {
-                    self.mirror(Side::Right);
-                }
-            });
-        });
-        if let Some((c, guide)) = self.selected {
-            ui.add_space(4.0);
-            self.component_inspector(ui, c, guide);
-        } else {
-            ui.add_space(8.0);
-            ui.label(
-                RichText::new("Select a component, or click a guide in the view, to edit it.")
-                    .color(TEXT_FAINT),
-            );
-        }
-    }
-
-    fn component_inspector(&mut self, ui: &mut Ui, c: usize, guide: Option<usize>) {
-        let Some(doc) = &self.doc else { return };
-        let Some(comp) = doc.guides.components.get(c).cloned() else {
-            return;
-        };
-        let own: Vec<String> = match &doc.preview {
-            Ok(b) => b
-                .skeleton
-                .bones
-                .iter()
-                .filter(|b| b.component == comp.id)
-                .map(|b| b.name.clone())
-                .collect(),
-            Err(_) => Vec::new(),
-        };
-        let parents: Vec<String> = doc
-            .bone_names()
-            .into_iter()
-            .filter(|b| !own.contains(b))
-            .collect();
-
-        theme::card(ui, |ui| {
-            ui.horizontal(|ui| {
-                theme::dot(ui, side_color(comp.side));
-                ui.label(RichText::new(&comp.id).size(16.0).strong().color(TEXT));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    theme::badge(ui, kind_label(comp.kind), ACCENT);
-                    theme::badge(ui, side_label(comp.side), side_color(comp.side));
-                });
-            });
-            ui.label(RichText::new(format!("{} bones", own.len())).color(TEXT_DIM));
-            ui.add_space(4.0);
-
-            if let Some(parent) = &comp.parent {
-                let mut chosen = parent.clone();
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Attached to").color(TEXT_DIM));
-                    egui::ComboBox::from_id_salt("parent")
-                        .selected_text(chosen.as_str())
-                        .height(320.0)
-                        .show_ui(ui, |ui| {
-                            for b in &parents {
-                                ui.selectable_value(&mut chosen, b.clone(), b);
+                egui::ScrollArea::vertical()
+                    .max_height(max_h.max(120.0))
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        for (i, (id, kind, side, depth)) in rows.iter().enumerate() {
+                            let selected = self.selected.is_some_and(|(c, _)| c == i);
+                            let row =
+                                component_row(ui, id, *kind, *side, (*depth).min(4), selected);
+                            if row.clicked() {
+                                self.selected = if selected { None } else { Some((i, None)) };
+                                self.mode = Mode::Guides;
                             }
-                        });
-                });
-                if &chosen != parent {
-                    let id = comp.id.clone();
-                    self.edit("re-attach it", |g| {
-                        let target = g.components.iter_mut().find(|x| x.id == id).unwrap();
-                        target.parent = Some(chosen.clone());
-                        Ok(format!("{id} now hangs from {chosen}."))
-                    });
-                }
-            }
-            match comp.kind {
-                Kind::Spine => {
-                    let mut joints = comp.options.joints.unwrap_or(components::SPINE_JOINTS);
-                    let before = joints;
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("Spine joints").color(TEXT_DIM));
-                        ui.add(egui::DragValue::new(&mut joints).range(1..=16));
-                    });
-                    if joints != before {
-                        let id = comp.id.clone();
-                        self.edit("change the spine", |g| {
-                            components::set_spine_joints(g, &id, joints)?;
-                            Ok(format!("Spine now has {joints} joints."))
-                        });
-                    }
-                }
-                Kind::Arm | Kind::Leg => {
-                    let mut twist = comp.options.twist;
-                    ui.horizontal(|ui| {
-                        if theme::pill(ui, &mut twist, "Twist bones").clicked() {
-                            let id = comp.id.clone();
-                            self.edit("change twist bones", |g| {
-                                g.components
-                                    .iter_mut()
-                                    .find(|x| x.id == id)
-                                    .unwrap()
-                                    .options
-                                    .twist = twist;
-                                Ok(format!(
-                                    "Twist bones {} on {id}.",
-                                    if twist { "on" } else { "off" }
-                                ))
-                            });
                         }
                     });
+                ui.add_space(4.0);
+                let add =
+                    egui::Button::new(RichText::new("+  Add component").size(13.5).color(ACCENT))
+                        .fill(ACCENT.gamma_multiply(0.1))
+                        .stroke(Stroke::new(1.0, ACCENT.gamma_multiply(0.35)))
+                        .corner_radius(10)
+                        .min_size(Vec2::new(ui.available_width(), 32.0));
+                if ui
+                    .add(add)
+                    .on_hover_text("Open the rigging window (Shift+A)")
+                    .clicked()
+                {
+                    self.library_open = true;
                 }
-                _ => {}
-            }
-
-            ui.add_space(6.0);
-            theme::label_caps(ui, "Guides");
-            egui::Grid::new("guides")
-                .num_columns(4)
-                .spacing([4.0, 4.0])
-                .min_col_width(0.0)
-                .show(ui, |ui| {
-                    ui.label("");
-                    for axis in ["X", "Y", "Z"] {
-                        ui.label(RichText::new(axis).size(11.0).color(TEXT_FAINT));
-                    }
-                    ui.end_row();
-                    for (gi, g) in comp.guides.iter().enumerate() {
-                        let is_sel = guide == Some(gi);
-                        if ui
-                            .selectable_label(is_sel, RichText::new(&g.name).size(13.0))
-                            .clicked()
-                        {
-                            self.selected = Some((c, Some(gi)));
-                            self.mode = Mode::Guides;
-                        }
-                        let mut p = g.position;
-                        let mut changed = false;
-                        for v in [&mut p.x, &mut p.y, &mut p.z] {
-                            changed |= ui
-                                .add_sized(
-                                    [62.0, 24.0],
-                                    egui::DragValue::new(v).speed(0.002).max_decimals(3),
-                                )
-                                .changed();
-                        }
-                        if changed {
-                            self.selected = Some((c, Some(gi)));
-                            self.begin_change();
-                            self.move_guide(c, gi, p);
-                        }
-                        ui.end_row();
-                    }
-                });
-            if comp.kind != Kind::Root {
-                ui.add_space(6.0);
-                let remove = egui::Button::new(RichText::new("Remove component").color(ERR))
-                    .fill(ERR.gamma_multiply(0.1))
-                    .stroke(Stroke::new(1.0, ERR.gamma_multiply(0.4)))
-                    .corner_radius(10)
-                    .min_size(Vec2::new(ui.available_width(), 32.0));
-                if ui.add(remove).clicked() {
-                    self.remove_selected();
-                }
-            }
+            });
         });
     }
 
-    /// Record an undo step for a guide move unless one is already in progress.
-    fn begin_change(&mut self) {
-        if self.drag.is_none()
-            && let Some(doc) = &mut self.doc
-            && doc.undo.last().is_none_or(|u| !same_layout(u, &doc.guides))
-        {
-            push_undo(&mut doc.undo, &doc.guides);
-            doc.redo.clear();
-        }
-    }
+    // ----------------------------------------------------------------------- properties
 
-    fn library_tab(&mut self, ui: &mut Ui) {
-        let w = ((ui.available_width() - 14.0) / 2.0).floor();
-        let tiles: [LibraryItem; 8] = [
-            (TileIcon::Eyes, "Eyes", "Look-at control", Studio::add_eyes),
-            (TileIcon::Jaw, "Jaw", "Opens the mouth", Studio::add_jaw),
-            (
-                TileIcon::Fingers,
-                "Fingers",
-                "Five fingers per hand",
-                Studio::add_fingers,
-            ),
-            (
-                TileIcon::Tail,
-                "Tail",
-                "Behind the pelvis",
-                Studio::add_tail,
-            ),
-            (
-                TileIcon::Ears,
-                "Ears",
-                "A pair on the head",
-                Studio::add_ears,
-            ),
-            (
-                TileIcon::Ponytail,
-                "Ponytail",
-                "Hair from the head",
-                Studio::add_ponytail,
-            ),
-            (TileIcon::Prop, "Prop", "Weapon socket", Studio::add_prop),
-            (
-                TileIcon::Chain,
-                "Chain",
-                "FK chain on any bone",
-                Studio::add_chain,
-            ),
-        ];
-        theme::label_caps(ui, "Premade components");
-        for row in tiles.chunks(2) {
-            ui.horizontal(|ui| {
-                for (icon, title, text, add) in row {
-                    if library_tile(ui, w, *icon, title, text).clicked() {
-                        add(self);
-                        self.mode = Mode::Guides;
+    fn properties(&mut self, ctx: &egui::Context) {
+        let max_h = ctx.content_rect().height() - PANEL_TOP - DOCK_CLEARANCE - 50.0;
+        let title = match self.selected {
+            Some(_) => "Component",
+            None => "Rig",
+        };
+        floating_area("properties", Align2::RIGHT_TOP, Vec2::new(-EDGE, PANEL_TOP)).show(
+            ctx,
+            |ui| {
+                room(ui, PROPERTIES_WIDTH, max_h + 50.0);
+                panel_frame().show(ui, |ui| {
+                    ui.set_width(PROPERTIES_WIDTH);
+                    let mut open = self.properties_open;
+                    panel_header(ui, "Properties", title, &mut open);
+                    self.properties_open = open;
+                    if !open {
+                        return;
                     }
-                }
-            });
-        }
-        ui.add_space(6.0);
-        theme::card(ui, |ui| {
-            theme::card_title(ui, "Options", None);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Fingers on").color(TEXT_DIM));
-                theme::segmented(
-                    ui,
-                    &mut self.finger_sides,
-                    &[
-                        (FingerSides::Both, "Both"),
-                        (FingerSides::Left, "Left"),
-                        (FingerSides::Right, "Right"),
-                    ],
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Tail bones").color(TEXT_DIM));
-                ui.add(egui::DragValue::new(&mut self.tail_joints).range(2..=24));
-            });
-        });
-        ui.add_space(4.0);
-        let bones = self.doc.as_ref().map(Doc::bone_names).unwrap_or_default();
-        if !bones.contains(&self.chain_parent) {
-            self.chain_parent = bones
-                .iter()
-                .find(|b| b.as_str() == "head")
-                .or(bones.first())
-                .cloned()
-                .unwrap_or_default();
-        }
-        theme::card(ui, |ui| {
-            theme::card_title(ui, "Custom chain", None);
-            egui::Grid::new("chain")
-                .num_columns(2)
-                .spacing([10.0, 8.0])
-                .show(ui, |ui| {
-                    ui.label(RichText::new("On bone").color(TEXT_DIM));
-                    egui::ComboBox::from_id_salt("chain_parent")
-                        .selected_text(self.chain_parent.as_str())
-                        .height(320.0)
-                        .show_ui(ui, |ui| {
-                            for b in &bones {
-                                ui.selectable_value(&mut self.chain_parent, b.clone(), b);
-                            }
+                    egui::ScrollArea::vertical()
+                        .max_height(max_h.max(120.0))
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| match self.selected {
+                            Some((c, guide)) => self.component_inspector(ui, c, guide),
+                            None => self.rig_overview(ui),
                         });
-                    ui.end_row();
-                    ui.label(RichText::new("Bones").color(TEXT_DIM));
-                    ui.add(egui::DragValue::new(&mut self.chain_joints).range(1..=24));
-                    ui.end_row();
-                    ui.label(RichText::new("Name").color(TEXT_DIM));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.chain_id)
-                            .hint_text("automatic")
-                            .desired_width(150.0),
-                    );
-                    ui.end_row();
                 });
-            ui.add_space(4.0);
-            if theme::primary(ui, "Add chain", ui.available_width(), true).clicked() {
-                self.add_chain();
-                self.mode = Mode::Guides;
-            }
-        });
+            },
+        );
     }
 
-    // ----------------------------------------------------------------------- right panel
-
-    fn rig_panel(&mut self, ui: &mut Ui) {
-        ui.add_space(4.0);
+    fn rig_overview(&mut self, ui: &mut Ui) {
         let Some(doc) = &self.doc else { return };
         let built = doc.rig.is_some();
         let summary = doc.preview.as_ref().ok().map(|b| {
@@ -916,147 +734,815 @@ impl Studio {
                     .collect()
             })
             .unwrap_or_default();
+        let naming = doc.guides.naming.clone();
 
-        theme::card(ui, |ui| {
-            let badge = if preview_error.is_some() {
-                RichText::new("Guides need fixing").color(ERR)
+        ui.horizontal(|ui| {
+            let (text, color) = if preview_error.is_some() {
+                ("Guides need fixing", ERR)
             } else if built {
-                RichText::new("Built").color(OK)
+                ("Built", OK)
             } else {
-                RichText::new("Not built").color(TEXT_FAINT)
+                ("Not built yet", TEXT_FAINT)
             };
-            theme::card_title(ui, "Rig", Some(badge.size(12.0)));
-            if let Some(e) = &preview_error {
-                ui.label(RichText::new(e).color(ERR));
-            }
-            if let Some((bones, controls, ik)) = summary {
-                let w = (ui.available_width() - 16.0) / 3.0;
-                ui.horizontal(|ui| {
-                    theme::stat(ui, bones, "bones", w);
-                    theme::stat(ui, controls, "controls", w);
-                    theme::stat(ui, ik, "IK limbs", w);
-                });
-            }
-            ui.add_space(4.0);
-            let label = if built { "Rebuild rig" } else { "Build rig" };
-            if theme::primary(ui, label, ui.available_width(), preview_error.is_none()).clicked() {
-                self.build();
-            }
-            if !built {
-                ui.label(
-                    RichText::new("Builds the bones, controls and skin weights.")
-                        .size(12.0)
-                        .color(TEXT_FAINT),
-                );
-            }
+            theme::badge(ui, text, color);
         });
-
-        ui.add_space(4.0);
-        theme::card(ui, |ui| {
-            theme::card_title(ui, "View", None);
-            let mut mode = self.mode;
-            theme::segmented(
-                ui,
-                &mut mode,
-                &[
-                    (Mode::Guides, "Guides"),
-                    (Mode::Skeleton, "Skeleton"),
-                    (Mode::Rig, "Controls"),
-                ],
-            );
-            self.mode = mode;
-            ui.horizontal(|ui| {
-                theme::pill(ui, &mut self.show_mesh, "Mesh");
-                theme::pill(ui, &mut self.xray, "X-ray");
-            });
-        });
-
-        ui.add_space(4.0);
-        theme::card(ui, |ui| {
-            theme::card_title(ui, "Skin weights", None);
-            if deform.is_empty() {
-                ui.label(
-                    RichText::new("Build the rig to paint each bone's weights on the mesh.")
-                        .color(TEXT_FAINT),
-                );
-            } else {
-                egui::ComboBox::from_id_salt("weights")
-                    .width(ui.available_width() - 8.0)
-                    .selected_text(self.weights_bone.as_deref().unwrap_or("Off"))
-                    .height(360.0)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.weights_bone, None, "Off");
-                        for b in &deform {
-                            ui.selectable_value(&mut self.weights_bone, Some(b.clone()), b);
-                        }
-                    });
-                weight_legend(ui);
-            }
-        });
-
-        ui.add_space(4.0);
-        let Some(doc) = &mut self.doc else { return };
-        let mut export_dir = None;
-        let mut choose = false;
-        theme::card(ui, |ui| {
-            theme::card_title(ui, "Export", None);
+        if let Some(e) = &preview_error {
+            ui.label(RichText::new(e).color(ERR));
+        }
+        if let Some((bones, controls, ik)) = summary {
             let w = (ui.available_width() - 16.0) / 3.0;
             ui.horizontal(|ui| {
-                for (i, (name, note)) in
-                    [("Blender", "3.6+"), ("Maya", "2022+"), ("Unreal", "5.2+")]
-                        .into_iter()
-                        .enumerate()
-                {
-                    if target_tile(ui, w, name, note, self.targets[i]).clicked() {
-                        self.targets[i] = !self.targets[i];
-                    }
-                }
+                theme::stat(ui, bones, "bones", w);
+                theme::stat(ui, controls, "controls", w);
+                theme::stat(ui, ik, "IK limbs", w);
             });
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Name").color(TEXT_DIM));
-                let mut name = doc.name.clone();
-                if ui
-                    .add(egui::TextEdit::singleline(&mut name).desired_width(f32::INFINITY))
-                    .changed()
-                {
-                    doc.name = hive_rig::export::sanitize_name(&name);
-                }
-            });
-            ui.add(
-                egui::Label::new(
-                    RichText::new(doc.out_dir.display().to_string())
-                        .size(11.5)
-                        .color(TEXT_FAINT),
-                )
-                .truncate(),
+        }
+        ui.label(
+            RichText::new(
+                "Click a component in the outliner, or a guide on the character, to edit it.",
             )
-            .on_hover_text(doc.out_dir.display().to_string());
-            let any = self.targets.iter().any(|t| *t);
-            if theme::primary(ui, "Export rig", ui.available_width(), any).clicked() {
-                export_dir = Some(doc.out_dir.clone());
-            }
-            ui.horizontal(|ui| {
-                let w = (ui.available_width() - 8.0) / 2.0;
-                if theme::secondary(ui, "Choose folder…", w).clicked() {
-                    choose = true;
-                }
-                let dir = doc.out_dir.clone();
+            .size(12.0)
+            .color(TEXT_FAINT),
+        );
+
+        ui.add_space(8.0);
+        theme::label_caps(ui, "Skin weights");
+        if deform.is_empty() {
+            ui.label(
+                RichText::new("Build the rig to paint each bone's weights on the mesh.")
+                    .size(12.5)
+                    .color(TEXT_FAINT),
+            );
+        } else {
+            egui::ComboBox::from_id_salt("weights")
+                .width(ui.available_width() - 8.0)
+                .selected_text(self.weights_bone.as_deref().unwrap_or("Off"))
+                .height(360.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.weights_bone, None, "Off");
+                    for b in &deform {
+                        ui.selectable_value(&mut self.weights_bone, Some(b.clone()), b);
+                    }
+                });
+            weight_legend(ui);
+        }
+
+        ui.add_space(8.0);
+        theme::label_caps(ui, "Naming");
+        ui.horizontal(|ui| {
+            let label = naming.preset().map_or("Custom", |p| p.label());
+            ui.label(RichText::new(label).strong().color(TEXT));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui
-                    .add_enabled(
-                        dir.is_dir(),
-                        egui::Button::new("Open folder")
-                            .corner_radius(10)
-                            .min_size(Vec2::new(w, 34.0)),
-                    )
+                    .add(egui::Button::new(RichText::new("Change").size(12.5)).corner_radius(8))
                     .clicked()
                 {
-                    open_folder(&dir);
+                    self.export_open = true;
                 }
             });
-            if doc.exported {
-                ui.label(RichText::new("Exported").color(OK));
+        });
+        naming_examples(ui, &naming, 3);
+    }
+
+    fn component_inspector(&mut self, ui: &mut Ui, c: usize, guide: Option<usize>) {
+        let Some(doc) = &self.doc else { return };
+        let Some(comp) = doc.guides.components.get(c).cloned() else {
+            return;
+        };
+        let naming = doc.guides.naming.clone();
+        let own: Vec<String> = match &doc.preview {
+            Ok(b) => b
+                .skeleton
+                .bones
+                .iter()
+                .filter(|b| b.component == comp.id)
+                .map(|b| b.name.clone())
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        let parents: Vec<String> = doc
+            .bone_names()
+            .into_iter()
+            .filter(|b| !own.contains(b))
+            .collect();
+
+        ui.horizontal(|ui| {
+            theme::dot(ui, side_color(comp.side));
+            ui.label(RichText::new(&comp.id).size(16.0).strong().color(TEXT));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .add(egui::Button::new(RichText::new("Done").size(12.5)).corner_radius(8))
+                    .on_hover_text("Back to the rig overview")
+                    .clicked()
+                {
+                    self.selected = None;
+                }
+            });
+        });
+        ui.horizontal(|ui| {
+            theme::badge(ui, kind_label(comp.kind), ACCENT);
+            theme::badge(ui, side_label(comp.side), side_color(comp.side));
+            ui.label(
+                RichText::new(format!("{} bones", own.len()))
+                    .size(12.5)
+                    .color(TEXT_DIM),
+            );
+        });
+        ui.add_space(4.0);
+
+        if let Some(parent) = &comp.parent {
+            let mut chosen = parent.clone();
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Attached to").color(TEXT_DIM));
+                egui::ComboBox::from_id_salt("parent")
+                    .selected_text(chosen.as_str())
+                    .height(320.0)
+                    .show_ui(ui, |ui| {
+                        for b in &parents {
+                            ui.selectable_value(&mut chosen, b.clone(), b);
+                        }
+                    });
+            });
+            if &chosen != parent {
+                let id = comp.id.clone();
+                self.edit("re-attach it", |g| {
+                    let target = g.components.iter_mut().find(|x| x.id == id).unwrap();
+                    target.parent = Some(chosen.clone());
+                    Ok(format!("{id} now hangs from {chosen}."))
+                });
+            }
+        }
+        match comp.kind {
+            Kind::Spine => {
+                let mut joints = comp.options.joints.unwrap_or(components::SPINE_JOINTS);
+                let before = joints;
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Spine joints").color(TEXT_DIM));
+                    ui.add(egui::DragValue::new(&mut joints).range(1..=16));
+                });
+                if joints != before {
+                    let id = comp.id.clone();
+                    self.edit("change the spine", |g| {
+                        components::set_spine_joints(g, &id, joints)?;
+                        Ok(format!("Spine now has {joints} joints."))
+                    });
+                }
+            }
+            Kind::Arm | Kind::Leg => {
+                let mut twist = comp.options.twist;
+                ui.horizontal(|ui| {
+                    if theme::pill(ui, &mut twist, "Twist bones").clicked() {
+                        let id = comp.id.clone();
+                        self.edit("change twist bones", |g| {
+                            g.components
+                                .iter_mut()
+                                .find(|x| x.id == id)
+                                .unwrap()
+                                .options
+                                .twist = twist;
+                            Ok(format!(
+                                "Twist bones {} on {id}.",
+                                if twist { "on" } else { "off" }
+                            ))
+                        });
+                    }
+                });
+            }
+            _ => {}
+        }
+
+        ui.add_space(6.0);
+        theme::label_caps(ui, "Guides");
+        egui::Grid::new("guides")
+            .num_columns(4)
+            .spacing([4.0, 4.0])
+            .min_col_width(0.0)
+            .show(ui, |ui| {
+                ui.label("");
+                for axis in ["X", "Y", "Z"] {
+                    ui.label(RichText::new(axis).size(11.0).color(TEXT_FAINT));
+                }
+                ui.end_row();
+                for (gi, g) in comp.guides.iter().enumerate() {
+                    let is_sel = guide == Some(gi);
+                    if ui
+                        .selectable_label(is_sel, RichText::new(&g.name).size(13.0))
+                        .clicked()
+                    {
+                        self.selected = Some((c, Some(gi)));
+                        self.mode = Mode::Guides;
+                    }
+                    let mut p = g.position;
+                    let mut changed = false;
+                    for v in [&mut p.x, &mut p.y, &mut p.z] {
+                        changed |= ui
+                            .add_sized(
+                                [60.0, 24.0],
+                                egui::DragValue::new(v).speed(0.002).max_decimals(3),
+                            )
+                            .changed();
+                    }
+                    if changed {
+                        self.selected = Some((c, Some(gi)));
+                        self.begin_change();
+                        self.move_guide(c, gi, p);
+                    }
+                    ui.end_row();
+                }
+            });
+
+        if !own.is_empty() {
+            ui.add_space(6.0);
+            egui::CollapsingHeader::new(
+                RichText::new(format!("Exports as ({})", own.len()))
+                    .size(12.0)
+                    .strong()
+                    .color(TEXT_FAINT),
+            )
+            .id_salt("exports_as")
+            .show(ui, |ui| {
+                for b in &own {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(b).size(12.0).color(TEXT_FAINT));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(naming.bone(b))
+                                    .size(12.5)
+                                    .monospace()
+                                    .color(TEXT),
+                            );
+                        });
+                    });
+                }
+            });
+        }
+        if comp.kind != Kind::Root {
+            ui.add_space(6.0);
+            let remove = egui::Button::new(RichText::new("Remove component").color(ERR))
+                .fill(ERR.gamma_multiply(0.1))
+                .stroke(Stroke::new(1.0, ERR.gamma_multiply(0.4)))
+                .corner_radius(10)
+                .min_size(Vec2::new(ui.available_width(), 32.0));
+            if ui.add(remove).on_hover_text("Delete").clicked() {
+                self.remove_selected();
+            }
+        }
+    }
+
+    /// Record an undo step for a guide move unless one is already in progress.
+    fn begin_change(&mut self) {
+        if self.drag.is_none()
+            && let Some(doc) = &mut self.doc
+            && doc.undo.last().is_none_or(|u| !same_layout(u, &doc.guides))
+        {
+            push_undo(&mut doc.undo, &doc.guides);
+            doc.redo.clear();
+        }
+    }
+
+    // ----------------------------------------------------------------------- dock
+
+    fn dock(&mut self, ctx: &egui::Context) {
+        floating_area("dock", Align2::CENTER_BOTTOM, Vec2::new(0.0, -EDGE)).show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(Color32::from_rgba_unmultiplied(20, 23, 30, 240))
+                .stroke(Stroke::new(1.0, Color32::from_white_alpha(16)))
+                .corner_radius(20)
+                .inner_margin(Margin::symmetric(10, 6))
+                .shadow(Shadow {
+                    offset: [0, 10],
+                    blur: 30,
+                    spread: 0,
+                    color: Color32::from_black_alpha(130),
+                })
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        self.dock_buttons(ui);
+                    });
+                });
+        });
+    }
+
+    fn dock_buttons(&mut self, ui: &mut Ui) {
+        let built = self.doc.as_ref().is_some_and(|d| d.rig.is_some());
+        let buildable = self.doc.as_ref().is_some_and(|d| d.preview.is_ok());
+        let guides = self.mode == Mode::Guides;
+
+        if dock_button(
+            ui,
+            Icon::Move,
+            "Move",
+            guides,
+            true,
+            "Drag guides to place joints (1)",
+        )
+        .clicked()
+        {
+            self.mode = Mode::Guides;
+        }
+        if dock_button(
+            ui,
+            Icon::Add,
+            "Add",
+            self.library_open,
+            true,
+            "Add a component (Shift+A)",
+        )
+        .clicked()
+        {
+            self.library_open = true;
+        }
+        let mirror = dock_button(
+            ui,
+            Icon::Mirror,
+            "Mirror",
+            false,
+            true,
+            "Copy the left side onto the right. Right-click for the other way.",
+        );
+        if mirror.clicked() {
+            self.mirror(Side::Left);
+        }
+        mirror.context_menu(|ui| {
+            if ui.button("Left to right").clicked() {
+                self.mirror(Side::Left);
+                ui.close();
+            }
+            if ui.button("Right to left").clicked() {
+                self.mirror(Side::Right);
+                ui.close();
             }
         });
+        if dock_button(
+            ui,
+            Icon::Symmetry,
+            "Symmetry",
+            self.symmetry,
+            true,
+            "Moving a left or right guide moves its twin too",
+        )
+        .clicked()
+        {
+            self.symmetry = !self.symmetry;
+        }
+        dock_separator(ui);
+        for (mode, icon, label, tip) in [
+            (Mode::Guides, Icon::Guides, "Guides", "Show guides (1)"),
+            (
+                Mode::Skeleton,
+                Icon::Skeleton,
+                "Skeleton",
+                "Show the skeleton (2)",
+            ),
+            (
+                Mode::Rig,
+                Icon::Controls,
+                "Controls",
+                "Show the animator controls (3)",
+            ),
+        ] {
+            if dock_button(
+                ui,
+                icon,
+                label,
+                self.mode == mode && mode != Mode::Guides,
+                true,
+                tip,
+            )
+            .clicked()
+            {
+                self.mode = mode;
+            }
+        }
+
+        let label = if built { "Rebuild" } else { "Build" };
+        if hex_button(ui, label, buildable)
+            .on_hover_text("Build the bones, controls and skin weights (Ctrl+B)")
+            .clicked()
+        {
+            self.build();
+        }
+
+        if dock_button(
+            ui,
+            Icon::Mesh,
+            "Mesh",
+            self.show_mesh,
+            true,
+            "Show the character mesh",
+        )
+        .clicked()
+        {
+            self.show_mesh = !self.show_mesh;
+        }
+        if dock_button(
+            ui,
+            Icon::Xray,
+            "X-ray",
+            self.xray,
+            true,
+            "See the rig through the mesh",
+        )
+        .clicked()
+        {
+            self.xray = !self.xray;
+        }
+        let weights_on = self.weights_bone.is_some();
+        if dock_button(
+            ui,
+            Icon::Weights,
+            "Weights",
+            weights_on,
+            built,
+            "Paint a bone's skin weights on the mesh (build first)",
+        )
+        .clicked()
+        {
+            self.weights_bone = if weights_on {
+                None
+            } else {
+                self.doc.as_ref().and_then(|d| {
+                    let rig = d.rig.as_ref()?;
+                    let first = rig.skeleton.bones.iter().find(|b| b.deform)?;
+                    let upper = rig.guides.naming.bone("upperarm_l");
+                    let pick = rig
+                        .skeleton
+                        .bone(&upper)
+                        .map_or(first.name.clone(), |b| b.name.clone());
+                    Some(pick)
+                })
+            };
+            self.properties_open = true;
+            self.selected = None;
+        }
+        dock_separator(ui);
+        if dock_button(
+            ui,
+            Icon::Undo,
+            "Undo",
+            false,
+            self.can_undo(),
+            "Undo (Ctrl+Z)",
+        )
+        .clicked()
+        {
+            self.undo();
+        }
+        if dock_button(
+            ui,
+            Icon::Redo,
+            "Redo",
+            false,
+            self.can_redo(),
+            "Redo (Ctrl+Y)",
+        )
+        .clicked()
+        {
+            self.redo();
+        }
+        if dock_button(
+            ui,
+            Icon::Frame,
+            "Frame",
+            false,
+            true,
+            "Frame the character (F)",
+        )
+        .clicked()
+        {
+            self.frame_camera();
+        }
+        dock_separator(ui);
+        if dock_button(
+            ui,
+            Icon::Export,
+            "Export",
+            self.export_open,
+            true,
+            "Export to Blender, Maya and Unreal (Ctrl+E)",
+        )
+        .clicked()
+        {
+            self.export_open = true;
+        }
+    }
+
+    // ----------------------------------------------------------------------- rigging window
+
+    fn library_window(&mut self, ctx: &egui::Context) {
+        if !self.library_open {
+            return;
+        }
+        let screen = ctx.content_rect();
+        let width = 820f32.min(screen.width() - 60.0);
+        let kinds: Vec<Kind> = self
+            .doc
+            .as_ref()
+            .map(|d| d.guides.components.iter().map(|c| c.kind).collect())
+            .unwrap_or_default();
+        let mut close = false;
+        let modal = egui::Modal::new(egui::Id::unique("library"))
+            .frame(dialog_frame())
+            .backdrop_color(Color32::from_black_alpha(140))
+            .show(ctx, |ui| {
+                ui.set_width(width);
+                close |= dialog_header(
+                    ui,
+                    "Add a component",
+                    "Premade parts land on the guides, ready to adjust. Shift+A opens this window.",
+                );
+                ui.add_space(4.0);
+                let mut cat = self.category;
+                theme::segmented(
+                    ui,
+                    &mut cat,
+                    &[
+                        (Category::All, "All"),
+                        (Category::Face, "Face"),
+                        (Category::Body, "Body"),
+                        (Category::Extras, "Extras"),
+                    ],
+                );
+                self.category = cat;
+                ui.add_space(8.0);
+                let parts: Vec<&LibraryPart> = LIBRARY
+                    .iter()
+                    .filter(|p| self.category == Category::All || p.category == self.category)
+                    .collect();
+                let gap = 12.0;
+                let card_w = ((width - 3.0 * gap) / 4.0).floor();
+                for row in parts.chunks(4) {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = gap;
+                        for part in row {
+                            let added = part.once.is_some_and(|k| kinds.contains(&k));
+                            if part_card(ui, card_w, part, added).clicked() && !added {
+                                let before = self.status_serial;
+                                (part.add)(self);
+                                self.mode = Mode::Guides;
+                                if self.status_serial != before && !self.error {
+                                    close = true;
+                                }
+                            }
+                        }
+                    });
+                    ui.add_space(gap - 8.0);
+                }
+                ui.add_space(4.0);
+                self.library_options(ui);
+            });
+        if close || modal.should_close() {
+            self.library_open = false;
+        }
+    }
+
+    fn library_options(&mut self, ui: &mut Ui) {
+        let bones = self.doc.as_ref().map(Doc::bone_names).unwrap_or_default();
+        if !bones.contains(&self.chain_parent) {
+            self.chain_parent = bones
+                .iter()
+                .find(|b| b.as_str() == "head")
+                .or(bones.first())
+                .cloned()
+                .unwrap_or_default();
+        }
+        egui::Frame::new()
+            .fill(Color32::from_rgb(17, 20, 26))
+            .stroke(Stroke::new(1.0, BORDER))
+            .corner_radius(12)
+            .inner_margin(12)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    theme::label_caps(ui, "Options");
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Fingers on").color(TEXT_DIM));
+                    theme::segmented(
+                        ui,
+                        &mut self.finger_sides,
+                        &[
+                            (FingerSides::Both, "Both"),
+                            (FingerSides::Left, "Left"),
+                            (FingerSides::Right, "Right"),
+                        ],
+                    );
+                    ui.add_space(12.0);
+                    ui.label(RichText::new("Tail bones").color(TEXT_DIM));
+                    ui.add(egui::DragValue::new(&mut self.tail_joints).range(2..=24));
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    theme::label_caps(ui, "Chain");
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("on").color(TEXT_DIM));
+                    egui::ComboBox::from_id_salt("chain_parent")
+                        .selected_text(self.chain_parent.as_str())
+                        .height(320.0)
+                        .show_ui(ui, |ui| {
+                            for b in &bones {
+                                ui.selectable_value(&mut self.chain_parent, b.clone(), b);
+                            }
+                        });
+                    ui.label(RichText::new("bones").color(TEXT_DIM));
+                    ui.add(egui::DragValue::new(&mut self.chain_joints).range(1..=24));
+                    ui.label(RichText::new("name").color(TEXT_DIM));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.chain_id)
+                            .hint_text("automatic")
+                            .desired_width(110.0),
+                    );
+                });
+            });
+    }
+
+    // ----------------------------------------------------------------------- export window
+
+    fn export_window(&mut self, ctx: &egui::Context) {
+        if !self.export_open || self.doc.is_none() {
+            return;
+        }
+        let mut close = false;
+        let mut export_dir = None;
+        let mut choose = false;
+        let mut apply: Option<Naming> = None;
+        let modal = egui::Modal::new(egui::Id::unique("export"))
+            .frame(dialog_frame())
+            .backdrop_color(Color32::from_black_alpha(140))
+            .show(ctx, |ui| {
+                ui.set_width(600f32.min(ctx.content_rect().width() - 60.0));
+                close |= dialog_header(
+                    ui,
+                    "Export rig",
+                    "Writes the skinned .glb and a builder script per program, with every control.",
+                );
+                let doc = self.doc.as_mut().unwrap();
+
+                theme::label_caps(ui, "Programs");
+                let w = (ui.available_width() - 16.0) / 3.0;
+                ui.horizontal(|ui| {
+                    for (i, (name, note)) in
+                        [("Blender", "3.6+"), ("Maya", "2022+"), ("Unreal", "5.2+")]
+                            .into_iter()
+                            .enumerate()
+                    {
+                        if target_tile(ui, w, name, note, self.targets[i]).clicked() {
+                            self.targets[i] = !self.targets[i];
+                        }
+                    }
+                });
+
+                ui.add_space(10.0);
+                theme::label_caps(ui, "Naming convention");
+                let current = doc.guides.naming.clone();
+                let mut choice = match (&self.naming_draft, current.preset()) {
+                    (None, Some(p)) => NamingChoice::Preset(p),
+                    _ => NamingChoice::Custom,
+                };
+                let before = choice;
+                theme::segmented(
+                    ui,
+                    &mut choice,
+                    &[
+                        (NamingChoice::Preset(Preset::Game), Preset::Game.label()),
+                        (NamingChoice::Preset(Preset::Prefix), Preset::Prefix.label()),
+                        (NamingChoice::Preset(Preset::Suffix), Preset::Suffix.label()),
+                        (NamingChoice::Custom, "Custom"),
+                    ],
+                );
+                if choice != before {
+                    match choice {
+                        NamingChoice::Preset(p) => {
+                            self.naming_draft = None;
+                            apply = Some(p.naming());
+                        }
+                        NamingChoice::Custom => self.naming_draft = Some(current.clone()),
+                    }
+                }
+                if choice == NamingChoice::Custom && self.naming_draft.is_none() {
+                    self.naming_draft = Some(current.clone());
+                }
+                let shown = self.naming_draft.clone().unwrap_or(current.clone());
+                ui.label(
+                    RichText::new(match choice {
+                        NamingChoice::Preset(Preset::Game) => {
+                            "Matches the Unreal mannequin, so animations retarget without remapping."
+                        }
+                        NamingChoice::Preset(Preset::Prefix) => {
+                            "Side first, joints end in _jnt: common in Maya studio pipelines."
+                        }
+                        NamingChoice::Preset(Preset::Suffix) => {
+                            "Side after the name, upper-case type: easy to sort and search."
+                        }
+                        NamingChoice::Custom => {
+                            "Use {name}, {side} and {desc} (fk, ik, pole, chain numbers)."
+                        }
+                    })
+                    .size(12.5)
+                    .color(TEXT_FAINT),
+                );
+                if let Some(draft) = &mut self.naming_draft {
+                    egui::Grid::new("naming_fields")
+                        .num_columns(4)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("Joints").color(TEXT_DIM));
+                            ui.add(egui::TextEdit::singleline(&mut draft.joint).desired_width(190.0));
+                            ui.label(RichText::new("Controls").color(TEXT_DIM));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut draft.control).desired_width(190.0),
+                            );
+                            ui.end_row();
+                            ui.label(RichText::new("Left / right").color(TEXT_DIM));
+                            ui.horizontal(|ui| {
+                                ui.add(egui::TextEdit::singleline(&mut draft.left).desired_width(54.0));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut draft.right).desired_width(54.0),
+                                );
+                            });
+                            ui.label(RichText::new("Centre").color(TEXT_DIM));
+                            ui.add(egui::TextEdit::singleline(&mut draft.center).desired_width(54.0));
+                            ui.end_row();
+                        });
+                    let check = draft.validate();
+                    ui.horizontal(|ui| {
+                        match &check {
+                            Ok(()) if *draft == current => {
+                                ui.label(RichText::new("In use").size(12.5).color(OK));
+                            }
+                            Ok(()) => {
+                                if ui.button("Use this naming").clicked() {
+                                    apply = Some(draft.clone());
+                                }
+                            }
+                            Err(e) => {
+                                ui.label(RichText::new(format!("{e}")).size(12.5).color(ERR));
+                            }
+                        };
+                    });
+                }
+                naming_examples(ui, &shown, 4);
+
+                ui.add_space(10.0);
+                theme::label_caps(ui, "Files");
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Name").color(TEXT_DIM));
+                    let mut name = doc.name.clone();
+                    if ui
+                        .add(egui::TextEdit::singleline(&mut name).desired_width(f32::INFINITY))
+                        .changed()
+                    {
+                        doc.name = hive_rig::export::sanitize_name(&name);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Folder").color(TEXT_DIM));
+                    let dir = doc.out_dir.clone();
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add_enabled(dir.is_dir(), egui::Button::new("Open").corner_radius(8))
+                            .clicked()
+                        {
+                            open_folder(&dir);
+                        }
+                        if ui
+                            .add(egui::Button::new("Choose…").corner_radius(8))
+                            .clicked()
+                        {
+                            choose = true;
+                        }
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(dir.display().to_string())
+                                    .size(12.0)
+                                    .color(TEXT_FAINT),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(dir.display().to_string());
+                    });
+                });
+
+                ui.add_space(12.0);
+                let any = self.targets.iter().any(|t| *t);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if theme::primary(ui, "Export", 140.0, any).clicked() {
+                        export_dir = Some(doc.out_dir.clone());
+                    }
+                    if theme::secondary(ui, "Close", 90.0).clicked() {
+                        close = true;
+                    }
+                    if doc.exported {
+                        ui.label(RichText::new("Exported").color(OK));
+                    }
+                });
+            });
+        if let Some(n) = apply
+            && self.set_naming(n)
+            && self.naming_draft.is_some()
+        {
+            self.naming_draft = self.doc.as_ref().map(|d| d.guides.naming.clone());
+        }
         if choose {
             let start = self
                 .doc
@@ -1066,28 +1552,21 @@ impl Studio {
             if let Some(dir) = rfd::FileDialog::new()
                 .set_directory(start.parent().unwrap_or(&start))
                 .pick_folder()
+                && let Some(doc) = &mut self.doc
             {
-                export_dir = Some(dir);
+                doc.out_dir = dir;
             }
         }
         if let Some(dir) = export_dir {
             self.do_export(dir);
+            if !self.error {
+                close = true;
+            }
         }
-
-        ui.add_space(4.0);
-        theme::card(ui, |ui| {
-            egui::CollapsingHeader::new(RichText::new("Using the export").strong()).show(ui, |ui| {
-                for (app, how) in [
-                    ("Blender", "Scripting tab > Open the _blender.py > Run. Edit guides and rebuild later in the Hive tab (N panel)."),
-                    ("Maya", "Script Editor > Python > load the _maya.py > Execute. The Hive Rig window rebuilds it."),
-                    ("Unreal", "Enable the Python and Control Rig plugins, then Tools > Execute Python Script > the _unreal.py."),
-                ] {
-                    ui.label(RichText::new(app).strong().color(TEXT));
-                    ui.label(RichText::new(how).color(TEXT_DIM));
-                }
-                ui.label(RichText::new("Keep hive-rig.exe next to HiveRig.exe: Blender and Maya call it to rebuild.").color(TEXT_FAINT));
-            });
-        });
+        if close || modal.should_close() {
+            self.export_open = false;
+            self.naming_draft = None;
+        }
     }
 
     // ----------------------------------------------------------------------- viewport
@@ -1100,20 +1579,19 @@ impl Studio {
     }
 
     fn viewport(&mut self, ui: &mut Ui) {
-        let outer = ui.max_rect();
-        let rect = outer;
+        let rect = ui.max_rect();
         let (response, painter) = ui.allocate_painter(rect.size(), Sense::click_and_drag());
         let rect = response.rect;
         let painter = painter.with_clip_rect(rect);
 
-        let typing = ui.ctx().egui_wants_keyboard_input();
+        let blocked = ui.ctx().egui_wants_keyboard_input() || self.library_open || self.export_open;
         if response.hovered() {
             let scroll = ui.input(|i| i.smooth_scroll_delta().y);
             if scroll != 0.0 {
                 self.camera.zoom(scroll);
             }
         }
-        if !typing {
+        if !blocked {
             if ui.input(|i| i.key_pressed(Key::F)) {
                 self.frame_camera();
             }
@@ -1173,71 +1651,7 @@ impl Studio {
         paint_axes(
             &painter,
             &pr,
-            Pos2::new(rect.left() + 44.0, rect.bottom() - 44.0),
-        );
-
-        // Floating toolbars over the view.
-        let bar = Rect::from_min_size(
-            rect.left_top() + Vec2::new(14.0, 12.0),
-            Vec2::new(rect.width() - 28.0, 40.0),
-        );
-        ui.scope_builder(UiBuilder::new().max_rect(bar), |ui| {
-            ui.horizontal(|ui| {
-                floating(ui, |ui| {
-                    let mut mode = self.mode;
-                    theme::segmented(
-                        ui,
-                        &mut mode,
-                        &[
-                            (Mode::Guides, "Guides"),
-                            (Mode::Skeleton, "Skeleton"),
-                            (Mode::Rig, "Controls"),
-                        ],
-                    );
-                    self.mode = mode;
-                });
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    floating(ui, |ui| {
-                        if theme::icon(ui, "⛶", "Frame the character (F)", true).clicked() {
-                            self.frame_camera();
-                        }
-                        for (name, yaw, pitch) in [
-                            ("Persp", 0.55, 0.22),
-                            ("Side", std::f32::consts::FRAC_PI_2, 0.05),
-                            ("Front", 0.0, 0.05),
-                        ] {
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        RichText::new(name).size(13.0).color(TEXT_DIM),
-                                    )
-                                    .frame_when_inactive(false)
-                                    .corner_radius(8),
-                                )
-                                .clicked()
-                            {
-                                self.camera.yaw = yaw;
-                                self.camera.pitch = pitch;
-                            }
-                        }
-                    });
-                });
-            });
-        });
-        let hint = match self.mode {
-            Mode::Guides => {
-                "Drag a guide to move a joint  ·  left-drag to orbit  ·  right-drag to pan  ·  scroll to zoom"
-            }
-            _ => {
-                "Left-drag to orbit  ·  right-drag to pan  ·  scroll to zoom  ·  switch to Guides to edit"
-            }
-        };
-        painter.text(
-            Pos2::new(rect.left() + 92.0, rect.bottom() - 16.0),
-            Align2::LEFT_BOTTOM,
-            hint,
-            FontId::proportional(12.0),
-            TEXT_FAINT,
+            Pos2::new(rect.left() + 50.0, rect.bottom() - 50.0),
         );
     }
 
@@ -1297,7 +1711,11 @@ impl Studio {
             let (Some(h), Some(t)) = (pr.pos(b.head), pr.pos(b.tail)) else {
                 continue;
             };
-            let color = if weights.as_deref() == Some(b.name.as_str()) {
+            // The preview uses internal names; the weights list uses exported ones.
+            let color = if weights
+                .as_deref()
+                .is_some_and(|w| w == doc.guides.naming.bone(&b.name))
+            {
                 ACCENT
             } else if b.deform {
                 Color32::from_rgb(226, 228, 236)
@@ -1383,7 +1801,7 @@ impl Studio {
     }
 }
 
-// --------------------------------------------------------------------------- widgets
+// --------------------------------------------------------------------------- frames
 
 fn theme_once(ctx: &egui::Context) {
     let id = egui::Id::unique("hive_theme");
@@ -1393,6 +1811,910 @@ fn theme_once(ctx: &egui::Context) {
     }
 }
 
+fn floating_area(id: &'static str, anchor: Align2, offset: Vec2) -> egui::Area {
+    egui::Area::new(egui::Id::unique(id))
+        .anchor(anchor, offset)
+        .order(egui::Order::Middle)
+        .movable(false)
+}
+
+/// An area's ui is only as big as its contents were last frame, so a panel that
+/// grows (an outliner gaining rows) needs its room set explicitly.
+fn room(ui: &mut Ui, width: f32, height: f32) {
+    ui.set_max_size(Vec2::new(width + 20.0, height.max(140.0)));
+}
+
+fn glass(radius: u8, margin: Margin) -> egui::Frame {
+    egui::Frame::new()
+        .fill(Color32::from_rgba_unmultiplied(20, 23, 30, 236))
+        .stroke(Stroke::new(1.0, Color32::from_white_alpha(14)))
+        .corner_radius(radius)
+        .inner_margin(margin)
+        .shadow(Shadow {
+            offset: [0, 8],
+            blur: 26,
+            spread: 0,
+            color: Color32::from_black_alpha(110),
+        })
+}
+
+fn pill_frame() -> egui::Frame {
+    glass(14, Margin::symmetric(8, 4))
+}
+
+fn panel_frame() -> egui::Frame {
+    glass(16, Margin::same(10))
+}
+
+fn dialog_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(Color32::from_rgb(22, 25, 32))
+        .stroke(Stroke::new(1.0, Color32::from_white_alpha(18)))
+        .corner_radius(20)
+        .inner_margin(Margin::same(20))
+        .shadow(Shadow {
+            offset: [0, 16],
+            blur: 48,
+            spread: 0,
+            color: Color32::from_black_alpha(160),
+        })
+}
+
+/// A panel title that collapses the panel when clicked.
+fn panel_header(ui: &mut Ui, title: &str, note: &str, open: &mut bool) {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::click());
+    let painter = ui.painter();
+    if response.hovered() {
+        painter.rect_filled(rect.expand(2.0), 8, Color32::from_white_alpha(6));
+    }
+    painter.text(
+        rect.left_center() + Vec2::new(4.0, 0.0),
+        Align2::LEFT_CENTER,
+        title,
+        FontId::proportional(14.0),
+        TEXT,
+    );
+    painter.text(
+        rect.right_center() - Vec2::new(26.0, 0.0),
+        Align2::RIGHT_CENTER,
+        note,
+        FontId::proportional(12.0),
+        TEXT_FAINT,
+    );
+    let c = rect.right_center() - Vec2::new(10.0, 0.0);
+    let pts = if *open {
+        vec![
+            c + Vec2::new(-4.0, -2.0),
+            c + Vec2::new(0.0, 2.0),
+            c + Vec2::new(4.0, -2.0),
+        ]
+    } else {
+        vec![
+            c + Vec2::new(-2.0, -4.0),
+            c + Vec2::new(2.0, 0.0),
+            c + Vec2::new(-2.0, 4.0),
+        ]
+    };
+    painter.add(egui::Shape::line(pts, Stroke::new(1.6, TEXT_DIM)));
+    if response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
+    {
+        *open = !*open;
+    }
+    if *open {
+        ui.add_space(2.0);
+    }
+}
+
+/// Title, subtitle and a close button. Returns whether close was clicked.
+fn dialog_header(ui: &mut Ui, title: &str, text: &str) -> bool {
+    let mut close = false;
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.label(RichText::new(title).size(22.0).strong().color(TEXT));
+            ui.label(RichText::new(text).size(13.0).color(TEXT_DIM));
+        });
+        ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+            let (rect, r) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::click());
+            let painter = ui.painter();
+            if r.hovered() {
+                painter.circle_filled(rect.center(), 15.0, Color32::from_white_alpha(12));
+            }
+            let s = Stroke::new(1.8, if r.hovered() { TEXT } else { TEXT_DIM });
+            let c = rect.center();
+            painter.line_segment([c + Vec2::new(-5.0, -5.0), c + Vec2::new(5.0, 5.0)], s);
+            painter.line_segment([c + Vec2::new(5.0, -5.0), c + Vec2::new(-5.0, 5.0)], s);
+            close = r.on_hover_text("Close (Esc)").clicked();
+        });
+    });
+    ui.add_space(8.0);
+    close
+}
+
+/// Example internal names and what they export as.
+fn naming_examples(ui: &mut Ui, naming: &Naming, rows: usize) {
+    let examples = [
+        ("upperarm_l", false),
+        ("spine_01", false),
+        ("hand_l_ik_ctrl", true),
+        ("root_ctrl", true),
+    ];
+    egui::Frame::new()
+        .fill(Color32::from_rgb(15, 17, 22))
+        .corner_radius(10)
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 3.0;
+            for (internal, control) in examples.into_iter().take(rows) {
+                let name = if control {
+                    naming.control(internal)
+                } else {
+                    naming.bone(internal)
+                };
+                ui.horizontal(|ui| {
+                    let kind = if control { "control" } else { "joint" };
+                    ui.label(RichText::new(kind).size(11.0).color(TEXT_FAINT));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(RichText::new(name).monospace().size(13.0).color(ACCENT));
+                    });
+                });
+            }
+        });
+}
+
+// --------------------------------------------------------------------------- dock widgets
+
+#[derive(Clone, Copy)]
+enum Icon {
+    Move,
+    Add,
+    Mirror,
+    Symmetry,
+    Guides,
+    Skeleton,
+    Controls,
+    Mesh,
+    Xray,
+    Weights,
+    Undo,
+    Redo,
+    Frame,
+    Export,
+}
+
+fn dock_button(
+    ui: &mut Ui,
+    icon: Icon,
+    label: &str,
+    active: bool,
+    enabled: bool,
+    tip: &str,
+) -> egui::Response {
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(60.0, 56.0), sense);
+    let hovered = enabled && response.hovered();
+    let painter = ui.painter();
+    if active {
+        painter.rect_filled(rect.shrink(3.0), 12, ACCENT.gamma_multiply(0.16));
+    } else if hovered {
+        painter.rect_filled(rect.shrink(3.0), 12, Color32::from_white_alpha(10));
+    }
+    let color = if !enabled {
+        TEXT_FAINT.gamma_multiply(0.7)
+    } else if active {
+        ACCENT
+    } else if hovered {
+        TEXT
+    } else {
+        TEXT_DIM
+    };
+    dock_icon(
+        painter,
+        rect.center_top() + Vec2::new(0.0, 21.0),
+        icon,
+        color,
+    );
+    painter.text(
+        rect.center_bottom() - Vec2::new(0.0, 7.0),
+        Align2::CENTER_BOTTOM,
+        label,
+        FontId::proportional(11.0),
+        color,
+    );
+    let response = response.on_hover_text(tip);
+    if enabled {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    }
+}
+
+fn dock_separator(ui: &mut Ui) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(13.0, 56.0), Sense::hover());
+    ui.painter().line_segment(
+        [
+            rect.center_top() + Vec2::new(0.0, 12.0),
+            rect.center_bottom() - Vec2::new(0.0, 12.0),
+        ],
+        Stroke::new(1.0, BORDER),
+    );
+}
+
+fn hexagon(c: Pos2, r: f32) -> Vec<Pos2> {
+    (0..6)
+        .map(|i| {
+            let a = std::f32::consts::FRAC_PI_3 * i as f32 + std::f32::consts::FRAC_PI_6;
+            c + Vec2::angled(a) * r
+        })
+        .collect()
+}
+
+/// The Build button: a honeycomb cell that rises out of the dock.
+fn hex_button(ui: &mut Ui, label: &str, enabled: bool) -> egui::Response {
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(96.0, 56.0), sense);
+    let hovered = enabled && response.hovered();
+    let pressed = enabled && response.is_pointer_button_down_on();
+    let painter = ui.painter();
+    let c = rect.center() - Vec2::new(0.0, if pressed { 10.0 } else { 12.0 });
+    let r = 40.0;
+    painter.add(egui::Shape::convex_polygon(
+        hexagon(c + Vec2::new(0.0, 5.0), r),
+        Color32::from_black_alpha(110),
+        Stroke::NONE,
+    ));
+    let fill = if !enabled {
+        Color32::from_rgb(92, 80, 52)
+    } else if hovered {
+        Color32::from_rgb(255, 202, 96)
+    } else {
+        ACCENT
+    };
+    painter.add(egui::Shape::convex_polygon(
+        hexagon(c, r),
+        fill,
+        Stroke::new(3.0, Color32::from_rgb(20, 23, 30)),
+    ));
+    painter.add(egui::Shape::closed_line(
+        hexagon(c, r - 7.0),
+        Stroke::new(1.0, theme::ACCENT_TEXT.gamma_multiply(0.25)),
+    ));
+    // A three-joint chain, the logo's mark.
+    let ink = theme::ACCENT_TEXT;
+    let (a, b, d) = (
+        c + Vec2::new(-9.0, 2.0),
+        c + Vec2::new(0.0, -10.0),
+        c + Vec2::new(9.0, 2.0),
+    );
+    painter.line_segment([a, b], Stroke::new(2.5, ink));
+    painter.line_segment([b, d], Stroke::new(2.5, ink));
+    for p in [a, b, d] {
+        painter.circle_filled(p, 3.0, ink);
+    }
+    painter.text(
+        c + Vec2::new(0.0, 17.0),
+        Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(12.5),
+        ink,
+    );
+    if enabled {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    }
+}
+
+fn arrow_head(painter: &egui::Painter, tip: Pos2, dir: Vec2, stroke: Stroke) {
+    let d = dir.normalized() * 4.5;
+    let n = Vec2::new(-d.y, d.x);
+    painter.line_segment([tip, tip - d + n], stroke);
+    painter.line_segment([tip, tip - d - n], stroke);
+}
+
+fn arc(c: Pos2, r: f32, from: f32, to: f32) -> Vec<Pos2> {
+    (0..=16)
+        .map(|i| {
+            let a = from + (to - from) * i as f32 / 16.0;
+            c + Vec2::new(a.cos(), -a.sin()) * r
+        })
+        .collect()
+}
+
+/// The dock's line icons, drawn so they look the same on every system.
+fn dock_icon(painter: &egui::Painter, c: Pos2, icon: Icon, color: Color32) {
+    let s = Stroke::new(1.8, color);
+    let p = |x: f32, y: f32| c + Vec2::new(x, y);
+    match icon {
+        Icon::Move => {
+            for d in [Vec2::X, -Vec2::X, Vec2::Y, -Vec2::Y] {
+                painter.line_segment([c, c + d * 10.0], s);
+                arrow_head(painter, c + d * 10.0, d, s);
+            }
+        }
+        Icon::Add => {
+            painter.add(egui::Shape::closed_line(hexagon(c, 10.0), s));
+            painter.line_segment([p(-4.0, 0.0), p(4.0, 0.0)], s);
+            painter.line_segment([p(0.0, -4.0), p(0.0, 4.0)], s);
+        }
+        Icon::Mirror => {
+            painter.add(egui::Shape::convex_polygon(
+                vec![p(-3.0, -8.0), p(-3.0, 8.0), p(-11.0, 8.0)],
+                color,
+                Stroke::NONE,
+            ));
+            painter.add(egui::Shape::closed_line(
+                vec![p(3.0, -8.0), p(3.0, 8.0), p(11.0, 8.0)],
+                s,
+            ));
+            painter.extend(egui::Shape::dashed_line(
+                &[p(0.0, -11.0), p(0.0, 11.0)],
+                Stroke::new(1.2, color),
+                2.5,
+                2.0,
+            ));
+        }
+        Icon::Symmetry => {
+            painter.extend(egui::Shape::dashed_line(
+                &[p(0.0, -11.0), p(0.0, 11.0)],
+                Stroke::new(1.2, color),
+                2.5,
+                2.0,
+            ));
+            painter.circle_filled(p(-7.0, 2.0), 3.2, color);
+            painter.circle_filled(p(7.0, 2.0), 3.2, color);
+            painter.add(egui::Shape::line(arc(p(0.0, 2.0), 7.0, 0.35, 2.8), s));
+        }
+        Icon::Guides => {
+            let pts = [p(-9.0, 7.0), p(-2.0, -1.0), p(8.0, -7.0)];
+            painter.add(egui::Shape::line(pts.to_vec(), s));
+            for q in pts {
+                painter.circle_filled(q, 3.0, color);
+            }
+        }
+        Icon::Skeleton => bone_shape(painter, p(-8.0, 8.0), p(8.0, -8.0), color),
+        Icon::Controls => {
+            painter.circle_stroke(c, 9.5, s);
+            painter.circle_stroke(c, 4.5, Stroke::new(1.2, color));
+            painter.circle_filled(c, 1.8, color);
+        }
+        Icon::Mesh => {
+            painter.circle_stroke(c, 10.0, s);
+            let ellipse = |rx: f32, ry: f32| -> Vec<Pos2> {
+                (0..=24)
+                    .map(|i| {
+                        let a = std::f32::consts::TAU * i as f32 / 24.0;
+                        p(a.cos() * rx, a.sin() * ry)
+                    })
+                    .collect()
+            };
+            painter.add(egui::Shape::line(
+                ellipse(10.0, 3.5),
+                Stroke::new(1.2, color),
+            ));
+            painter.add(egui::Shape::line(
+                ellipse(4.0, 10.0),
+                Stroke::new(1.2, color),
+            ));
+        }
+        Icon::Xray => {
+            painter.circle_stroke(c, 10.0, s);
+            let half: Vec<Pos2> = arc(
+                c,
+                10.0,
+                std::f32::consts::FRAC_PI_2,
+                1.5 * std::f32::consts::PI,
+            );
+            painter.add(egui::Shape::convex_polygon(
+                half,
+                color.gamma_multiply(0.45),
+                Stroke::NONE,
+            ));
+            painter.line_segment([p(0.0, -10.0), p(0.0, 10.0)], Stroke::new(1.2, color));
+        }
+        Icon::Weights => {
+            let mut drop = arc(p(0.0, 3.0), 7.0, -0.45, std::f32::consts::PI + 0.45);
+            drop.reverse();
+            drop.push(p(0.0, -11.0));
+            painter.add(egui::Shape::closed_line(drop, s));
+            painter.circle_filled(p(-2.5, 4.0), 2.0, color);
+        }
+        Icon::Undo | Icon::Redo => {
+            let flip = if matches!(icon, Icon::Undo) {
+                1.0
+            } else {
+                -1.0
+            };
+            let pts: Vec<Pos2> = arc(p(0.0, 3.0), 8.0, -0.4, std::f32::consts::PI)
+                .into_iter()
+                .map(|q| Pos2::new(c.x + (q.x - c.x) * flip, q.y))
+                .collect();
+            let tip = *pts.last().unwrap();
+            painter.add(egui::Shape::line(pts, s));
+            arrow_head(painter, tip + Vec2::new(0.0, 1.0), Vec2::new(0.0, 1.0), s);
+        }
+        Icon::Frame => {
+            for (sx, sy) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+                let corner = p(10.0 * sx, 9.0 * sy);
+                painter.line_segment([corner, corner - Vec2::new(5.0 * sx, 0.0)], s);
+                painter.line_segment([corner, corner - Vec2::new(0.0, 5.0 * sy)], s);
+            }
+            painter.circle_filled(c, 2.5, color);
+        }
+        Icon::Export => {
+            painter.add(egui::Shape::line(
+                vec![p(-9.0, 1.0), p(-9.0, 9.0), p(9.0, 9.0), p(9.0, 1.0)],
+                s,
+            ));
+            painter.line_segment([p(0.0, 4.0), p(0.0, -10.0)], s);
+            arrow_head(painter, p(0.0, -10.0), Vec2::new(0.0, -1.0), s);
+        }
+    }
+}
+
+// --------------------------------------------------------------------------- rigging window art
+
+#[derive(Clone, Copy)]
+enum Art {
+    Eyes,
+    Jaw,
+    Ears,
+    Fingers,
+    Tail,
+    Ponytail,
+    Prop,
+    Chain,
+}
+
+fn part_card(ui: &mut Ui, width: f32, part: &LibraryPart, added: bool) -> egui::Response {
+    let height = 204.0;
+    let sense = if added {
+        Sense::hover()
+    } else {
+        Sense::click()
+    };
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), sense);
+    let hovered = response.hovered() && !added;
+    let painter = ui.painter();
+    painter.rect_filled(rect, 14, if hovered { CARD_HI } else { CARD });
+    painter.rect_stroke(
+        rect,
+        14,
+        Stroke::new(
+            if hovered { 1.5 } else { 1.0 },
+            if hovered {
+                ACCENT.gamma_multiply(0.8)
+            } else {
+                BORDER
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    let art = Rect::from_min_size(rect.min + Vec2::splat(6.0), Vec2::new(width - 12.0, 128.0));
+    paint_art_backdrop(painter, art, hovered);
+    illustration(&painter.with_clip_rect(art), art, part.art, hovered);
+    if added {
+        let chip = Rect::from_min_size(
+            art.right_top() + Vec2::new(-60.0, 8.0),
+            Vec2::new(52.0, 20.0),
+        );
+        painter.rect_filled(chip, 10, OK.gamma_multiply(0.2));
+        painter.text(
+            chip.center(),
+            Align2::CENTER_CENTER,
+            "Added",
+            FontId::proportional(11.0),
+            OK,
+        );
+    } else {
+        let plus = art.right_top() + Vec2::new(-16.0, 16.0);
+        painter.circle_filled(
+            plus,
+            11.0,
+            if hovered {
+                ACCENT
+            } else {
+                Color32::from_black_alpha(90)
+            },
+        );
+        let ink = if hovered {
+            theme::ACCENT_TEXT
+        } else {
+            TEXT_DIM
+        };
+        painter.line_segment(
+            [plus - Vec2::new(4.5, 0.0), plus + Vec2::new(4.5, 0.0)],
+            Stroke::new(1.8, ink),
+        );
+        painter.line_segment(
+            [plus - Vec2::new(0.0, 4.5), plus + Vec2::new(0.0, 4.5)],
+            Stroke::new(1.8, ink),
+        );
+    }
+    painter.text(
+        Pos2::new(rect.left() + 14.0, art.bottom() + 12.0),
+        Align2::LEFT_TOP,
+        part.title,
+        FontId::proportional(15.5),
+        if added { TEXT_DIM } else { TEXT },
+    );
+    let galley = painter.layout(
+        part.text.to_string(),
+        FontId::proportional(12.0),
+        TEXT_DIM,
+        width - 28.0,
+    );
+    painter.galley(
+        Pos2::new(rect.left() + 14.0, art.bottom() + 34.0),
+        galley,
+        TEXT_DIM,
+    );
+    if added {
+        response.on_hover_text(format!("The rig already has {}", part.title.to_lowercase()))
+    } else {
+        response
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(format!("Add {}", part.title.to_lowercase()))
+    }
+}
+
+/// A soft spotlight behind an illustration.
+fn paint_art_backdrop(painter: &egui::Painter, r: Rect, hot: bool) {
+    painter.rect_filled(r, 10, Color32::from_rgb(29, 33, 42));
+    let glow = if hot { 16 } else { 9 };
+    for (k, a) in [(0.62f32, glow / 2), (0.45, glow), (0.3, glow + 4)] {
+        painter.circle_filled(
+            r.center() + Vec2::new(0.0, r.height() * 0.08),
+            r.height() * k,
+            Color32::from_rgba_unmultiplied(255, 214, 140, a),
+        );
+    }
+    // A floor line under the figure.
+    let y = r.bottom() - r.height() * 0.07;
+    painter.line_segment(
+        [
+            Pos2::new(r.left() + 20.0, y),
+            Pos2::new(r.right() - 20.0, y),
+        ],
+        Stroke::new(1.0, Color32::from_white_alpha(14)),
+    );
+}
+
+const SKIN: Color32 = Color32::from_rgb(68, 76, 92);
+const BONE: Color32 = Color32::from_rgb(140, 148, 166);
+
+/// A joint dot coloured by side, like the guides in the view.
+fn joint(painter: &egui::Painter, at: Pos2, x: f32, r: f32) {
+    let color = if x.abs() < 0.5 {
+        theme::CENTER
+    } else if x > 0.0 {
+        theme::LEFT
+    } else {
+        theme::RIGHT
+    };
+    painter.circle_filled(at, r + 1.0, Color32::from_black_alpha(160));
+    painter.circle_filled(at, r, color.gamma_multiply(0.85));
+}
+
+/// A highlighted chain: glow, honey line and joint rings.
+fn hot_chain(painter: &egui::Painter, pts: &[Pos2], width: f32, hot: bool) {
+    let honey = if hot {
+        Color32::from_rgb(255, 205, 100)
+    } else {
+        ACCENT
+    };
+    painter.add(egui::Shape::line(
+        pts.to_vec(),
+        Stroke::new(width + 6.0, ACCENT.gamma_multiply(0.18)),
+    ));
+    painter.add(egui::Shape::line(pts.to_vec(), Stroke::new(width, honey)));
+    for p in pts {
+        painter.circle_filled(*p, width + 1.6, Color32::from_rgb(29, 33, 42));
+        painter.circle_stroke(*p, width + 1.6, Stroke::new(1.6, honey));
+    }
+}
+
+/// Illustrations for the rigging window: a small mannequin, or a bust for face
+/// parts, with the part the component adds picked out in honey.
+fn illustration(painter: &egui::Painter, r: Rect, art: Art, hot: bool) {
+    match art {
+        Art::Eyes | Art::Jaw | Art::Ears | Art::Ponytail => bust(painter, r, art, hot),
+        Art::Fingers | Art::Tail | Art::Prop | Art::Chain => figure(painter, r, art, hot),
+    }
+}
+
+fn figure(painter: &egui::Painter, r: Rect, art: Art, hot: bool) {
+    // A 100-unit-tall mannequin facing the viewer: its left is on screen right.
+    let k = r.height() * 0.84 / 100.0;
+    let origin = Pos2::new(r.center().x, r.top() + r.height() * 0.06);
+    let pt = |x: f32, y: f32| origin + Vec2::new(x * k, y * k);
+    let limb = Stroke::new(5.5 * k, SKIN);
+    // Body.
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            pt(-12.0, 20.0),
+            pt(12.0, 20.0),
+            pt(9.5, 38.0),
+            pt(8.0, 53.0),
+            pt(-8.0, 53.0),
+            pt(-9.5, 38.0),
+        ],
+        SKIN,
+        Stroke::NONE,
+    ));
+    painter.circle_filled(pt(0.0, 9.0), 7.5 * k, SKIN);
+    painter.line_segment([pt(0.0, 14.0), pt(0.0, 21.0)], Stroke::new(4.0 * k, SKIN));
+    let arm = |s: f32| [pt(12.0 * s, 21.0), pt(23.0 * s, 34.0), pt(32.0 * s, 46.0)];
+    let leg = |s: f32| {
+        [
+            pt(5.5 * s, 52.0),
+            pt(6.5 * s, 74.0),
+            pt(7.0 * s, 94.0),
+            pt(9.5 * s, 98.0),
+        ]
+    };
+    for s in [-1.0f32, 1.0] {
+        let a = arm(s);
+        painter.add(egui::Shape::line(a.to_vec(), limb));
+        painter.circle_filled(a[2], 3.2 * k, SKIN);
+        let l = leg(s);
+        painter.add(egui::Shape::line(l.to_vec(), Stroke::new(6.5 * k, SKIN)));
+    }
+    // Skeleton.
+    let bone = Stroke::new(1.2, BONE);
+    let spine = [
+        pt(0.0, 52.0),
+        pt(0.0, 37.0),
+        pt(0.0, 22.0),
+        pt(0.0, 16.0),
+        pt(0.0, 9.0),
+    ];
+    painter.add(egui::Shape::line(spine.to_vec(), bone));
+    for s in [-1.0f32, 1.0] {
+        let a = arm(s);
+        painter.add(egui::Shape::line(
+            vec![pt(0.0, 22.0), a[0], a[1], a[2]],
+            bone,
+        ));
+        let l = leg(s);
+        painter.add(egui::Shape::line(
+            vec![pt(0.0, 52.0), l[0], l[1], l[2], l[3]],
+            bone,
+        ));
+    }
+    let dot = 2.4;
+    for (x, y) in [
+        (0.0, 52.0),
+        (0.0, 37.0),
+        (0.0, 22.0),
+        (0.0, 16.0),
+        (0.0, 9.0),
+    ] {
+        joint(painter, pt(x, y), x, dot);
+    }
+    for s in [-1.0f32, 1.0] {
+        for (x, y) in [
+            (12.0, 21.0),
+            (23.0, 34.0),
+            (32.0, 46.0),
+            (5.5, 52.0),
+            (6.5, 74.0),
+            (7.0, 94.0),
+        ] {
+            joint(painter, pt(x * s, y), x * s, dot);
+        }
+    }
+
+    match art {
+        Art::Fingers => {
+            for s in [-1.0f32, 1.0] {
+                let wrist = pt(32.0 * s, 46.0);
+                painter.circle_filled(
+                    wrist + Vec2::new(2.0 * s * k, 5.0 * k),
+                    9.0 * k,
+                    ACCENT.gamma_multiply(0.16),
+                );
+                for (dx, dy) in [(-1.5, 6.5), (1.0, 8.5), (3.2, 8.8), (5.2, 8.0), (6.8, 6.2)] {
+                    let base = wrist + Vec2::new(1.5 * s * k, 2.5 * k);
+                    let tip = wrist + Vec2::new(dx * s * k, dy * k);
+                    let mid = base.lerp(tip, 0.5);
+                    hot_chain(painter, &[base, mid, tip], 1.0, hot);
+                }
+            }
+        }
+        Art::Tail => {
+            let pts: Vec<Pos2> = [
+                (3.0, 55.0),
+                (9.0, 63.0),
+                (16.0, 68.0),
+                (23.0, 68.0),
+                (28.0, 64.0),
+                (31.0, 58.0),
+            ]
+            .into_iter()
+            .map(|(x, y)| pt(x, y))
+            .collect();
+            hot_chain(painter, &pts, 2.2, hot);
+        }
+        Art::Prop => {
+            let hand = pt(-32.0, 46.0);
+            let tip = pt(-46.0, 14.0);
+            let dir = (tip - hand).normalized();
+            let n = Vec2::new(-dir.y, dir.x);
+            let guard = hand + dir * 5.0 * k;
+            painter.add(egui::Shape::line(
+                vec![hand, tip],
+                Stroke::new(8.0, ACCENT.gamma_multiply(0.18)),
+            ));
+            painter.add(egui::Shape::convex_polygon(
+                vec![guard + n * 2.2 * k, tip, guard - n * 2.2 * k],
+                if hot {
+                    Color32::from_rgb(255, 205, 100)
+                } else {
+                    ACCENT
+                },
+                Stroke::NONE,
+            ));
+            painter.line_segment(
+                [guard + n * 5.0 * k, guard - n * 5.0 * k],
+                Stroke::new(2.5, ACCENT),
+            );
+            painter.circle_stroke(hand, 4.5, Stroke::new(1.8, ACCENT));
+        }
+        Art::Chain => {
+            let pts: Vec<Pos2> = [
+                (13.0, 22.0),
+                (17.0, 29.0),
+                (19.5, 36.5),
+                (20.5, 44.0),
+                (20.0, 51.0),
+            ]
+            .into_iter()
+            .map(|(x, y)| pt(x + 4.0, y))
+            .collect();
+            hot_chain(painter, &pts, 1.8, hot);
+        }
+        _ => {}
+    }
+}
+
+fn bust(painter: &egui::Painter, r: Rect, art: Art, hot: bool) {
+    let rad = r.height() * 0.26;
+    let hc = r.center() - Vec2::new(0.0, r.height() * 0.1);
+    let p = |x: f32, y: f32| hc + Vec2::new(x * rad, y * rad);
+    // Shoulders, neck and head.
+    painter.add(egui::Shape::convex_polygon(
+        vec![p(-1.7, 1.55), p(1.7, 1.55), p(2.6, 2.6), p(-2.6, 2.6)],
+        SKIN,
+        Stroke::NONE,
+    ));
+    painter.rect_filled(Rect::from_min_max(p(-0.38, 0.6), p(0.38, 1.7)), 4, SKIN);
+    painter.circle_filled(hc, rad, SKIN);
+    // Neck and head bones.
+    let bone = Stroke::new(1.2, BONE);
+    painter.line_segment([p(0.0, 1.6), p(0.0, 0.25)], bone);
+    painter.line_segment([p(0.0, 0.25), p(0.0, -0.95)], bone);
+    joint(painter, p(0.0, 1.6), 0.0, 2.6);
+    joint(painter, p(0.0, 0.25), 0.0, 2.6);
+
+    match art {
+        Art::Eyes => {
+            let target = p(1.6, -1.15);
+            for sx in [-1.0f32, 1.0] {
+                let eye = p(0.36 * sx, -0.08);
+                painter.extend(egui::Shape::dashed_line(
+                    &[eye, target],
+                    Stroke::new(1.2, ACCENT.gamma_multiply(0.75)),
+                    4.0,
+                    3.0,
+                ));
+                painter.circle_filled(eye, 0.19 * rad, Color32::from_rgb(222, 226, 235));
+                painter.circle_filled(
+                    eye + (target - eye).normalized() * 0.07 * rad,
+                    0.09 * rad,
+                    Color32::from_rgb(28, 30, 36),
+                );
+                painter.circle_stroke(
+                    eye,
+                    0.19 * rad + 2.0,
+                    Stroke::new(
+                        1.6,
+                        if hot {
+                            Color32::from_rgb(255, 205, 100)
+                        } else {
+                            ACCENT
+                        },
+                    ),
+                );
+            }
+            let d = 6.0;
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    target + Vec2::new(0.0, -d),
+                    target + Vec2::new(d, 0.0),
+                    target + Vec2::new(0.0, d),
+                    target + Vec2::new(-d, 0.0),
+                ],
+                ACCENT,
+                Stroke::new(1.0, theme::ACCENT_TEXT),
+            ));
+        }
+        Art::Jaw => {
+            let outline: Vec<Pos2> = [
+                (-0.86, 0.05),
+                (-0.62, 0.72),
+                (0.0, 1.05),
+                (0.62, 0.72),
+                (0.86, 0.05),
+            ]
+            .into_iter()
+            .map(|(x, y)| p(x, y + 0.08))
+            .collect();
+            painter.add(egui::Shape::line(
+                outline.clone(),
+                Stroke::new(7.0, ACCENT.gamma_multiply(0.16)),
+            ));
+            painter.add(egui::Shape::line(outline, Stroke::new(2.0, ACCENT)));
+            painter.add(egui::Shape::line(
+                arc(p(0.0, 0.55), 0.32 * rad, -2.6, -0.54),
+                Stroke::new(1.6, Color32::from_rgb(28, 30, 36)),
+            ));
+            hot_chain(painter, &[p(0.0, 0.12), p(0.0, 1.05)], 2.0, hot);
+        }
+        Art::Ears => {
+            for sx in [-1.0f32, 1.0] {
+                let shape = vec![p(0.88 * sx, 0.2), p(1.55 * sx, -0.95), p(1.0 * sx, -0.45)];
+                painter.add(egui::Shape::convex_polygon(
+                    shape,
+                    SKIN,
+                    Stroke::new(1.0, ACCENT.gamma_multiply(0.6)),
+                ));
+                hot_chain(
+                    painter,
+                    &[
+                        p(0.92 * sx, -0.05),
+                        p(1.18 * sx, -0.48),
+                        p(1.45 * sx, -0.85),
+                    ],
+                    1.6,
+                    hot,
+                );
+            }
+        }
+        Art::Ponytail => {
+            // A hair cap, then the tail swinging down one side.
+            painter.add(egui::Shape::line(
+                arc(hc, rad * 1.02, 0.2, std::f32::consts::PI - 0.2),
+                Stroke::new(4.0, Color32::from_rgb(86, 94, 112)),
+            ));
+            let pts = [
+                p(0.35, -1.0),
+                p(0.95, -0.85),
+                p(1.3, -0.3),
+                p(1.42, 0.4),
+                p(1.36, 1.1),
+                p(1.5, 1.75),
+            ];
+            hot_chain(painter, &pts, 2.0, hot);
+        }
+        _ => {}
+    }
+}
+
+// --------------------------------------------------------------------------- other widgets
+
 fn component_row(
     ui: &mut Ui,
     id: &str,
@@ -1401,7 +2723,7 @@ fn component_row(
     depth: usize,
     selected: bool,
 ) -> egui::Response {
-    let height = 30.0;
+    let height = 28.0;
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
     let painter = ui.painter();
@@ -1439,7 +2761,7 @@ fn component_row(
         Pos2::new(x + 16.0, rect.center().y),
         Align2::LEFT_CENTER,
         id,
-        FontId::proportional(14.0),
+        FontId::proportional(13.5),
         if selected {
             TEXT
         } else {
@@ -1450,152 +2772,10 @@ fn component_row(
         Pos2::new(rect.right() - 10.0, rect.center().y),
         Align2::RIGHT_CENTER,
         kind_label(kind),
-        FontId::proportional(12.0),
+        FontId::proportional(11.5),
         TEXT_FAINT,
     );
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
-}
-
-fn library_tile(
-    ui: &mut Ui,
-    width: f32,
-    icon: TileIcon,
-    title: &str,
-    text: &str,
-) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 100.0), Sense::click());
-    let hovered = response.hovered();
-    let painter = ui.painter();
-    painter.rect_filled(rect, 12, if hovered { CARD_HI } else { CARD });
-    painter.rect_stroke(
-        rect,
-        12,
-        Stroke::new(
-            1.0,
-            if hovered {
-                ACCENT.gamma_multiply(0.7)
-            } else {
-                BORDER
-            },
-        ),
-        egui::StrokeKind::Inside,
-    );
-    let icon_center = rect.left_top() + Vec2::new(28.0, 28.0);
-    painter.circle_filled(icon_center, 17.0, ACCENT.gamma_multiply(0.14));
-    tile_icon(painter, icon_center, icon);
-    painter.text(
-        rect.right_top() + Vec2::new(-12.0, 14.0),
-        Align2::RIGHT_TOP,
-        "+",
-        FontId::proportional(20.0),
-        if hovered { ACCENT } else { TEXT_FAINT },
-    );
-    painter.text(
-        rect.left_top() + Vec2::new(12.0, 54.0),
-        Align2::LEFT_TOP,
-        title,
-        FontId::proportional(15.0),
-        TEXT,
-    );
-    let galley = painter.layout(
-        text.to_string(),
-        FontId::proportional(11.5),
-        TEXT_DIM,
-        width - 24.0,
-    );
-    painter.galley(rect.left_top() + Vec2::new(12.0, 74.0), galley, TEXT_DIM);
-    response
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(format!("Add {title}"))
-}
-
-/// A premade component in the library: icon, title, description, and how to add it.
-type LibraryItem = (TileIcon, &'static str, &'static str, fn(&mut Studio));
-
-#[derive(Clone, Copy)]
-enum TileIcon {
-    Eyes,
-    Jaw,
-    Fingers,
-    Tail,
-    Ears,
-    Ponytail,
-    Prop,
-    Chain,
-}
-
-/// Small line icons for the component library, drawn so they look the same everywhere.
-fn tile_icon(painter: &egui::Painter, c: Pos2, icon: TileIcon) {
-    let s = Stroke::new(2.0, ACCENT);
-    let p = |x: f32, y: f32| c + Vec2::new(x, y);
-    match icon {
-        TileIcon::Eyes => {
-            for x in [-5.0f32, 5.0] {
-                painter.circle_stroke(p(x, 0.0), 4.5, s);
-                painter.circle_filled(p(x + 1.0, 0.5), 1.8, ACCENT);
-            }
-        }
-        TileIcon::Jaw => {
-            painter.add(egui::Shape::line(
-                vec![
-                    p(-8.0, -6.0),
-                    p(-7.0, 2.0),
-                    p(0.0, 8.0),
-                    p(7.0, 2.0),
-                    p(8.0, -6.0),
-                ],
-                s,
-            ));
-            painter.line_segment([p(-4.0, 1.0), p(4.0, 1.0)], s);
-        }
-        TileIcon::Fingers => {
-            for (x, top) in [(-4.5, -8.0), (-1.5, -9.5), (1.5, -9.0), (4.5, -7.0)] {
-                painter.line_segment([p(x, 1.0), p(x, top)], s);
-            }
-            painter.line_segment([p(-7.5, 2.0), p(-5.0, 7.0)], s);
-            painter.line_segment([p(-5.0, 7.0), p(5.0, 7.0)], s);
-            painter.line_segment([p(-5.5, 1.0), p(5.5, 1.0)], s);
-        }
-        TileIcon::Tail => {
-            let pts: Vec<Pos2> = (0..=16)
-                .map(|i| {
-                    let t = i as f32 / 16.0;
-                    p(
-                        -8.0 + 16.0 * t,
-                        5.0 - 10.0 * t * t + 3.0 * (t * 9.0).sin() * t,
-                    )
-                })
-                .collect();
-            painter.add(egui::Shape::line(pts, s));
-        }
-        TileIcon::Ears => {
-            for sx in [-1.0f32, 1.0] {
-                painter.add(egui::Shape::closed_line(
-                    vec![p(2.0 * sx, 6.0), p(8.0 * sx, -8.0), p(9.0 * sx, 4.0)],
-                    s,
-                ));
-            }
-        }
-        TileIcon::Ponytail => {
-            painter.circle_stroke(p(-3.0, -3.0), 5.0, s);
-            let pts: Vec<Pos2> = (0..=12)
-                .map(|i| {
-                    let t = i as f32 / 12.0;
-                    p(1.0 + 7.0 * t, -1.0 + 10.0 * t + 1.5 * (t * 12.0).sin())
-                })
-                .collect();
-            painter.add(egui::Shape::line(pts, s));
-        }
-        TileIcon::Prop => {
-            painter.line_segment([p(-7.0, 7.0), p(8.0, -8.0)], s);
-            painter.line_segment([p(-6.0, 0.0), p(0.0, 6.0)], s);
-        }
-        TileIcon::Chain => {
-            for x in [-6.0f32, 0.0, 6.0] {
-                painter.circle_stroke(p(x, 0.0), 3.5, s);
-            }
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -1609,27 +2789,11 @@ fn folder_icon(painter: &egui::Painter, c: Pos2, color: Color32) {
     let tab = Rect::from_min_size(body.left_top() - Vec2::new(0.0, 4.0), Vec2::new(11.0, 6.0));
     painter.rect_filled(tab, 2, color.gamma_multiply(0.8));
     painter.rect_filled(body, 3, color);
-    painter.line_segment(
-        [
-            Pos2::new(c.x, body.top() + 5.0),
-            Pos2::new(c.x, body.bottom() - 4.0),
-        ],
-        Stroke::new(2.0, theme::ACCENT_TEXT),
-    );
-    painter.line_segment(
-        [
-            Pos2::new(c.x - 4.0, body.top() + 9.0),
-            Pos2::new(c.x, body.top() + 5.0),
-        ],
-        Stroke::new(2.0, theme::ACCENT_TEXT),
-    );
-    painter.line_segment(
-        [
-            Pos2::new(c.x + 4.0, body.top() + 9.0),
-            Pos2::new(c.x, body.top() + 5.0),
-        ],
-        Stroke::new(2.0, theme::ACCENT_TEXT),
-    );
+    let ink = Stroke::new(2.0, theme::ACCENT_TEXT);
+    let top = Pos2::new(c.x, body.top() + 5.0);
+    painter.line_segment([top, Pos2::new(c.x, body.bottom() - 4.0)], ink);
+    painter.line_segment([Pos2::new(c.x - 4.0, body.top() + 9.0), top], ink);
+    painter.line_segment([Pos2::new(c.x + 4.0, body.top() + 9.0), top], ink);
 }
 
 fn target_tile(ui: &mut Ui, width: f32, name: &str, note: &str, on: bool) -> egui::Response {
@@ -1733,7 +2897,7 @@ fn big_card(
 
 fn step_card(ui: &mut Ui, width: f32, n: &str, title: &str, text: &str) {
     egui::Frame::new()
-        .fill(Color32::from_rgb(19, 22, 28))
+        .fill(Color32::from_rgba_unmultiplied(19, 22, 28, 230))
         .stroke(Stroke::new(1.0, BORDER))
         .corner_radius(12)
         .inner_margin(12)
@@ -1747,24 +2911,6 @@ fn step_card(ui: &mut Ui, width: f32, n: &str, title: &str, text: &str) {
                 });
                 ui.label(RichText::new(text).size(12.0).color(TEXT_DIM));
             });
-        });
-}
-
-/// A translucent floating group of controls over the viewport.
-fn floating(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
-    egui::Frame::new()
-        .fill(Color32::from_rgba_unmultiplied(22, 25, 32, 230))
-        .stroke(Stroke::new(1.0, BORDER))
-        .corner_radius(12)
-        .inner_margin(Margin::same(4))
-        .shadow(egui::Shadow {
-            offset: [0, 4],
-            blur: 14,
-            spread: 0,
-            color: Color32::from_black_alpha(90),
-        })
-        .show(ui, |ui| {
-            ui.horizontal(add);
         });
 }
 
@@ -1817,8 +2963,8 @@ fn dashed_rect(painter: &egui::Painter, rect: Rect, stroke: Stroke) {
 
 /// A soft vertical gradient behind the character.
 fn paint_backdrop(painter: &egui::Painter, rect: Rect) {
-    let top = Color32::from_rgb(34, 38, 47);
-    let bottom = Color32::from_rgb(17, 19, 24);
+    let top = Color32::from_rgb(38, 42, 52);
+    let bottom = Color32::from_rgb(15, 17, 21);
     let mut mesh = egui::Mesh::default();
     mesh.colored_vertex(rect.left_top(), top);
     mesh.colored_vertex(rect.right_top(), top);
@@ -1832,7 +2978,7 @@ fn paint_backdrop(painter: &egui::Painter, rect: Rect) {
 /// A floor grid under the character, fading towards its edge.
 fn paint_grid(painter: &egui::Painter, pr: &Projector, floor: f32, size: f32) {
     let step = (size / 8.0).max(0.05);
-    let n: i32 = 10;
+    let n: i32 = 12;
     let extent = step * n as f32;
     for i in -n..=n {
         let t = i as f32 * step;
@@ -1860,7 +3006,7 @@ fn paint_grid(painter: &egui::Painter, pr: &Projector, floor: f32, size: f32) {
 fn paint_axes(painter: &egui::Painter, pr: &Projector, at: Pos2) {
     let right = pr.forward.cross(Vec3::Y).normalize_or_zero();
     let up = right.cross(pr.forward);
-    painter.circle_filled(at, 30.0, Color32::from_rgba_unmultiplied(14, 16, 20, 160));
+    painter.circle_filled(at, 32.0, Color32::from_rgba_unmultiplied(14, 16, 20, 150));
     let mut axes = [
         (Vec3::X, "X", Color32::from_rgb(240, 90, 90)),
         (Vec3::Y, "Y", Color32::from_rgb(110, 210, 120)),

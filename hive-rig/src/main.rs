@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use hive_rig::components::{self, AddOptions, Guides, Kind, Preset};
 use hive_rig::rig::detect_guides;
 use hive_rig::skeleton::Side;
-use hive_rig::{Rig, RigOptions, Target, build_rig, demo, export, import, mesh::Mesh};
+use hive_rig::{Rig, RigOptions, Target, build_rig, demo, export, import, mesh::Mesh, naming};
 
 #[derive(Parser)]
 #[command(
@@ -80,6 +80,25 @@ enum Command {
     Remove { guides: PathBuf, id: String },
     /// List the components in a guides file.
     Components { guides: PathBuf },
+    /// Show or set how a guides file names joints and controls on export.
+    Naming {
+        guides: PathBuf,
+        /// game (Unreal mannequin), prefix (L_arm_jnt) or suffix (arm_L_JNT).
+        preset: Option<String>,
+        /// Joint pattern using {name}, {side} and {desc}.
+        #[arg(long)]
+        joint: Option<String>,
+        /// Control pattern using {name}, {side} and {desc}.
+        #[arg(long)]
+        control: Option<String>,
+        #[arg(long)]
+        left: Option<String>,
+        #[arg(long)]
+        right: Option<String>,
+        /// Centre side token (empty to leave it out).
+        #[arg(long)]
+        center: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -310,6 +329,52 @@ fn main() -> Result<()> {
                 };
                 println!("{:<12} {:<6} on {:<12} {extra}", c.id, kind, parent);
             }
+            Ok(())
+        }
+        Command::Naming {
+            guides,
+            preset,
+            joint,
+            control,
+            left,
+            right,
+            center,
+        } => {
+            let mut g = Guides::load(&guides)?;
+            let mut n = match &preset {
+                Some(p) => p.parse::<naming::Preset>()?.naming(),
+                None => g.naming.clone(),
+            };
+            let mut changed = preset.is_some();
+            for (field, value) in [
+                (&mut n.joint, joint),
+                (&mut n.control, control),
+                (&mut n.left, left),
+                (&mut n.right, right),
+                (&mut n.center, center),
+            ] {
+                if let Some(v) = value {
+                    *field = v;
+                    changed = true;
+                }
+            }
+            if changed {
+                n.validate()?;
+                g.naming = n.clone();
+                save_guides(&guides, &g)?;
+            }
+            let label = n.preset().map_or("custom", |p| p.key());
+            println!("naming: {label}");
+            println!(
+                "  joints:   {}  (upperarm_l -> {})",
+                n.joint,
+                n.bone("upperarm_l")
+            );
+            println!(
+                "  controls: {}  (upperarm_l_fk_ctrl -> {})",
+                n.control,
+                n.control("upperarm_l_fk_ctrl")
+            );
             Ok(())
         }
     }

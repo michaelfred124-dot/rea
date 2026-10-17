@@ -5,11 +5,16 @@ Run with the `bpy` module (pip install bpy) or Blender itself:
     blender --background --python blender_check.py -- <name>_blender.py <name>.glb
 """
 
+import json
+import os
 import runpy
 import sys
 
 import bpy
 from mathutils import Vector
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import hive_names  # noqa: E402
 
 args = sys.argv[sys.argv.index("--") + 1 :] if "--" in sys.argv else sys.argv[1:]
 script, glb = args[0], args[1]
@@ -22,8 +27,33 @@ sys.argv = saved_argv
 
 rig = next(o for o in bpy.data.objects if o.type == "ARMATURE")
 geo = next(o for o in bpy.data.objects if o.type == "MESH" and not o.name.startswith("WGT_"))
-pb = rig.pose.bones
-rest_bones = rig.data.bones
+
+
+# The checks use the internal (default) names; a rig exported with another naming
+# convention is checked through the same renaming hive-rig applies (src/naming.rs).
+NAMING = json.loads(open(script).read().split('r"""', 1)[1].split('"""', 1)[0])["guides"].get("naming")
+
+
+def final(internal):
+    return hive_names.final(NAMING, internal)
+
+
+class Named:
+    def __init__(self, items):
+        self.items = items
+
+    def __getitem__(self, internal):
+        return self.items[final(internal)]
+
+    def __contains__(self, internal):
+        return final(internal) in self.items
+
+    def __iter__(self):
+        return iter(self.items)
+
+
+pb = Named(rig.pose.bones)
+rest_bones = Named(rig.data.bones)
 
 
 def update():

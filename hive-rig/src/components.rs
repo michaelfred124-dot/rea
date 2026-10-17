@@ -16,6 +16,7 @@ use crate::controls::{
     Control, ControlKind, ControlParent, ControlRig, FootRoll, IkChain, Shape, ctrl_name, fk_name,
 };
 use crate::landmarks::{Landmarks, mirror};
+use crate::naming::Naming;
 use crate::skeleton::{Region, Side, Skeleton, Twist};
 
 pub const GUIDES_FORMAT: &str = "hive-rig-guides";
@@ -30,6 +31,10 @@ pub struct Guides {
     pub version: u32,
     pub body: Body,
     pub components: Vec<Component>,
+    /// How exported joints and controls are named. Absent means the default
+    /// (Unreal mannequin) names.
+    #[serde(default, skip_serializing_if = "Naming::is_default")]
+    pub naming: Naming,
 }
 
 /// Whole-body measurements used to split the mesh into skin regions.
@@ -259,6 +264,7 @@ pub fn biped(lm: &Landmarks) -> Guides {
             torso_half_width: lm.torso_half_width,
         },
         components,
+        naming: Naming::default(),
     }
 }
 

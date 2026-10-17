@@ -1,7 +1,8 @@
 //! Hive Rig: the desktop rigging app. Double-click it, open a character, adjust
 //! the guides, build and export.
 //!
-//! `HiveRig [character file] [--demo] [--build] [--weights BONE] [--screenshot OUT.ppm]`
+//! `HiveRig [character file] [--demo] [--build] [--weights BONE] [--library] [--export]
+//! [--select COMPONENT] [--screenshot OUT.ppm]`
 //! (the flags exist so the window can be checked automatically).
 
 // No console window behind the app on Windows.
@@ -23,6 +24,9 @@ struct Launch {
     demo: bool,
     build: bool,
     weights: Option<String>,
+    library: bool,
+    export: bool,
+    select: Option<String>,
     screenshot: Option<PathBuf>,
 }
 
@@ -35,6 +39,11 @@ fn parse_args() -> Launch {
             Some("--build") => launch.build = true,
             Some("--weights") => {
                 launch.weights = args.next().map(|s| s.to_string_lossy().into_owned())
+            }
+            Some("--library") => launch.library = true,
+            Some("--export") => launch.export = true,
+            Some("--select") => {
+                launch.select = args.next().map(|s| s.to_string_lossy().into_owned())
             }
             Some("--screenshot") => launch.screenshot = args.next().map(PathBuf::from),
             _ => launch.file = Some(PathBuf::from(a)),
@@ -98,6 +107,16 @@ fn main() -> eframe::Result {
         studio.build();
     }
     studio.weights_bone = launch.weights;
+    studio.library_open = launch.library;
+    studio.export_open = launch.export;
+    if let (Some(id), Some(doc)) = (&launch.select, &studio.doc) {
+        studio.selected = doc
+            .guides
+            .components
+            .iter()
+            .position(|c| &c.id == id)
+            .map(|c| (c, None));
+    }
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
