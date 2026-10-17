@@ -147,11 +147,12 @@ pub fn draw_mesh(
     painter: &egui::Painter,
     pr: &Projector,
     mesh: &Mesh,
+    positions: &[Vec3],
     base: Color32,
     vertex_colors: Option<&[Color32]>,
     alpha: f32,
 ) {
-    let screen: Vec<Option<(Pos2, f32)>> = mesh.positions.iter().map(|&p| pr.project(p)).collect();
+    let screen: Vec<Option<(Pos2, f32)>> = positions.iter().map(|&p| pr.project(p)).collect();
     let mut tris: Vec<(f32, [usize; 3])> = Vec::with_capacity(mesh.indices.len() / 3);
     for t in mesh.triangles() {
         let (Some(a), Some(b), Some(c)) = (screen[t[0]], screen[t[1]], screen[t[2]]) else {
@@ -170,7 +171,7 @@ pub fn draw_mesh(
     out.reserve_triangles(tris.len());
     out.reserve_vertices(tris.len() * 3);
     for (_, t) in tris {
-        let [p0, p1, p2] = t.map(|i| mesh.positions[i]);
+        let [p0, p1, p2] = t.map(|i| positions[i]);
         let n = (p1 - p0).cross(p2 - p0).normalize_or_zero();
         let to_eye = (pr.eye - (p0 + p1 + p2) / 3.0).normalize_or_zero();
         // Head light, lit from both sides so inconsistent winding still reads.

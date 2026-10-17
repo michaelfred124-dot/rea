@@ -31,7 +31,7 @@ a joint; with Symmetry on, its twin on the other side follows.
   selected, its attachment, options, exact guide positions and the names its
   bones will export as. Click a panel's title to fold it away.
 * **The rigging window** (Add, or Shift+A) is the library of premade parts, each
-  with an illustration: face joints, eyes with a look-at control, a jaw, ears, fingers, a
+  with an illustration: face joints, eyes with a look-at control, a jaw, ears, fingers, toes, a
   tail, a ponytail, a prop socket in the right hand, and a custom chain.
 * **The export window** (Ctrl+E) picks the programs, the naming convention, the
   file name and the folder.
@@ -179,6 +179,28 @@ guides: Unreal mannequin, Mixamo (`mixamorig:LeftArm`), 3ds Max biped
 are added when the skeleton has them; twist and helper joints are listed as not
 used. Guides with no matching joint stay where body detection put them. Pass
 `--ignore-joints` to place the guides on the mesh instead.
+
+### Parenting, test poses and control looks
+
+In the guides stage each component has a red handle on its first guide. Drag
+it onto a yellow joint to hang the component from that joint, or right-click a
+guide and choose **Attach component to**. In the build stages, click a joint or
+a control to pick it. Its panel in Properties shows the name and lets you:
+
+* **Test this bone** turns it, with everything hanging from it and the skin
+  that follows it, so you can check the rig before it reaches a DCC. Nothing is
+  saved.
+* **Control shape, size and colour** change how one control looks. The look is
+  saved in the guides file and survives a rebuild. The right-click menu on a
+  control has the same shape choice.
+
+From the right-click menu, **Import components…** brings the premade parts of
+another guides file in, hung from the bone under the pointer. The CLI has the
+same: `hive-rig import <guides> <other.guides.json> --parent ball_l` and
+`hive-rig attach <guides> <id> <bone>`. Components keep their ids, so an id the
+rig already uses is refused rather than renamed.
+
+Toes (`hive-rig add <guides> toes`) are five chains from each foot's ball.
 
 ### Weight tools
 

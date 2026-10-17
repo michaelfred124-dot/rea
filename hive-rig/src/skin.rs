@@ -13,7 +13,7 @@ use crate::mesh::Mesh;
 use glam::Vec3;
 
 use crate::landmarks::mirror;
-use crate::skeleton::{Bone, Region, Side, Skeleton};
+use crate::skeleton::{Bone, Region, Side, Skeleton, turn_about};
 
 pub const MAX_INFLUENCES: usize = 4;
 
@@ -359,6 +359,38 @@ fn keep_top(w: &mut [f32]) {
         }
     }
 }
+/// Skin the mesh's rest positions with the bones in `moved` turned by `radians`
+/// about `axis` through `pivot`, the rest of the bones staying put. Each vertex
+/// takes its weighted blend of its bones' transforms, as a game engine would.
+pub fn deform_turn(
+    rest: &[Vec3],
+    skin: &SkinWeights,
+    moved: &[bool],
+    pivot: Vec3,
+    axis: Vec3,
+    radians: f32,
+) -> Vec<Vec3> {
+    rest.iter()
+        .enumerate()
+        .map(|(v, &p)| {
+            let (Some(joints), Some(weights)) = (skin.joints.get(v), skin.weights.get(v)) else {
+                return p;
+            };
+            let turned = turn_about(pivot, axis, radians, p);
+            let mut out = Vec3::ZERO;
+            let mut total = 0.0;
+            for (&j, &w) in joints.iter().zip(weights) {
+                if w <= 0.0 {
+                    continue;
+                }
+                let moves = moved.get(j as usize).copied().unwrap_or(false);
+                out += if moves { turned } else { p } * w;
+                total += w;
+            }
+            if total > 0.0 { out / total } else { p }
+        })
+        .collect()
+}
 
 #[cfg(test)]
 mod tests {
@@ -453,5 +485,40 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn turning_a_bone_moves_only_its_skin() {
+        // Vertex 0 belongs to the turned bone, vertex 1 to a bone that stays put,
+        // vertex 2 is shared half and half.
+        let skin = SkinWeights {
+            joints: vec![[1, 0, 0, 0], [0, 0, 0, 0], [0, 1, 0, 0]],
+            weights: vec![
+                [1.0, 0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                [0.5, 0.5, 0.0, 0.0],
+            ],
+        };
+        let rest = [
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+        ];
+        let moved = [false, true];
+        let posed = deform_turn(
+            &rest,
+            &skin,
+            &moved,
+            Vec3::ZERO,
+            Vec3::Z,
+            std::f32::consts::FRAC_PI_2,
+        );
+        assert!(posed[0].distance(Vec3::new(0.0, 1.0, 0.0)) < 1e-5);
+        assert!(posed[1].distance(Vec3::new(0.0, 1.0, 0.0)) < 1e-5);
+        // Half turned and half fixed: the midpoint of the two positions.
+        assert!(posed[2].distance(Vec3::new(0.5, 0.5, 0.0)) < 1e-5);
+        // No turn, no change.
+        let still = deform_turn(&rest, &skin, &[false, false], Vec3::ZERO, Vec3::Z, 1.0);
+        assert_eq!(still, rest.to_vec());
     }
 }

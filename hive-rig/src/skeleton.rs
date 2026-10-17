@@ -152,6 +152,18 @@ impl Skeleton {
         self.bones.len() - 1
     }
 
+    /// True when `bone` is `ancestor` or hangs below it.
+    pub fn within(&self, bone: usize, ancestor: usize) -> bool {
+        let mut at = Some(bone);
+        while let Some(i) = at {
+            if i == ancestor {
+                return true;
+            }
+            at = self.bones.get(i).and_then(|b| b.parent);
+        }
+        false
+    }
+
     pub fn children(&self, index: usize) -> impl Iterator<Item = usize> + '_ {
         self.bones
             .iter()
@@ -181,4 +193,10 @@ impl Skeleton {
             None => bone.head,
         }
     }
+}
+
+/// `point` turned by `radians` about `axis` through `pivot` (right-handed).
+pub fn turn_about(pivot: Vec3, axis: Vec3, radians: f32, point: Vec3) -> Vec3 {
+    let axis = axis.try_normalize().unwrap_or(Vec3::Y);
+    pivot + glam::Quat::from_axis_angle(axis, radians) * (point - pivot)
 }

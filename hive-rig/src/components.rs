@@ -6,7 +6,7 @@
 //! are saved next to the rig as `<name>.guides.json`, so they can be moved,
 //! components can be added or removed, and the rig rebuilt from them.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{Context, Result, bail, ensure};
 use glam::Vec3;
@@ -35,6 +35,22 @@ pub struct Guides {
     /// (Unreal mannequin) names.
     #[serde(default, skip_serializing_if = "Naming::is_default")]
     pub naming: Naming,
+    /// Changes to individual controls' look, keyed by the control's internal name.
+    /// They survive rebuilds; a control that no longer exists is ignored.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub control_styles: BTreeMap<String, ControlStyle>,
+}
+
+/// How one control looks. Unset fields keep the component's default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct ControlStyle {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<Shape>,
+    /// Radius or half-extent in metres.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<[f32; 3]>,
 }
 
 /// Whole-body measurements used to split the mesh into skin regions.
@@ -290,6 +306,7 @@ pub fn biped(lm: &Landmarks) -> Guides {
         },
         components,
         naming: Naming::default(),
+        control_styles: BTreeMap::new(),
     }
 }
 
@@ -308,6 +325,8 @@ pub enum Preset {
     Jaw,
     /// Face joints: brows, eyelids, cheeks, nose and lips.
     Face,
+    /// Five toes on each foot, from the ball of the foot (3 joints each).
+    Toes,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -373,6 +392,51 @@ pub fn add_preset(g: &mut Guides, preset: Preset, opts: &AddOptions) -> Result<V
                     let mut c = Component::new(&id, Kind::Chain, side, Some(&hand));
                     for k in 0..4 {
                         let p = base + fdir * flen * len * (k as f32 / 3.0);
+                        c = c.guide(format!("j{}", k + 1), p);
+                    }
+                    g.components.push(c);
+                    added.push(id);
+                }
+            }
+        }
+        Preset::Toes => {
+            let sides = match opts.side {
+                Some(Side::Center) => bail!("toes need --side left or right"),
+                Some(s) => vec![s],
+                None => vec![Side::Left, Side::Right],
+            };
+            for side in sides {
+                let leg = g
+                    .components
+                    .iter()
+                    .find(|c| c.kind == Kind::Leg && c.side == side)
+                    .with_context(|| format!("no {side:?} leg to add toes to"))?;
+                let ball_at = leg.position("ball").unwrap();
+                let toe_tip = leg.position("toe").unwrap();
+                let ball = format!("ball{}", side.suffix());
+                ensure!(sk.bone(&ball).is_some(), "no bone named {ball}");
+                let len = ball_at.distance(toe_tip);
+                let dir = (toe_tip - ball_at).normalize();
+                // Across the foot, pointing towards the big toe (the inside).
+                let mut across = dir.cross(Vec3::Y).try_normalize().unwrap_or(Vec3::X);
+                if (across.x < 0.0) == (side == Side::Left) {
+                    across = -across;
+                }
+                let toes: [(&str, f32, f32, f32); 5] = [
+                    // name, offset across, length (fractions of the foot), joint spacing
+                    ("big", 0.36, 0.45, 0.30),
+                    ("second", 0.18, 0.50, 0.30),
+                    ("middle", 0.0, 0.52, 0.30),
+                    ("fourth", -0.16, 0.48, 0.30),
+                    ("little", -0.32, 0.40, 0.30),
+                ];
+                for (name, off, flen, _) in toes {
+                    let id = format!("toe_{name}{}", side.suffix());
+                    ensure!(g.component(&id).is_none(), "{id} already exists");
+                    let base = ball_at + across * off * len * 0.5;
+                    let mut c = Component::new(&id, Kind::Chain, side, Some(&ball));
+                    for k in 0..4 {
+                        let p = base + dir * flen * len * (k as f32 / 3.0);
                         c = c.guide(format!("j{}", k + 1), p);
                     }
                     g.components.push(c);
@@ -577,6 +641,87 @@ pub fn remove(g: &mut Guides, id: &str) -> Result<Vec<String>> {
     g.components.retain(|c| !removed.contains(&c.id));
     build(g).context("the layout doesn't build without that component")?;
     Ok(ids)
+}
+
+/// Hang a component from another bone. The caller checks that the layout still builds.
+pub fn attach(g: &mut Guides, id: &str, bone: &str) -> Result<()> {
+    let c = g
+        .components
+        .iter_mut()
+        .find(|c| c.id == id)
+        .with_context(|| format!("no component named {id}"))?;
+    ensure!(c.kind != Kind::Root, "the root component stays where it is");
+    c.parent = Some(bone.to_string());
+    build(g).map(|_| ())
+}
+
+/// Set one control's look, or clear it when the style is empty.
+pub fn set_control_style(g: &mut Guides, control: &str, style: ControlStyle) -> Result<()> {
+    if style == ControlStyle::default() {
+        g.control_styles.remove(control);
+    } else {
+        if let Some(size) = style.size {
+            ensure!(size > 0.0, "control size must be positive");
+        }
+        g.control_styles.insert(control.to_string(), style);
+    }
+    Ok(())
+}
+
+/// Bring the components of another layout in, hung from `bone`. Only premade
+/// parts (chains, eyes, jaw, face) can be imported: the body's own components
+/// are fixed to the mannequin's bones. Components keep their ids, so an id
+/// already in use is refused rather than renamed, because bone names depend on it.
+pub fn import(g: &mut Guides, src: &Guides, bone: &str) -> Result<Vec<String>> {
+    let target = build(g)?;
+    ensure!(
+        target.skeleton.bone(bone).is_some(),
+        "no bone named {bone} to attach to"
+    );
+    let source = build(src).context("the file to import doesn't build")?;
+    let owner: HashMap<&str, &str> = source
+        .skeleton
+        .bones
+        .iter()
+        .map(|b| (b.name.as_str(), b.component.as_str()))
+        .collect();
+    let imported: Vec<&Component> = src
+        .components
+        .iter()
+        .filter(|c| matches!(c.kind, Kind::Chain | Kind::Eyes | Kind::Jaw | Kind::Face))
+        .collect();
+    let ids: HashSet<&str> = imported.iter().map(|c| c.id.as_str()).collect();
+    for c in &imported {
+        ensure!(
+            g.component(&c.id).is_none(),
+            "the rig already has a component named {}; rename it or remove it first",
+            c.id
+        );
+        if matches!(c.kind, Kind::Eyes | Kind::Jaw | Kind::Face) {
+            ensure!(
+                !g.components.iter().any(|x| x.kind == c.kind),
+                "the rig already has one {:?} component",
+                c.kind
+            );
+        }
+    }
+    let mut added = Vec::new();
+    for c in imported {
+        let mut c = c.clone();
+        // Parts that hang from another imported part keep that link; the rest hang from `bone`.
+        let inside = c
+            .parent
+            .as_deref()
+            .and_then(|p| owner.get(p))
+            .is_some_and(|o| ids.contains(o));
+        if !inside {
+            c.parent = Some(bone.to_string());
+        }
+        added.push(c.id.clone());
+        g.components.push(c);
+    }
+    build(g).context("the imported parts don't fit this rig")?;
+    Ok(added)
 }
 
 /// The other side's twin of a sided component (`arm_l` <-> `arm_r`), if any.
@@ -818,6 +963,20 @@ pub fn build(g: &Guides) -> Result<Built> {
         }
     }
     assign_spaces(&mut b);
+    for (name, style) in &g.control_styles {
+        let Some(c) = b.rig.controls.iter_mut().find(|c| &c.name == name) else {
+            continue;
+        };
+        if let Some(shape) = style.shape {
+            c.shape = shape;
+        }
+        if let Some(size) = style.size {
+            c.size = size.max(0.001);
+        }
+        if let Some(color) = style.color {
+            c.color = color;
+        }
+    }
     Ok(Built {
         skeleton: b.sk,
         controls: b.rig,
@@ -1832,5 +1991,112 @@ mod tests {
         let back: Guides = serde_json::from_str(&text).unwrap();
         assert_eq!(back.components.len(), g.components.len());
         assert!(back.components.iter().all(|c| c.options.twist));
+    }
+
+    #[test]
+    fn control_styles_import_and_attach() {
+        let mut g = demo_guides();
+        // A styled control keeps its look through a rebuild, and clears when reset.
+        let built = build(&g).unwrap();
+        let name = built.controls.controls[0].name.clone();
+        set_control_style(
+            &mut g,
+            &name,
+            ControlStyle {
+                shape: Some(Shape::Cube),
+                size: Some(0.02),
+                color: None,
+            },
+        )
+        .unwrap();
+        let styled = build(&g).unwrap();
+        let c = styled.controls.control(&name).unwrap();
+        assert_eq!((c.shape, c.size), (Shape::Cube, 0.02));
+        let json = serde_json::to_string(&g).unwrap();
+        let back: Guides = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.control_styles.get(&name).unwrap().shape,
+            Some(Shape::Cube)
+        );
+        set_control_style(&mut g, &name, ControlStyle::default()).unwrap();
+        assert!(g.control_styles.is_empty());
+        assert!(
+            set_control_style(
+                &mut g,
+                &name,
+                ControlStyle {
+                    size: Some(0.0),
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+
+        // A tail from another layout comes in on the chosen bone and builds.
+        let mut src = demo_guides();
+        add_preset(&mut src, Preset::Tail, &AddOptions::default()).unwrap();
+        let mut dst = demo_guides();
+        let ids = import(&mut dst, &src, "pelvis").unwrap();
+        assert_eq!(ids, vec!["tail".to_string()]);
+        assert_eq!(
+            dst.component("tail").unwrap().parent.as_deref(),
+            Some("pelvis")
+        );
+        assert!(build(&dst).unwrap().skeleton.bone("tail_01").is_some());
+        // Importing it again clashes with the id, and body parts are refused.
+        assert!(import(&mut dst, &src, "pelvis").is_err());
+        assert!(
+            import(&mut demo_guides(), &demo_guides(), "pelvis")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(import(&mut demo_guides(), &src, "no_such_bone").is_err());
+
+        // Attaching moves a part and keeps the layout buildable.
+        attach(&mut dst, "tail", "head").unwrap();
+        assert!(
+            build(&dst)
+                .unwrap()
+                .skeleton
+                .bone("tail_01")
+                .unwrap()
+                .parent
+                .is_some()
+        );
+        assert!(attach(&mut dst, "tail", "no_such_bone").is_err());
+    }
+
+    #[test]
+    fn toes_hang_from_the_ball_of_each_foot() {
+        let mut g = demo_guides();
+        let ids = add_preset(&mut g, Preset::Toes, &AddOptions::default()).unwrap();
+        assert_eq!(ids.len(), 10);
+        let built = build(&g).unwrap();
+        for side in ["_l", "_r"] {
+            let toe = built.skeleton.bone(&format!("toe_big_01{side}")).unwrap();
+            let ball = built.skeleton.bone(&format!("ball{side}")).unwrap();
+            assert_eq!(toe.parent, built.skeleton.index_of(&ball.name));
+        }
+        // Toes are plain FK chains: a control per joint, as fingers have.
+        assert!(
+            built.controls.control("ctrl_toe_big_01_l").is_some()
+                || built
+                    .controls
+                    .controls
+                    .iter()
+                    .any(|c| c.name.contains("toe_big"))
+        );
+        let mut no_side = demo_guides();
+        assert!(
+            add_preset(
+                &mut no_side,
+                Preset::Toes,
+                &AddOptions {
+                    side: Some(Side::Center),
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
     }
 }

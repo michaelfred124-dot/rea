@@ -10,12 +10,12 @@ use eframe::egui::Color32;
 use glam::Vec3;
 
 use hive_rig::components::{
-    self, AddOptions, Built, Component, Guide, Guides, Kind, Options, Preset,
+    self, AddOptions, Built, Component, ControlStyle, Guide, Guides, Kind, Options, Preset,
 };
 use hive_rig::naming::Naming;
 use hive_rig::rig::detect_guides;
-use hive_rig::skeleton::Side;
-use hive_rig::{Rig, RigOptions, Target, build_rig, demo, export, import, mesh::Mesh};
+use hive_rig::skeleton::{Side, turn_about};
+use hive_rig::{Rig, RigOptions, Target, build_rig, demo, export, import, mesh::Mesh, skin};
 
 use crate::view::{self, Camera};
 
@@ -100,6 +100,31 @@ struct Drag {
     guide: usize,
 }
 
+/// A bone or control picked in the build stages.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RigPick {
+    Bone(String),
+    Control(String),
+}
+
+/// A test pose: one bone (and everything hanging from it) turned about a world axis.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pose {
+    pub bone: String,
+    /// 0 = X, 1 = Y, 2 = Z.
+    pub axis: usize,
+    pub degrees: f32,
+}
+
+/// The bones, controls and skin as they show with the test pose applied.
+pub struct Frame {
+    pub bones: Vec<(Vec3, Vec3)>,
+    pub controls: Vec<Vec3>,
+    pub control_axes: Vec<Vec3>,
+    /// Deformed mesh vertices, when the rig is built.
+    pub mesh: Option<Vec<Vec3>>,
+}
+
 pub struct Studio {
     pub doc: Option<Doc>,
     pub camera: Camera,
@@ -131,6 +156,14 @@ pub struct Studio {
     pub chain_parent: String,
     pub chain_joints: usize,
     pub chain_id: String,
+    /// Bone or control picked in the build stages, shown in Properties.
+    pub rig_pick: Option<RigPick>,
+    pub pose: Option<Pose>,
+    /// What a right-click in the viewport landed on, for its menu.
+    pub menu_guide: Option<(usize, usize)>,
+    pub menu_rig: Option<RigPick>,
+    /// Component whose handle is being dragged onto a joint to attach it.
+    pub handle_drag: Option<usize>,
     drag: Option<Drag>,
     weight_colors: Option<(String, Vec<Color32>)>,
 }
@@ -141,6 +174,11 @@ impl Default for Studio {
             doc: None,
             camera: Camera::default(),
             selected: None,
+            rig_pick: None,
+            pose: None,
+            menu_guide: None,
+            menu_rig: None,
+            handle_drag: None,
             symmetry: true,
             mode: Mode::Guides,
             outliner_open: true,
@@ -187,6 +225,8 @@ impl Studio {
         self.camera = Camera::default();
         self.camera.frame(min, max);
         self.selected = None;
+        self.rig_pick = None;
+        self.pose = None;
         self.weights_bone = None;
         self.weight_colors = None;
         self.drag = None;
@@ -321,6 +361,96 @@ impl Studio {
 
     /// Apply a layout change as one undo step. A change that leaves the layout
     /// unbuildable is rolled back and reported.
+    /// Set or clear one control's style (shape, size, colour), as one undo step.
+    pub fn restyle_control(&mut self, control: &str, style: ControlStyle) {
+        let name = control.to_string();
+        self.edit("restyle the control", |g| {
+            components::set_control_style(g, &name, style)?;
+            Ok(format!("Restyled {name}."))
+        });
+    }
+
+    /// Hang a component from a bone, as one undo step.
+    pub fn attach_component(&mut self, comp: usize, bone: &str) {
+        let Some(id) = self
+            .doc
+            .as_ref()
+            .and_then(|d| d.guides.components.get(comp))
+            .map(|c| c.id.clone())
+        else {
+            return;
+        };
+        let bone = bone.to_string();
+        self.edit("attach the component", |g| {
+            components::attach(g, &id, &bone)?;
+            Ok(format!("{id} now hangs from {bone}."))
+        });
+    }
+
+    /// Bring the components of another guides file in, hung from `bone`.
+    pub fn import_components(&mut self, path: &Path, bone: &str) {
+        let src = match Guides::load(path) {
+            Ok(g) => g,
+            Err(e) => return self.fail(format!("Couldn't read {}: {e:#}", path.display())),
+        };
+        let bone = bone.to_string();
+        self.edit("import components", |g| {
+            let added = components::import(g, &src, &bone)?;
+            Ok(format!("Imported {} from {}.", added.join(", "), bone))
+        });
+    }
+
+    /// The bones, controls and skin as they show now, with any test pose applied.
+    pub fn frame(&self) -> Option<Frame> {
+        let doc = self.doc.as_ref()?;
+        let built = doc.preview.as_ref().ok()?;
+        let sk = &built.skeleton;
+        let mut frame = Frame {
+            bones: sk.bones.iter().map(|b| (b.head, b.tail)).collect(),
+            controls: built.controls.controls.iter().map(|c| c.position).collect(),
+            control_axes: built.controls.controls.iter().map(|c| c.axis).collect(),
+            mesh: None,
+        };
+        let (Some(pose), Some(rig)) = (&self.pose, &doc.rig) else {
+            return Some(frame);
+        };
+        let Some(pivot_bone) = sk.index_of(&pose.bone) else {
+            return Some(frame);
+        };
+        let axis = [Vec3::X, Vec3::Y, Vec3::Z][pose.axis.min(2)];
+        let radians = pose.degrees.to_radians();
+        let pivot = sk.bones[pivot_bone].head;
+        let moved: Vec<bool> = (0..sk.bones.len())
+            .map(|i| sk.within(i, pivot_bone))
+            .collect();
+        for (i, (h, t)) in frame.bones.iter_mut().enumerate() {
+            if moved[i] {
+                *h = turn_about(pivot, axis, radians, *h);
+                *t = turn_about(pivot, axis, radians, *t);
+            }
+        }
+        for (i, c) in built.controls.controls.iter().enumerate() {
+            let on = c
+                .bone
+                .as_deref()
+                .and_then(|b| sk.index_of(b))
+                .is_some_and(|b| moved[b]);
+            if on {
+                frame.controls[i] = turn_about(pivot, axis, radians, c.position);
+                frame.control_axes[i] = turn_about(Vec3::ZERO, axis, radians, c.axis);
+            }
+        }
+        frame.mesh = Some(skin::deform_turn(
+            &doc.mesh.positions,
+            &rig.skin,
+            &moved,
+            pivot,
+            axis,
+            radians,
+        ));
+        Some(frame)
+    }
+
     pub fn edit(
         &mut self,
         what: &str,
@@ -413,6 +543,22 @@ impl Studio {
         }
         doc.refresh();
         self.weight_colors = None;
+    }
+
+    /// Toes on the feet, on the same side choice as fingers.
+    pub fn add_toes(&mut self) {
+        let side = match self.finger_sides {
+            FingerSides::Both => None,
+            FingerSides::Left => Some(Side::Left),
+            FingerSides::Right => Some(Side::Right),
+        };
+        self.add(
+            Preset::Toes,
+            AddOptions {
+                side,
+                ..AddOptions::default()
+            },
+        );
     }
 
     pub fn add_fingers(&mut self) {
@@ -1030,5 +1176,49 @@ mod tests {
         let rig = s.doc.as_ref().unwrap().rig.as_ref().unwrap();
         assert_ne!(serde_json::to_string(&rig.skin).unwrap(), before);
         assert!(!s.doc.as_ref().unwrap().exported);
+    }
+
+    #[test]
+    fn test_pose_turns_the_skin_and_controls_are_restyled() {
+        let mut s = demo_studio();
+        assert!(s.build(), "{}", s.status);
+        let rest = s.frame().unwrap();
+        assert!(rest.mesh.is_none());
+        s.start_pose("upperarm_l");
+        s.pose.as_mut().unwrap().degrees = 60.0;
+        let posed = s.frame().unwrap();
+        let skinned = posed.mesh.as_ref().unwrap();
+        assert!(
+            skinned
+                .iter()
+                .zip(&s.doc.as_ref().unwrap().mesh.positions)
+                .any(|(a, b)| a.distance(*b) > 0.01)
+        );
+        // The chest, which doesn't hang from the arm, stays put.
+        let built = s.doc.as_ref().unwrap().preview.as_ref().unwrap();
+        let spine = built.skeleton.index_of("spine_01").unwrap();
+        assert_eq!(posed.bones[spine], rest.bones[spine]);
+
+        // A control's shape is saved in the guides and survives a rebuild.
+        let name = built.controls.controls[0].name.clone();
+        s.restyle_control(
+            &name,
+            hive_rig::components::ControlStyle {
+                shape: Some(hive_rig::controls::Shape::Cross),
+                ..Default::default()
+            },
+        );
+        assert!(!s.error, "{}", s.status);
+        let rebuilt = s.doc.as_ref().unwrap().preview.as_ref().unwrap();
+        assert_eq!(
+            rebuilt.controls.control(&name).unwrap().shape,
+            hive_rig::controls::Shape::Cross
+        );
+        s.undo();
+        let back = s.doc.as_ref().unwrap().preview.as_ref().unwrap();
+        assert_ne!(
+            back.controls.control(&name).unwrap().shape,
+            hive_rig::controls::Shape::Cross
+        );
     }
 }

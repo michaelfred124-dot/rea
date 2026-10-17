@@ -14,15 +14,22 @@ use eframe::egui::{
 };
 use glam::Vec3;
 
-use hive_rig::components::{self, Guides, Kind};
+use hive_rig::components::{self, ControlStyle, Guides, Kind};
+use hive_rig::controls::{ControlKind, Shape};
 use hive_rig::naming::{Naming, Preset};
 use hive_rig::skeleton::Side;
 
-use super::{Category, Doc, Drag, FingerSides, Mode, Studio, push_undo};
+use super::{Category, Doc, Drag, FingerSides, Mode, Pose, RigPick, Studio, push_undo};
 use crate::theme::{self, ACCENT, BORDER, CARD, CARD_HI, ERR, OK, TEXT, TEXT_DIM, TEXT_FAINT};
 use crate::view::{self, Projector};
 
 const PICK_RADIUS: f32 = 10.0;
+/// Component handles: half their size on screen, and how close a drop must be.
+const HANDLE_HALF: f32 = 4.5;
+const HANDLE_RADIUS: f32 = 9.0;
+const JOINT_RADIUS: f32 = 16.0;
+const HANDLE: Color32 = Color32::from_rgb(230, 52, 52);
+const JOINT: Color32 = Color32::from_rgb(255, 205, 60);
 const TOAST_SECONDS: f64 = 5.0;
 const EDGE: f32 = 16.0;
 /// Where the side panels start, below the top pills.
@@ -125,7 +132,7 @@ struct LibraryPart {
     once: Option<Kind>,
 }
 
-const LIBRARY: [LibraryPart; 9] = [
+const LIBRARY: [LibraryPart; 10] = [
     LibraryPart {
         art: Art::Face,
         title: "Face",
@@ -164,6 +171,14 @@ const LIBRARY: [LibraryPart; 9] = [
         text: "Thumb to pinky, three joints each.",
         category: Category::Body,
         add: Studio::add_fingers,
+        once: None,
+    },
+    LibraryPart {
+        art: Art::Toes,
+        title: "Toes",
+        text: "Five toes on each foot, from the ball.",
+        category: Category::Body,
+        add: Studio::add_toes,
         once: None,
     },
     LibraryPart {
@@ -692,9 +707,12 @@ impl Studio {
 
     fn properties(&mut self, ctx: &egui::Context) {
         let max_h = ctx.content_rect().height() - PANEL_TOP - DOCK_CLEARANCE - 50.0;
-        let title = match self.selected {
-            Some(_) => "Component",
-            None => "Rig",
+        let picking = self.mode != Mode::Guides && self.rig_pick.is_some();
+        let title = match (&self.rig_pick, self.selected, picking) {
+            (Some(RigPick::Control(_)), _, true) => "Control",
+            (Some(RigPick::Bone(_)), _, true) => "Bone",
+            (_, Some(_), _) => "Component",
+            _ => "Rig",
         };
         floating_area("properties", Align2::RIGHT_TOP, Vec2::new(-EDGE, PANEL_TOP)).show(
             ctx,
@@ -712,12 +730,282 @@ impl Studio {
                         .max_height(max_h.max(120.0))
                         .auto_shrink([false, true])
                         .show(ui, |ui| match self.selected {
+                            _ if picking => self.rig_inspector(ui),
                             Some((c, guide)) => self.component_inspector(ui, c, guide),
                             None => self.rig_overview(ui),
                         });
                 });
             },
         );
+    }
+
+    /// The right-click menu of the viewport: attaching and importing in the guides
+    /// stage, and parenting, test poses and control looks in the build stages.
+    fn canvas_menu(&mut self, ui: &mut Ui) {
+        let Some(doc) = &self.doc else { return };
+        let bones: Vec<String> = match &doc.preview {
+            Ok(b) => b.skeleton.bones.iter().map(|b| b.name.clone()).collect(),
+            Err(_) => Vec::new(),
+        };
+        let selected_id = self
+            .selected
+            .and_then(|(s, _)| doc.guides.components.get(s).map(|c| c.id.clone()));
+        let selected = self.selected.map(|(s, _)| s);
+        let control_bone = match &self.menu_rig {
+            Some(RigPick::Control(name)) => doc
+                .preview
+                .as_ref()
+                .ok()
+                .and_then(|b| b.controls.control(name))
+                .and_then(|c| c.bone.clone()),
+            _ => None,
+        };
+        let mut import_at = None;
+        if self.mode == Mode::Guides {
+            if let Some((c, g)) = self.menu_guide {
+                if ui.button("Select this guide").clicked() {
+                    self.selected = Some((c, Some(g)));
+                    ui.close();
+                }
+                ui.menu_button("Attach component to", |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(320.0)
+                        .show(ui, |ui| {
+                            for b in &bones {
+                                if ui.button(b).clicked() {
+                                    self.attach_component(c, b);
+                                    ui.close();
+                                }
+                            }
+                        });
+                });
+                ui.separator();
+            }
+        } else {
+            match self.menu_rig.clone() {
+                Some(RigPick::Bone(bone)) => {
+                    if ui.button("Test pose on this bone").clicked() {
+                        self.start_pose(&bone);
+                        ui.close();
+                    }
+                    if let (Some(sel), Some(id)) = (selected, &selected_id)
+                        && ui.button(format!("Attach {id} to this bone")).clicked()
+                    {
+                        self.attach_component(sel, &bone);
+                        ui.close();
+                    }
+                    ui.separator();
+                }
+                Some(RigPick::Control(name)) => {
+                    if let Some(bone) = control_bone
+                        && ui.button("Test pose on its bone").clicked()
+                    {
+                        self.start_pose(&bone);
+                        ui.close();
+                    }
+                    ui.menu_button("Control shape", |ui| {
+                        for (shape, label) in SHAPES {
+                            if ui.button(label).clicked() {
+                                let mut style = self.style_of(&name);
+                                style.shape = Some(shape);
+                                self.restyle_control(&name, style);
+                                ui.close();
+                            }
+                        }
+                    });
+                    if ui.button("Reset this control's look").clicked() {
+                        self.restyle_control(&name, ControlStyle::default());
+                        ui.close();
+                    }
+                    ui.separator();
+                }
+                None => {}
+            }
+            if self.pose.is_some() && ui.button("Stop the test pose").clicked() {
+                self.pose = None;
+                ui.close();
+            }
+        }
+        if ui.button("Import components…").clicked() {
+            import_at = Some(match &self.menu_rig {
+                Some(RigPick::Bone(b)) => b.clone(),
+                _ => "pelvis".to_string(),
+            });
+            ui.close();
+        }
+        if let Some(bone) = import_at
+            && let Some(p) = rfd::FileDialog::new()
+                .set_title("Import components from a guides file")
+                .add_filter("Hive guides", &["json"])
+                .pick_file()
+        {
+            self.import_components(&p, &bone);
+        }
+    }
+
+    pub fn start_pose(&mut self, bone: &str) {
+        self.pose = Some(Pose {
+            bone: bone.to_string(),
+            axis: 0,
+            degrees: 0.0,
+        });
+        if self.doc.as_ref().is_some_and(|d| d.rig.is_none()) {
+            self.info("Build the rig to see the skin move with the test pose.");
+        }
+    }
+
+    /// The look a control has been given in the guides file, if any.
+    fn style_of(&self, control: &str) -> ControlStyle {
+        self.doc
+            .as_ref()
+            .and_then(|d| d.guides.control_styles.get(control).copied())
+            .unwrap_or_default()
+    }
+
+    /// Properties for the bone or control picked in the build stages.
+    fn rig_inspector(&mut self, ui: &mut Ui) {
+        let Some(pick) = self.rig_pick.clone() else {
+            return;
+        };
+        let Some(doc) = &self.doc else { return };
+        let Ok(built) = &doc.preview else { return };
+        let naming = doc.guides.naming.clone();
+        match pick {
+            RigPick::Control(name) => {
+                let Some(c) = built.controls.control(&name).cloned() else {
+                    self.rig_pick = None;
+                    return;
+                };
+                ui.label(
+                    RichText::new(naming.control(&name))
+                        .size(15.0)
+                        .strong()
+                        .color(TEXT),
+                );
+                let bone = c.bone.clone().unwrap_or_else(|| "none".into());
+                ui.label(
+                    RichText::new(format!(
+                        "{} control on {}",
+                        kind_word(c.kind),
+                        naming.bone(&bone)
+                    ))
+                    .size(12.5)
+                    .color(TEXT_FAINT),
+                );
+                ui.add_space(8.0);
+                let mut style = self.style_of(&name);
+                let before = style;
+                let mut changed = false;
+                theme::label_caps(ui, "Shape");
+                let mut shape = c.shape;
+                if theme::segmented(ui, &mut shape, &SHAPES) {
+                    style.shape = Some(shape);
+                    changed = true;
+                }
+                ui.add_space(6.0);
+                theme::label_caps(ui, "Size (metres)");
+                let mut size = c.size;
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut size)
+                            .speed(0.001)
+                            .range(0.001..=0.5)
+                            .fixed_decimals(3),
+                    )
+                    .changed()
+                {
+                    style.size = Some(size);
+                    changed = true;
+                }
+                ui.add_space(6.0);
+                theme::label_caps(ui, "Colour");
+                let mut rgb = c.color;
+                if ui.color_edit_button_rgb(&mut rgb).changed() {
+                    style.color = Some(rgb);
+                    changed = true;
+                }
+                if changed {
+                    self.restyle_control(&name, style);
+                }
+                if before != ControlStyle::default()
+                    && ui.button("Reset this control's look").clicked()
+                {
+                    self.restyle_control(&name, ControlStyle::default());
+                }
+                ui.add_space(8.0);
+                if let Some(bone) = c.bone {
+                    self.pose_section(ui, &bone);
+                }
+            }
+            RigPick::Bone(name) => {
+                let Some(b) = built.skeleton.bone(&name).cloned() else {
+                    self.rig_pick = None;
+                    return;
+                };
+                ui.label(
+                    RichText::new(naming.bone(&name))
+                        .size(15.0)
+                        .strong()
+                        .color(TEXT),
+                );
+                let role = if b.deform {
+                    "Deforming bone"
+                } else {
+                    "Helper bone"
+                };
+                ui.label(
+                    RichText::new(format!("{role} from {}", b.component))
+                        .size(12.5)
+                        .color(TEXT_FAINT),
+                );
+                ui.add_space(8.0);
+                if let Some(idx) = doc
+                    .guides
+                    .components
+                    .iter()
+                    .position(|c| c.id == b.component)
+                    && ui.button("Select its component").clicked()
+                {
+                    self.selected = Some((idx, None));
+                    self.mode = Mode::Guides;
+                }
+                ui.add_space(8.0);
+                self.pose_section(ui, &name);
+            }
+        }
+    }
+
+    /// Turn a bone to test the rig: the bone, its children and their skin move.
+    fn pose_section(&mut self, ui: &mut Ui, bone: &str) {
+        theme::label_caps(ui, "Test pose");
+        let rigged = self.doc.as_ref().is_some_and(|d| d.rig.is_some());
+        let active = self.pose.as_ref().is_some_and(|p| p.bone == bone);
+        if !active {
+            if ui.button("Test this bone").clicked() {
+                self.start_pose(bone);
+            }
+        } else {
+            let mut pose = self.pose.clone().unwrap_or(Pose {
+                bone: bone.to_string(),
+                axis: 0,
+                degrees: 0.0,
+            });
+            let before = pose.clone();
+            theme::segmented(ui, &mut pose.axis, &[(0, "X"), (1, "Y"), (2, "Z")]);
+            ui.add(egui::Slider::new(&mut pose.degrees, -150.0..=150.0).suffix("°"));
+            if pose != before {
+                self.pose = Some(pose);
+            }
+            if ui.button("Stop the test").clicked() {
+                self.pose = None;
+            }
+        }
+        let note = if rigged {
+            "Turns this bone and everything hanging from it, skin included. Nothing is saved."
+        } else {
+            "Build the rig to see the skin move. Nothing is saved."
+        };
+        ui.label(RichText::new(note).size(12.0).color(TEXT_FAINT));
     }
 
     fn rig_overview(&mut self, ui: &mut Ui) {
@@ -1638,14 +1926,19 @@ impl Studio {
         // Pick where the button went down: a drag only starts once the pointer has moved.
         if response.drag_started_by(PointerButton::Primary)
             && let Some(p) = press.or(pointer)
-            && let Some((c, g)) = self.pick_guide(&pr, p)
         {
-            self.selected = Some((c, Some(g)));
-            self.begin_change();
-            self.drag = Some(Drag { comp: c, guide: g });
+            if let Some(c) = self.handle_at(&pr, p) {
+                self.selected = Some((c, None));
+                self.handle_drag = Some(c);
+            } else if let Some((c, g)) = self.pick_guide(&pr, p) {
+                self.selected = Some((c, Some(g)));
+                self.begin_change();
+                self.drag = Some(Drag { comp: c, guide: g });
+            }
         }
         if response.dragged_by(PointerButton::Primary) {
             match (&self.drag, pointer) {
+                _ if self.handle_drag.is_some() => {}
                 (Some(d), Some(p)) => {
                     let (c, g) = (d.comp, d.guide);
                     let current =
@@ -1654,6 +1947,15 @@ impl Studio {
                     self.move_guide(c, g, to);
                 }
                 _ => self.camera.orbit(response.drag_delta()),
+            }
+        }
+        if response.drag_stopped()
+            && let Some(c) = self.handle_drag.take()
+        {
+            // Dropped on a joint: hang the component from it.
+            match pointer.and_then(|p| self.joint_at(&pr, p)) {
+                Some(bone) => self.attach_component(c, &bone),
+                None => self.info("Drop a component's red handle on a yellow joint to attach it."),
             }
         }
         if response.dragged_by(PointerButton::Secondary)
@@ -1667,8 +1969,19 @@ impl Studio {
         if response.clicked()
             && let Some(p) = pointer
         {
-            self.selected = self.pick_guide(&pr, p).map(|(c, g)| (c, Some(g)));
+            if self.mode == Mode::Guides {
+                self.selected = self.pick_guide(&pr, p).map(|(c, g)| (c, Some(g)));
+            } else {
+                self.rig_pick = self.pick_rig(&pr, p);
+            }
         }
+        if response.secondary_clicked()
+            && let Some(p) = pointer
+        {
+            self.menu_guide = self.pick_guide(&pr, p);
+            self.menu_rig = self.pick_rig(&pr, p);
+        }
+        response.context_menu(|ui| self.canvas_menu(ui));
         if response.double_clicked() {
             self.frame_camera();
         }
@@ -1708,6 +2021,116 @@ impl Studio {
         best.map(|b| (b.2, b.3))
     }
 
+    /// The control or bone under the pointer in the build stages. Controls win over
+    /// the bones beneath them.
+    fn pick_rig(&self, pr: &Projector, at: Pos2) -> Option<RigPick> {
+        if self.mode == Mode::Guides {
+            return None;
+        }
+        let doc = self.doc.as_ref()?;
+        let built = doc.preview.as_ref().ok()?;
+        let frame = self.frame()?;
+        let mut best: Option<(f32, RigPick)> = None;
+        for (i, c) in built.controls.controls.iter().enumerate() {
+            let Some(s) = pr.pos(frame.controls[i]) else {
+                continue;
+            };
+            let d = s.distance(at);
+            if d <= PICK_RADIUS && best.as_ref().is_none_or(|b| d < b.0) {
+                best = Some((d, RigPick::Control(c.name.clone())));
+            }
+        }
+        if best.is_some() {
+            return best.map(|b| b.1);
+        }
+        for (i, b) in built.skeleton.bones.iter().enumerate() {
+            if self.mode == Mode::Rig && !b.deform {
+                continue;
+            }
+            let (Some(h), Some(t)) = (pr.pos(frame.bones[i].0), pr.pos(frame.bones[i].1)) else {
+                continue;
+            };
+            let d = distance_to_segment(at, h, t);
+            if d <= PICK_RADIUS && best.as_ref().is_none_or(|x| d < x.0) {
+                best = Some((d, RigPick::Bone(b.name.clone())));
+            }
+        }
+        best.map(|b| b.1)
+    }
+
+    /// The red handle of a component under the pointer, if any. Each component
+    /// (except the root) has one on its first guide; dragging it onto a joint
+    /// hangs the component from that joint.
+    fn handle_at(&self, pr: &Projector, at: Pos2) -> Option<usize> {
+        let doc = self.doc.as_ref()?;
+        doc.guides
+            .components
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.kind != Kind::Root)
+            .find_map(|(ci, c)| {
+                let p = pr.pos(c.guides.first()?.position)?;
+                (p.distance(at) <= HANDLE_RADIUS).then_some(ci)
+            })
+    }
+
+    /// The bone whose joint (its head) is under the pointer.
+    fn joint_at(&self, pr: &Projector, at: Pos2) -> Option<String> {
+        let frame = self.frame()?;
+        let built = self.doc.as_ref()?.preview.as_ref().ok()?;
+        built
+            .skeleton
+            .bones
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| Some((pr.pos(frame.bones[i].0)?.distance(at), &b.name)))
+            .filter(|(d, _)| *d <= JOINT_RADIUS)
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, name)| name.clone())
+    }
+
+    fn paint_handles(&self, painter: &egui::Painter, pr: &Projector, pointer: Option<Pos2>) {
+        let Some(doc) = &self.doc else { return };
+        let hot = pointer.and_then(|p| self.handle_at(pr, p));
+        for (ci, c) in doc.guides.components.iter().enumerate() {
+            if c.kind == Kind::Root {
+                continue;
+            }
+            let Some(at) = c.guides.first().and_then(|g| pr.pos(g.position)) else {
+                continue;
+            };
+            let grow = if hot == Some(ci) || self.handle_drag == Some(ci) {
+                2.0
+            } else {
+                0.0
+            };
+            let rect = Rect::from_center_size(at, Vec2::splat(2.0 * HANDLE_HALF + grow));
+            painter.rect_filled(rect, 2.0, HANDLE);
+            painter.rect_stroke(
+                rect,
+                2.0,
+                Stroke::new(1.2, Color32::WHITE),
+                egui::StrokeKind::Inside,
+            );
+        }
+        if let (Some(ci), Some(p)) = (self.handle_drag, pointer)
+            && let Some(c) = doc.guides.components.get(ci)
+            && let Some(from) = c.guides.first().and_then(|g| pr.pos(g.position))
+        {
+            painter.line_segment([from, p], Stroke::new(1.5, HANDLE));
+            // The joint the handle would snap to.
+            let built = doc.preview.as_ref().ok();
+            let target = self.joint_at(pr, p).and_then(|bone| {
+                let i = built?.skeleton.index_of(&bone)?;
+                let frame = self.frame()?;
+                pr.pos(frame.bones[i].0)
+            });
+            if let Some(at) = target {
+                painter.circle_stroke(at, JOINT_RADIUS * 0.6, Stroke::new(2.0, ACCENT));
+            }
+        }
+    }
+
     fn paint(&mut self, painter: &egui::Painter, pr: &Projector, pointer: Option<Pos2>) {
         let weights = self.weights_bone.clone();
         let colors = match &weights {
@@ -1715,39 +2138,56 @@ impl Studio {
             _ => None,
         };
         let Some(doc) = &self.doc else { return };
+        let frame = self.frame();
         if self.show_mesh {
             let alpha = if self.xray { 0.3 } else { 1.0 };
             let base = Color32::from_rgb(168, 172, 182);
-            view::draw_mesh(painter, pr, &doc.mesh, base, colors.as_deref(), alpha);
+            let posed = frame.as_ref().and_then(|f| f.mesh.as_deref());
+            let positions = posed.unwrap_or(&doc.mesh.positions);
+            view::draw_mesh(
+                painter,
+                pr,
+                &doc.mesh,
+                positions,
+                base,
+                colors.as_deref(),
+                alpha,
+            );
         }
         let Ok(built) = &doc.preview else { return };
         let bones = &built.skeleton.bones;
+        let frame = frame.as_ref();
 
         if self.mode == Mode::Rig {
-            for c in &built.controls.controls {
+            for (i, c) in built.controls.controls.iter().enumerate() {
+                let position = frame.map_or(c.position, |f| f.controls[i]);
+                let axis = frame.map_or(c.axis, |f| f.control_axes[i]);
+                let picked = self.rig_pick == Some(RigPick::Control(c.name.clone()));
                 view::ring(
                     painter,
                     pr,
-                    c.position,
-                    c.axis,
+                    position,
+                    axis,
                     c.size.max(0.01),
-                    Stroke::new(2.0, rgb(c.color)),
+                    Stroke::new(if picked { 3.5 } else { 2.0 }, rgb(c.color)),
                 );
             }
         }
         let bone_alpha = if self.mode == Mode::Guides { 0.45 } else { 1.0 };
-        for b in bones {
+        for (i, b) in bones.iter().enumerate() {
             if self.mode == Mode::Rig && !b.deform {
                 continue;
             }
-            let (Some(h), Some(t)) = (pr.pos(b.head), pr.pos(b.tail)) else {
+            let (head, tail) = frame.map_or((b.head, b.tail), |f| f.bones[i]);
+            let (Some(h), Some(t)) = (pr.pos(head), pr.pos(tail)) else {
                 continue;
             };
             // The preview uses internal names; the weights list uses exported ones.
-            let color = if weights
+            let picked = self.rig_pick == Some(RigPick::Bone(b.name.clone()));
+            let weighted = weights
                 .as_deref()
-                .is_some_and(|w| w == doc.guides.naming.bone(&b.name))
-            {
+                .is_some_and(|w| w == doc.guides.naming.bone(&b.name));
+            let color = if picked || weighted {
                 ACCENT
             } else if b.deform {
                 Color32::from_rgb(226, 228, 236)
@@ -1755,7 +2195,9 @@ impl Studio {
                 Color32::from_rgb(130, 134, 150)
             };
             bone_shape(painter, h, t, color.gamma_multiply(bone_alpha));
+            joint_marker(painter, h, if picked { ACCENT } else { JOINT });
         }
+        self.paint_handles(painter, pr, pointer);
         if self.mode != Mode::Guides {
             return;
         }
@@ -2302,6 +2744,7 @@ fn dock_icon(painter: &egui::Painter, c: Pos2, icon: Icon, color: Color32) {
 #[derive(Clone, Copy)]
 enum Art {
     Face,
+    Toes,
     Eyes,
     Jaw,
     Ears,
@@ -2465,7 +2908,9 @@ fn hot_chain(painter: &egui::Painter, pts: &[Pos2], width: f32, hot: bool) {
 fn illustration(painter: &egui::Painter, r: Rect, art: Art, hot: bool) {
     match art {
         Art::Face | Art::Eyes | Art::Jaw | Art::Ears | Art::Ponytail => bust(painter, r, art, hot),
-        Art::Fingers | Art::Tail | Art::Prop | Art::Chain => figure(painter, r, art, hot),
+        Art::Fingers | Art::Toes | Art::Tail | Art::Prop | Art::Chain => {
+            figure(painter, r, art, hot)
+        }
     }
 }
 
@@ -2563,6 +3008,25 @@ fn figure(painter: &egui::Painter, r: Rect, art: Art, hot: bool) {
                 for (dx, dy) in [(-1.5, 6.5), (1.0, 8.5), (3.2, 8.8), (5.2, 8.0), (6.8, 6.2)] {
                     let base = wrist + Vec2::new(1.5 * s * k, 2.5 * k);
                     let tip = wrist + Vec2::new(dx * s * k, dy * k);
+                    let mid = base.lerp(tip, 0.5);
+                    hot_chain(painter, &[base, mid, tip], 1.0, hot);
+                }
+            }
+        }
+        Art::Toes => {
+            // Five toes fanning out from each foot's ball.
+            for s in [-1.0f32, 1.0] {
+                let ball = pt(9.5 * s, 97.0);
+                painter.circle_filled(ball, 3.0 * k, ACCENT.gamma_multiply(0.16));
+                for (dx, dy) in [
+                    (3.2, 3.5),
+                    (2.5, 1.2),
+                    (1.2, 0.4),
+                    (-0.2, -0.2),
+                    (-1.5, -1.0),
+                ] {
+                    let tip = ball + Vec2::new(dx * s * k * 2.0, dy * k * 2.0);
+                    let base = ball;
                     let mid = base.lerp(tip, 0.5);
                     hot_chain(painter, &[base, mid, tip], 1.0, hot);
                 }
@@ -3087,6 +3551,52 @@ fn paint_axes(painter: &egui::Painter, pr: &Projector, at: Pos2) {
 }
 
 /// A bone as a thin diamond from head to tail.
+/// The control shapes a rig can use, as the control builder offers them.
+const SHAPES: [(Shape, &str); 5] = [
+    (Shape::Circle, "Circle"),
+    (Shape::Square, "Square"),
+    (Shape::Cube, "Cube"),
+    (Shape::Diamond, "Diamond"),
+    (Shape::Cross, "Cross"),
+];
+
+fn kind_word(kind: ControlKind) -> &'static str {
+    match kind {
+        ControlKind::Root => "Root",
+        ControlKind::Cog => "Centre of gravity",
+        ControlKind::Fk => "FK",
+        ControlKind::IkEffector => "IK",
+        ControlKind::Pole => "Pole",
+        _ => "Animator",
+    }
+}
+
+/// A joint as a small ring with a cross, so it reads as a joint rather than a dot.
+fn joint_marker(painter: &egui::Painter, at: Pos2, color: Color32) {
+    painter.circle_filled(at, 4.5, Color32::from_black_alpha(160));
+    painter.circle_stroke(at, 4.5, Stroke::new(1.6, color));
+    let arm = 7.0;
+    painter.line_segment(
+        [at - Vec2::X * arm, at + Vec2::X * arm],
+        Stroke::new(1.0, color),
+    );
+    painter.line_segment(
+        [at - Vec2::Y * arm, at + Vec2::Y * arm],
+        Stroke::new(1.0, color),
+    );
+}
+
+/// Screen distance from `p` to the segment `a`-`b`.
+fn distance_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
+    let ab = b - a;
+    let len2 = ab.length_sq();
+    if len2 < 1e-6 {
+        return p.distance(a);
+    }
+    let t = ((p - a).dot(ab) / len2).clamp(0.0, 1.0);
+    p.distance(a + ab * t)
+}
+
 fn bone_shape(painter: &egui::Painter, head: Pos2, tail: Pos2, color: Color32) {
     let d = tail - head;
     let len = d.length();

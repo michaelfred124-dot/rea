@@ -59,6 +59,11 @@ jobs:
           cargo run --locked -q -- add "$rig/hive_demo.guides.json" jaw
           cargo run --locked -q -- add "$rig/hive_demo.guides.json" face
           cargo run --locked -q -- remove "$rig/hive_demo.guides.json" ear
+          # Toes and an import from another layout, hung from the left ball of the foot.
+          cargo run --locked -q -- demo -o "$rig/other"
+          cargo run --locked -q -- add "$rig/other/hive_demo.guides.json" toes --side left
+          cargo run --locked -q -- import "$rig/hive_demo.guides.json" "$rig/other/hive_demo.guides.json" --parent ball_l
+          cargo run --locked -q -- attach "$rig/hive_demo.guides.json" toe_big_l ball_l
           cargo run --locked -q -- components "$rig/hive_demo.guides.json"
           cargo run --locked -q -- rebuild "$rig/hive_demo.hive.json"
           python3 -I tests/dcc_stub_run.py unreal "$rig/hive_demo_unreal.py"
@@ -119,7 +124,7 @@ jobs:
         run: |
           rig="$RUNNER_TEMP/face"
           cargo run -q -- demo -o "$rig"
-          for part in eyes jaw face fingers; do cargo run -q -- add "$rig/hive_demo.guides.json" "$part"; done
+          for part in eyes jaw face fingers toes; do cargo run -q -- add "$rig/hive_demo.guides.json" "$part"; done
           cargo run -q -- rebuild "$rig/hive_demo.hive.json"
           python tests/blender_check.py "$rig/hive_demo_blender.py" "$rig/hive_demo.glb"
       - name: Side-first naming in Blender

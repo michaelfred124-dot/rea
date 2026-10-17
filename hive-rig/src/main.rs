@@ -80,6 +80,23 @@ enum Command {
         #[arg(long)]
         id: Option<String>,
     },
+    /// Hang a component from another bone (its guides stay where they are).
+    Attach {
+        guides: PathBuf,
+        /// Component id.
+        id: String,
+        /// Bone to hang it from.
+        bone: String,
+    },
+    /// Import the premade components of another guides file, hung from a bone.
+    Import {
+        guides: PathBuf,
+        /// The guides file to take components from.
+        from: PathBuf,
+        /// Bone to hang the imported components from.
+        #[arg(long)]
+        parent: String,
+    },
     /// Remove a component (and everything attached to it) from a guides file.
     Remove { guides: PathBuf, id: String },
     /// List the components in a guides file.
@@ -361,6 +378,25 @@ fn main() -> Result<()> {
             let added = components::add_preset(&mut g, preset, &opts)?;
             save_guides(&guides, &g)?;
             println!("Added {}", added.join(", "));
+            Ok(())
+        }
+        Command::Attach { guides, id, bone } => {
+            let mut g = Guides::load(&guides)?;
+            components::attach(&mut g, &id, &bone)?;
+            save_guides(&guides, &g)?;
+            println!("{id} now hangs from {bone}");
+            Ok(())
+        }
+        Command::Import {
+            guides,
+            from,
+            parent,
+        } => {
+            let mut g = Guides::load(&guides)?;
+            let src = Guides::load(&from)?;
+            let added = components::import(&mut g, &src, &parent)?;
+            save_guides(&guides, &g)?;
+            println!("Imported {} from {from:?} onto {parent}", added.join(", "));
             Ok(())
         }
         Command::Remove { guides, id } => {

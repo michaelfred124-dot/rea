@@ -27,6 +27,8 @@ struct Launch {
     library: bool,
     export: bool,
     select: Option<String>,
+    pick: Option<String>,
+    pose: Option<String>,
     screenshot: Option<PathBuf>,
 }
 
@@ -45,6 +47,8 @@ fn parse_args() -> Launch {
             Some("--select") => {
                 launch.select = args.next().map(|s| s.to_string_lossy().into_owned())
             }
+            Some("--pick") => launch.pick = args.next().map(|s| s.to_string_lossy().into_owned()),
+            Some("--pose") => launch.pose = args.next().map(|s| s.to_string_lossy().into_owned()),
             Some("--screenshot") => launch.screenshot = args.next().map(PathBuf::from),
             _ => launch.file = Some(PathBuf::from(a)),
         }
@@ -109,6 +113,19 @@ fn main() -> eframe::Result {
     studio.weights_bone = launch.weights;
     studio.library_open = launch.library;
     studio.export_open = launch.export;
+    if let Some(bone) = &launch.pose {
+        studio.start_pose(bone);
+        if let Some(p) = studio.pose.as_mut() {
+            p.degrees = 40.0;
+        }
+    }
+    if let Some(name) = &launch.pick {
+        studio.rig_pick = Some(if name.starts_with("ctrl") || name.ends_with("_ctrl") {
+            app::RigPick::Control(name.clone())
+        } else {
+            app::RigPick::Bone(name.clone())
+        });
+    }
     if let (Some(id), Some(doc)) = (&launch.select, &studio.doc) {
         studio.selected = doc
             .guides
