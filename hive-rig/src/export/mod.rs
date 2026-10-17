@@ -109,7 +109,9 @@ pub fn script(rig: &Rig, target: Target, glb_path: &Path) -> Result<String> {
 /// Write `<name>.glb`, `<name>.hive.json` and one builder script per target.
 pub fn write_all(rig: &Rig, out_dir: &Path, targets: &[Target]) -> Result<Vec<PathBuf>> {
     std::fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
-    let out_dir = out_dir.canonicalize()?;
+    // `absolute` rather than `canonicalize`: on Windows the latter adds a `\\?\` prefix
+    // that DCC importers such as Unreal's may not accept in the embedded .glb path.
+    let out_dir = std::path::absolute(out_dir)?;
     let mut written = Vec::new();
 
     let glb_path = out_dir.join(format!("{}.glb", rig.name));
