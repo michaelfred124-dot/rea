@@ -30,8 +30,10 @@ impl Mesh {
 
     pub fn triangles(&self) -> impl Iterator<Item = [usize; 3]> + '_ {
         self.indices
-            .chunks_exact(3)
-            .map(|t| [t[0] as usize, t[1] as usize, t[2] as usize])
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|t| t.map(|i| i as usize))
     }
 
     pub fn bounds(&self) -> (Vec3, Vec3) {
