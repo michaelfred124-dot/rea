@@ -24,12 +24,14 @@ patterns) applied to every export, and now:
 - **Animator tools** (Blender tab and Maya window): IK to FK and FK to IK
   matching per limb, mirror pose, reset pose, select all controls and space
   switching without a pop. Checked in real Blender; Maya only against stubs.
+- **Quadruped hind legs and a dog**: the `quad_leg` component and a built-in
+  dog layout and test mesh (`hive-rig demo --quadruped`); see gap 1.
 
 ## Gaps, ranked by how much they'd help a rigger
 
 | # | Area | What Hive/Zoo offer publicly | What we'd build | Size |
 |---|------|------------------------------|-----------------|------|
-| 1 | Quadrupeds and creatures | Dog, horse, spider, dinosaur, werewolf templates; quad legs | A `quad_leg` component (3-bone IK with hock and paw roll) and creature templates | Large |
+| 1 | Quadrupeds and creatures | Dog, horse, spider, dinosaur, werewolf templates; quad legs | Done: a `quad_leg` component (thigh, calf, hock and paw; two-bone IK aimed at a hock control, reverse paw roll, FK, stretch) and a dog layout (`demo --quadruped`), checked in real Blender. Next: horse, spider and dinosaur templates, multi-leg sides, an automatic (spring) hock | Medium |
 | 2 | Face, next steps | Joint-based face plus face controls on a panel | Done: face joints. Next: a 2D face control board, lip zippers, sticky lips | Medium |
 | 3 | Bendy limbs | Bendy/ribbon arms and legs, soft IK | Extra mid-limb controls driving the twist bones; soft IK to stop knee pop | Medium |
 | 4 | Spine and tentacles | Spline (IK) spine, tentacles, multi-branch FK | A spline-chain component with stretch and volume | Medium |

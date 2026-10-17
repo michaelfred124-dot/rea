@@ -907,6 +907,23 @@ impl Studio {
         );
     }
 
+    /// Three-segment hind legs on the pelvis, on the same side choice as fingers.
+    /// A side that already has a leg is refused; remove that leg first.
+    pub fn add_hind_legs(&mut self) {
+        let side = match self.finger_sides {
+            FingerSides::Both => None,
+            FingerSides::Left => Some(Side::Left),
+            FingerSides::Right => Some(Side::Right),
+        };
+        self.add(
+            Preset::QuadLegs,
+            AddOptions {
+                side,
+                ..AddOptions::default()
+            },
+        );
+    }
+
     pub fn add_fingers(&mut self) {
         let side = match self.finger_sides {
             FingerSides::Both => None,
@@ -1365,6 +1382,24 @@ mod tests {
         s.remove_selected();
         assert!(s.error);
         assert_eq!(s.doc.as_ref().unwrap().guides.components.len(), before);
+    }
+
+    #[test]
+    fn hind_legs_replace_the_biped_legs() {
+        let mut s = demo_studio();
+        // The biped already has legs, so the hind legs are refused.
+        s.add_hind_legs();
+        assert!(s.error);
+        for id in ["leg_l", "leg_r"] {
+            s.selected = Some((comp(&s, id), None));
+            s.remove_selected();
+        }
+        s.add_hind_legs();
+        assert!(!s.error, "{}", s.status);
+        let g = &s.doc.as_ref().unwrap().guides;
+        assert_eq!(g.component("hind_leg_r").unwrap().kind, Kind::QuadLeg);
+        let built = components::build(g).unwrap();
+        assert!(built.skeleton.bone("hock_l").is_some());
     }
 
     #[test]

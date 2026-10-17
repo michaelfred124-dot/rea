@@ -203,6 +203,12 @@ def rotate(vec, axis, angle):
 # ----------------------------------------------------------------------- controls
 chain_end_ik = {c["ik_control"]: c["end"] for c in CHAINS}
 chain_of_pole = {c["pole_control"]: c for c in CHAINS}
+chain_of_hock = {c["hock"]["control"]: c for c in CHAINS if c.get("hock")}
+
+
+def solve_end(chain):
+    """Where the two-bone solve ends: the hock on a three-segment leg, else the end bone."""
+    return chain["hock"]["bone"] if chain.get("hock") else chain["end"]
 
 
 def target_transform(c):
@@ -215,9 +221,14 @@ def target_transform(c):
         return initial(bone_key(BASIS_BONES[0]))
     if c["kind"] == "aim":
         return unreal.Transform(location=to_ue(c["position"]))
+    if c["kind"] == "hock":
+        # At the ankle, turned like the hock bone.
+        chain = chain_of_hock[c["name"]]
+        return unreal.Transform(location=bone_location(chain["end"]),
+                                rotation=initial(bone_key(chain["hock"]["bone"])).rotation.rotator())
     if c["kind"] == "pole":
         chain = chain_of_pole[c["name"]]
-        a, m, e = (bone_location(chain[k]) for k in ("upper", "lower", "end"))
+        a, m, e = (bone_location(b) for b in (chain["upper"], chain["lower"], solve_end(chain)))
         bend = m - (a + e) * 0.5
         bend = bend.normal() if bend.length() > 1e-3 else unreal.Vector(0, 1, 0)
         return unreal.Transform(location=m + bend * (0.3 * HEIGHT_CM))
@@ -237,7 +248,7 @@ def add_control(name, parent, settings, value):
     return hc.add_control(name, parent, settings, value, True, False)
 
 
-for c in CONTROLS:
+def make_control(c, parent):
     settings = unreal.RigControlSettings()
     settings.control_type = unreal.RigControlType.EULER_TRANSFORM
     try:
@@ -247,13 +258,19 @@ for c in CONTROLS:
     settings.shape_name = shape_for(c["shape"])
     settings.shape_color = unreal.LinearColor(c["color"][0], c["color"][1], c["color"][2], 1.0)
     value = unreal.RigHierarchy.make_control_value_from_euler_transform(unreal.EulerTransform())
-    parent = parent_key(c)
     k = add_control(c["name"], parent, settings, value)
     world = target_transform(c)
     parent_world = initial(parent) if parent.name != "None" else unreal.Transform()
     hierarchy.set_control_offset_transform(k, world.make_relative(parent_world), True, True)
     scale = c["size"] * 100.0 / SHAPE_UNIT_CM
     hierarchy.set_control_shape_transform(k, unreal.Transform(scale=unreal.Vector(scale, scale, scale)), True)
+    return k
+
+
+for c in CONTROLS:
+    # Hock controls hang from the reverse-foot ankle null, made below.
+    if c["kind"] != "hock":
+        make_control(c, parent_key(c))
 
 def add_float(name, parent, lo, hi, value):
     settings = unreal.RigControlSettings()
@@ -310,6 +327,18 @@ for chain in CHAINS:
     foot_rig[n] = dict(pivots=pivots, ankle=ankle, flat=flat, axis=local_axis, sign=sign,
                        brk=float(foot["break_angle"]), ball_bone=foot["ball_bone"],
                        ball_control=foot["ball_control"])
+
+# Three-segment legs: the hock control rides on the ankle null (so it follows the
+# roll) and carries a null at the hock bone, which the thigh and calf solve to.
+hock_null = {}
+for chain in CHAINS:
+    hock = chain.get("hock")
+    if not hock:
+        continue
+    n = chain["name"]
+    ankle = foot_rig[n]["ankle"] if n in foot_rig else control_key(chain["ik_control"])
+    hock_ctrl = make_control(next(c for c in CONTROLS if c["name"] == hock["control"]), ankle)
+    hock_null[n] = hc.add_null(n + "_hock", hock_ctrl, initial(bone_key(hock["bone"])), True, True, False)
 
 # ----------------------------------------------------------------------- forward solve graph
 def find_begin_node():
@@ -401,7 +430,8 @@ for c in CONTROLS:
 # IK on top of FK, weighted by the blend control.
 for chain in CHAINS:
     upper = initial(bone_key(chain["upper"]))
-    a, m, e = (bone_location(chain[k]) for k in ("upper", "lower", "end"))
+    ik_end = solve_end(chain)
+    a, m, e = (bone_location(b) for b in (chain["upper"], chain["lower"], ik_end))
     primary = upper.inverse_transform_direction((m - a).normal())
     bend = m - (a + e) * 0.5
     secondary = upper.inverse_transform_direction(bend.normal() if bend.length() > 1e-3 else unreal.Vector(0, 1, 0))
@@ -434,6 +464,8 @@ for chain in CHAINS:
         effector = get_null(rig_foot["ankle"])
     else:
         effector = get_control(chain["ik_control"])
+    # The two-bone solve aims at the hock null on a three-segment leg.
+    solve_to = get_null(hock_null[chain["name"]]) if chain["name"] in hock_null else effector
     pole = get_control(chain["pole_control"])
     stretch = get_float(chain["name"] + "_stretch")
     max_ratio = math("FloatAdd", chain["name"] + "_stretch_ratio", {"A": "1.0"})
@@ -441,7 +473,7 @@ for chain in CHAINS:
     ik = unit("RigUnit_TwoBoneIKSimplePerItem", "IK_" + chain["name"], {
         "ItemA": item_pin("Bone", chain["upper"]),
         "ItemB": item_pin("Bone", chain["lower"]),
-        "EffectorItem": item_pin("Bone", chain["end"]),
+        "EffectorItem": item_pin("Bone", ik_end),
         "PrimaryAxis": vector_text(primary),
         "SecondaryAxis": vector_text(secondary),
         "PoleVectorKind": "Location",
@@ -450,10 +482,17 @@ for chain in CHAINS:
         "bPropagateToChildren": "True",
     })
     vm.add_link(max_ratio + ".Result", ik + ".StretchMaximumRatio")
-    vm.add_link(effector + ".Transform", ik + ".Effector")
+    vm.add_link(solve_to + ".Transform", ik + ".Effector")
     vm.add_link(pole + ".Transform.Translation", ik + ".PoleVector")
     vm.add_link(blend + ".FloatValue", ik + ".Weight")
     chain_exec(ik)
+
+    if ik_end != chain["end"]:
+        seg = unit("RigUnit_SetRotation", "IKRot_" + ik_end,
+                   {"Item": item_pin("Bone", ik_end), "Space": "GlobalSpace", "bPropagateToChildren": "True"})
+        vm.add_link(solve_to + ".Transform.Rotation", seg + ".Value")
+        vm.add_link(blend + ".FloatValue", seg + ".Weight")
+        chain_exec(seg)
 
     hand = unit("RigUnit_SetRotation", "IKRot_" + chain["end"],
                 {"Item": item_pin("Bone", chain["end"]), "Space": "GlobalSpace", "bPropagateToChildren": "True"})

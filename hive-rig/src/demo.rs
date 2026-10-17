@@ -139,6 +139,64 @@ pub fn humanoid(arm_drop_degrees: f32) -> Mesh {
     m
 }
 
+/// Height of the demo dog, floor to the top of the head.
+pub const DOG_HEIGHT: f32 = 0.8;
+
+/// A procedural dog standing on all fours, facing +Z, built around the default
+/// quadruped guides (`components::quadruped(DOG_HEIGHT)`) so every bone sits
+/// inside the body: a barrel torso, neck, head and muzzle, tail and four legs.
+pub fn demo_quadruped() -> Mesh {
+    let g = crate::components::quadruped(DOG_HEIGHT);
+    let h = DOG_HEIGHT;
+    let guide = |comp: &str, name: &str| g.component(comp).unwrap().position(name).unwrap();
+    let mut m = Mesh::default();
+    let step = 0.02;
+    let pelvis = guide("spine", "pelvis");
+    let chest = guide("spine", "chest");
+    let back = vec3(0.0, pelvis.y + 0.02 * h, pelvis.z - 0.1 * h);
+    let front = vec3(0.0, chest.y, chest.z + 0.1 * h);
+    m.append(&cylinder(back, front, (0.11 * h, 0.12 * h), 20, step));
+    let head = guide("head", "head");
+    m.append(&cylinder(
+        guide("head", "neck"),
+        head,
+        (0.06 * h, 0.06 * h),
+        14,
+        step,
+    ));
+    m.append(&sphere(head, 0.09 * h, 16, 10));
+    m.append(&cylinder(
+        head,
+        guide("head", "head_top"),
+        (0.045 * h, 0.04 * h),
+        12,
+        step,
+    ));
+    let tail = g.component("tail").unwrap();
+    m.append(&cylinder(
+        tail.guides[0].position,
+        tail.guides.last().unwrap().position,
+        (0.025 * h, 0.025 * h),
+        10,
+        step,
+    ));
+    for s in ["_l", "_r"] {
+        let arm = format!("front_leg{s}");
+        let leg = format!("hind_leg{s}");
+        let limbs: [(&str, &[&str], f32); 2] = [
+            (&arm, &["shoulder", "elbow", "wrist", "hand_tip"], 0.045),
+            (&leg, &["hip", "knee", "hock", "ankle", "toe"], 0.05),
+        ];
+        for (comp, points, r) in limbs {
+            for pair in points.windows(2) {
+                let (a, b) = (guide(comp, pair[0]), guide(comp, pair[1]));
+                m.append(&cylinder(a, b, (r * h, r * h), 12, step));
+            }
+        }
+    }
+    m
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +208,14 @@ mod tests {
         let (min, max) = m.bounds();
         assert!(min.y.abs() < 1e-5 && (max.y - 1.8).abs() < 1e-5);
         assert!((max.x - 0.86).abs() < 1e-5 && (min.x + 0.86).abs() < 1e-5);
+    }
+
+    #[test]
+    fn demo_dog_is_valid_and_stands_on_the_floor() {
+        let m = demo_quadruped();
+        m.validate().unwrap();
+        let (min, max) = m.bounds();
+        assert!(min.y > -0.05 * DOG_HEIGHT && min.y < 0.02 * DOG_HEIGHT);
+        assert!(max.z - min.z > max.y - min.y, "longer than it is tall");
     }
 }
