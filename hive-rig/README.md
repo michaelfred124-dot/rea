@@ -361,7 +361,9 @@ have an **Animation** section:
   to the pose the IK limb has now; FK to IK moves the IK control onto the FK
   hand or foot and puts the pole in front of the elbow or knee, in the plane of
   the limb. Either way the `ik_fk` blend flips afterwards and the limb doesn't
-  move. A rolled foot keeps its roll. FK has no stretch, so a stretched IK limb
+  move. A rolled foot keeps its roll. On a three-segment hind leg the hock
+  is matched too: IK to FK sets the hock's FK control, and FK to IK turns the
+  IK hock control to the FK hock. FK has no stretch, so a stretched IK limb
   can't be matched exactly in FK.
 * **Mirror Pose** copies the selected controls' pose onto their twins on the
   other side, or every left (right) control's pose when nothing is selected.

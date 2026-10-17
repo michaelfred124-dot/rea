@@ -322,7 +322,7 @@ def build(RIG, geo=None):
             cmds.matchTransform(solve_to, joint_of[hock["bone"]], position=True, rotation=True)
             cmds.orientConstraint(goal, ik_chain[3], maintainOffset=True)
         cmds.parent(handle, solve_to)
-        limb_nodes[chain["name"]] = {"fk_joints": fk_chain, "goal": goal}
+        limb_nodes[chain["name"]] = {"fk_joints": fk_chain, "goal": goal, "solve_to": solve_to}
         cmds.orientConstraint(solve_to, ik_chain[2], maintainOffset=True)
 
         # Stretch: scale the IK joints' lengths by how far the goal is beyond reach.
@@ -387,16 +387,20 @@ def build(RIG, geo=None):
     for chain in CHAINS:
         nodes = limb_nodes[chain["name"]]
         ik_ctrl = ctrl_of[chain["ik_control"]]
+        hock = chain.get("hock")
+        # Joints and FK controls run from the top down; a three-segment leg has its
+        # hock third, and its two-bone IK reaches the hock joint (the third joint).
         limbs.append({
             "name": chain["name"],
-            "joints": [joint_of[chain[k]] for k in ("upper", "lower", "end")],
+            "joints": [joint_of[b] for b in chain_bones(chain)],
             "fk_joints": nodes["fk_joints"],
             "goal": nodes["goal"],
             "ik": ik_ctrl,
             "pole": ctrl_of[chain["pole_control"]],
-            "fk": [ctrl_of[n] for n in chain["fk_controls"]],
-            "rest": [world_matrix(joint_of[chain[k]]) for k in ("upper", "lower", "end")],
+            "fk": [ctrl_of[n] for n in chain_fk_controls(chain)],
+            "rest": [world_matrix(joint_of[b]) for b in chain_bones(chain)],
             "rest_pole": world_matrix(ctrl_of[chain["pole_control"]]),
+            "hock": {"control": ctrl_of[hock["control"]], "target": nodes["solve_to"]} if hock else None,
         })
         d = defaults.setdefault(ik_ctrl, {})
         d.update(ikFk=float(chain["default_blend"]), stretch=float(chain["default_stretch"]))
@@ -578,7 +582,7 @@ def limb_frame(a, b, c, fallback):
 
 def pole_position(limb, a, b, c, upper):
     """Where the pole sat at bind relative to the limb's frame, in today's frame."""
-    ra, rb, rc = (translation(from_maya(m)) for m in limb["rest"])
+    ra, rb, rc = (translation(from_maya(m)) for m in limb["rest"][:3])
     rest_pole = translation(from_maya(limb["rest_pole"]))
     rest = limb_frame(ra, rb, rc, sub(rest_pole, rb))
     coords = [dot(axis, sub(rest_pole, rb)) for axis in rest]
@@ -601,8 +605,15 @@ def fk_to_ik(name):
     fk = [world(j) for j in limb["fk_joints"]]
     # The IK goal can sit below the control (a rolled foot); keep that offset.
     offset = mat_mul(mat_inv(world(limb["ik"])), world(limb["goal"]))
-    set_world(limb["ik"], mat_mul(fk[2], mat_inv(offset)))
-    a, b, c = (translation(m) for m in fk)
+    set_world(limb["ik"], mat_mul(fk[-1], mat_inv(offset)))
+    hock = limb.get("hock")
+    if hock:
+        # Turn the hock control (it pivots on the ankle) until the group it carries
+        # at the hock point lines up with the FK hock joint.
+        carry = mat_mul(mat_inv(world(hock["control"])), world(hock["target"]))
+        set_world(hock["control"], mat_mul(fk[2], mat_inv(carry)))
+    # The two-bone IK reaches the third joint: the end, or the hock joint.
+    a, b, c = (translation(m) for m in fk[:3])
     pole = world(limb["pole"])
     set_world(limb["pole"], with_translation(pole, pole_position(limb, a, b, c, fk[0])))
     cmds.setAttr(limb["ik"] + ".ikFk", 1)
@@ -619,7 +630,7 @@ def fk_to_ik(name):
             break
         pole = world(limb["pole"])
         set_world(limb["pole"], with_translation(pole, rotate_about(translation(pole), a, along, angle)))
-    key_controls([limb["ik"], limb["pole"]])
+    key_controls([limb["ik"], limb["pole"]] + ([hock["control"]] if hock else []))
 
 
 def mirror_pose(names=None, source="left"):

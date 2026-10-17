@@ -173,6 +173,9 @@ jobs:
           for drop in 0 45; do
             python tests/blender_anim_check.py "$RUNNER_TEMP/rig$drop/hive_demo_blender.py"
           done
+          # The dog's hind legs have a hock segment between calf and foot.
+          cargo run -q -- demo --quadruped -o "$RUNNER_TEMP/anim_dog"
+          python tests/blender_anim_check.py "$RUNNER_TEMP/anim_dog/hive_dog_blender.py"
       - name: Eyes, jaw, face joints and fingers in Blender
         run: |
           rig="$RUNNER_TEMP/face"
@@ -188,6 +191,7 @@ jobs:
           cargo run -q -- naming "$dog/hive_dog.guides.json" prefix
           cargo run -q -- rebuild "$dog/hive_dog.hive.json"
           python tests/blender_quad_check.py "$dog/hive_dog_blender.py" "$dog/hive_dog.glb"
+          python tests/blender_anim_check.py "$dog/hive_dog_blender.py"
       - name: Side-first naming in Blender
         run: |
           rig="$RUNNER_TEMP/face"

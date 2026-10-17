@@ -265,6 +265,9 @@ if __name__ == "__main__":
         anim = json.loads(ns["cmds"].getAttr(ns["TOP"] + ".hiveAnim"))
         assert anim["limbs"] and anim["mirror"] and anim["spaces"], sorted(anim)
         for limb in anim["limbs"]:
+            # Three-segment legs carry their hock joint and FK control in order.
+            segments = 4 if limb["hock"] else 3
+            assert len(limb["joints"]) == len(limb["fk"]) == len(limb["fk_joints"]) == segments, limb["name"]
             ns["ik_to_fk"](limb["name"])
             ns["fk_to_ik"](limb["name"])
         assert ns["mirror_pose"](None, "left") == len(anim["mirror"])

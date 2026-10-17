@@ -422,7 +422,7 @@ def build(RIG, geo=None):
     rig["hive_name"] = NAME
     rig["hive_guides"] = json.dumps(RIG["guides"])
     rig["hive_dir"] = OUT_DIR
-    rig["hive_anim"] = json.dumps(animator_data(RIG, foot_ik_target))
+    rig["hive_anim"] = json.dumps(animator_data(RIG, foot_ik_target, hock_target))
     bpy.context.view_layer.objects.active = rig
     print("hive-rig: built %s with %d bones and %d controls" % (NAME, len(BONES), len(CONTROLS)))
     return rig, geo
@@ -435,14 +435,23 @@ def build(RIG, geo=None):
 ANIM_PROPS = ("ik_fk", "stretch", "roll", "space")
 
 
-def animator_data(RIG, goals):
+def animator_data(RIG, goals, hock_targets):
     controls = RIG["controls"]
     limbs, defaults = [], {}
     for c in controls["ik_chains"]:
+        hock = c.get("hock")
+        fk = c["fk_controls"]
         limbs.append({
             "name": c["name"], "upper": c["upper"], "lower": c["lower"], "end": c["end"],
-            "ik": c["ik_control"], "pole": c["pole_control"], "fk": c["fk_controls"],
+            "ik": c["ik_control"], "pole": c["pole_control"],
             "goal": goals.get(c["name"], c["ik_control"]),
+            # The chain's bones and their FK controls from the top down, with the
+            # hock segment of a three-segment leg between the lower bone and the end.
+            "bones": [c["upper"], c["lower"]] + ([hock["bone"]] if hock else []) + [c["end"]],
+            "fk": fk[:2] + ([hock["fk_control"]] if hock else []) + fk[2:],
+            # The two-bone IK reaches the hock joint on those legs.
+            "reach": hock["bone"] if hock else c["end"],
+            "hock": {"control": hock["control"], "target": hock_targets[c["name"]]} if hock else None,
         })
         d = defaults.setdefault(c["ik_control"], {})
         d.update(ik_fk=float(c["default_blend"]), stretch=float(c["default_stretch"]))
@@ -511,7 +520,7 @@ def pole_position(rig, limb, a, b, c, upper_matrix):
     on the same bend. A straight limb has no plane; then the rest bend is carried
     along by the upper bone."""
     bones = rig.data.bones
-    ra, rb, rc = (bones[limb[k]].head_local for k in ("upper", "lower", "end"))
+    ra, rb, rc = (bones[limb[k]].head_local for k in ("upper", "lower", "reach"))
     rest_pole = bones[limb["pole"]].head_local
     rest = limb_frame(ra, rb, rc, rest_pole - rb)
     rest_upper = bones[limb["upper"]].matrix_local.to_3x3().normalized()
@@ -527,7 +536,7 @@ def ik_to_fk(rig, name):
     ik = pose[limb["ik"]]
     ik["ik_fk"] = 1.0
     refresh(rig)
-    targets = [rotation_only(pose[limb[k]].matrix) for k in ("upper", "lower", "end")]
+    targets = [rotation_only(pose[b].matrix) for b in limb["bones"]]
     for fk, m in zip(limb["fk"], targets):
         pb = pose[fk]
         pb.matrix = m
@@ -548,8 +557,17 @@ def fk_to_ik(rig, name):
     ik, goal = pose[limb["ik"]], pose[limb["goal"]]
     # The IK goal can sit below the control (a rolled foot); keep that offset.
     offset = ik.matrix.inverted() @ goal.matrix
-    ik.matrix = fk[2] @ offset.inverted()
+    ik.matrix = fk[-1] @ offset.inverted()
     refresh(rig)
+    hock = limb.get("hock")
+    if hock:
+        # Turn the hock control (it pivots on the ankle) until its copy of the hock
+        # bone lines up with the FK hock; the IK then reaches the FK hock joint.
+        ctrl, target = pose[hock["control"]], pose[hock["target"]]
+        carry = ctrl.matrix.inverted() @ target.matrix
+        ctrl.matrix = fk[2] @ carry.inverted()
+        ctrl.location = (0.0, 0.0, 0.0)
+        refresh(rig)
     pole = pose[limb["pole"]]
     a, b, c = fk[0].translation, fk[1].translation, fk[2].translation
     m = pole.matrix.copy()
@@ -575,7 +593,7 @@ def fk_to_ik(rig, name):
         m.translation = a + Matrix.Rotation(angle, 3, along) @ (m.translation - a)
         pole.matrix = m
         refresh(rig)
-    key_controls(rig, [limb["ik"], limb["pole"]])
+    key_controls(rig, [limb["ik"], limb["pole"]] + ([hock["control"]] if hock else []))
 
 
 def mirror_pose(rig, names=None, source="left"):
