@@ -93,6 +93,26 @@ def check(cond, msg):
     print("ok:", msg)
 
 
+def shape_mismatch(c):
+    """How far the control's custom shape, as Blender draws it at rest, strays from
+    the outline hive-rig wrote for it (metres), or None if the edge count is off."""
+    bone = rig.data.bones[c["name"]]
+    wgt = rig.pose.bones[c["name"]].custom_shape
+    lines = c["outline"]
+    want_edges = sum(len(line) - 1 for line in lines)
+    if wgt is None or len(wgt.data.edges) != want_edges:
+        return None
+    drawn = [rig.matrix_world @ bone.matrix_local @ v.co for v in wgt.data.vertices]
+    wanted = [Vector((p[0], -p[2], p[1])) for line in lines for p in line]
+    return max(min((d - w).length for d in drawn) for w in wanted)
+
+
+RIG_CONTROLS = json.loads(open(script).read().split('r"""', 1)[1].split('"""', 1)[0])["controls"]["controls"]
+worst = [shape_mismatch(c) for c in RIG_CONTROLS]
+check(all(w is not None and w < 1e-3 for w in worst),
+      "every control shape sits on its outline (%d controls, %d shapes)"
+      % (len(RIG_CONTROLS), len({c["shape"] for c in RIG_CONTROLS})))
+
 rest = [v.co.copy() for v in geo.data.vertices]
 check(max((a - b).length for a, b in zip(rest, deformed())) < 1e-4, "rig adds no offset in the rest pose")
 

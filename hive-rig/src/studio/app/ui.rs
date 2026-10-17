@@ -958,15 +958,16 @@ impl Studio {
             .selected
             .and_then(|(s, _)| doc.guides.components.get(s).map(|c| c.id.clone()));
         let selected = self.selected.map(|(s, _)| s);
-        let control_bone = match &self.menu_rig {
+        let menu_control = match &self.menu_rig {
             Some(RigPick::Control(name)) => doc
                 .preview
                 .as_ref()
                 .ok()
-                .and_then(|b| b.controls.control(name))
-                .and_then(|c| c.bone.clone()),
+                .and_then(|b| b.controls.control(name)),
             _ => None,
         };
+        let control_bone = menu_control.and_then(|c| c.bone.clone());
+        let control_shape = menu_control.map(|c| c.shape);
         let mut import_at = None;
         if self.mode == Mode::Guides {
             let target = self.menu_guide;
@@ -1014,14 +1015,13 @@ impl Studio {
                         self.start_pose(&bone);
                         ui.close();
                     }
+                    let current = control_shape.unwrap_or(Shape::Circle);
                     ui.menu_button("Control shape", |ui| {
-                        for (shape, label) in SHAPES {
-                            if ui.button(label).clicked() {
-                                let mut style = self.style_of(&name);
-                                style.shape = Some(shape);
-                                self.restyle_control(&name, style);
-                                ui.close();
-                            }
+                        if let Some(shape) = shape_grid(ui, current, 5) {
+                            let mut style = self.style_of(&name);
+                            style.shape = Some(shape);
+                            self.restyle_control(&name, style);
+                            ui.close();
                         }
                     });
                     if ui.button("Reset this control's look").clicked() {
@@ -1122,11 +1122,11 @@ impl Studio {
                 let before = style;
                 let mut changed = false;
                 theme::label_caps(ui, "Shape");
-                let mut shape = c.shape;
-                if theme::segmented(ui, &mut shape, &SHAPES) {
+                if let Some(shape) = shape_grid(ui, c.shape, 5) {
                     style.shape = Some(shape);
                     changed = true;
                 }
+                ui.label(RichText::new(c.shape.label()).size(12.0).color(TEXT_FAINT));
                 ui.add_space(6.0);
                 theme::label_caps(ui, "Size (metres)");
                 let mut size = c.size;
@@ -2486,12 +2486,11 @@ impl Studio {
                 let position = frame.map_or(c.position, |f| f.controls[i]);
                 let axis = frame.map_or(c.axis, |f| f.control_axes[i]);
                 let picked = self.rig_pick == Some(RigPick::Control(c.name.clone()));
-                view::ring(
+                // The same lines the Blender and Maya builders draw.
+                view::strokes(
                     painter,
                     pr,
-                    position,
-                    axis,
-                    c.size.max(0.01),
+                    &c.outline_at(position, axis),
                     Stroke::new(if picked { 3.5 } else { 2.0 }, rgb(c.color)),
                 );
             }
@@ -4106,14 +4105,73 @@ fn paint_axes(painter: &egui::Painter, pr: &Projector, at: Pos2) {
 }
 
 /// A bone as a thin diamond from head to tail.
-/// The control shapes a rig can use, as the control builder offers them.
-const SHAPES: [(Shape, &str); 5] = [
-    (Shape::Circle, "Circle"),
-    (Shape::Square, "Square"),
-    (Shape::Cube, "Cube"),
-    (Shape::Diamond, "Diamond"),
-    (Shape::Cross, "Cross"),
-];
+/// Every control shape as a grid of drawn tiles, `columns` wide. Returns the
+/// shape clicked, if it differs from `current`.
+fn shape_grid(ui: &mut Ui, current: Shape, columns: usize) -> Option<Shape> {
+    const TILE: f32 = 40.0;
+    let mut chosen = None;
+    egui::Grid::new(ui.next_auto_id())
+        .spacing(Vec2::splat(4.0))
+        .show(ui, |ui| {
+            for (i, shape) in Shape::ALL.into_iter().enumerate() {
+                let (rect, response) = ui.allocate_exact_size(Vec2::splat(TILE), Sense::click());
+                let on = shape == current;
+                let hot = response.hovered();
+                let painter = ui.painter_at(rect);
+                painter.rect(
+                    rect,
+                    8.0,
+                    if on {
+                        ACCENT.gamma_multiply(0.25)
+                    } else if hot {
+                        Color32::from_rgb(34, 38, 48)
+                    } else {
+                        Color32::from_rgb(20, 23, 30)
+                    },
+                    Stroke::new(1.0, if on { ACCENT } else { BORDER }),
+                    egui::StrokeKind::Inside,
+                );
+                let color = if on || hot { TEXT } else { TEXT_DIM };
+                shape_preview(&painter, rect.shrink(8.0), shape, Stroke::new(1.4, color));
+                if response.on_hover_text(shape.label()).clicked() && !on {
+                    chosen = Some(shape);
+                }
+                if (i + 1) % columns == 0 {
+                    ui.end_row();
+                }
+            }
+        });
+    chosen
+}
+
+/// A shape's lines seen from slightly above and to the side, so the solid shapes
+/// read as solids while the flat ones stay face on.
+fn shape_preview(painter: &egui::Painter, rect: Rect, shape: Shape, stroke: Stroke) {
+    let strokes = shape.strokes();
+    let solid = strokes.iter().flatten().any(|p| p.y != 0.0);
+    // Turned, a unit cube reaches about 1.3 from the centre.
+    let (yaw, pitch, reach) = if solid {
+        (0.45f32, 0.35f32, 1.3)
+    } else {
+        (0.0, 0.0, 1.0)
+    };
+    let (sa, ca) = yaw.sin_cos();
+    let (sb, cb) = pitch.sin_cos();
+    let half = rect.width().min(rect.height()) * 0.5 / reach;
+    let at = rect.center();
+    for line in strokes {
+        let pts: Vec<Pos2> = line
+            .iter()
+            .map(|p| {
+                let x = p.x * ca + p.y * sa;
+                let depth = -p.x * sa + p.y * ca;
+                let up = p.z * cb + depth * sb;
+                at + Vec2::new(x, -up) * half
+            })
+            .collect();
+        painter.add(egui::Shape::line(pts, stroke));
+    }
+}
 
 fn kind_word(kind: ControlKind) -> &'static str {
     match kind {

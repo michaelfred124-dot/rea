@@ -5,9 +5,12 @@
 //! Unreal. Positions are model space (Y-up, metres). `components` builds it.
 
 use glam::Vec3;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// How a control is drawn. The geometry lives here, in [`Shape::strokes`]: the
+/// Blender and Maya builders and the app all draw the same lines from it, and
+/// Unreal picks the matching shape from its built-in library.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Shape {
     Circle,
@@ -15,6 +18,228 @@ pub enum Shape {
     Cube,
     Diamond,
     Cross,
+    /// Three rings, one in each plane.
+    Sphere,
+    /// A flat arrow pointing along the shape's up direction.
+    Arrow,
+    /// Arrowheads on both ends.
+    DoubleArrow,
+    /// A move cross with an arrowhead on each arm.
+    FourArrows,
+    Hexagon,
+    Octagon,
+    /// Pointing along the shape's up direction.
+    Triangle,
+    /// An arch over the shape's up side, closed by its diameter.
+    HalfCircle,
+    /// A square base in the control's plane with its apex along the axis.
+    Pyramid,
+    /// A four-pointed star.
+    Star,
+}
+
+/// Line strips in a shape's own frame: `x` across, `y` along the control's axis
+/// (the plane normal) and `z` up within the plane. A closed loop repeats its
+/// first point at the end.
+pub type Strokes = Vec<Vec<Vec3>>;
+
+/// Segments in a full ring of the round shapes.
+const RING_SEGMENTS: usize = 32;
+
+impl Shape {
+    pub const ALL: [Shape; 15] = [
+        Shape::Circle,
+        Shape::Square,
+        Shape::Cube,
+        Shape::Diamond,
+        Shape::Cross,
+        Shape::Sphere,
+        Shape::Arrow,
+        Shape::DoubleArrow,
+        Shape::FourArrows,
+        Shape::Hexagon,
+        Shape::Octagon,
+        Shape::Triangle,
+        Shape::HalfCircle,
+        Shape::Pyramid,
+        Shape::Star,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Shape::Circle => "Circle",
+            Shape::Square => "Square",
+            Shape::Cube => "Cube",
+            Shape::Diamond => "Diamond",
+            Shape::Cross => "Cross",
+            Shape::Sphere => "Sphere",
+            Shape::Arrow => "Arrow",
+            Shape::DoubleArrow => "Double arrow",
+            Shape::FourArrows => "Four arrows",
+            Shape::Hexagon => "Hexagon",
+            Shape::Octagon => "Octagon",
+            Shape::Triangle => "Triangle",
+            Shape::HalfCircle => "Half circle",
+            Shape::Pyramid => "Pyramid",
+            Shape::Star => "Star",
+        }
+    }
+
+    /// The shape's lines at unit size (radius or half-extent 1).
+    pub fn strokes(self) -> Strokes {
+        use std::f32::consts::{FRAC_PI_2, PI, TAU};
+        // A closed loop through points in the control's plane, given as (across, up).
+        fn flat(pts: &[(f32, f32)]) -> Vec<Vec3> {
+            let mut out: Vec<Vec3> = pts.iter().map(|&(x, z)| Vec3::new(x, 0.0, z)).collect();
+            out.push(out[0]);
+            out
+        }
+        fn polygon(sides: usize, start_deg: f32) -> Vec<Vec3> {
+            let pts: Vec<(f32, f32)> = (0..sides)
+                .map(|i| {
+                    let a = (start_deg + i as f32 * 360.0 / sides as f32).to_radians();
+                    (a.cos(), a.sin())
+                })
+                .collect();
+            flat(&pts)
+        }
+        fn arc(a: Vec3, b: Vec3, sweep: f32, segments: usize) -> Vec<Vec3> {
+            (0..=segments)
+                .map(|i| {
+                    let t = i as f32 / segments as f32 * sweep;
+                    a * t.cos() + b * t.sin()
+                })
+                .collect()
+        }
+        let ring = |a, b| {
+            let mut r = arc(a, b, TAU, RING_SEGMENTS);
+            r[RING_SEGMENTS] = r[0];
+            r
+        };
+        const SQUARE: [(f32, f32); 4] = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
+        match self {
+            Shape::Circle => vec![ring(Vec3::X, Vec3::Z)],
+            Shape::Square => vec![flat(&SQUARE)],
+            Shape::Cube => {
+                let face = |y: f32| -> Vec<Vec3> {
+                    flat(&SQUARE).into_iter().map(|p| p.with_y(y)).collect()
+                };
+                let mut out = vec![face(-1.0), face(1.0)];
+                out.extend(
+                    SQUARE
+                        .iter()
+                        .map(|&(x, z)| vec![Vec3::new(x, -1.0, z), Vec3::new(x, 1.0, z)]),
+                );
+                out
+            }
+            Shape::Diamond => {
+                let loop4 = |a: Vec3, b: Vec3| vec![a, b, -a, -b, a];
+                vec![
+                    loop4(Vec3::X, Vec3::Z),
+                    loop4(Vec3::X, Vec3::Y),
+                    loop4(Vec3::Y, Vec3::Z),
+                ]
+            }
+            Shape::Cross => vec![vec![-Vec3::X, Vec3::X], vec![-Vec3::Z, Vec3::Z]],
+            Shape::Sphere => vec![
+                ring(Vec3::X, Vec3::Z),
+                ring(Vec3::X, Vec3::Y),
+                ring(Vec3::Y, Vec3::Z),
+            ],
+            Shape::Arrow => vec![flat(&[
+                (-0.18, -1.0),
+                (0.18, -1.0),
+                (0.18, 0.15),
+                (0.5, 0.15),
+                (0.0, 1.0),
+                (-0.5, 0.15),
+                (-0.18, 0.15),
+            ])],
+            Shape::DoubleArrow => vec![flat(&[
+                (0.0, -1.0),
+                (0.5, -0.4),
+                (0.18, -0.4),
+                (0.18, 0.4),
+                (0.5, 0.4),
+                (0.0, 1.0),
+                (-0.5, 0.4),
+                (-0.18, 0.4),
+                (-0.18, -0.4),
+                (-0.5, -0.4),
+            ])],
+            Shape::FourArrows => {
+                // One arm pointing up, from an inner corner to the next, turned four times.
+                const ARM: [(f32, f32); 6] = [
+                    (0.13, 0.13),
+                    (0.13, 0.6),
+                    (0.32, 0.6),
+                    (0.0, 1.0),
+                    (-0.32, 0.6),
+                    (-0.13, 0.6),
+                ];
+                let pts: Vec<(f32, f32)> = (0..4)
+                    .flat_map(|quarter| {
+                        let (s, c) = (quarter as f32 * FRAC_PI_2).sin_cos();
+                        ARM.iter()
+                            .map(move |&(x, z)| (x * c - z * s, x * s + z * c))
+                    })
+                    .collect();
+                vec![flat(&pts)]
+            }
+            Shape::Hexagon => vec![polygon(6, 90.0)],
+            Shape::Octagon => vec![polygon(8, 22.5)],
+            Shape::Triangle => vec![polygon(3, 90.0)],
+            Shape::HalfCircle => {
+                let mut arch = arc(Vec3::X, Vec3::Z, PI, RING_SEGMENTS / 2);
+                arch.push(arch[0]);
+                vec![arch]
+            }
+            Shape::Pyramid => {
+                let base: Vec<Vec3> = flat(&SQUARE).into_iter().map(|p| p * 0.8).collect();
+                let mut out: Strokes = base[..4].iter().map(|&p| vec![p, Vec3::Y]).collect();
+                out.insert(0, base);
+                out
+            }
+            Shape::Star => {
+                let pts: Vec<(f32, f32)> = (0..8)
+                    .map(|i| {
+                        let a = (90.0 + i as f32 * 45.0f32).to_radians();
+                        let r = if i % 2 == 0 { 1.0 } else { 0.32 };
+                        (r * a.cos(), r * a.sin())
+                    })
+                    .collect();
+                vec![flat(&pts)]
+            }
+        }
+    }
+}
+
+/// The frame a control's shape is drawn in: across, along `axis`, and up. Up is
+/// world up (+Y) flattened into the control's plane, or forward (+Z) when the
+/// axis itself points up or down, so arrows point the same way in every program.
+pub fn shape_frame(axis: Vec3) -> [Vec3; 3] {
+    let along = axis.try_normalize().unwrap_or(Vec3::Y);
+    let reference = if along.y.abs() > 0.9 {
+        Vec3::Z
+    } else {
+        Vec3::Y
+    };
+    let up = (reference - along * along.dot(reference)).normalize();
+    [along.cross(up), along, up]
+}
+
+/// `shape`'s lines at `position`, facing `axis`, at `size`, in model space.
+pub fn place_strokes(shape: Shape, position: Vec3, axis: Vec3, size: f32) -> Strokes {
+    let [across, along, up] = shape_frame(axis);
+    shape
+        .strokes()
+        .into_iter()
+        .map(|line| {
+            line.into_iter()
+                .map(|p| position + (across * p.x + along * p.y + up * p.z) * size)
+                .collect()
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,7 +270,10 @@ pub enum ControlParent {
     Bone(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Written with one extra field, `outline`: the shape's lines in model space at
+/// rest, which the Blender and Maya builders draw as they are. It is derived from
+/// the other fields, so reading a rig back ignores it.
+#[derive(Debug, Clone, Deserialize)]
 pub struct Control {
     pub name: String,
     pub kind: ControlKind,
@@ -61,12 +289,64 @@ pub struct Control {
     pub color: [f32; 3],
     /// Space-switch targets. When non-empty, the first entry is the default
     /// parent and the animator can switch the control to follow any of the others.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub spaces: Vec<String>,
     /// Id of the component that built this control. Only known for a freshly
     /// built rig; it isn't written to rig files.
     #[serde(skip)]
     pub component: String,
+}
+
+impl Control {
+    /// The control's shape in model space, drawn at `position` facing `axis`
+    /// (its rest placement or a posed one).
+    pub fn outline_at(&self, position: Vec3, axis: Vec3) -> Strokes {
+        place_strokes(self.shape, position, axis, self.size)
+    }
+
+    pub fn outline(&self) -> Strokes {
+        self.outline_at(self.position, self.axis)
+    }
+}
+
+impl Serialize for Control {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Written<'a> {
+            name: &'a str,
+            kind: ControlKind,
+            parent: &'a ControlParent,
+            bone: &'a Option<String>,
+            position: Vec3,
+            axis: Vec3,
+            shape: Shape,
+            size: f32,
+            color: [f32; 3],
+            #[serde(skip_serializing_if = "<[String]>::is_empty")]
+            spaces: &'a [String],
+            outline: Vec<Vec<[f32; 3]>>,
+        }
+        // A tenth of a millimetre is plenty for a drawn line and keeps files small.
+        let round = |v: Vec3| (v * 1e4).round().to_array().map(|x| x / 1e4);
+        Written {
+            name: &self.name,
+            kind: self.kind,
+            parent: &self.parent,
+            bone: &self.bone,
+            position: self.position,
+            axis: self.axis,
+            shape: self.shape,
+            size: self.size,
+            color: self.color,
+            spaces: &self.spaces,
+            outline: self
+                .outline()
+                .into_iter()
+                .map(|line| line.into_iter().map(round).collect())
+                .collect(),
+        }
+        .serialize(serializer)
+    }
 }
 
 /// A two-bone limb with IK and FK controls and a blend between them.
@@ -120,4 +400,168 @@ pub fn ctrl_name(bone: &str) -> String {
 
 pub fn fk_name(bone: &str) -> String {
     format!("{bone}_fk_ctrl")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn control(shape: Shape, axis: Vec3) -> Control {
+        Control {
+            name: "test_ctrl".into(),
+            kind: ControlKind::Fk,
+            parent: ControlParent::None,
+            bone: Some("hand_l".into()),
+            position: Vec3::new(0.5, 1.2, 0.1),
+            axis,
+            shape,
+            size: 0.05,
+            color: [0.1, 0.4, 1.0],
+            spaces: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn every_shape_is_unit_sized_lines() {
+        for shape in Shape::ALL {
+            let strokes = shape.strokes();
+            assert!(!strokes.is_empty(), "{shape:?}");
+            let mut reach = 0.0f32;
+            for line in &strokes {
+                assert!(line.len() >= 2, "{shape:?}");
+                for p in line {
+                    assert!(p.abs().max_element() <= 1.0 + 1e-5, "{shape:?} {p}");
+                    reach = reach.max(p.length());
+                }
+            }
+            // Each shape fills its size, so a style's size means the same for all.
+            assert!(reach > 0.99, "{shape:?} reaches {reach}");
+        }
+    }
+
+    #[test]
+    fn shapes_read_as_themselves() {
+        let points = |s: Shape| s.strokes().concat();
+        for s in [
+            Shape::Arrow,
+            Shape::DoubleArrow,
+            Shape::FourArrows,
+            Shape::Star,
+        ] {
+            assert!(points(s).iter().all(|p| p.y == 0.0), "{s:?} is flat");
+        }
+        // Three rings, one per plane.
+        assert_eq!(Shape::Sphere.strokes().len(), 3);
+        // The arrow points up its plane, with a single tip.
+        let arrow = points(Shape::Arrow);
+        assert_eq!(arrow.iter().filter(|p| p.z == 1.0).count(), 1);
+        assert!(arrow.iter().all(|p| p.z >= -1.0));
+        // The double arrow has a tip at each end.
+        let double = points(Shape::DoubleArrow);
+        assert!(double.contains(&Vec3::Z) && double.contains(&-Vec3::Z));
+        // Four arrowheads, one on each side.
+        let fa = points(Shape::FourArrows);
+        for dir in [Vec3::X, -Vec3::X, Vec3::Z, -Vec3::Z] {
+            assert!(fa.iter().any(|p| (*p - dir).length() < 1e-5), "{dir}");
+        }
+        // Polygons have the right number of corners.
+        for (s, corners) in [
+            (Shape::Triangle, 3),
+            (Shape::Hexagon, 6),
+            (Shape::Octagon, 8),
+        ] {
+            assert_eq!(s.strokes()[0].len(), corners + 1, "{s:?}");
+        }
+        // The pyramid's apex is out along the control's axis.
+        assert!(points(Shape::Pyramid).contains(&Vec3::Y));
+        // The half circle only covers the up side.
+        assert!(points(Shape::HalfCircle).iter().all(|p| p.z >= -1e-6));
+        // Closed outlines end where they start.
+        for s in [
+            Shape::Circle,
+            Shape::Square,
+            Shape::Arrow,
+            Shape::Star,
+            Shape::HalfCircle,
+        ] {
+            for line in s.strokes() {
+                assert_eq!(line.first(), line.last(), "{s:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn shape_names_are_stable_snake_case() {
+        for shape in Shape::ALL {
+            let name = serde_json::to_string(&shape).unwrap();
+            assert_eq!(serde_json::from_str::<Shape>(&name).unwrap(), shape);
+        }
+        // Names already in guides files keep working.
+        for old in ["circle", "square", "cube", "diamond", "cross"] {
+            serde_json::from_str::<Shape>(&format!("\"{old}\"")).unwrap();
+        }
+        assert_eq!(
+            serde_json::to_string(&[Shape::DoubleArrow, Shape::FourArrows, Shape::HalfCircle])
+                .unwrap(),
+            r#"["double_arrow","four_arrows","half_circle"]"#
+        );
+        let mut labels: Vec<_> = Shape::ALL.iter().map(|s| s.label()).collect();
+        labels.sort();
+        labels.dedup();
+        assert_eq!(labels.len(), Shape::ALL.len());
+    }
+
+    #[test]
+    fn frame_faces_the_axis_with_up_kept_up() {
+        for axis in [
+            Vec3::X,
+            -Vec3::X,
+            Vec3::Y,
+            -Vec3::Y,
+            Vec3::Z,
+            Vec3::new(0.3, -0.8, 0.2),
+        ] {
+            let [across, along, up] = shape_frame(axis);
+            assert!((along - axis.normalize()).length() < 1e-6);
+            for (a, b) in [(across, along), (along, up), (up, across)] {
+                assert!(a.dot(b).abs() < 1e-5);
+            }
+            assert!((across.cross(along) - up).length() < 1e-5, "right-handed");
+            if axis.y.abs() < 0.9 {
+                assert!(up.y > 0.0, "up stays up for {axis}");
+            } else {
+                assert!(up.z > 0.99, "a vertical control's up points forward");
+            }
+        }
+    }
+
+    #[test]
+    fn outline_is_written_and_ignored_on_read() {
+        let c = control(Shape::Arrow, Vec3::X);
+        let json = serde_json::to_value(&c).unwrap();
+        let outline = json["outline"].as_array().unwrap();
+        let expected = c.outline();
+        assert_eq!(outline.len(), expected.len());
+        for (written, line) in outline.iter().zip(&expected) {
+            let written = written.as_array().unwrap();
+            assert_eq!(written.len(), line.len());
+            for (w, p) in written.iter().zip(line) {
+                let w: [f32; 3] = serde_json::from_value(w.clone()).unwrap();
+                assert!((Vec3::from(w) - *p).length() < 1e-4);
+            }
+        }
+        // The arrow tip sits one size up from the control, in model space.
+        let tip = c.position + Vec3::Y * c.size;
+        assert!(expected[0].iter().any(|p| (*p - tip).length() < 1e-6));
+        assert!(json.get("spaces").is_none(), "no spaces, no field");
+        let back: Control = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            (back.shape, back.size, back.position),
+            (c.shape, c.size, c.position)
+        );
+        // The outline follows the shape, so it is never stale.
+        let mut restyled = back;
+        restyled.shape = Shape::Sphere;
+        assert_eq!(restyled.outline().len(), 3);
+    }
 }

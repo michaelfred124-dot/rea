@@ -32,13 +32,47 @@ SKELETAL_MESH_PATH = ""
 SHAPE_UNIT_CM = 10.0
 HEIGHT_CM = RIG["height"] * 100.0
 
+# Each hive shape as the look-alike from Control Rig's default shape library.
+# Unreal draws its own meshes, so unlike Blender and Maya the lines are not
+# hive-rig's outline; a name the library lacks falls back to the circle.
 SHAPES = {
     "circle": "Circle_Thick",
     "square": "Square_Thick",
     "cube": "Box_Thick",
     "diamond": "Diamond_Thick",
     "cross": "Arrow4_Thick",
+    "sphere": "Sphere_Thick",
+    "arrow": "Arrow_Thick",
+    "double_arrow": "Arrow2_Thick",
+    "four_arrows": "Arrow4_Thick",
+    "hexagon": "Hexagon_Thick",
+    "octagon": "Octagon_Thick",
+    "triangle": "Triangle_Thick",
+    "half_circle": "HalfCircle_Thick",
+    "pyramid": "Pyramid_Thick",
+    "star": "Star4_Thick",
 }
+FALLBACK_SHAPE = "Circle_Thick"
+
+
+def library_shapes():
+    """Shape names in Control Rig's default library, or None when they can't be read."""
+    try:
+        lib = unreal.load_asset("/ControlRig/Controls/DefaultGizmoLibrary")
+        names = {str(s.shape_name) for s in lib.shapes}
+        return names or None
+    except Exception:
+        return None
+
+
+AVAILABLE_SHAPES = library_shapes()
+
+
+def shape_for(kind):
+    name = SHAPES.get(kind, FALLBACK_SHAPE)
+    if AVAILABLE_SHAPES is not None and name not in AVAILABLE_SHAPES:
+        return FALLBACK_SHAPE
+    return name
 
 
 def locate_glb():
@@ -210,7 +244,7 @@ for c in CONTROLS:
         settings.animation_type = unreal.RigControlAnimationType.ANIMATION_CONTROL
     except AttributeError:
         pass
-    settings.shape_name = SHAPES.get(c["shape"], "Circle_Thick")
+    settings.shape_name = shape_for(c["shape"])
     settings.shape_color = unreal.LinearColor(c["color"][0], c["color"][1], c["color"][2], 1.0)
     value = unreal.RigHierarchy.make_control_value_from_euler_transform(unreal.EulerTransform())
     parent = parent_key(c)

@@ -13,7 +13,6 @@ Running it again in a file that already has this rig only brings the Hive tab ba
 """
 
 import json
-import math
 import os
 import subprocess
 import sys
@@ -90,49 +89,24 @@ def build(RIG, geo=None):
         geo.matrix_world = world
 
     # --------------------------------------------------------------------------- widgets
-    def widget(name, verts, edges):
-        me = bpy.data.meshes.new("WGT_" + name)
+    def outline_widget(c, bone_matrix):
+        """A wire mesh of the control's outline (hive-rig's model-space lines),
+        expressed in the bone's rest space so the custom shape lands exactly there."""
+        to_bone = bone_matrix.inverted()
+        verts, edges = [], []
+        for line in c["outline"]:
+            start = len(verts)
+            closed = len(line) > 2 and line[0] == line[-1]
+            points = line[:-1] if closed else line
+            verts.extend(to_bone @ to_blender(p) for p in points)
+            edges.extend((start + i, start + i + 1) for i in range(len(points) - 1))
+            if closed:
+                edges.append((start + len(points) - 1, start))
+        me = bpy.data.meshes.new("WGT_" + c["name"])
         me.from_pydata(verts, edges, [])
-        obj = bpy.data.objects.new("WGT_" + NAME + "_" + name, me)
+        obj = bpy.data.objects.new("WGT_" + NAME + "_" + c["name"], me)
         widget_coll.objects.link(obj)
         return obj
-
-
-    def ring(n=32):
-        # In the bone's XZ plane, so the circle wraps around the bone's Y axis.
-        verts = [(math.cos(i / n * math.tau), 0.0, math.sin(i / n * math.tau)) for i in range(n)]
-        return verts, [(i, (i + 1) % n) for i in range(n)]
-
-
-    def square():
-        verts = [(-1, 0, -1), (1, 0, -1), (1, 0, 1), (-1, 0, 1)]
-        return verts, [(0, 1), (1, 2), (2, 3), (3, 0)]
-
-
-    def cube():
-        verts = [(x, y, z) for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]
-        edges = [(a, b) for a in range(8) for b in range(a + 1, 8) if sum(verts[a][k] != verts[b][k] for k in range(3)) == 1]
-        return verts, edges
-
-
-    def diamond():
-        verts = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]
-        edges = [(a, b) for a in range(6) for b in range(a + 1, 6) if a // 2 != b // 2]
-        return verts, edges
-
-
-    def cross():
-        verts = [(-1, 0, 0), (1, 0, 0), (0, 0, -1), (0, 0, 1)]
-        return verts, [(0, 1), (2, 3)]
-
-
-    WIDGETS = {
-        "circle": widget("circle", *ring()),
-        "square": widget("square", *square()),
-        "cube": widget("cube", *cube()),
-        "diamond": widget("diamond", *diamond()),
-        "cross": widget("cross", *cross()),
-    }
 
     # --------------------------------------------------------------------------- armature
     arm_data = bpy.data.armatures.new(NAME + "_rig")
@@ -268,14 +242,9 @@ def build(RIG, geo=None):
 
     for c in CONTROLS:
         pb = pose[c["name"]]
-        pb.custom_shape = WIDGETS[c["shape"]]
+        # The outline already sits at the control's position (e.g. clavicle at the shoulder).
+        pb.custom_shape = outline_widget(c, pb.bone.matrix_local)
         pb.use_custom_shape_bone_size = False
-        pb.custom_shape_scale_xyz = (c["size"],) * 3
-        if c["kind"] == "fk" and c["bone"]:
-            # Shift the shape onto the control's position (e.g. clavicle at the shoulder).
-            offset = to_blender(c["position"]) - pb.bone.head_local
-            local = pb.bone.matrix_local.to_3x3().inverted() @ offset
-            pb.custom_shape_translation = local
         pb.rotation_mode = "XYZ"
         if c["kind"] == "fk" and c["bone"] and copy_rule(bone_by_name[c["bone"]]) == "COPY_ROTATION":
             pb.lock_location = (True, True, True)
