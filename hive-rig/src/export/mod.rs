@@ -20,6 +20,7 @@ const UNREAL_TEMPLATE: &str = include_str!("../../templates/unreal_rig.py");
 
 const JSON_SLOT: &str = "__HIVE_RIG_JSON__";
 const GLB_SLOT: &str = "__HIVE_GLB_PATH__";
+const EXE_SLOT: &str = "__HIVE_EXE__";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
@@ -70,6 +71,13 @@ pub fn sanitize_name(name: &str) -> String {
     out
 }
 
+/// This program, so builder scripts can call it back to rebuild from edited guides.
+fn exe_path() -> String {
+    std::env::current_exe()
+        .map(|p| p.to_string_lossy().replace('"', ""))
+        .unwrap_or_default()
+}
+
 fn fill(template: &str, json: &str, glb_path: &str) -> String {
     // The data is placed inside a raw triple-quoted Python string. Names are
     // sanitised and the rest is numbers, so the data cannot contain `"""`.
@@ -77,6 +85,7 @@ fn fill(template: &str, json: &str, glb_path: &str) -> String {
     template
         .replace(JSON_SLOT, json)
         .replace(GLB_SLOT, glb_path)
+        .replace(EXE_SLOT, &exe_path())
 }
 
 /// Generate the builder script for one DCC.
@@ -96,7 +105,7 @@ pub fn script(rig: &Rig, target: Target, glb_path: &Path) -> Result<String> {
                 .collect();
             let data = json!({
                 "name": rig.name,
-                "height": rig.landmarks.height,
+                "height": rig.guides.body.height,
                 "bones": bones,
                 "controls": rig.controls.controls,
                 "ik_chains": rig.controls.ik_chains,
@@ -106,7 +115,8 @@ pub fn script(rig: &Rig, target: Target, glb_path: &Path) -> Result<String> {
     })
 }
 
-/// Write `<name>.glb`, `<name>.hive.json` and one builder script per target.
+/// Write `<name>.glb`, `<name>.hive.json`, `<name>.guides.json` and one builder
+/// script per target.
 pub fn write_all(rig: &Rig, out_dir: &Path, targets: &[Target]) -> Result<Vec<PathBuf>> {
     std::fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
     // `absolute` rather than `canonicalize`: on Windows the latter adds a `\\?\` prefix
@@ -121,6 +131,10 @@ pub fn write_all(rig: &Rig, out_dir: &Path, targets: &[Target]) -> Result<Vec<Pa
     let json_path = out_dir.join(format!("{}.hive.json", rig.name));
     std::fs::write(&json_path, serde_json::to_vec_pretty(rig)?)?;
     written.push(json_path);
+
+    let guides_path = out_dir.join(format!("{}.guides.json", rig.name));
+    std::fs::write(&guides_path, serde_json::to_vec_pretty(&rig.guides)?)?;
+    written.push(guides_path);
 
     for &t in targets {
         let path = out_dir.join(format!("{}_{}.py", rig.name, t.key()));
@@ -153,7 +167,10 @@ mod tests {
         let r = rig::auto_rig(demo_humanoid(), "demo", Default::default()).unwrap();
         for t in Target::ALL {
             let s = script(&r, t, Path::new("/tmp/demo.glb")).unwrap();
-            assert!(!s.contains(JSON_SLOT) && !s.contains(GLB_SLOT), "{t:?}");
+            assert!(
+                !s.contains(JSON_SLOT) && !s.contains(GLB_SLOT) && !s.contains(EXE_SLOT),
+                "{t:?}"
+            );
             let start = s.find("r\"\"\"").unwrap() + 4;
             let end = start + s[start..].find("\"\"\"").unwrap();
             let v: serde_json::Value = serde_json::from_str(&s[start..end]).unwrap();

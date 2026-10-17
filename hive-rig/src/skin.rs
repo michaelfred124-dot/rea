@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::landmarks::Landmarks;
+use crate::components::Body;
 use crate::mesh::Mesh;
 use crate::skeleton::{Bone, Region, Skeleton};
 
@@ -38,16 +38,16 @@ impl Default for SkinOptions {
     }
 }
 
-fn vertex_region(lm: &Landmarks, x: f32, y: f32) -> Region {
-    let dx = x - lm.center_x;
-    if y < lm.crotch_y {
+fn vertex_region(body: &Body, x: f32, y: f32) -> Region {
+    let dx = x - body.center_x;
+    if y < body.crotch_y {
         return if dx >= 0.0 {
             Region::LegL
         } else {
             Region::LegR
         };
     }
-    if dx.abs() > lm.torso_half_width * 1.05 {
+    if dx.abs() > body.torso_half_width * 1.05 {
         return if dx > 0.0 { Region::ArmL } else { Region::ArmR };
     }
     Region::Center
@@ -55,33 +55,15 @@ fn vertex_region(lm: &Landmarks, x: f32, y: f32) -> Region {
 
 /// Bones allowed to influence vertices of `region`.
 fn allowed_bones(sk: &Skeleton, region: Region) -> Vec<usize> {
-    let mut out = Vec::new();
-    for (i, b) in sk.bones.iter().enumerate() {
-        if !b.deform {
-            continue;
-        }
-        let ok = match region {
-            Region::Center => {
-                b.region == Region::Center
-                    || b.name.starts_with("upperarm")
-                    || b.name.starts_with("thigh")
-            }
-            Region::LegL | Region::LegR => b.region == region || b.name == "pelvis",
-            Region::ArmL | Region::ArmR => {
-                let side = if region == Region::ArmL { "_l" } else { "_r" };
-                b.region == region
-                    || b.name == format!("clavicle{side}")
-                    || b.name == format!("spine_{:02}", crate::biped::SPINE_COUNT)
-            }
-        };
-        if ok {
-            out.push(i);
-        }
-    }
-    out
+    sk.bones
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| b.deform && (b.region == region || b.links.contains(&region)))
+        .map(|(i, _)| i)
+        .collect()
 }
 
-pub fn compute(mesh: &Mesh, sk: &Skeleton, lm: &Landmarks, opts: SkinOptions) -> SkinWeights {
+pub fn compute(mesh: &Mesh, sk: &Skeleton, body: &Body, opts: SkinOptions) -> SkinWeights {
     let regions = [
         Region::Center,
         Region::ArmL,
@@ -91,7 +73,7 @@ pub fn compute(mesh: &Mesh, sk: &Skeleton, lm: &Landmarks, opts: SkinOptions) ->
     ];
     let allowed: Vec<Vec<usize>> = regions.iter().map(|r| allowed_bones(sk, *r)).collect();
     let n_bones = sk.bones.len();
-    let eps = (lm.height * 0.005).powi(2);
+    let eps = (body.height * 0.005).powi(2);
     // Distance is measured to each bone's skinned segment (see Skeleton::skin_segment).
     let segments: Vec<Bone> = (0..n_bones)
         .map(|i| {
@@ -109,7 +91,7 @@ pub fn compute(mesh: &Mesh, sk: &Skeleton, lm: &Landmarks, opts: SkinOptions) ->
         .positions
         .iter()
         .map(|p| {
-            let r = vertex_region(lm, p.x, p.y);
+            let r = vertex_region(body, p.x, p.y);
             let ri = regions.iter().position(|x| *x == r).unwrap();
             let mut w = vec![0.0f32; n_bones];
             for &b in &allowed[ri] {
@@ -203,14 +185,14 @@ fn keep_top(w: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{biped, demo::demo_humanoid, landmarks::detect};
+    use crate::{components, demo::demo_humanoid, landmarks::detect};
 
     #[test]
     fn weights_are_normalised_and_regional() {
         let mesh = demo_humanoid();
-        let lm = detect(&mesh);
-        let sk = biped::build(&lm);
-        let skin = compute(&mesh, &sk, &lm, SkinOptions::default());
+        let guides = components::biped(&detect(&mesh));
+        let sk = components::build(&guides).unwrap().skeleton;
+        let skin = compute(&mesh, &sk, &guides.body, SkinOptions::default());
         assert_eq!(skin.weights.len(), mesh.vertex_count());
         for w in &skin.weights {
             let s: f32 = w.iter().sum();

@@ -18,9 +18,10 @@ pub enum Region {
     LegR,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Side {
+    #[default]
     Center,
     Left,
     Right,
@@ -55,6 +56,13 @@ pub struct Bone {
     pub deform: bool,
     pub side: Side,
     pub region: Region,
+    /// Other regions whose vertices this bone may also weight, so skin blends
+    /// across a joint between regions (e.g. the upper arm into the torso).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<Region>,
+    /// Id of the component that built this bone.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub component: String,
     /// Twist helper: rotates about its own length by `factor` times the twist of `source`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub twist: Option<Twist>,
@@ -127,6 +135,8 @@ impl Skeleton {
             deform: true,
             side,
             region,
+            links: Vec::new(),
+            component: String::new(),
             twist: None,
         });
         self.bones.len() - 1
