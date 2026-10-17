@@ -137,7 +137,89 @@ fn save_guides(path: &Path, g: &Guides) -> Result<()> {
         .with_context(|| format!("writing {}", path.display()))
 }
 
+/// Opened by double-clicking (no arguments) or by dropping a file on the program:
+/// ask for a character, rig it, show the output folder, and wait so the console
+/// window doesn't close before it can be read.
+fn guided(dropped: Option<PathBuf>) -> Result<()> {
+    let result = guided_rig(dropped);
+    if let Err(e) = &result {
+        eprintln!("\nSomething went wrong: {e:#}");
+    }
+    println!("\nPress Enter to close this window.");
+    let _ = std::io::stdin().read_line(&mut String::new());
+    result
+}
+
+fn guided_rig(dropped: Option<PathBuf>) -> Result<()> {
+    println!(
+        "hive-rig {}: automatic rigger for Blender, Maya and Unreal\n",
+        env!("CARGO_PKG_VERSION")
+    );
+    let input = match dropped {
+        Some(p) => Some(p),
+        None => {
+            println!(
+                "Drag your character file (.glb, .gltf or .obj) into this window and press Enter,"
+            );
+            println!("or just press Enter to rig the built-in demo character.");
+            print!("> ");
+            std::io::Write::flush(&mut std::io::stdout())?;
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            // Dropping a file into a console pastes its path, quoted when it has spaces.
+            let path = line.trim().trim_matches(|c| c == '"' || c == '\'');
+            (!path.is_empty()).then(|| PathBuf::from(path))
+        }
+    };
+    let common = Common {
+        targets: Target::ALL.to_vec(),
+        smooth: 3,
+    };
+    let out = match input {
+        Some(input) => {
+            let mesh = import::load_mesh(&input)?;
+            mesh.validate()?;
+            let stem = input
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "character".into());
+            let out = input
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join(format!("{stem}_rig"));
+            println!();
+            let guides = detect(&mesh);
+            run(mesh, &stem, guides, &out, &common)?;
+            out
+        }
+        None => {
+            let here = std::env::current_exe()?;
+            let out = here.parent().unwrap_or(Path::new(".")).join("demo_rig");
+            println!();
+            let mesh = demo::humanoid(0.0);
+            let guides = detect(&mesh);
+            run(mesh, "hive_demo", guides, &out, &common)?;
+            out
+        }
+    };
+    println!(
+        "\nDone. Open the _blender.py, _maya.py or _unreal.py file from this folder in that program:"
+    );
+    println!("  {}", out.display());
+    if cfg!(windows) {
+        let _ = std::process::Command::new("explorer").arg(&out).spawn();
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    match args.as_slice() {
+        [] => return guided(None),
+        // A character file dropped onto the program.
+        [file] if Path::new(file).is_file() => return guided(Some(PathBuf::from(file))),
+        _ => {}
+    }
     match Cli::parse().command {
         Command::Rig {
             input,

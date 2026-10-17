@@ -14,6 +14,10 @@ cargo run --release -- demo -o out/            # T-pose test character
 cargo run --release -- demo -o out/ --arm-drop 45   # A-pose
 ```
 
+On Windows you can also just double-click `hive-rig.exe`: it asks for a
+character file (drag it into the window, or press Enter for the demo), rigs it
+and opens the output folder. Dropping a file onto the exe does the same.
+
 ## What you get
 
 | File | Use it in | What it contains |
