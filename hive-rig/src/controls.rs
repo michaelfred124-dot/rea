@@ -418,6 +418,7 @@ mod tests {
             size: 0.05,
             color: [0.1, 0.4, 1.0],
             spaces: Vec::new(),
+            component: String::new(),
         }
     }
 
