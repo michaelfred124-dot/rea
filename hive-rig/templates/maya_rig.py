@@ -14,7 +14,6 @@ is already in the scene only reopens the window.
 """
 
 import json
-import math
 import os
 import subprocess
 import sys
@@ -129,21 +128,30 @@ def build(RIG, geo=None):
     fn_skin.setWeights(shape_path, comp, om.MIntArray(list(range(n_inf))), weights, False)
 
     # --------------------------------------------------------------------------- control shapes
-    def shape_points(kind):
-        # Local shapes with X as the normal (Maya joints aim X down the bone).
-        if kind == "circle":
-            return [(0, math.cos(a), math.sin(a)) for a in [i / 16.0 * math.tau for i in range(17)]]
-        if kind == "square":
-            return [(0, -1, -1), (0, 1, -1), (0, 1, 1), (0, -1, 1), (0, -1, -1)]
-        if kind == "cube":
-            c = [(-1, -1, -1), (1, -1, -1), (1, 1, -1), (-1, 1, -1), (-1, -1, -1), (-1, -1, 1), (1, -1, 1),
-                 (1, -1, -1), (1, 1, -1), (1, 1, 1), (1, -1, 1), (1, 1, 1), (-1, 1, 1), (-1, 1, -1),
-                 (-1, 1, 1), (-1, -1, 1)]
-            return c
-        if kind == "diamond":
-            return [(0, 1, 0), (0, 0, 1), (0, -1, 0), (0, 0, -1), (0, 1, 0), (1, 0, 0), (0, -1, 0),
-                    (-1, 0, 0), (0, 1, 0), (0, 0, 1), (1, 0, 0), (0, 0, -1), (-1, 0, 0), (0, 0, 1)]
-        return [(0, -1, 0), (0, 1, 0), (0, 0, 0), (0, 0, -1), (0, 0, 1)]  # cross
+    def outline_curves(c):
+        """One linear curve shape per line of the control's outline (hive-rig's
+        model-space lines), all under a transform named after the control."""
+        lines = c["outline"]
+        ctrl = cmds.curve(degree=1, point=[mpos(p) for p in lines[0]], name=c["name"])
+        shapes = [cmds.rename(cmds.listRelatives(ctrl, shapes=True)[0], c["name"] + "Shape")]
+        for i, line in enumerate(lines[1:], 1):
+            extra = cmds.curve(degree=1, point=[mpos(p) for p in line])
+            shape = cmds.rename(cmds.listRelatives(extra, shapes=True)[0], "%sShape%d" % (c["name"], i))
+            cmds.parent(shape, ctrl, relative=True, shape=True)
+            cmds.delete(extra)
+            shapes.append(shape)
+        for shape in shapes:
+            cmds.setAttr(shape + ".overrideEnabled", 1)
+            cmds.setAttr(shape + ".overrideRGBColors", 1)
+            cmds.setAttr(shape + ".overrideColorRGB", *c["color"])
+        return ctrl, shapes
+
+
+    def place_outline(shapes, lines):
+        """Put every CV back on its model-space point once the control is placed."""
+        for shape, line in zip(shapes, lines):
+            for i, p in enumerate(line):
+                cmds.xform("%s.cv[%d]" % (shape, i), worldSpace=True, translation=mpos(p))
 
 
     def axis_matrix(axis, position):
@@ -160,14 +168,7 @@ def build(RIG, geo=None):
     ctrl_of = {}
     offset_of = {}
     for c in CONTROLS:
-        size = c["size"] * SCALE
-        pts = [(x * size, y * size, z * size) for x, y, z in shape_points(c["shape"])]
-        ctrl = cmds.curve(degree=1, point=pts, name=c["name"])
-        shape = cmds.listRelatives(ctrl, shapes=True)[0]
-        shape = cmds.rename(shape, c["name"] + "Shape")
-        cmds.setAttr(shape + ".overrideEnabled", 1)
-        cmds.setAttr(shape + ".overrideRGBColors", 1)
-        cmds.setAttr(shape + ".overrideColorRGB", *c["color"])
+        ctrl, shapes = outline_curves(c)
         offset = cmds.group(empty=True, name=c["name"] + "_offset")
         cmds.parent(ctrl, offset, relative=True)
 
@@ -180,13 +181,10 @@ def build(RIG, geo=None):
         template = c["bone"] if c["kind"] in ("fk", "root") else chain_end_ik.get(c["name"])
         if template:
             cmds.matchTransform(offset, joint_of[template], position=True, rotation=True)
-            if c["kind"] == "fk":
-                # Shape sits at the control's position (clavicle shape at the shoulder).
-                delta = om.MVector(*mpos(c["position"])) - om.MVector(*cmds.xform(offset, q=True, ws=True, t=True))
-                if delta.length() > 1e-3:
-                    cmds.move(delta.x, delta.y, delta.z, shape + ".cv[*]", relative=True, worldSpace=True)
         else:
             cmds.xform(offset, worldSpace=True, matrix=axis_matrix(c["axis"], c["position"]))
+        # The outline sits at the control's position (clavicle shape at the shoulder).
+        place_outline(shapes, c["outline"])
         if parent["type"] == "bone":
             cmds.parentConstraint(joint_of[parent["name"]], offset, maintainOffset=True)
         if c.get("spaces"):

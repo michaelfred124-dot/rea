@@ -45,6 +45,7 @@ class Vec:
 
 N_VERTS = [0]
 SCRIPT = [""]
+CV_POSITIONS = {}  # "curveShape.cv[i]" -> world position set by the Maya builder
 
 
 def stub_maya():
@@ -82,6 +83,8 @@ def stub_maya():
                     return list(positions.get(args[0], [0.0, 0.0, 0.0]))
                 if "t" in kwargs:
                     positions[args[0]] = list(kwargs["t"])
+                if "translation" in kwargs and kwargs.get("worldSpace"):
+                    CV_POSITIONS[args[0]] = list(kwargs["translation"])
                 return None
             if name == "getAttr":
                 return attrs.get(args[0], 10.0)
@@ -245,6 +248,14 @@ if __name__ == "__main__":
         sys.argv = [script, "--save", "/dev/null"]  # batch: no window
         ns = runpy.run_path(script, run_name="__main__")
         assert "setWeights" in calls and "ikHandle" in calls, calls
+        # Every CV of every control curve lands on hive-rig's outline (in cm).
+        rig = json.loads(open(script).read().split('r"""', 1)[1].split('"""', 1)[0])
+        for c in rig["controls"]["controls"]:
+            for i, line in enumerate(c["outline"]):
+                shape = c["name"] + "Shape" + (str(i) if i else "")
+                for j, p in enumerate(line):
+                    got = CV_POSITIONS.get("%s.cv[%d]" % (shape, j))
+                    assert got is not None and max(abs(g - 100.0 * w) for g, w in zip(got, p)) < 1e-6, (shape, j)
         if os.path.isfile(ns["HIVE_EXE"]) and "--guides" in sys_args:
             # Guide tools: edit, mirror, add a component, rebuild keeping weights.
             ns["show_guides"]()

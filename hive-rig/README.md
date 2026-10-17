@@ -205,8 +205,40 @@ Properties shows the name and lets you:
   that follows it, so you can check the rig before it reaches a DCC. Nothing is
   saved.
 * **Control shape, size and colour** change how one control looks. The look is
-  saved in the guides file and survives a rebuild. The right-click menu on a
-  control has the same shape choice.
+  saved in the guides file and survives a rebuild. Shapes are picked from a
+  grid of drawn tiles (hover one for its name); the right-click menu on a
+  control has the same grid.
+
+### Control shapes
+
+| Shape | `guides.json` name | Unreal library shape |
+| --- | --- | --- |
+| Circle | `circle` | `Circle_Thick` |
+| Square | `square` | `Square_Thick` |
+| Cube | `cube` | `Box_Thick` |
+| Diamond (three loops) | `diamond` | `Diamond_Thick` |
+| Cross | `cross` | `Arrow4_Thick` |
+| Sphere (three rings) | `sphere` | `Sphere_Thick` |
+| Arrow | `arrow` | `Arrow_Thick` |
+| Double arrow | `double_arrow` | `Arrow2_Thick` |
+| Four arrows (move cross) | `four_arrows` | `Arrow4_Thick` |
+| Hexagon | `hexagon` | `Hexagon_Thick` |
+| Octagon | `octagon` | `Octagon_Thick` |
+| Triangle | `triangle` | `Triangle_Thick` |
+| Half circle | `half_circle` | `HalfCircle_Thick` |
+| Pyramid | `pyramid` | `Pyramid_Thick` |
+| Four-pointed star | `star` | `Star4_Thick` |
+
+Set one by hand in `guides.json` with
+`"control_styles": { "head_ctrl": { "shape": "sphere", "size": 0.12 } }`.
+The shapes are defined once, in `src/controls.rs`. Flat shapes lie in the
+plane facing the control's axis, and arrows and triangles point up, or forward
+for a control that faces up or down. Each control's lines are written into the
+rig as `outline` (model space, at rest), and the app, Blender (as the bone's
+custom shape) and Maya (as one curve per line) all draw exactly those lines.
+Unreal draws the look-alike from Control Rig's default shape library in the
+table above. If the library lacks that name, Unreal uses the circle. Those
+names and their orientation haven't been checked in Unreal yet.
 
 From the right-click menu, **Import components…** brings the premade parts of
 another guides file in, hung from the bone under the pointer. The CLI has the
@@ -289,7 +321,8 @@ python3 tests/dcc_stub_run.py maya out/hive_demo_maya.py --guides       # Maya g
 
 `blender_check.py` builds the rig in real Blender and checks that it works as
 a rig: the rest pose is unchanged, feet and hands reach their IK goals, knees
-bend forward and elbows bend back, and FK rotates the limbs. It checks the heel,
+bend forward and elbows bend back, and FK rotates the limbs. It checks that
+every control's custom shape sits on the outline hive-rig wrote for it. It checks the heel,
 ball and toe roll stages, stretchy IK, the forearm twist share, and space
 switching (no pop at rest, and the IK hand follows the chest only in chest
 space). It also checks that every driver uses a simple expression, so the rig
@@ -307,7 +340,8 @@ executables as a downloadable artifact.
 
 The Maya and Unreal builders, and the Maya guide tools, are checked against stub
 APIs. That catches script errors but doesn't prove the application calls behave
-as intended. They haven't been run inside Maya or Unreal yet.
+as intended. The Maya stub also checks that every control curve point is placed
+on the control's outline. The builders haven't been run inside Maya or Unreal yet.
 
 ## Not yet included
 

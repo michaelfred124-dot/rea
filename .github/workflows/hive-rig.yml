@@ -120,6 +120,22 @@ jobs:
             cargo run -q -- demo -o "$RUNNER_TEMP/rig$drop" --arm-drop "$drop"
             python tests/blender_check.py "$RUNNER_TEMP/rig$drop/hive_demo_blender.py" "$RUNNER_TEMP/rig$drop/hive_demo.glb"
           done
+      - name: Control shapes set in guides.json, in Blender
+        run: |
+          rig="$RUNNER_TEMP/shapes"
+          cargo run -q -- demo -o "$rig"
+          python - "$rig/hive_demo.guides.json" <<'EOF'
+          import json, sys
+          shapes = {"root_ctrl": "four_arrows", "cog_ctrl": "octagon", "head_ctrl": "sphere",
+                    "pelvis_ctrl": "star", "spine_02_ctrl": "hexagon", "hand_l_ik_ctrl": "pyramid",
+                    "lowerarm_l_pole_ctrl": "arrow", "lowerarm_r_pole_ctrl": "triangle",
+                    "foot_l_ik_ctrl": "double_arrow", "foot_r_ik_ctrl": "half_circle"}
+          g = json.load(open(sys.argv[1]))
+          g["control_styles"] = {name: {"shape": shape} for name, shape in shapes.items()}
+          json.dump(g, open(sys.argv[1], "w"))
+          EOF
+          cargo run -q -- rebuild "$rig/hive_demo.hive.json"
+          python tests/blender_check.py "$rig/hive_demo_blender.py" "$rig/hive_demo.glb"
       - name: Eyes, jaw, face joints and fingers in Blender
         run: |
           rig="$RUNNER_TEMP/face"

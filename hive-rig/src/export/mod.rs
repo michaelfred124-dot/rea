@@ -189,4 +189,36 @@ mod tests {
             assert_eq!(v["name"], "demo");
         }
     }
+
+    #[test]
+    fn every_shape_reaches_every_builder() {
+        use crate::controls::Shape;
+        // Blender and Maya draw the outline hive-rig writes, so they have no
+        // shape table of their own to fall behind.
+        for template in [BLENDER_TEMPLATE, MAYA_TEMPLATE] {
+            assert!(template.contains("[\"outline\"]"));
+            assert!(!template.contains("\"circle\""));
+        }
+        // Unreal maps every shape to a library shape.
+        for shape in Shape::ALL {
+            let key = serde_json::to_string(&shape).unwrap();
+            assert!(
+                UNREAL_TEMPLATE.contains(&format!("    {key}: \"")),
+                "{key} missing from Unreal's SHAPES"
+            );
+        }
+        // The embedded rig carries each control's outline.
+        let r = rig::auto_rig(demo_humanoid(), "demo", Default::default()).unwrap();
+        let s = script(&r, Target::Maya, Path::new("/tmp/demo.glb")).unwrap();
+        let start = s.find("r\"\"\"").unwrap() + 4;
+        let end = start + s[start..].find("\"\"\"").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s[start..end]).unwrap();
+        for c in v["controls"]["controls"].as_array().unwrap() {
+            assert!(
+                !c["outline"].as_array().unwrap().is_empty(),
+                "{}",
+                c["name"]
+            );
+        }
+    }
 }

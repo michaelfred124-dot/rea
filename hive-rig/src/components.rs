@@ -2052,6 +2052,33 @@ mod tests {
     }
 
     #[test]
+    fn every_shape_styles_a_control_from_guides_json() {
+        let mut g = demo_guides();
+        let names: Vec<String> = build(&g)
+            .unwrap()
+            .controls
+            .controls
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        for (name, shape) in names.iter().zip(Shape::ALL) {
+            let style = ControlStyle {
+                shape: Some(shape),
+                ..Default::default()
+            };
+            set_control_style(&mut g, name, style).unwrap();
+        }
+        // Through guides.json and back, as the CLI, app and DCC rebuilds read it.
+        let back: Guides = serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
+        let built = build(&back).unwrap();
+        for (name, shape) in names.iter().zip(Shape::ALL) {
+            let c = built.controls.control(name).unwrap();
+            assert_eq!(c.shape, shape);
+            assert_eq!(c.outline().len(), shape.strokes().len(), "{name}");
+        }
+    }
+
+    #[test]
     fn control_styles_import_and_attach() {
         let mut g = demo_guides();
         // A styled control keeps its look through a rebuild, and clears when reset.

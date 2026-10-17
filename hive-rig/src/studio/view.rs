@@ -192,28 +192,26 @@ pub fn draw_mesh(
     painter.add(Shape::mesh(out));
 }
 
-/// A circle of `radius` around `center`, in the plane facing `axis`.
-pub fn ring(
-    painter: &egui::Painter,
-    pr: &Projector,
-    center: Vec3,
-    axis: Vec3,
-    radius: f32,
-    stroke: Stroke,
-) {
-    let axis = axis.try_normalize().unwrap_or(Vec3::Y);
-    let helper = if axis.y.abs() > 0.9 { Vec3::X } else { Vec3::Y };
-    let u = axis.cross(helper).normalize();
-    let v = axis.cross(u);
-    let points: Vec<Pos2> = (0..=32)
-        .filter_map(|i| {
-            let a = i as f32 / 32.0 * std::f32::consts::TAU;
-            pr.pos(center + (u * a.cos() + v * a.sin()) * radius)
-        })
-        .collect();
-    if points.len() > 2 {
-        painter.add(Shape::line(points, stroke));
+/// Model-space line strips, such as a control's outline. A strip that crosses
+/// behind the camera is split there rather than drawn through it.
+pub fn strokes(painter: &egui::Painter, pr: &Projector, lines: &[Vec<Vec3>], stroke: Stroke) {
+    for line in lines {
+        let mut run: Vec<Pos2> = Vec::with_capacity(line.len());
+        for &p in line {
+            match pr.pos(p) {
+                Some(s) => run.push(s),
+                None => flush(painter, &mut run, stroke),
+            }
+        }
+        flush(painter, &mut run, stroke);
     }
+}
+
+fn flush(painter: &egui::Painter, run: &mut Vec<Pos2>, stroke: Stroke) {
+    if run.len() > 1 {
+        painter.add(Shape::line(std::mem::take(run), stroke));
+    }
+    run.clear();
 }
 
 #[cfg(test)]
