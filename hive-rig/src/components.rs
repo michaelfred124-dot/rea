@@ -435,6 +435,66 @@ pub fn remove(g: &mut Guides, id: &str) -> Result<Vec<String>> {
     Ok(ids)
 }
 
+/// The other side's twin of a sided component (`arm_l` <-> `arm_r`), if any.
+pub fn twin_id(c: &Component) -> Option<String> {
+    let (from, to) = match c.side {
+        Side::Left => ("_l", "_r"),
+        Side::Right => ("_r", "_l"),
+        Side::Center => return None,
+    };
+    c.id.strip_suffix(from).map(|base| format!("{base}{to}"))
+}
+
+/// `p` reflected across the body's centre line.
+pub fn mirror_point(g: &Guides, p: Vec3) -> Vec3 {
+    mirror(p, g.body.center_x)
+}
+
+/// Copy every `source`-side component's guides onto its twin, mirrored across
+/// the body. Returns how many components were updated.
+pub fn mirror_side(g: &mut Guides, source: Side) -> usize {
+    let mut updates = Vec::new();
+    for (i, c) in g.components.iter().enumerate() {
+        if c.side != source {
+            continue;
+        }
+        let Some(twin) = twin_id(c) else { continue };
+        if let Some(j) = g.components.iter().position(|t| t.id == twin)
+            && g.components[j].guides.len() == c.guides.len()
+        {
+            updates.push((i, j));
+        }
+    }
+    let cx = g.body.center_x;
+    for &(i, j) in &updates {
+        let points: Vec<Vec3> = g.components[i].guides.iter().map(|x| x.position).collect();
+        for (guide, p) in g.components[j].guides.iter_mut().zip(points) {
+            guide.position = mirror(p, cx);
+        }
+    }
+    updates.len()
+}
+
+/// Change the spine component's joint count, re-attaching components that hung
+/// from the old top joint to the new one.
+pub fn set_spine_joints(g: &mut Guides, spine_id: &str, joints: usize) -> Result<()> {
+    ensure!((1..=16).contains(&joints), "spine joints must be 1 to 16");
+    let spine = g
+        .components
+        .iter_mut()
+        .find(|c| c.id == spine_id && c.kind == Kind::Spine)
+        .with_context(|| format!("no spine component named {spine_id}"))?;
+    let old_top = spine_name(spine.options.joints.unwrap_or(SPINE_JOINTS) - 1);
+    spine.options.joints = Some(joints);
+    let new_top = spine_name(joints - 1);
+    for c in &mut g.components {
+        if c.parent.as_deref() == Some(old_top.as_str()) {
+            c.parent = Some(new_top.clone());
+        }
+    }
+    build(g).map(|_| ())
+}
+
 // --------------------------------------------------------------------------- building
 
 pub struct Built {
@@ -1301,6 +1361,32 @@ mod tests {
         g.components[4].guides[2].position = p;
         let e = build(&g).err().unwrap().to_string();
         assert!(e.contains("no length"), "{e}");
+    }
+
+    #[test]
+    fn mirror_and_spine_joint_helpers() {
+        let mut g = demo_guides();
+        g.components[3].guides[2].position += Vec3::new(0.0, -0.1, 0.0);
+        assert_eq!(mirror_side(&mut g, Side::Left), 2);
+        let l = g.component("arm_l").unwrap().guides[2].position;
+        let r = g.component("arm_r").unwrap().guides[2].position;
+        assert!((mirror_point(&g, l) - r).length() < 1e-5);
+        assert_eq!(
+            twin_id(g.component("leg_r").unwrap()).as_deref(),
+            Some("leg_l")
+        );
+
+        set_spine_joints(&mut g, "spine", 5).unwrap();
+        assert_eq!(
+            g.component("head").unwrap().parent.as_deref(),
+            Some("spine_05")
+        );
+        let sk = build(&g).unwrap().skeleton;
+        assert_eq!(
+            sk.bone("clavicle_l").unwrap().parent,
+            sk.index_of("spine_05")
+        );
+        assert!(set_spine_joints(&mut g, "spine", 0).is_err());
     }
 
     #[test]

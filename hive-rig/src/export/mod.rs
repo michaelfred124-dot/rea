@@ -71,11 +71,20 @@ pub fn sanitize_name(name: &str) -> String {
     out
 }
 
-/// This program, so builder scripts can call it back to rebuild from edited guides.
+/// The command-line `hive-rig`, so builder scripts can call it back to rebuild
+/// from edited guides. When the scripts are written by the desktop app, that's
+/// the `hive-rig` program next to it.
 fn exe_path() -> String {
-    std::env::current_exe()
-        .map(|p| p.to_string_lossy().replace('"', ""))
-        .unwrap_or_default()
+    let Ok(exe) = std::env::current_exe() else {
+        return String::new();
+    };
+    let cli = format!("hive-rig{}", std::env::consts::EXE_SUFFIX);
+    let path = if exe.file_name().is_some_and(|n| n == cli.as_str()) {
+        exe
+    } else {
+        exe.with_file_name(cli)
+    };
+    path.to_string_lossy().replace('"', "")
 }
 
 fn fill(template: &str, json: &str, glb_path: &str) -> String {

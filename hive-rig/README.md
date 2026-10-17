@@ -14,9 +14,32 @@ cargo run --release -- demo -o out/            # T-pose test character
 cargo run --release -- demo -o out/ --arm-drop 45   # A-pose
 ```
 
-On Windows you can also just double-click `hive-rig.exe`: it asks for a
-character file (drag it into the window, or press Enter for the demo), rigs it
-and opens the output folder. Dropping a file onto the exe does the same.
+## The Hive Rig app
+
+`HiveRig` (`HiveRig.exe` on Windows) is a desktop rigging app built on the same
+library. Open a character (or the demo), and the guides appear on it in a 3D
+view. Drag a guide to move a joint; with Symmetry on, its twin on the other
+side follows. The component list lets you type exact guide positions, change
+spine joints, twist bones and what a component is attached to, remove
+components, mirror one side onto the other, and add fingers, a tail or a chain
+on any bone. Every change rebuilds the bone and control preview at once, and
+Ctrl+Z undoes it. Build Rig computes the skin weights, which you can inspect per
+bone. Export writes the files below for the programs you tick. It can also open
+a `.hive.json` to keep editing an exported rig, or a `.guides.json` to apply a
+saved layout.
+
+```bash
+cargo run --release --bin HiveRig               # or: HiveRig character.glb / HiveRig --demo
+```
+
+The viewport is drawn with egui shapes on the CPU and the window uses OpenGL
+(eframe with the glow backend), so it runs without a dedicated GPU. Build
+without the app with `--no-default-features`. Keep `hive-rig.exe` next to
+`HiveRig.exe`: the scripts it exports call the command line to rebuild.
+
+Double-clicking `hive-rig.exe` (the command line) still works without the app:
+it asks for a character file, rigs it with the default guides and opens the
+output folder.
 
 ## What you get
 
@@ -171,7 +194,11 @@ mesh deforms, and the `.glb` re-imports with weights on every bone.
 mirrors it, paints a weight, adds fingers and a tail, and rebuilds. Then it
 checks that the bones moved, the painted weight survived, the new fingers got
 weights and controls, and a finger control bends the finger.
-CI runs all of this (`.github/workflows/hive-rig.yml`).
+The app's editing operations (add, remove, mirror, symmetric moves, undo, build,
+export and reopening a rig) have unit tests in `src/studio/app.rs`, and CI opens
+the app on a virtual screen and screenshots it after building the demo rig.
+CI runs all of this (`.github/workflows/hive-rig.yml`), and builds both Windows
+executables as a downloadable artifact.
 
 The Maya and Unreal builders, and the Maya guide tools, are checked against stub
 APIs. That catches script errors but doesn't prove the application calls behave

@@ -31,6 +31,13 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      - name: Open the Hive Rig app on a virtual screen
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq xvfb libxkbcommon-x11-0 libgl1-mesa-dri
+          xvfb-run -a -s "-screen 0 1400x900x24" cargo run --locked -q --bin HiveRig -- \
+            --demo --build --weights upperarm_l --screenshot "$RUNNER_TEMP/hive-rig-app.ppm"
+          test "$(head -c 2 "$RUNNER_TEMP/hive-rig-app.ppm")" = P6
       - name: Generate demo rigs (T-pose and A-pose)
         run: |
           cargo run --locked -q -- demo -o "$RUNNER_TEMP/t_pose"
@@ -58,6 +65,26 @@ jobs:
           name: hive-demo-rigs
           path: ${{ runner.temp }}/*_pose
           retention-days: 7
+
+  windows:
+    name: Windows build
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Toolchain
+        run: rustup update stable && rustup default stable
+      - run: cargo build --release --locked
+      - name: Rig the demo with the Windows command line
+        shell: bash
+        run: ./target/release/hive-rig.exe demo -o "$RUNNER_TEMP/win_demo"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hive-rig-windows
+          path: |
+            hive-rig/target/release/HiveRig.exe
+            hive-rig/target/release/hive-rig.exe
+          retention-days: 14
 
   blender:
     name: Build and exercise the rig in Blender
