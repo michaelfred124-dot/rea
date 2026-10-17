@@ -41,6 +41,18 @@ jobs:
             python3 -I tests/dcc_stub_run.py maya "$RUNNER_TEMP/$pose/hive_demo_maya.py"
             python3 -I tests/dcc_stub_run.py unreal "$RUNNER_TEMP/$pose/hive_demo_unreal.py"
           done
+      - name: Components - add, remove, rebuild and the Maya guide tools
+        run: |
+          rig="$RUNNER_TEMP/components"
+          cargo run --locked -q -- demo -o "$rig"
+          cargo run --locked -q -- add "$rig/hive_demo.guides.json" fingers
+          cargo run --locked -q -- add "$rig/hive_demo.guides.json" tail
+          cargo run --locked -q -- add "$rig/hive_demo.guides.json" chain --parent head --joints 2 --id ear
+          cargo run --locked -q -- remove "$rig/hive_demo.guides.json" ear
+          cargo run --locked -q -- components "$rig/hive_demo.guides.json"
+          cargo run --locked -q -- rebuild "$rig/hive_demo.hive.json"
+          python3 -I tests/dcc_stub_run.py unreal "$rig/hive_demo_unreal.py"
+          python3 -I tests/dcc_stub_run.py maya "$rig/hive_demo_maya.py" --guides
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: hive-demo-rigs
@@ -67,3 +79,7 @@ jobs:
             cargo run -q -- demo -o "$RUNNER_TEMP/rig$drop" --arm-drop "$drop"
             python tests/blender_check.py "$RUNNER_TEMP/rig$drop/hive_demo_blender.py" "$RUNNER_TEMP/rig$drop/hive_demo.glb"
           done
+      - name: Edit guides, add fingers and a tail, and rebuild in Blender
+        run: |
+          cargo run -q -- demo -o "$RUNNER_TEMP/guides"
+          python tests/blender_guides_check.py "$RUNNER_TEMP/guides/hive_demo_blender.py"

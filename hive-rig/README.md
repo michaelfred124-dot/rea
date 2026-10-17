@@ -2,7 +2,9 @@
 
 An automatic humanoid rigger written in Rust. Give it a character mesh and it
 produces a skinned skeleton plus an animator control rig for **Blender**,
-**Maya** and **Unreal Engine**.
+**Maya** and **Unreal Engine**. The rig is built from premade components placed
+by editable guides, so you can move guides, add fingers or a tail, and rebuild
+without losing your skin weights.
 
 ```bash
 cd hive-rig
@@ -20,6 +22,7 @@ cargo run --release -- demo -o out/ --arm-drop 45   # A-pose
 | `<name>_blender.py` | Blender 3.6+ | Mesh, armature, weights **and controls** |
 | `<name>_maya.py` | Maya 2022+ | Mesh, oriented joints, skinCluster **and controls** |
 | `<name>_unreal.py` | Unreal Engine 5.2+ | Imports the .glb and builds a **Control Rig Blueprint** |
+| `<name>.guides.json` | hive-rig, Blender, Maya | The editable component layout |
 | `<name>.hive.json` | Your own tools | The full rig description |
 
 Controls don't survive generic formats like FBX or glTF, so each application
@@ -62,6 +65,54 @@ Bone names follow the Unreal mannequin (`pelvis`, `spine_01`, `upperarm_l`,
   `/Game/HiveRig/<name>` and creates the Control Rig next to the mesh. Set
   `SKELETAL_MESH_PATH` at the top of the script to reuse a mesh you've already imported.
 
+## Components and guides
+
+A rig is a list of components, each placed by a few guide points:
+
+| Component | Guides | Builds |
+| --- | --- | --- |
+| root | root | `root` bone, `root_ctrl` |
+| spine | pelvis, chest | `pelvis`, `spine_01`… (3 joints by default), COG, pelvis and spine controls |
+| head | neck, head, head_top | `neck_01`, `head`, controls with space switching |
+| arm | clavicle, shoulder, elbow, wrist, hand_tip | clavicle, IK/FK arm, stretch, spaces, twist bones |
+| leg | hip, knee, ankle, ball, toe, heel | IK/FK leg, reverse foot, stretch, spaces, twist bones |
+| chain | two or more | an FK chain: fingers, tails, ears, hair, props |
+
+The first rig detects the body and places the default biped. From then on you
+can change the layout and rebuild:
+
+```bash
+hive-rig add out/hero.guides.json fingers           # five fingers on each hand
+hive-rig add out/hero.guides.json tail --joints 6
+hive-rig add out/hero.guides.json chain --parent head --joints 2 --id ear_l
+hive-rig remove out/hero.guides.json tail           # also removes anything attached to it
+hive-rig components out/hero.guides.json            # list the layout
+hive-rig rebuild out/hero.hive.json                 # rebuild from the edited guides
+hive-rig rig other_character.glb --guides out/hero.guides.json   # reuse a layout
+```
+
+`guides.json` is plain JSON, so you can also edit guide positions, the spine's
+`joints` option, or `twist: false` on a limb by hand.
+
+### Editing guides in Blender and Maya
+
+The Blender script adds a **Hive** tab to the 3D view sidebar (press N). The
+Maya script opens a **Hive Rig** window. Both have the same tools:
+
+* **Edit Guides** puts out a sphere (Blender) or locator (Maya) for every guide
+  and hides the controls. Move the guides where you want the joints.
+* **Mirror Left to Right** copies the left side's guides onto the right.
+* **Add Fingers / Add Tail** and **Remove Component** (select one of its guides first).
+* **Rebuild Rig** rebuilds the skeleton and controls from the guides. The mesh
+  object is kept, along with its materials and modifiers. With **Keep Weights**
+  on, every vertex keeps its current weights unless the new rig gives it to a
+  bone that didn't exist before, such as a newly added finger. Turn it off to
+  get fresh automatic weights everywhere.
+
+Rebuilding runs the `hive-rig` program that generated the script. If you've
+moved it since, set `HIVE_EXE` at the top of the script. Running the script
+again in a file that already has the rig only brings back the tab or window.
+
 ## Input requirements
 
 * `.obj`, `.gltf` or `.glb`
@@ -81,14 +132,15 @@ back to average human proportions and prints a warning.
    Joints are then pulled to the centroid of the nearby geometry so they sit
    inside the limbs. Elbows get a slight backward bend and knees a slight
    forward bend, which tells IK solvers which way to fold.
-2. **Skeleton** (`src/biped.rs`): 31 bones, including 8 twist helpers, built from
-   the landmarks and mirrored for the right side.
+2. **Guides** (`src/components.rs`): the landmarks place the default biped
+   layout, mirrored for the right side. Each component builds its bones and
+   controls from its guides: 31 bones for the biped, including 8 twist helpers.
 3. **Skin** (`src/skin.rs`): every vertex is assigned to a body region (torso,
    left/right arm or leg), so weights can't bleed between limbs that are close
    together. Weights fall off with inverse distance to each bone, are limited
    to 4 influences, and are smoothed over the surface.
-4. **Controls** (`src/controls.rs`): a DCC-neutral description of every control,
-   its parent, shape, colour and driven bone, plus the IK chains.
+4. **Controls** (`src/controls.rs`): the DCC-neutral description of every control
+   (its parent, shape, colour and driven bone) and the IK chains, as built by the components.
 5. **Export** (`src/export/`): the glTF writer and the three builder templates
    in `templates/`, with the rig data embedded so each script is self-contained.
 
@@ -99,6 +151,8 @@ cargo test                       # landmarks, skeleton, skin, controls, glTF rou
 python3 tests/dcc_stub_run.py maya out/hive_demo_maya.py      # Python-level check
 python3 tests/dcc_stub_run.py unreal out/hive_demo_unreal.py  # Python-level check
 pip install bpy && python tests/blender_check.py out/hive_demo_blender.py out/hive_demo.glb
+python tests/blender_guides_check.py out/hive_demo_blender.py           # guides and rebuild
+python3 tests/dcc_stub_run.py maya out/hive_demo_maya.py --guides       # Maya guide tools
 ```
 
 `blender_check.py` builds the rig in real Blender and checks that it works as
@@ -109,14 +163,19 @@ switching (no pop at rest, and the IK hand follows the chest only in chest
 space). It also checks that every driver uses a simple expression, so the rig
 works without enabling Python auto-run. Finally, the COG moves the body, the
 mesh deforms, and the `.glb` re-imports with weights on every bone.
+`blender_guides_check.py` edits the guides in real Blender. It moves the elbow,
+mirrors it, paints a weight, adds fingers and a tail, and rebuilds. Then it
+checks that the bones moved, the painted weight survived, the new fingers got
+weights and controls, and a finger control bends the finger.
 CI runs all of this (`.github/workflows/hive-rig.yml`).
 
-The Maya and Unreal builders are checked against stub APIs, which catches
-script errors but doesn't prove the application calls behave as intended.
-They haven't been run inside Maya or Unreal yet.
+The Maya and Unreal builders, and the Maya guide tools, are checked against stub
+APIs. That catches script errors but doesn't prove the application calls behave
+as intended. They haven't been run inside Maya or Unreal yet.
 
 ## Not yet included
 
-Fingers, facial bones, editable guides with rebuilds, quadruped and creature
-templates, IK/FK and space *matching* (snapping without a pop when switching
-mid-animation), and FBX output.
+Facial bones, quadruped and creature templates, extra arms or legs on the same
+side, guide editing in Unreal (rebuild with the CLI and rerun the script), IK/FK
+and space *matching* (snapping without a pop when switching mid-animation), and
+FBX output.

@@ -3,23 +3,30 @@
 Builds the skinned mesh, a deform armature and an animator control rig with FK
 and IK controls, pole targets and an IK/FK blend slider on every limb.
 
+It also adds a "Hive" tab to the 3D view sidebar (press N) for editing the rig's
+guides, adding or removing components (fingers, tails) and rebuilding the rig.
+Rebuilding keeps your skin weights except where new bones were added.
+
 Run inside Blender 3.6+ (Scripting tab > Open > Run Script), or headless:
     blender --background --python <this file> -- --save out.blend
+Running it again in a file that already has this rig only brings the Hive tab back.
 """
 
 import json
 import math
+import os
+import subprocess
 import sys
 
 import bpy
 from mathutils import Vector
 
-RIG = json.loads(r"""__HIVE_RIG_JSON__""")
-
-NAME = RIG["name"]
-BONES = RIG["skeleton"]["bones"]
-CONTROLS = RIG["controls"]["controls"]
-CHAINS = RIG["controls"]["ik_chains"]
+RIG_DATA = json.loads(r"""__HIVE_RIG_JSON__""")
+GLB_PATH = r"""__HIVE_GLB_PATH__"""
+# The hive-rig program, used to rebuild from edited guides. Change this if you
+# moved it since generating this script.
+HIVE_EXE = r"""__HIVE_EXE__"""
+OUT_DIR = os.path.dirname(GLB_PATH)
 
 
 def to_blender(p):
@@ -27,369 +34,700 @@ def to_blender(p):
     return Vector((p[0], -p[2], p[1]))
 
 
-def copy_rule(bone):
-    """Bones without a deforming parent follow position too; the rest only rotate."""
-    parent = bone["parent"]
-    return "COPY_TRANSFORMS" if parent is None or not BONES[parent]["deform"] else "COPY_ROTATION"
+def from_blender(v):
+    return [v[0], v[2], -v[1]]
 
 
-# --------------------------------------------------------------------------- scene
-def new_collection(name, parent):
-    coll = bpy.data.collections.new(name)
-    parent.children.link(coll)
-    return coll
+def build(RIG, geo=None):
+    """Build the armature, controls and skin for RIG. With `geo`, re-skin that
+    existing mesh object instead of creating a new one."""
+    NAME = RIG["name"]
+    BONES = RIG["skeleton"]["bones"]
+    CONTROLS = RIG["controls"]["controls"]
+    CHAINS = RIG["controls"]["ik_chains"]
+
+    def copy_rule(bone):
+        """Bones without a deforming parent follow position too; the rest only rotate."""
+        parent = bone["parent"]
+        return "COPY_TRANSFORMS" if parent is None or not BONES[parent]["deform"] else "COPY_ROTATION"
+
+    # --------------------------------------------------------------------------- scene
+    def new_collection(name, parent):
+        coll = bpy.data.collections.new(name)
+        parent.children.link(coll)
+        return coll
 
 
-root_coll = new_collection(NAME, bpy.context.scene.collection)
-widget_coll = new_collection(NAME + "_widgets", root_coll)
-widget_coll.hide_viewport = True
-widget_coll.hide_render = True
+    root_coll = bpy.data.collections.get(NAME) or new_collection(NAME, bpy.context.scene.collection)
+    widget_coll = new_collection(NAME + "_widgets", root_coll)
+    widget_coll.hide_viewport = True
+    widget_coll.hide_render = True
 
-# --------------------------------------------------------------------------- mesh
-positions = RIG["mesh"]["positions"]
-indices = RIG["mesh"]["indices"]
-mesh = bpy.data.meshes.new(NAME + "_mesh")
-mesh.from_pydata(
-    [to_blender(p) for p in positions],
-    [],
-    [indices[i : i + 3] for i in range(0, len(indices), 3)],
-)
-mesh.update()
-for poly in mesh.polygons:
-    poly.use_smooth = True
-geo = bpy.data.objects.new(NAME + "_geo", mesh)
-root_coll.objects.link(geo)
-
-# --------------------------------------------------------------------------- widgets
-def widget(name, verts, edges):
-    me = bpy.data.meshes.new("WGT_" + name)
-    me.from_pydata(verts, edges, [])
-    obj = bpy.data.objects.new("WGT_" + NAME + "_" + name, me)
-    widget_coll.objects.link(obj)
-    return obj
-
-
-def ring(n=32):
-    # In the bone's XZ plane, so the circle wraps around the bone's Y axis.
-    verts = [(math.cos(i / n * math.tau), 0.0, math.sin(i / n * math.tau)) for i in range(n)]
-    return verts, [(i, (i + 1) % n) for i in range(n)]
-
-
-def square():
-    verts = [(-1, 0, -1), (1, 0, -1), (1, 0, 1), (-1, 0, 1)]
-    return verts, [(0, 1), (1, 2), (2, 3), (3, 0)]
-
-
-def cube():
-    verts = [(x, y, z) for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]
-    edges = [(a, b) for a in range(8) for b in range(a + 1, 8) if sum(verts[a][k] != verts[b][k] for k in range(3)) == 1]
-    return verts, edges
-
-
-def diamond():
-    verts = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]
-    edges = [(a, b) for a in range(6) for b in range(a + 1, 6) if a // 2 != b // 2]
-    return verts, edges
-
-
-def cross():
-    verts = [(-1, 0, 0), (1, 0, 0), (0, 0, -1), (0, 0, 1)]
-    return verts, [(0, 1), (2, 3)]
-
-
-WIDGETS = {
-    "circle": widget("circle", *ring()),
-    "square": widget("square", *square()),
-    "cube": widget("cube", *cube()),
-    "diamond": widget("diamond", *diamond()),
-    "cross": widget("cross", *cross()),
-}
-
-# --------------------------------------------------------------------------- armature
-arm_data = bpy.data.armatures.new(NAME + "_rig")
-arm_data.display_type = "STICK"
-rig = bpy.data.objects.new(NAME + "_rig", arm_data)
-rig.show_in_front = True
-root_coll.objects.link(rig)
-
-for obj in bpy.context.view_layer.objects:
-    obj.select_set(False)
-bpy.context.view_layer.objects.active = rig
-rig.select_set(True)
-bpy.ops.object.mode_set(mode="EDIT")
-
-edit = arm_data.edit_bones
-for b in BONES:
-    eb = edit.new(b["name"])
-    eb.head = to_blender(b["head"])
-    eb.tail = to_blender(b["tail"])
-    eb.use_deform = b["deform"]
-for b in BONES:
-    if b["parent"] is not None:
-        edit[b["name"]].parent = edit[BONES[b["parent"]]["name"]]
-
-bone_by_name = {b["name"]: b for b in BONES}
-chain_end_ik = {c["ik_control"]: c["end"] for c in CHAINS}
-
-for c in CONTROLS:
-    eb = edit.new(c["name"])
-    eb.use_deform = False
-    template = c["bone"] if c["kind"] in ("fk", "root") else chain_end_ik.get(c["name"])
-    if template:
-        # Same rest orientation as the bone it drives, so constraints add no offset.
-        src = edit[template]
-        eb.head, eb.tail, eb.roll = src.head.copy(), src.tail.copy(), src.roll
+    # --------------------------------------------------------------------------- mesh
+    if geo is None:
+        positions = RIG["mesh"]["positions"]
+        indices = RIG["mesh"]["indices"]
+        mesh = bpy.data.meshes.new(NAME + "_mesh")
+        mesh.from_pydata(
+            [to_blender(p) for p in positions],
+            [],
+            [indices[i : i + 3] for i in range(0, len(indices), 3)],
+        )
+        mesh.update()
+        for poly in mesh.polygons:
+            poly.use_smooth = True
+        geo = bpy.data.objects.new(NAME + "_geo", mesh)
+        root_coll.objects.link(geo)
     else:
-        head = to_blender(c["position"])
-        eb.head = head
-        eb.tail = head + to_blender(c["axis"]).normalized() * max(c["size"], 0.02)
+        # Rebuilding: keep the user's mesh object (materials, modifiers, edits) and
+        # replace only its skin.
+        geo.vertex_groups.clear()
+        for m in [m for m in geo.modifiers if m.type == "ARMATURE"]:
+            geo.modifiers.remove(m)
+        world = geo.matrix_world.copy()
+        geo.parent = None
+        geo.matrix_world = world
 
-for c in CONTROLS:
-    parent = c["parent"]
-    if parent["type"] in ("control", "bone"):
-        edit[c["name"]].parent = edit[parent["name"]]
-
-MCH = []  # helper bones: hidden, never animated directly
-
-
-def mch(name, like=None, head=None, parent=None):
-    """Helper bone copying `like`'s rest geometry, or standing upright at `head`."""
-    eb = edit.new(name)
-    eb.use_deform = False
-    if like is not None:
-        src = edit[like]
-        eb.head, eb.tail, eb.roll = src.head.copy(), src.tail.copy(), src.roll
-    else:
-        # Upright with zero roll, so local X is world X: rotating about X pitches the foot.
-        eb.head = head
-        eb.tail = head + Vector((0.0, 0.0, 0.05))
-        eb.roll = 0.0
-    if parent is not None:
-        eb.parent = edit[parent]
-    MCH.append(name)
-    return name
+    # --------------------------------------------------------------------------- widgets
+    def widget(name, verts, edges):
+        me = bpy.data.meshes.new("WGT_" + name)
+        me.from_pydata(verts, edges, [])
+        obj = bpy.data.objects.new("WGT_" + NAME + "_" + name, me)
+        widget_coll.objects.link(obj)
+        return obj
 
 
-# Space switching: each switchable control hangs under a parentless helper that an
-# Armature constraint binds to whichever space is selected.
-space_bone = {}
-for c in CONTROLS:
-    if c.get("spaces"):
-        space_bone[c["name"]] = mch("MCH_%s_space" % c["name"], like=c["name"])
-        edit[c["name"]].parent = edit[space_bone[c["name"]]]
-
-# Reverse foot: heel > toe tip > ball > ankle under the foot IK control.
-foot_ik_target = {}
-for chain in CHAINS:
-    foot = chain.get("foot")
-    if not foot:
-        continue
-    n = chain["name"]
-    heel = mch("MCH_%s_heel" % n, head=to_blender(foot["heel"]), parent=chain["ik_control"])
-    toe = mch("MCH_%s_toe" % n, head=to_blender(foot["toe_tip"]), parent=heel)
-    ball = mch("MCH_%s_ball" % n, head=to_blender(foot["ball"]), parent=toe)
-    foot_ik_target[n] = mch("MCH_%s_ankle" % n, like=chain["end"], parent=ball)
-    # The toe control follows the foot in FK and stays planted on the toe pivot in IK.
-    flat = mch("MCH_%s_toe_flat" % n, like=foot["ball_bone"], parent=toe)
-    ball_space = mch("MCH_%s_ball_space" % n, like=foot["ball_bone"], parent=chain["end"])
-    edit[foot["ball_control"]].parent = edit[ball_space]
-    chain["_flat"], chain["_ball_space"] = flat, ball_space
-    chain["_pivots"] = (heel, toe, ball)
+    def ring(n=32):
+        # In the bone's XZ plane, so the circle wraps around the bone's Y axis.
+        verts = [(math.cos(i / n * math.tau), 0.0, math.sin(i / n * math.tau)) for i in range(n)]
+        return verts, [(i, (i + 1) % n) for i in range(n)]
 
 
-def signed_angle(u, v, normal):
-    a = u.angle(v)
-    if u.cross(v).angle(normal) < 1:
-        a = -a
-    return a
+    def square():
+        verts = [(-1, 0, -1), (1, 0, -1), (1, 0, 1), (-1, 0, 1)]
+        return verts, [(0, 1), (1, 2), (2, 3), (3, 0)]
 
 
-def pole_angle(base, ik, pole):
-    normal = (ik.tail - base.head).cross(pole - base.head)
-    projected = normal.cross(base.tail - base.head)
-    return signed_angle(base.x_axis, projected, base.tail - base.head)
+    def cube():
+        verts = [(x, y, z) for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]
+        edges = [(a, b) for a in range(8) for b in range(a + 1, 8) if sum(verts[a][k] != verts[b][k] for k in range(3)) == 1]
+        return verts, edges
 
 
-pole_angles = {
-    c["name"]: pole_angle(edit[c["upper"]], edit[c["lower"]], edit[c["pole_control"]].head)
-    for c in CHAINS
-}
+    def diamond():
+        verts = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]
+        edges = [(a, b) for a in range(6) for b in range(a + 1, 6) if a // 2 != b // 2]
+        return verts, edges
 
-bpy.ops.object.mode_set(mode="POSE")
 
-# --------------------------------------------------------------------------- bone collections / colours
-has_collections = hasattr(arm_data, "collections")
-if has_collections:
-    def_coll = arm_data.collections.new("DEF")
-    ctrl_coll = arm_data.collections.new("CTRL")
-    def_coll.is_visible = False
+    def cross():
+        verts = [(-1, 0, 0), (1, 0, 0), (0, 0, -1), (0, 0, 1)]
+        return verts, [(0, 1), (2, 3)]
 
-pose = rig.pose.bones
-for b in BONES:
+
+    WIDGETS = {
+        "circle": widget("circle", *ring()),
+        "square": widget("square", *square()),
+        "cube": widget("cube", *cube()),
+        "diamond": widget("diamond", *diamond()),
+        "cross": widget("cross", *cross()),
+    }
+
+    # --------------------------------------------------------------------------- armature
+    arm_data = bpy.data.armatures.new(NAME + "_rig")
+    arm_data.display_type = "STICK"
+    rig = bpy.data.objects.new(NAME + "_rig", arm_data)
+    rig.show_in_front = True
+    root_coll.objects.link(rig)
+
+    for obj in bpy.context.view_layer.objects:
+        if obj is not None:  # entries for objects removed by a rebuild
+            obj.select_set(False)
+    bpy.context.view_layer.objects.active = rig
+    rig.select_set(True)
+    bpy.ops.object.mode_set(mode="EDIT")
+
+    edit = arm_data.edit_bones
+    for b in BONES:
+        eb = edit.new(b["name"])
+        eb.head = to_blender(b["head"])
+        eb.tail = to_blender(b["tail"])
+        eb.use_deform = b["deform"]
+    for b in BONES:
+        if b["parent"] is not None:
+            edit[b["name"]].parent = edit[BONES[b["parent"]]["name"]]
+
+    bone_by_name = {b["name"]: b for b in BONES}
+    chain_end_ik = {c["ik_control"]: c["end"] for c in CHAINS}
+
+    for c in CONTROLS:
+        eb = edit.new(c["name"])
+        eb.use_deform = False
+        template = c["bone"] if c["kind"] in ("fk", "root") else chain_end_ik.get(c["name"])
+        if template:
+            # Same rest orientation as the bone it drives, so constraints add no offset.
+            src = edit[template]
+            eb.head, eb.tail, eb.roll = src.head.copy(), src.tail.copy(), src.roll
+        else:
+            head = to_blender(c["position"])
+            eb.head = head
+            eb.tail = head + to_blender(c["axis"]).normalized() * max(c["size"], 0.02)
+
+    for c in CONTROLS:
+        parent = c["parent"]
+        if parent["type"] in ("control", "bone"):
+            edit[c["name"]].parent = edit[parent["name"]]
+
+    MCH = []  # helper bones: hidden, never animated directly
+
+
+    def mch(name, like=None, head=None, parent=None):
+        """Helper bone copying `like`'s rest geometry, or standing upright at `head`."""
+        eb = edit.new(name)
+        eb.use_deform = False
+        if like is not None:
+            src = edit[like]
+            eb.head, eb.tail, eb.roll = src.head.copy(), src.tail.copy(), src.roll
+        else:
+            # Upright with zero roll, so local X is world X: rotating about X pitches the foot.
+            eb.head = head
+            eb.tail = head + Vector((0.0, 0.0, 0.05))
+            eb.roll = 0.0
+        if parent is not None:
+            eb.parent = edit[parent]
+        MCH.append(name)
+        return name
+
+
+    # Space switching: each switchable control hangs under a parentless helper that an
+    # Armature constraint binds to whichever space is selected.
+    space_bone = {}
+    for c in CONTROLS:
+        if c.get("spaces"):
+            space_bone[c["name"]] = mch("MCH_%s_space" % c["name"], like=c["name"])
+            edit[c["name"]].parent = edit[space_bone[c["name"]]]
+
+    # Reverse foot: heel > toe tip > ball > ankle under the foot IK control.
+    foot_ik_target = {}
+    for chain in CHAINS:
+        foot = chain.get("foot")
+        if not foot:
+            continue
+        n = chain["name"]
+        heel = mch("MCH_%s_heel" % n, head=to_blender(foot["heel"]), parent=chain["ik_control"])
+        toe = mch("MCH_%s_toe" % n, head=to_blender(foot["toe_tip"]), parent=heel)
+        ball = mch("MCH_%s_ball" % n, head=to_blender(foot["ball"]), parent=toe)
+        foot_ik_target[n] = mch("MCH_%s_ankle" % n, like=chain["end"], parent=ball)
+        # The toe control follows the foot in FK and stays planted on the toe pivot in IK.
+        flat = mch("MCH_%s_toe_flat" % n, like=foot["ball_bone"], parent=toe)
+        ball_space = mch("MCH_%s_ball_space" % n, like=foot["ball_bone"], parent=chain["end"])
+        edit[foot["ball_control"]].parent = edit[ball_space]
+        chain["_flat"], chain["_ball_space"] = flat, ball_space
+        chain["_pivots"] = (heel, toe, ball)
+
+
+    def signed_angle(u, v, normal):
+        a = u.angle(v)
+        if u.cross(v).angle(normal) < 1:
+            a = -a
+        return a
+
+
+    def pole_angle(base, ik, pole):
+        normal = (ik.tail - base.head).cross(pole - base.head)
+        projected = normal.cross(base.tail - base.head)
+        return signed_angle(base.x_axis, projected, base.tail - base.head)
+
+
+    pole_angles = {
+        c["name"]: pole_angle(edit[c["upper"]], edit[c["lower"]], edit[c["pole_control"]].head)
+        for c in CHAINS
+    }
+
+    bpy.ops.object.mode_set(mode="POSE")
+
+    # --------------------------------------------------------------------------- bone collections / colours
+    has_collections = hasattr(arm_data, "collections")
     if has_collections:
-        def_coll.assign(arm_data.bones[b["name"]])
-if has_collections:
-    mch_coll = arm_data.collections.new("MCH")
-    mch_coll.is_visible = False
+        def_coll = arm_data.collections.new("DEF")
+        ctrl_coll = arm_data.collections.new("CTRL")
+        def_coll.is_visible = False
+
+    pose = rig.pose.bones
+    for b in BONES:
+        if has_collections:
+            def_coll.assign(arm_data.bones[b["name"]])
+    if has_collections:
+        mch_coll = arm_data.collections.new("MCH")
+        mch_coll.is_visible = False
+        for name in MCH:
+            mch_coll.assign(arm_data.bones[name])
     for name in MCH:
-        mch_coll.assign(arm_data.bones[name])
-for name in MCH:
-    pose[name].rotation_mode = "XYZ"
+        pose[name].rotation_mode = "XYZ"
 
-for c in CONTROLS:
-    pb = pose[c["name"]]
-    pb.custom_shape = WIDGETS[c["shape"]]
-    pb.use_custom_shape_bone_size = False
-    pb.custom_shape_scale_xyz = (c["size"],) * 3
-    if c["kind"] == "fk" and c["bone"]:
-        # Shift the shape onto the control's position (e.g. clavicle at the shoulder).
-        offset = to_blender(c["position"]) - pb.bone.head_local
-        local = pb.bone.matrix_local.to_3x3().inverted() @ offset
-        pb.custom_shape_translation = local
-    pb.rotation_mode = "XYZ"
-    if c["kind"] == "fk" and c["bone"] and copy_rule(bone_by_name[c["bone"]]) == "COPY_ROTATION":
-        pb.lock_location = (True, True, True)
-    if has_collections:
-        ctrl_coll.assign(arm_data.bones[c["name"]])
-    if hasattr(pb, "color"):
-        pb.color.palette = "CUSTOM"
-        col = c["color"]
-        pb.color.custom.normal = col
-        pb.color.custom.select = [min(1.0, x + 0.35) for x in col]
-        pb.color.custom.active = (1.0, 1.0, 1.0)
+    for c in CONTROLS:
+        pb = pose[c["name"]]
+        pb.custom_shape = WIDGETS[c["shape"]]
+        pb.use_custom_shape_bone_size = False
+        pb.custom_shape_scale_xyz = (c["size"],) * 3
+        if c["kind"] == "fk" and c["bone"]:
+            # Shift the shape onto the control's position (e.g. clavicle at the shoulder).
+            offset = to_blender(c["position"]) - pb.bone.head_local
+            local = pb.bone.matrix_local.to_3x3().inverted() @ offset
+            pb.custom_shape_translation = local
+        pb.rotation_mode = "XYZ"
+        if c["kind"] == "fk" and c["bone"] and copy_rule(bone_by_name[c["bone"]]) == "COPY_ROTATION":
+            pb.lock_location = (True, True, True)
+        if has_collections:
+            ctrl_coll.assign(arm_data.bones[c["name"]])
+        if hasattr(pb, "color"):
+            pb.color.palette = "CUSTOM"
+            col = c["color"]
+            pb.color.custom.normal = col
+            pb.color.custom.select = [min(1.0, x + 0.35) for x in col]
+            pb.color.custom.active = (1.0, 1.0, 1.0)
 
-# --------------------------------------------------------------------------- constraints
-def add_driver(owner, path, control, prop, expression, index=-1):
-    """Drive owner.path from a custom property on a control (simple expressions only,
-    so it works without enabling Python auto-run)."""
-    fcurve = owner.driver_add(path, index) if index >= 0 else owner.driver_add(path)
-    drv = fcurve.driver
-    drv.type = "SCRIPTED"
-    var = drv.variables.new()
-    var.name = prop
-    var.type = "SINGLE_PROP"
-    var.targets[0].id = rig
-    var.targets[0].data_path = 'pose.bones["%s"]["%s"]' % (control, prop)
-    drv.expression = expression
-    return fcurve
+    # --------------------------------------------------------------------------- constraints
+    def add_driver(owner, path, control, prop, expression, index=-1):
+        """Drive owner.path from a custom property on a control (simple expressions only,
+        so it works without enabling Python auto-run)."""
+        fcurve = owner.driver_add(path, index) if index >= 0 else owner.driver_add(path)
+        drv = fcurve.driver
+        drv.type = "SCRIPTED"
+        var = drv.variables.new()
+        var.name = prop
+        var.type = "SINGLE_PROP"
+        var.targets[0].id = rig
+        var.targets[0].data_path = 'pose.bones["%s"]["%s"]' % (control, prop)
+        drv.expression = expression
+        return fcurve
 
 
-def add_blend_driver(con, ik_control):
-    add_driver(con, "influence", ik_control, "ik_fk", "ik_fk")
+    def add_blend_driver(con, ik_control):
+        add_driver(con, "influence", ik_control, "ik_fk", "ik_fk")
 
 
-def add_property(pb, name, value, lo, hi, description):
-    pb[name] = value
-    try:
-        pb.id_properties_ui(name).update(min=lo, max=hi, soft_min=lo, soft_max=hi, description=description)
-    except AttributeError:
-        pass
+    def add_property(pb, name, value, lo, hi, description):
+        pb[name] = value
+        try:
+            pb.id_properties_ui(name).update(min=lo, max=hi, soft_min=lo, soft_max=hi, description=description)
+        except AttributeError:
+            pass
 
 
-for c in CONTROLS:
-    if c["kind"] in ("fk", "root") and c["bone"]:
-        con = pose[c["bone"]].constraints.new(copy_rule(bone_by_name[c["bone"]]))
-        con.name = "FK"
+    for c in CONTROLS:
+        if c["kind"] in ("fk", "root") and c["bone"]:
+            con = pose[c["bone"]].constraints.new(copy_rule(bone_by_name[c["bone"]]))
+            con.name = "FK"
+            con.target = rig
+            con.subtarget = c["name"]
+
+    for chain in CHAINS:
+        ik_pb = pose[chain["ik_control"]]
+        add_property(ik_pb, "ik_fk", float(chain["default_blend"]), 0.0, 1.0, "0 = FK, 1 = IK")
+        add_property(ik_pb, "stretch", float(chain["default_stretch"]), 0.0, 1.0,
+                     "Let the limb stretch to reach the IK control")
+        goal = foot_ik_target.get(chain["name"], chain["ik_control"])
+
+        ik = pose[chain["lower"]].constraints.new("IK")
+        ik.name = "IK"
+        ik.target = rig
+        ik.subtarget = goal
+        ik.use_stretch = True
+        for bone in (chain["upper"], chain["lower"]):
+            add_driver(pose[bone], "ik_stretch", chain["ik_control"], "stretch", "stretch * 0.1")
+        ik.pole_target = rig
+        ik.pole_subtarget = chain["pole_control"]
+        ik.pole_angle = pole_angles[chain["name"]]
+        ik.chain_count = 2
+        add_blend_driver(ik, chain["ik_control"])
+
+        rot = pose[chain["end"]].constraints.new("COPY_ROTATION")
+        rot.name = "IK Rotation"
+        rot.target = rig
+        rot.subtarget = goal
+        add_blend_driver(rot, chain["ik_control"])
+
+        foot = chain.get("foot")
+        if foot:
+            add_property(ik_pb, "roll", 0.0, -90.0, 120.0,
+                         "Negative rocks back on the heel; positive rolls through the ball, then the toe")
+            brk = float(foot["break_angle"])
+            heel, toe, ball = chain["_pivots"]
+            d2r = "0.0174533"
+            add_driver(pose[heel], "rotation_euler", chain["ik_control"], "roll", "min(roll, 0) * " + d2r, 0)
+            add_driver(pose[ball], "rotation_euler", chain["ik_control"], "roll",
+                       "min(max(roll, 0), %g) * %s" % (brk, d2r), 0)
+            add_driver(pose[toe], "rotation_euler", chain["ik_control"], "roll",
+                       "max(roll - %g, 0) * %s" % (brk, d2r), 0)
+            follow = pose[chain["_ball_space"]].constraints.new("COPY_TRANSFORMS")
+            follow.name = "IK Toe"
+            follow.target = rig
+            follow.subtarget = chain["_flat"]
+            add_blend_driver(follow, chain["ik_control"])
+
+    # Twist helpers take a share of their source bone's twist (rotation about its length).
+    for b in BONES:
+        twist = b.get("twist")
+        if not twist:
+            continue
+        con = pose[b["name"]].constraints.new("COPY_ROTATION")
+        con.name = "Twist"
         con.target = rig
-        con.subtarget = c["name"]
+        con.subtarget = twist["source"]
+        con.use_x = con.use_z = False
+        con.use_y = True
+        con.invert_y = twist["factor"] < 0
+        con.owner_space = con.target_space = "LOCAL"
+        con.mix_mode = "ADD"
+        con.influence = abs(twist["factor"])
 
-for chain in CHAINS:
-    ik_pb = pose[chain["ik_control"]]
-    add_property(ik_pb, "ik_fk", float(chain["default_blend"]), 0.0, 1.0, "0 = FK, 1 = IK")
-    add_property(ik_pb, "stretch", float(chain["default_stretch"]), 0.0, 1.0,
-                 "Let the limb stretch to reach the IK control")
-    goal = foot_ik_target.get(chain["name"], chain["ik_control"])
+    # Space switching.
+    for c in CONTROLS:
+        if not c.get("spaces"):
+            continue
+        pb = pose[c["name"]]
+        add_property(pb, "space", 0, 0, len(c["spaces"]) - 1,
+                     "Follow: " + ", ".join("%d = %s" % (i, s) for i, s in enumerate(c["spaces"])))
+        con = pose[space_bone[c["name"]]].constraints.new("ARMATURE")
+        con.name = "Space"
+        for i, space in enumerate(c["spaces"]):
+            t = con.targets.new()
+            t.target = rig
+            t.subtarget = space
+            t.weight = 1.0 if i == 0 else 0.0
+            add_driver(t, "weight", c["name"], "space", "1 - min(abs(space - %d), 1)" % i)
 
-    ik = pose[chain["lower"]].constraints.new("IK")
-    ik.name = "IK"
-    ik.target = rig
-    ik.subtarget = goal
-    ik.use_stretch = True
-    for bone in (chain["upper"], chain["lower"]):
-        add_driver(pose[bone], "ik_stretch", chain["ik_control"], "stretch", "stretch * 0.1")
-    ik.pole_target = rig
-    ik.pole_subtarget = chain["pole_control"]
-    ik.pole_angle = pole_angles[chain["name"]]
-    ik.chain_count = 2
-    add_blend_driver(ik, chain["ik_control"])
+    bpy.ops.object.mode_set(mode="OBJECT")
 
-    rot = pose[chain["end"]].constraints.new("COPY_ROTATION")
-    rot.name = "IK Rotation"
-    rot.target = rig
-    rot.subtarget = goal
-    add_blend_driver(rot, chain["ik_control"])
+    # --------------------------------------------------------------------------- skin
+    for b in BONES:
+        if b["deform"]:
+            geo.vertex_groups.new(name=b["name"])
+    groups = {vg.name: vg for vg in geo.vertex_groups}
+    for v, (joints, weights) in enumerate(zip(RIG["skin"]["joints"], RIG["skin"]["weights"])):
+        for j, w in zip(joints, weights):
+            if w > 0.0:
+                groups[BONES[j]["name"]].add([v], w, "REPLACE")
 
-    foot = chain.get("foot")
-    if foot:
-        add_property(ik_pb, "roll", 0.0, -90.0, 120.0,
-                     "Negative rocks back on the heel; positive rolls through the ball, then the toe")
-        brk = float(foot["break_angle"])
-        heel, toe, ball = chain["_pivots"]
-        d2r = "0.0174533"
-        add_driver(pose[heel], "rotation_euler", chain["ik_control"], "roll", "min(roll, 0) * " + d2r, 0)
-        add_driver(pose[ball], "rotation_euler", chain["ik_control"], "roll",
-                   "min(max(roll, 0), %g) * %s" % (brk, d2r), 0)
-        add_driver(pose[toe], "rotation_euler", chain["ik_control"], "roll",
-                   "max(roll - %g, 0) * %s" % (brk, d2r), 0)
-        follow = pose[chain["_ball_space"]].constraints.new("COPY_TRANSFORMS")
-        follow.name = "IK Toe"
-        follow.target = rig
-        follow.subtarget = chain["_flat"]
-        add_blend_driver(follow, chain["ik_control"])
+    mod = geo.modifiers.new("Armature", "ARMATURE")
+    mod.object = rig
+    geo.parent = rig
 
-# Twist helpers take a share of their source bone's twist (rotation about its length).
-for b in BONES:
-    twist = b.get("twist")
-    if not twist:
-        continue
-    con = pose[b["name"]].constraints.new("COPY_ROTATION")
-    con.name = "Twist"
-    con.target = rig
-    con.subtarget = twist["source"]
-    con.use_x = con.use_z = False
-    con.use_y = True
-    con.invert_y = twist["factor"] < 0
-    con.owner_space = con.target_space = "LOCAL"
-    con.mix_mode = "ADD"
-    con.influence = abs(twist["factor"])
+    # What the Hive panel needs to edit guides and rebuild, kept with the rig so it
+    # survives saving and reopening the file.
+    rig["hive_name"] = NAME
+    rig["hive_guides"] = json.dumps(RIG["guides"])
+    rig["hive_dir"] = OUT_DIR
+    bpy.context.view_layer.objects.active = rig
+    print("hive-rig: built %s with %d bones and %d controls" % (NAME, len(BONES), len(CONTROLS)))
+    return rig, geo
 
-# Space switching.
-for c in CONTROLS:
-    if not c.get("spaces"):
-        continue
-    pb = pose[c["name"]]
-    add_property(pb, "space", 0, 0, len(c["spaces"]) - 1,
-                 "Follow: " + ", ".join("%d = %s" % (i, s) for i, s in enumerate(c["spaces"])))
-    con = pose[space_bone[c["name"]]].constraints.new("ARMATURE")
-    con.name = "Space"
-    for i, space in enumerate(c["spaces"]):
-        t = con.targets.new()
-        t.target = rig
-        t.subtarget = space
-        t.weight = 1.0 if i == 0 else 0.0
-        add_driver(t, "weight", c["name"], "space", "1 - min(abs(space - %d), 1)" % i)
 
-bpy.ops.object.mode_set(mode="OBJECT")
+# --------------------------------------------------------------------------- guides
+# Guides are empties named GDE_<rig>__<component>__<guide>. Moving them and
+# pressing Rebuild writes <name>.guides.json and asks hive-rig to rebuild.
 
-# --------------------------------------------------------------------------- skin
-for b in BONES:
-    if b["deform"]:
-        geo.vertex_groups.new(name=b["name"])
-groups = {vg.name: vg for vg in geo.vertex_groups}
-for v, (joints, weights) in enumerate(zip(RIG["skin"]["joints"], RIG["skin"]["weights"])):
-    for j, w in zip(joints, weights):
-        if w > 0.0:
-            groups[BONES[j]["name"]].add([v], w, "REPLACE")
 
-mod = geo.modifiers.new("Armature", "ARMATURE")
-mod.object = rig
-geo.parent = rig
+def find_rig(context=None):
+    """The Hive rig for the active object (the rig, its mesh, or one of its guides)."""
+    context = context or bpy.context
+    obj = context.active_object
+    candidates = [obj] if obj else []
+    if obj is not None:
+        candidates.append(obj.parent)
+        name = obj.get("hive_rig")
+        if name:
+            candidates.append(bpy.data.objects.get(name))
+    candidates += [o for o in bpy.data.objects if o.get("hive_guides")]
+    return next((o for o in candidates if o is not None and o.get("hive_guides")), None)
 
-bpy.context.view_layer.objects.active = rig
-print("hive-rig: built %s with %d bones and %d controls" % (NAME, len(BONES), len(CONTROLS)))
 
-# Optional: `-- --save path.blend` when run headless.
-if "--" in sys.argv:
-    args = sys.argv[sys.argv.index("--") + 1 :]
-    if "--save" in args:
-        bpy.ops.wm.save_as_mainfile(filepath=args[args.index("--save") + 1])
+def guide_objects(rig):
+    return [o for o in bpy.data.objects if o.get("hive_rig") == rig.name]
+
+
+def rig_mesh(rig):
+    return next((o for o in rig.children if o.type == "MESH"), None)
+
+
+def guides_of(rig):
+    """Current guides: from the guide empties when they're out, else as last built."""
+    data = json.loads(rig["hive_guides"])
+    by_key = {(o["hive_component"], o["hive_guide"]): o for o in guide_objects(rig)}
+    for comp in data["components"]:
+        for g in comp["guides"]:
+            obj = by_key.get((comp["id"], g["name"]))
+            if obj is not None:
+                # Guides are never parented, and `location` is current even before
+                # Blender refreshes matrix_world for newly created empties.
+                g["position"] = from_blender(obj.location)
+    return data
+
+
+def remove_guides(rig):
+    for o in guide_objects(rig):
+        bpy.data.objects.remove(o, do_unlink=True)
+    coll = bpy.data.collections.get(rig["hive_name"] + "_guides")
+    if coll is not None:
+        bpy.data.collections.remove(coll)
+
+
+def show_guides(rig, data=None):
+    """Put out an empty for every guide and hide the controls while editing."""
+    data = data or guides_of(rig)
+    remove_guides(rig)
+    name = rig["hive_name"]
+    parent_coll = bpy.data.collections.get(name) or bpy.context.scene.collection
+    coll = bpy.data.collections.new(name + "_guides")
+    parent_coll.children.link(coll)
+    size = 0.012 * data["body"]["height"]
+    colors = {"left": (0.1, 0.45, 1.0, 1.0), "right": (1.0, 0.15, 0.15, 1.0), "center": (1.0, 0.85, 0.1, 1.0)}
+    for comp in data["components"]:
+        for g in comp["guides"]:
+            obj = bpy.data.objects.new("GDE_%s__%s__%s" % (name, comp["id"], g["name"]), None)
+            obj.empty_display_type = "SPHERE"
+            obj.empty_display_size = size
+            obj.location = to_blender(g["position"])
+            obj.show_in_front = True
+            obj.color = colors.get(comp.get("side", "center"), colors["center"])
+            obj["hive_rig"] = rig.name
+            obj["hive_component"] = comp["id"]
+            obj["hive_guide"] = g["name"]
+            coll.objects.link(obj)
+    rig.hide_set(True)
+    rig["hive_guides"] = json.dumps(data)
+
+
+def mirror_guides(rig, source="left"):
+    """Copy one side's guide positions onto the other, mirrored across the body."""
+    data = guides_of(rig)
+    cx = data["body"]["center_x"]
+    other = "right" if source == "left" else "left"
+    suffix = {"left": "_l", "right": "_r"}
+    comps = {c["id"]: c for c in data["components"]}
+    for comp in data["components"]:
+        if comp.get("side") != source or not comp["id"].endswith(suffix[source]):
+            continue
+        twin = comps.get(comp["id"][: -len(suffix[source])] + suffix[other])
+        if twin is None or len(twin["guides"]) != len(comp["guides"]):
+            continue
+        for g, t in zip(comp["guides"], twin["guides"]):
+            x, y, z = g["position"]
+            t["position"] = [2 * cx - x, y, z]
+    show_guides(rig, data)
+
+
+def run_hive(*args):
+    if not HIVE_EXE or not os.path.isfile(HIVE_EXE):
+        raise RuntimeError("hive-rig program not found; set HIVE_EXE at the top of this script (%r)" % HIVE_EXE)
+    done = subprocess.run([HIVE_EXE] + [str(a) for a in args], capture_output=True, text=True)
+    if done.returncode != 0:
+        raise RuntimeError("hive-rig %s failed: %s" % (args[0], (done.stderr or done.stdout).strip()))
+    return done.stdout
+
+
+def files(rig):
+    name, folder = rig["hive_name"], rig["hive_dir"]
+    return os.path.join(folder, name + ".guides.json"), os.path.join(folder, name + ".hive.json")
+
+
+def write_guides(rig, data):
+    path = files(rig)[0]
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+    return path
+
+
+def change_components(rig, *args):
+    """Run `hive-rig add|remove <guides> ...` and show the updated guides."""
+    path = write_guides(rig, guides_of(rig))
+    out = run_hive(args[0], path, *args[1:])
+    with open(path) as f:
+        show_guides(rig, json.load(f))
+    return out.strip()
+
+
+def read_weights(geo):
+    names = {vg.index: vg.name for vg in geo.vertex_groups}
+    return [{names[g.group]: g.weight for g in v.groups if g.weight > 0.0} for v in geo.data.vertices]
+
+
+def rebuild(rig, keep_weights=True):
+    """Rebuild the rig from its guides. With keep_weights, vertices keep their
+    current weights unless the new rig weights them to a bone that didn't exist."""
+    guides_path, hive_path = files(rig)
+    write_guides(rig, guides_of(rig))
+    run_hive("rebuild", hive_path, "--guides", guides_path)
+    with open(hive_path) as f:
+        data = json.load(f)
+
+    geo = rig_mesh(rig)
+    old = read_weights(geo) if geo is not None and keep_weights else None
+    old_bones = {b.name for b in rig.data.bones}
+    name = rig["hive_name"]
+    remove_guides(rig)
+    arm = rig.data
+    bpy.data.objects.remove(rig, do_unlink=True)
+    bpy.data.armatures.remove(arm)
+    widgets = bpy.data.collections.get(name + "_widgets")
+    if widgets is not None:
+        for o in list(widgets.objects):
+            bpy.data.objects.remove(o, do_unlink=True)
+        bpy.data.collections.remove(widgets)
+
+    bpy.context.view_layer.update()
+    rig, geo = build(data, geo)
+    kept = 0
+    if old is not None and len(old) == len(geo.data.vertices):
+        groups = {vg.name: vg for vg in geo.vertex_groups}
+        new = read_weights(geo)
+        for v, (before, after) in enumerate(zip(old, new)):
+            if not before or not set(after) <= old_bones:
+                continue
+            for g in after:
+                groups[g].remove([v])
+            for g, w in before.items():
+                if g in groups:
+                    groups[g].add([v], w, "REPLACE")
+            kept += 1
+    print("hive-rig: rebuilt %s; kept the weights of %d vertices" % (name, kept))
+    return rig
+
+
+# --------------------------------------------------------------------------- UI
+
+
+class HIVE_OT_edit_guides(bpy.types.Operator):
+    bl_idname = "hive.edit_guides"
+    bl_label = "Edit Guides"
+    bl_description = "Show the guides so you can move them; Rebuild applies them"
+
+    def execute(self, context):
+        show_guides(find_rig(context))
+        return {"FINISHED"}
+
+
+class HIVE_OT_mirror_guides(bpy.types.Operator):
+    bl_idname = "hive.mirror_guides"
+    bl_label = "Mirror Left to Right"
+    bl_description = "Copy the left guides onto the right side"
+
+    def execute(self, context):
+        mirror_guides(find_rig(context))
+        return {"FINISHED"}
+
+
+class HIVE_OT_add_component(bpy.types.Operator):
+    bl_idname = "hive.add_component"
+    bl_label = "Add Component"
+    bl_description = "Add premade guides; Rebuild turns them into bones and controls"
+    preset: bpy.props.EnumProperty(
+        items=[("fingers", "Fingers", "Five fingers on each hand"), ("tail", "Tail", "A tail behind the pelvis")]
+    )
+
+    def execute(self, context):
+        try:
+            self.report({"INFO"}, change_components(find_rig(context), "add", self.preset))
+        except RuntimeError as e:
+            self.report({"ERROR"}, str(e))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class HIVE_OT_remove_component(bpy.types.Operator):
+    bl_idname = "hive.remove_component"
+    bl_label = "Remove Component"
+    bl_description = "Remove the selected guide's component and everything attached to it"
+
+    def execute(self, context):
+        obj = context.active_object
+        if obj is None or not obj.get("hive_component"):
+            self.report({"ERROR"}, "Select a guide of the component to remove")
+            return {"CANCELLED"}
+        try:
+            self.report({"INFO"}, change_components(find_rig(context), "remove", obj["hive_component"]))
+        except RuntimeError as e:
+            self.report({"ERROR"}, str(e))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class HIVE_OT_rebuild(bpy.types.Operator):
+    bl_idname = "hive.rebuild"
+    bl_label = "Rebuild Rig"
+    bl_description = "Rebuild the skeleton and controls from the guides"
+    keep_weights: bpy.props.BoolProperty(
+        name="Keep Weights", default=True, description="Keep current skin weights where the bones still exist"
+    )
+
+    def execute(self, context):
+        try:
+            rebuild(find_rig(context), self.keep_weights)
+        except RuntimeError as e:
+            self.report({"ERROR"}, str(e))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class HIVE_PT_panel(bpy.types.Panel):
+    bl_label = "Hive Rig"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Hive"
+
+    def draw(self, context):
+        layout = self.layout
+        rig = find_rig(context)
+        if rig is None:
+            layout.label(text="No Hive rig in this file")
+            return
+        layout.label(text=rig["hive_name"])
+        editing = bool(guide_objects(rig))
+        col = layout.column(align=True)
+        col.operator("hive.edit_guides", icon="EMPTY_DATA")
+        sub = col.column(align=True)
+        sub.enabled = editing
+        sub.operator("hive.mirror_guides", icon="MOD_MIRROR")
+        col = layout.column(align=True)
+        col.label(text="Components")
+        col.operator("hive.add_component", text="Add Fingers").preset = "fingers"
+        col.operator("hive.add_component", text="Add Tail").preset = "tail"
+        col.operator("hive.remove_component", icon="X")
+        layout.operator("hive.rebuild", icon="FILE_REFRESH").keep_weights = True
+
+
+CLASSES = (
+    HIVE_OT_edit_guides,
+    HIVE_OT_mirror_guides,
+    HIVE_OT_add_component,
+    HIVE_OT_remove_component,
+    HIVE_OT_rebuild,
+    HIVE_PT_panel,
+)
+
+
+def register():
+    for cls in CLASSES:
+        if hasattr(bpy.types, cls.__name__):
+            bpy.utils.unregister_class(getattr(bpy.types, cls.__name__))
+        bpy.utils.register_class(cls)
+
+
+def main():
+    existing = bpy.data.objects.get(RIG_DATA["name"] + "_rig")
+    if existing is not None and existing.get("hive_guides"):
+        print("hive-rig: %s is already in this file; the Hive tab is ready" % RIG_DATA["name"])
+    else:
+        build(RIG_DATA)
+    register()
+
+    # Optional: `-- --save path.blend` when run headless.
+    if "--" in sys.argv:
+        args = sys.argv[sys.argv.index("--") + 1 :]
+        if "--save" in args:
+            bpy.ops.wm.save_as_mainfile(filepath=args[args.index("--save") + 1])
+
+
+if __name__ == "__main__":
+    main()

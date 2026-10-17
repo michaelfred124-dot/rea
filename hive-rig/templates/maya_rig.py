@@ -6,10 +6,17 @@ vectors, and an `ikFk` blend attribute on every limb's IK control.
 
 Run in Maya 2022+: Script Editor > Python tab > File > Load Script > Execute,
 or `mayapy <this file>` with --save <path.ma> to build headless.
+
+It also opens a "Hive Rig" window for editing the rig's guides, adding or
+removing components (fingers, tails) and rebuilding. Rebuilding keeps your skin
+weights except where new bones were added. Running the script again when the rig
+is already in the scene only reopens the window.
 """
 
 import json
 import math
+import os
+import subprocess
 import sys
 
 import maya.api.OpenMaya as om
@@ -21,12 +28,14 @@ if not hasattr(cmds, "about"):  # running under mayapy without a UI
 
     maya.standalone.initialize(name="python")
 
-RIG = json.loads(r"""__HIVE_RIG_JSON__""")
-
-NAME = RIG["name"]
-BONES = RIG["skeleton"]["bones"]
-CONTROLS = RIG["controls"]["controls"]
-CHAINS = RIG["controls"]["ik_chains"]
+RIG_DATA = json.loads(r"""__HIVE_RIG_JSON__""")
+GLB_PATH = r"""__HIVE_GLB_PATH__"""
+# The hive-rig program, used to rebuild from edited guides. Change this if you
+# moved it since generating this script.
+HIVE_EXE = r"""__HIVE_EXE__"""
+OUT_DIR = os.path.dirname(GLB_PATH)
+NAME = RIG_DATA["name"]
+TOP = NAME + "_rig"
 SCALE = 100.0  # hive data is in metres; Maya's default unit is centimetres
 
 
@@ -34,299 +43,551 @@ def mpos(p):
     return [p[0] * SCALE, p[1] * SCALE, p[2] * SCALE]
 
 
-def copy_rule(bone):
-    parent = bone["parent"]
-    return "parent" if parent is None or not BONES[parent]["deform"] else "orient"
+def build(RIG, geo=None):
+    """Build the skeleton, skin and controls for RIG. With `geo`, re-skin that
+    existing mesh instead of creating a new one."""
+    BONES = RIG["skeleton"]["bones"]
+    CONTROLS = RIG["controls"]["controls"]
+    CHAINS = RIG["controls"]["ik_chains"]
 
+    def copy_rule(bone):
+        parent = bone["parent"]
+        return "parent" if parent is None or not BONES[parent]["deform"] else "orient"
 
-# --------------------------------------------------------------------------- groups
-top = cmds.group(empty=True, name=NAME + "_rig")
-geo_grp = cmds.group(empty=True, name=NAME + "_geo_grp", parent=top)
-skel_grp = cmds.group(empty=True, name=NAME + "_skeleton_grp", parent=top)
-ctrl_grp = cmds.group(empty=True, name=NAME + "_controls_grp", parent=top)
-helper_grp = cmds.group(empty=True, name=NAME + "_helpers_grp", parent=top)
-cmds.setAttr(helper_grp + ".visibility", 0)
+    # --------------------------------------------------------------------------- groups
+    top = cmds.group(empty=True, name=NAME + "_rig")
+    geo_grp = cmds.group(empty=True, name=NAME + "_geo_grp", parent=top)
+    skel_grp = cmds.group(empty=True, name=NAME + "_skeleton_grp", parent=top)
+    ctrl_grp = cmds.group(empty=True, name=NAME + "_controls_grp", parent=top)
+    helper_grp = cmds.group(empty=True, name=NAME + "_helpers_grp", parent=top)
+    cmds.setAttr(helper_grp + ".visibility", 0)
 
-# --------------------------------------------------------------------------- mesh
-positions = RIG["mesh"]["positions"]
-indices = RIG["mesh"]["indices"]
-points = om.MPointArray([om.MPoint(*mpos(p)) for p in positions])
-fn_mesh = om.MFnMesh()
-mesh_obj = fn_mesh.create(points, [3] * (len(indices) // 3), indices)
-geo = cmds.rename(om.MFnDagNode(mesh_obj).fullPathName(), NAME + "_geo")
-cmds.parent(geo, geo_grp)
-geo_shape = cmds.listRelatives(geo, shapes=True, fullPath=True)[0]
-cmds.sets(geo_shape, edit=True, forceElement="initialShadingGroup")
-cmds.polySoftEdge(geo, angle=180, constructionHistory=False)
-
-# --------------------------------------------------------------------------- joints
-joints = []
-for b in BONES:
-    parent = joints[b["parent"]] if b["parent"] is not None else skel_grp
-    j = cmds.createNode("joint", name=b["name"], parent=parent)
-    cmds.xform(j, worldSpace=True, translation=mpos(b["head"]))
-    joints.append(j)
-
-children = {i: [k for k, b in enumerate(BONES) if b["parent"] == i] for i in range(len(BONES))}
-for i, j in enumerate(joints):
-    if children[i]:
-        # Aim X at the first child (spine before limbs), keep children in place.
-        cmds.joint(j, edit=True, orientJoint="xyz", secondaryAxisOrient="zup", zeroScaleOrient=True, children=False)
+    # --------------------------------------------------------------------------- mesh
+    positions = RIG["mesh"]["positions"]
+    indices = RIG["mesh"]["indices"]
+    if geo is None:
+        points = om.MPointArray([om.MPoint(*mpos(p)) for p in positions])
+        fn_mesh = om.MFnMesh()
+        mesh_obj = fn_mesh.create(points, [3] * (len(indices) // 3), indices)
+        geo = cmds.rename(om.MFnDagNode(mesh_obj).fullPathName(), NAME + "_geo")
+        cmds.parent(geo, geo_grp)
+        geo_shape = cmds.listRelatives(geo, shapes=True, fullPath=True)[0]
+        cmds.sets(geo_shape, edit=True, forceElement="initialShadingGroup")
+        cmds.polySoftEdge(geo, angle=180, constructionHistory=False)
     else:
-        # End joints (head, hands, toes, twist helpers) inherit their parent's axes,
-        # so X still runs down the limb.
-        cmds.setAttr(j + ".jointOrient", 0, 0, 0)
-    cmds.setAttr(j + ".radius", 2.0)
+        # Rebuilding: keep the user's mesh (materials, edits) and re-skin it.
+        geo = cmds.parent(geo, geo_grp)[0]
+        geo_shape = cmds.listRelatives(geo, shapes=True, fullPath=True)[0]
 
-joint_of = {b["name"]: joints[i] for i, b in enumerate(BONES)}
-bone_by_name = {b["name"]: b for b in BONES}
+    # --------------------------------------------------------------------------- joints
+    joints = []
+    for b in BONES:
+        parent = joints[b["parent"]] if b["parent"] is not None else skel_grp
+        j = cmds.createNode("joint", name=b["name"], parent=parent)
+        cmds.xform(j, worldSpace=True, translation=mpos(b["head"]))
+        joints.append(j)
 
-# --------------------------------------------------------------------------- skin
-deform_joints = [joints[i] for i, b in enumerate(BONES) if b["deform"]]
-skin = cmds.skinCluster(
-    deform_joints, geo, toSelectedBones=True, bindMethod=0, maximumInfluences=4,
-    normalizeWeights=1, obeyMaxInfluences=True, name=NAME + "_skinCluster",
-)[0]
-
-sel = om.MSelectionList()
-sel.add(skin)
-sel.add(geo_shape)
-fn_skin = oma.MFnSkinCluster(sel.getDependNode(0))
-shape_path = sel.getDagPath(1)
-influences = [p.partialPathName() for p in fn_skin.influenceObjects()]
-column = {name.split("|")[-1]: k for k, name in enumerate(influences)}
-n_inf = len(influences)
-n_verts = len(positions)
-weights = om.MDoubleArray(n_verts * n_inf, 0.0)
-for v, (js, ws) in enumerate(zip(RIG["skin"]["joints"], RIG["skin"]["weights"])):
-    for j, w in zip(js, ws):
-        if w > 0.0:
-            weights[v * n_inf + column[BONES[j]["name"]]] += w
-comp_fn = om.MFnSingleIndexedComponent()
-comp = comp_fn.create(om.MFn.kMeshVertComponent)
-comp_fn.addElements(list(range(n_verts)))
-fn_skin.setWeights(shape_path, comp, om.MIntArray(list(range(n_inf))), weights, False)
-
-# --------------------------------------------------------------------------- control shapes
-def shape_points(kind):
-    # Local shapes with X as the normal (Maya joints aim X down the bone).
-    if kind == "circle":
-        return [(0, math.cos(a), math.sin(a)) for a in [i / 16.0 * math.tau for i in range(17)]]
-    if kind == "square":
-        return [(0, -1, -1), (0, 1, -1), (0, 1, 1), (0, -1, 1), (0, -1, -1)]
-    if kind == "cube":
-        c = [(-1, -1, -1), (1, -1, -1), (1, 1, -1), (-1, 1, -1), (-1, -1, -1), (-1, -1, 1), (1, -1, 1),
-             (1, -1, -1), (1, 1, -1), (1, 1, 1), (1, -1, 1), (1, 1, 1), (-1, 1, 1), (-1, 1, -1),
-             (-1, 1, 1), (-1, -1, 1)]
-        return c
-    if kind == "diamond":
-        return [(0, 1, 0), (0, 0, 1), (0, -1, 0), (0, 0, -1), (0, 1, 0), (1, 0, 0), (0, -1, 0),
-                (-1, 0, 0), (0, 1, 0), (0, 0, 1), (1, 0, 0), (0, 0, -1), (-1, 0, 0), (0, 0, 1)]
-    return [(0, -1, 0), (0, 1, 0), (0, 0, 0), (0, 0, -1), (0, 0, 1)]  # cross
-
-
-def axis_matrix(axis, position):
-    """World matrix whose X axis points along `axis`."""
-    x = om.MVector(*axis).normal()
-    up = om.MVector(0, 1, 0) if abs(x.y) < 0.9 else om.MVector(0, 0, 1)
-    z = (x ^ up).normal()
-    y = (z ^ x).normal()
-    p = mpos(position)
-    return [x.x, x.y, x.z, 0, y.x, y.y, y.z, 0, z.x, z.y, z.z, 0, p[0], p[1], p[2], 1]
-
-
-chain_end_ik = {c["ik_control"]: c["end"] for c in CHAINS}
-ctrl_of = {}
-offset_of = {}
-for c in CONTROLS:
-    size = c["size"] * SCALE
-    pts = [(x * size, y * size, z * size) for x, y, z in shape_points(c["shape"])]
-    ctrl = cmds.curve(degree=1, point=pts, name=c["name"])
-    shape = cmds.listRelatives(ctrl, shapes=True)[0]
-    shape = cmds.rename(shape, c["name"] + "Shape")
-    cmds.setAttr(shape + ".overrideEnabled", 1)
-    cmds.setAttr(shape + ".overrideRGBColors", 1)
-    cmds.setAttr(shape + ".overrideColorRGB", *c["color"])
-    offset = cmds.group(empty=True, name=c["name"] + "_offset")
-    cmds.parent(ctrl, offset, relative=True)
-
-    parent = c["parent"]
-    if parent["type"] == "control" and not c.get("spaces"):
-        cmds.parent(offset, ctrl_of[parent["name"]], relative=True)
-    else:
-        cmds.parent(offset, ctrl_grp, relative=True)
-
-    template = c["bone"] if c["kind"] in ("fk", "root") else chain_end_ik.get(c["name"])
-    if template:
-        cmds.matchTransform(offset, joint_of[template], position=True, rotation=True)
-        if c["kind"] == "fk":
-            # Shape sits at the control's position (clavicle shape at the shoulder).
-            delta = om.MVector(*mpos(c["position"])) - om.MVector(*cmds.xform(offset, q=True, ws=True, t=True))
-            if delta.length() > 1e-3:
-                cmds.move(delta.x, delta.y, delta.z, shape + ".cv[*]", relative=True, worldSpace=True)
-    else:
-        cmds.xform(offset, worldSpace=True, matrix=axis_matrix(c["axis"], c["position"]))
-    if parent["type"] == "bone":
-        cmds.parentConstraint(joint_of[parent["name"]], offset, maintainOffset=True)
-    if c.get("spaces"):
-        # Space switching: the offset follows whichever space the enum selects.
-        cmds.addAttr(ctrl, longName="space", attributeType="enum", enumName=":".join(c["spaces"]), keyable=True)
-        con = cmds.parentConstraint(*[ctrl_of[s] for s in c["spaces"]] + [offset], maintainOffset=True)[0]
-        for i, alias in enumerate(cmds.parentConstraint(con, query=True, weightAliasList=True)):
-            pick = cmds.createNode("condition", name="%s_space%d_cond" % (c["name"], i))
-            cmds.setAttr(pick + ".secondTerm", i)
-            cmds.setAttr(pick + ".colorIfTrueR", 1)
-            cmds.setAttr(pick + ".colorIfFalseR", 0)
-            cmds.connectAttr(ctrl + ".space", pick + ".firstTerm")
-            cmds.connectAttr(pick + ".outColorR", con + "." + alias)
-
-    ctrl_of[c["name"]] = ctrl
-    offset_of[c["name"]] = offset
-
-    if c["kind"] == "fk" and c["bone"] and copy_rule(bone_by_name[c["bone"]]) == "orient":
-        for attr in ("tx", "ty", "tz"):
-            cmds.setAttr(ctrl + "." + attr, lock=True, keyable=False, channelBox=False)
-    for attr in ("sx", "sy", "sz", "v"):
-        cmds.setAttr(ctrl + "." + attr, lock=True, keyable=False, channelBox=False)
-
-# --------------------------------------------------------------------------- FK for non-limb bones
-limb_bones = set()
-for chain in CHAINS:
-    limb_bones.update((chain["upper"], chain["lower"], chain["end"]))
-
-for c in CONTROLS:
-    if c["kind"] in ("fk", "root") and c["bone"] and c["bone"] not in limb_bones:
-        j = joint_of[c["bone"]]
-        if copy_rule(bone_by_name[c["bone"]]) == "parent":
-            cmds.parentConstraint(ctrl_of[c["name"]], j, maintainOffset=True)
+    children = {i: [k for k, b in enumerate(BONES) if b["parent"] == i] for i in range(len(BONES))}
+    for i, j in enumerate(joints):
+        if children[i]:
+            # Aim X at the first child (spine before limbs), keep children in place.
+            cmds.joint(j, edit=True, orientJoint="xyz", secondaryAxisOrient="zup", zeroScaleOrient=True, children=False)
         else:
-            cmds.orientConstraint(ctrl_of[c["name"]], j, maintainOffset=True)
+            # End joints (head, hands, toes, twist helpers) inherit their parent's axes,
+            # so X still runs down the limb.
+            cmds.setAttr(j + ".jointOrient", 0, 0, 0)
+        cmds.setAttr(j + ".radius", 2.0)
 
-# --------------------------------------------------------------------------- limbs: IK/FK blend
-def duplicate_chain(chain, suffix):
-    parent = cmds.listRelatives(joint_of[chain["upper"]], parent=True)[0]
-    out = []
-    for key in ("upper", "lower", "end"):
-        src = joint_of[chain[key]]
-        j = cmds.createNode("joint", name=chain[key] + suffix, parent=out[-1] if out else parent)
-        cmds.matchTransform(j, src, position=True, rotation=True)
-        cmds.makeIdentity(j, apply=True, rotate=True)
-        out.append(j)
-    return out
+    joint_of = {b["name"]: joints[i] for i, b in enumerate(BONES)}
+    bone_by_name = {b["name"]: b for b in BONES}
+
+    # --------------------------------------------------------------------------- skin
+    deform_joints = [joints[i] for i, b in enumerate(BONES) if b["deform"]]
+    skin = cmds.skinCluster(
+        deform_joints, geo, toSelectedBones=True, bindMethod=0, maximumInfluences=4,
+        normalizeWeights=1, obeyMaxInfluences=True, name=NAME + "_skinCluster",
+    )[0]
+
+    sel = om.MSelectionList()
+    sel.add(skin)
+    sel.add(geo_shape)
+    fn_skin = oma.MFnSkinCluster(sel.getDependNode(0))
+    shape_path = sel.getDagPath(1)
+    influences = [p.partialPathName() for p in fn_skin.influenceObjects()]
+    column = {name.split("|")[-1]: k for k, name in enumerate(influences)}
+    n_inf = len(influences)
+    n_verts = len(positions)
+    weights = om.MDoubleArray(n_verts * n_inf, 0.0)
+    for v, (js, ws) in enumerate(zip(RIG["skin"]["joints"], RIG["skin"]["weights"])):
+        for j, w in zip(js, ws):
+            if w > 0.0:
+                weights[v * n_inf + column[BONES[j]["name"]]] += w
+    comp_fn = om.MFnSingleIndexedComponent()
+    comp = comp_fn.create(om.MFn.kMeshVertComponent)
+    comp_fn.addElements(list(range(n_verts)))
+    fn_skin.setWeights(shape_path, comp, om.MIntArray(list(range(n_inf))), weights, False)
+
+    # --------------------------------------------------------------------------- control shapes
+    def shape_points(kind):
+        # Local shapes with X as the normal (Maya joints aim X down the bone).
+        if kind == "circle":
+            return [(0, math.cos(a), math.sin(a)) for a in [i / 16.0 * math.tau for i in range(17)]]
+        if kind == "square":
+            return [(0, -1, -1), (0, 1, -1), (0, 1, 1), (0, -1, 1), (0, -1, -1)]
+        if kind == "cube":
+            c = [(-1, -1, -1), (1, -1, -1), (1, 1, -1), (-1, 1, -1), (-1, -1, -1), (-1, -1, 1), (1, -1, 1),
+                 (1, -1, -1), (1, 1, -1), (1, 1, 1), (1, -1, 1), (1, 1, 1), (-1, 1, 1), (-1, 1, -1),
+                 (-1, 1, 1), (-1, -1, 1)]
+            return c
+        if kind == "diamond":
+            return [(0, 1, 0), (0, 0, 1), (0, -1, 0), (0, 0, -1), (0, 1, 0), (1, 0, 0), (0, -1, 0),
+                    (-1, 0, 0), (0, 1, 0), (0, 0, 1), (1, 0, 0), (0, 0, -1), (-1, 0, 0), (0, 0, 1)]
+        return [(0, -1, 0), (0, 1, 0), (0, 0, 0), (0, 0, -1), (0, 0, 1)]  # cross
 
 
-for chain in CHAINS:
-    ik_ctrl = ctrl_of[chain["ik_control"]]
-    cmds.addAttr(ik_ctrl, longName="ikFk", attributeType="double", min=0, max=1,
-                 defaultValue=chain["default_blend"], keyable=True)
+    def axis_matrix(axis, position):
+        """World matrix whose X axis points along `axis`."""
+        x = om.MVector(*axis).normal()
+        up = om.MVector(0, 1, 0) if abs(x.y) < 0.9 else om.MVector(0, 0, 1)
+        z = (x ^ up).normal()
+        y = (z ^ x).normal()
+        p = mpos(position)
+        return [x.x, x.y, x.z, 0, y.x, y.y, y.z, 0, z.x, z.y, z.z, 0, p[0], p[1], p[2], 1]
 
-    fk_chain = duplicate_chain(chain, "_fk")
-    ik_chain = duplicate_chain(chain, "_ik")
-    for j in fk_chain + ik_chain:
-        cmds.setAttr(j + ".visibility", 0)
 
-    for ctrl_name, j in zip(chain["fk_controls"], fk_chain):
-        cmds.orientConstraint(ctrl_of[ctrl_name], j, maintainOffset=True)
+    chain_end_ik = {c["ik_control"]: c["end"] for c in CHAINS}
+    ctrl_of = {}
+    offset_of = {}
+    for c in CONTROLS:
+        size = c["size"] * SCALE
+        pts = [(x * size, y * size, z * size) for x, y, z in shape_points(c["shape"])]
+        ctrl = cmds.curve(degree=1, point=pts, name=c["name"])
+        shape = cmds.listRelatives(ctrl, shapes=True)[0]
+        shape = cmds.rename(shape, c["name"] + "Shape")
+        cmds.setAttr(shape + ".overrideEnabled", 1)
+        cmds.setAttr(shape + ".overrideRGBColors", 1)
+        cmds.setAttr(shape + ".overrideColorRGB", *c["color"])
+        offset = cmds.group(empty=True, name=c["name"] + "_offset")
+        cmds.parent(ctrl, offset, relative=True)
 
-    cmds.joint(ik_chain[0], edit=True, setPreferredAngles=True, children=True)
-    handle = cmds.ikHandle(startJoint=ik_chain[0], endEffector=ik_chain[2], solver="ikRPsolver",
-                           name=chain["name"] + "_ikHandle")[0]
-    cmds.setAttr(handle + ".visibility", 0)
-    cmds.poleVectorConstraint(ctrl_of[chain["pole_control"]], handle)
+        parent = c["parent"]
+        if parent["type"] == "control" and not c.get("spaces"):
+            cmds.parent(offset, ctrl_of[parent["name"]], relative=True)
+        else:
+            cmds.parent(offset, ctrl_grp, relative=True)
 
-    reverse = cmds.createNode("reverse", name=chain["name"] + "_ikFk_reverse")
-    cmds.connectAttr(ik_ctrl + ".ikFk", reverse + ".inputX")
+        template = c["bone"] if c["kind"] in ("fk", "root") else chain_end_ik.get(c["name"])
+        if template:
+            cmds.matchTransform(offset, joint_of[template], position=True, rotation=True)
+            if c["kind"] == "fk":
+                # Shape sits at the control's position (clavicle shape at the shoulder).
+                delta = om.MVector(*mpos(c["position"])) - om.MVector(*cmds.xform(offset, q=True, ws=True, t=True))
+                if delta.length() > 1e-3:
+                    cmds.move(delta.x, delta.y, delta.z, shape + ".cv[*]", relative=True, worldSpace=True)
+        else:
+            cmds.xform(offset, worldSpace=True, matrix=axis_matrix(c["axis"], c["position"]))
+        if parent["type"] == "bone":
+            cmds.parentConstraint(joint_of[parent["name"]], offset, maintainOffset=True)
+        if c.get("spaces"):
+            # Space switching: the offset follows whichever space the enum selects.
+            cmds.addAttr(ctrl, longName="space", attributeType="enum", enumName=":".join(c["spaces"]), keyable=True)
+            con = cmds.parentConstraint(*[ctrl_of[s] for s in c["spaces"]] + [offset], maintainOffset=True)[0]
+            for i, alias in enumerate(cmds.parentConstraint(con, query=True, weightAliasList=True)):
+                pick = cmds.createNode("condition", name="%s_space%d_cond" % (c["name"], i))
+                cmds.setAttr(pick + ".secondTerm", i)
+                cmds.setAttr(pick + ".colorIfTrueR", 1)
+                cmds.setAttr(pick + ".colorIfFalseR", 0)
+                cmds.connectAttr(ctrl + ".space", pick + ".firstTerm")
+                cmds.connectAttr(pick + ".outColorR", con + "." + alias)
 
-    goal = ik_ctrl
-    foot = chain.get("foot")
-    if foot:
-        # Reverse foot: heel > toe tip > ball pivots under the IK control. Each pivot
-        # sits under a world-aligned zero group so its rotateX pitches the foot.
-        def pivot(name, position, parent):
-            zero = cmds.group(empty=True, name=name + "_zero", parent=parent)
-            p = mpos(position)
-            cmds.xform(zero, worldSpace=True, matrix=[1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, p[0], p[1], p[2], 1])
-            return cmds.group(empty=True, name=name, parent=zero)
+        ctrl_of[c["name"]] = ctrl
+        offset_of[c["name"]] = offset
 
-        n = chain["name"]
-        heel = pivot(n + "_heel_piv", foot["heel"], ik_ctrl)
-        toe = pivot(n + "_toe_piv", foot["toe_tip"], heel)
-        ball = pivot(n + "_ball_piv", foot["ball"], toe)
-        goal = cmds.group(empty=True, name=n + "_ankle_grp", parent=ball)
-        cmds.matchTransform(goal, joint_of[chain["end"]], position=True, rotation=True)
-        cmds.addAttr(ik_ctrl, longName="roll", attributeType="double", min=-90, max=120, defaultValue=0, keyable=True)
-        brk = foot["break_angle"]
-        cmds.expression(name=n + "_roll_expr", string=(
-            "{h}.rotateX = min({c}.roll, 0);\n"
-            "{b}.rotateX = min(max({c}.roll, 0), {k});\n"
-            "{t}.rotateX = max({c}.roll - {k}, 0);"
-        ).format(h=heel, b=ball, t=toe, c=ik_ctrl, k=brk))
-        # Toes stay planted on the toe pivot in IK and follow the foot in FK.
-        flat = cmds.group(empty=True, name=n + "_toe_flat_grp", parent=toe)
-        cmds.matchTransform(flat, joint_of[foot["ball_bone"]], position=True, rotation=True)
-        ball_offset = offset_of[foot["ball_control"]]
-        cmds.parentConstraint(flat, ball_offset, maintainOffset=True)
-        con = cmds.parentConstraint(ball_offset, query=True, name=True)
-        w_foot, w_flat = cmds.parentConstraint(con, query=True, weightAliasList=True)
-        cmds.connectAttr(reverse + ".outputX", con + "." + w_foot)
-        cmds.connectAttr(ik_ctrl + ".ikFk", con + "." + w_flat)
-    cmds.parent(handle, goal)
-    cmds.orientConstraint(goal, ik_chain[2], maintainOffset=True)
+        if c["kind"] == "fk" and c["bone"] and copy_rule(bone_by_name[c["bone"]]) == "orient":
+            for attr in ("tx", "ty", "tz"):
+                cmds.setAttr(ctrl + "." + attr, lock=True, keyable=False, channelBox=False)
+        for attr in ("sx", "sy", "sz", "v"):
+            cmds.setAttr(ctrl + "." + attr, lock=True, keyable=False, channelBox=False)
 
-    # Stretch: scale the IK joints' lengths by how far the goal is beyond reach.
-    cmds.addAttr(ik_ctrl, longName="stretch", attributeType="double", min=0, max=1,
-                 defaultValue=chain["default_stretch"], keyable=True)
-    rest = [cmds.getAttr(j + ".translateX") for j in ik_chain[1:]]
-    dist = cmds.createNode("distanceBetween", name=chain["name"] + "_stretch_dist")
-    cmds.connectAttr(ik_chain[0] + ".worldMatrix[0]", dist + ".inMatrix1")
-    cmds.connectAttr(goal + ".worldMatrix[0]", dist + ".inMatrix2")
-    ratio = cmds.createNode("multiplyDivide", name=chain["name"] + "_stretch_ratio")
-    cmds.setAttr(ratio + ".operation", 2)
-    cmds.connectAttr(dist + ".distance", ratio + ".input1X")
-    cmds.setAttr(ratio + ".input2X", sum(abs(r) for r in rest))
-    over = cmds.createNode("condition", name=chain["name"] + "_stretch_cond")
-    cmds.setAttr(over + ".operation", 2)  # greater than
-    cmds.connectAttr(ratio + ".outputX", over + ".firstTerm")
-    cmds.setAttr(over + ".secondTerm", 1)
-    cmds.connectAttr(ratio + ".outputX", over + ".colorIfTrueR")
-    cmds.setAttr(over + ".colorIfFalseR", 1)
-    amount = cmds.createNode("blendTwoAttr", name=chain["name"] + "_stretch_blend")
-    cmds.setAttr(amount + ".input[0]", 1)
-    cmds.connectAttr(over + ".outColorR", amount + ".input[1]")
-    cmds.connectAttr(ik_ctrl + ".stretch", amount + ".attributesBlender")
-    for j, length in zip(ik_chain[1:], rest):
-        scale = cmds.createNode("multiplyDivide", name=j + "_stretch_len")
-        cmds.connectAttr(amount + ".output", scale + ".input1X")
-        cmds.setAttr(scale + ".input2X", length)
-        cmds.connectAttr(scale + ".outputX", j + ".translateX")
+    # --------------------------------------------------------------------------- FK for non-limb bones
+    limb_bones = set()
+    for chain in CHAINS:
+        limb_bones.update((chain["upper"], chain["lower"], chain["end"]))
 
-    for key, ik_j, fk_j in zip(("upper", "lower", "end"), ik_chain, fk_chain):
-        # Lower joints also take position so stretching reaches the skin.
-        constrain = cmds.orientConstraint if key == "upper" else cmds.parentConstraint
-        con = constrain(ik_j, fk_j, joint_of[chain[key]], maintainOffset=False)[0]
-        w_ik, w_fk = constrain(con, query=True, weightAliasList=True)
-        cmds.connectAttr(ik_ctrl + ".ikFk", con + "." + w_ik)
-        cmds.connectAttr(reverse + ".outputX", con + "." + w_fk)
+    for c in CONTROLS:
+        if c["kind"] in ("fk", "root") and c["bone"] and c["bone"] not in limb_bones:
+            j = joint_of[c["bone"]]
+            if copy_rule(bone_by_name[c["bone"]]) == "parent":
+                cmds.parentConstraint(ctrl_of[c["name"]], j, maintainOffset=True)
+            else:
+                cmds.orientConstraint(ctrl_of[c["name"]], j, maintainOffset=True)
 
-    # Show only the controls of the active mode.
-    for name in chain["fk_controls"]:
-        cmds.connectAttr(reverse + ".outputX", offset_of[name] + ".visibility")
-    cmds.connectAttr(ik_ctrl + ".ikFk", offset_of[chain["pole_control"]] + ".visibility")
+    # --------------------------------------------------------------------------- limbs: IK/FK blend
+    def duplicate_chain(chain, suffix):
+        parent = cmds.listRelatives(joint_of[chain["upper"]], parent=True)[0]
+        out = []
+        for key in ("upper", "lower", "end"):
+            src = joint_of[chain[key]]
+            j = cmds.createNode("joint", name=chain[key] + suffix, parent=out[-1] if out else parent)
+            cmds.matchTransform(j, src, position=True, rotation=True)
+            cmds.makeIdentity(j, apply=True, rotate=True)
+            out.append(j)
+        return out
 
-# --------------------------------------------------------------------------- twist helpers
-for b in BONES:
-    twist = b.get("twist")
-    if not twist:
-        continue
-    share = cmds.createNode("multiplyDivide", name=b["name"] + "_twist_share")
-    cmds.connectAttr(joint_of[twist["source"]] + ".rotateX", share + ".input1X")
-    cmds.setAttr(share + ".input2X", twist["factor"])
-    cmds.connectAttr(share + ".outputX", joint_of[b["name"]] + ".rotateX")
 
-cmds.select(clear=True)
-print("hive-rig: built %s with %d joints and %d controls" % (NAME, len(joints), len(CONTROLS)))
+    for chain in CHAINS:
+        ik_ctrl = ctrl_of[chain["ik_control"]]
+        cmds.addAttr(ik_ctrl, longName="ikFk", attributeType="double", min=0, max=1,
+                     defaultValue=chain["default_blend"], keyable=True)
 
-if "--save" in sys.argv:
-    path = sys.argv[sys.argv.index("--save") + 1]
-    cmds.file(rename=path)
-    cmds.file(save=True, type="mayaAscii" if path.endswith(".ma") else "mayaBinary")
+        fk_chain = duplicate_chain(chain, "_fk")
+        ik_chain = duplicate_chain(chain, "_ik")
+        for j in fk_chain + ik_chain:
+            cmds.setAttr(j + ".visibility", 0)
+
+        for ctrl_name, j in zip(chain["fk_controls"], fk_chain):
+            cmds.orientConstraint(ctrl_of[ctrl_name], j, maintainOffset=True)
+
+        cmds.joint(ik_chain[0], edit=True, setPreferredAngles=True, children=True)
+        handle = cmds.ikHandle(startJoint=ik_chain[0], endEffector=ik_chain[2], solver="ikRPsolver",
+                               name=chain["name"] + "_ikHandle")[0]
+        cmds.setAttr(handle + ".visibility", 0)
+        cmds.poleVectorConstraint(ctrl_of[chain["pole_control"]], handle)
+
+        reverse = cmds.createNode("reverse", name=chain["name"] + "_ikFk_reverse")
+        cmds.connectAttr(ik_ctrl + ".ikFk", reverse + ".inputX")
+
+        goal = ik_ctrl
+        foot = chain.get("foot")
+        if foot:
+            # Reverse foot: heel > toe tip > ball pivots under the IK control. Each pivot
+            # sits under a world-aligned zero group so its rotateX pitches the foot.
+            def pivot(name, position, parent):
+                zero = cmds.group(empty=True, name=name + "_zero", parent=parent)
+                p = mpos(position)
+                cmds.xform(zero, worldSpace=True, matrix=[1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, p[0], p[1], p[2], 1])
+                return cmds.group(empty=True, name=name, parent=zero)
+
+            n = chain["name"]
+            heel = pivot(n + "_heel_piv", foot["heel"], ik_ctrl)
+            toe = pivot(n + "_toe_piv", foot["toe_tip"], heel)
+            ball = pivot(n + "_ball_piv", foot["ball"], toe)
+            goal = cmds.group(empty=True, name=n + "_ankle_grp", parent=ball)
+            cmds.matchTransform(goal, joint_of[chain["end"]], position=True, rotation=True)
+            cmds.addAttr(ik_ctrl, longName="roll", attributeType="double", min=-90, max=120, defaultValue=0, keyable=True)
+            brk = foot["break_angle"]
+            cmds.expression(name=n + "_roll_expr", string=(
+                "{h}.rotateX = min({c}.roll, 0);\n"
+                "{b}.rotateX = min(max({c}.roll, 0), {k});\n"
+                "{t}.rotateX = max({c}.roll - {k}, 0);"
+            ).format(h=heel, b=ball, t=toe, c=ik_ctrl, k=brk))
+            # Toes stay planted on the toe pivot in IK and follow the foot in FK.
+            flat = cmds.group(empty=True, name=n + "_toe_flat_grp", parent=toe)
+            cmds.matchTransform(flat, joint_of[foot["ball_bone"]], position=True, rotation=True)
+            ball_offset = offset_of[foot["ball_control"]]
+            cmds.parentConstraint(flat, ball_offset, maintainOffset=True)
+            con = cmds.parentConstraint(ball_offset, query=True, name=True)
+            w_foot, w_flat = cmds.parentConstraint(con, query=True, weightAliasList=True)
+            cmds.connectAttr(reverse + ".outputX", con + "." + w_foot)
+            cmds.connectAttr(ik_ctrl + ".ikFk", con + "." + w_flat)
+        cmds.parent(handle, goal)
+        cmds.orientConstraint(goal, ik_chain[2], maintainOffset=True)
+
+        # Stretch: scale the IK joints' lengths by how far the goal is beyond reach.
+        cmds.addAttr(ik_ctrl, longName="stretch", attributeType="double", min=0, max=1,
+                     defaultValue=chain["default_stretch"], keyable=True)
+        rest = [cmds.getAttr(j + ".translateX") for j in ik_chain[1:]]
+        dist = cmds.createNode("distanceBetween", name=chain["name"] + "_stretch_dist")
+        cmds.connectAttr(ik_chain[0] + ".worldMatrix[0]", dist + ".inMatrix1")
+        cmds.connectAttr(goal + ".worldMatrix[0]", dist + ".inMatrix2")
+        ratio = cmds.createNode("multiplyDivide", name=chain["name"] + "_stretch_ratio")
+        cmds.setAttr(ratio + ".operation", 2)
+        cmds.connectAttr(dist + ".distance", ratio + ".input1X")
+        cmds.setAttr(ratio + ".input2X", sum(abs(r) for r in rest))
+        over = cmds.createNode("condition", name=chain["name"] + "_stretch_cond")
+        cmds.setAttr(over + ".operation", 2)  # greater than
+        cmds.connectAttr(ratio + ".outputX", over + ".firstTerm")
+        cmds.setAttr(over + ".secondTerm", 1)
+        cmds.connectAttr(ratio + ".outputX", over + ".colorIfTrueR")
+        cmds.setAttr(over + ".colorIfFalseR", 1)
+        amount = cmds.createNode("blendTwoAttr", name=chain["name"] + "_stretch_blend")
+        cmds.setAttr(amount + ".input[0]", 1)
+        cmds.connectAttr(over + ".outColorR", amount + ".input[1]")
+        cmds.connectAttr(ik_ctrl + ".stretch", amount + ".attributesBlender")
+        for j, length in zip(ik_chain[1:], rest):
+            scale = cmds.createNode("multiplyDivide", name=j + "_stretch_len")
+            cmds.connectAttr(amount + ".output", scale + ".input1X")
+            cmds.setAttr(scale + ".input2X", length)
+            cmds.connectAttr(scale + ".outputX", j + ".translateX")
+
+        for key, ik_j, fk_j in zip(("upper", "lower", "end"), ik_chain, fk_chain):
+            # Lower joints also take position so stretching reaches the skin.
+            constrain = cmds.orientConstraint if key == "upper" else cmds.parentConstraint
+            con = constrain(ik_j, fk_j, joint_of[chain[key]], maintainOffset=False)[0]
+            w_ik, w_fk = constrain(con, query=True, weightAliasList=True)
+            cmds.connectAttr(ik_ctrl + ".ikFk", con + "." + w_ik)
+            cmds.connectAttr(reverse + ".outputX", con + "." + w_fk)
+
+        # Show only the controls of the active mode.
+        for name in chain["fk_controls"]:
+            cmds.connectAttr(reverse + ".outputX", offset_of[name] + ".visibility")
+        cmds.connectAttr(ik_ctrl + ".ikFk", offset_of[chain["pole_control"]] + ".visibility")
+
+    # --------------------------------------------------------------------------- twist helpers
+    for b in BONES:
+        twist = b.get("twist")
+        if not twist:
+            continue
+        share = cmds.createNode("multiplyDivide", name=b["name"] + "_twist_share")
+        cmds.connectAttr(joint_of[twist["source"]] + ".rotateX", share + ".input1X")
+        cmds.setAttr(share + ".input2X", twist["factor"])
+        cmds.connectAttr(share + ".outputX", joint_of[b["name"]] + ".rotateX")
+
+    # What the Hive window needs to edit guides and rebuild, kept on the rig so it
+    # survives saving and reopening the scene.
+    for attr, value in (("hiveGuides", json.dumps(RIG["guides"])), ("hiveDir", OUT_DIR)):
+        cmds.addAttr(top, longName=attr, dataType="string")
+        cmds.setAttr(top + "." + attr, value, type="string")
+    cmds.select(clear=True)
+    print("hive-rig: built %s with %d joints and %d controls" % (NAME, len(joints), len(CONTROLS)))
+    return top, geo
+
+
+# --------------------------------------------------------------------------- guides
+# Guides are locators named GDE_<rig>__<component>__<guide>. Moving them and
+# pressing Rebuild writes <name>.guides.json and asks hive-rig to rebuild.
+GUIDE_GRP = NAME + "_guides_grp"
+SIDE_COLORS = {"left": (0.1, 0.45, 1.0), "right": (1.0, 0.15, 0.15), "center": (1.0, 0.85, 0.1)}
+
+
+def guide_nodes():
+    return [n for n in (cmds.ls("GDE_%s__*" % NAME, type="transform") or []) if cmds.attributeQuery("hiveGuide", node=n, exists=True)]
+
+
+def stored_guides():
+    return json.loads(cmds.getAttr(TOP + ".hiveGuides"))
+
+
+def guides_of():
+    """Current guides: from the locators when they're out, else as last built."""
+    data = stored_guides()
+    by_key = {(cmds.getAttr(n + ".hiveComponent"), cmds.getAttr(n + ".hiveGuide")): n for n in guide_nodes()}
+    for comp in data["components"]:
+        for g in comp["guides"]:
+            node = by_key.get((comp["id"], g["name"]))
+            if node is not None:
+                g["position"] = [x / SCALE for x in cmds.xform(node, q=True, ws=True, t=True)]
+    return data
+
+
+def remove_guides():
+    if cmds.objExists(GUIDE_GRP):
+        cmds.delete(GUIDE_GRP)
+
+
+def show_guides(data=None):
+    """Put out a locator for every guide and hide the controls while editing."""
+    data = data or guides_of()
+    remove_guides()
+    cmds.group(empty=True, name=GUIDE_GRP)
+    size = 1.2 * data["body"]["height"]
+    for comp in data["components"]:
+        for g in comp["guides"]:
+            loc = cmds.spaceLocator(name="GDE_%s__%s__%s" % (NAME, comp["id"], g["name"]))[0]
+            loc = cmds.parent(loc, GUIDE_GRP)[0]
+            cmds.xform(loc, ws=True, t=mpos(g["position"]))
+            for axis in "XYZ":
+                cmds.setAttr(loc + ".localScale" + axis, size)
+            cmds.setAttr(loc + ".overrideEnabled", 1)
+            cmds.setAttr(loc + ".overrideRGBColors", 1)
+            cmds.setAttr(loc + ".overrideColorRGB", *SIDE_COLORS.get(comp.get("side", "center"), SIDE_COLORS["center"]))
+            for attr, value in (("hiveComponent", comp["id"]), ("hiveGuide", g["name"])):
+                cmds.addAttr(loc, longName=attr, dataType="string")
+                cmds.setAttr(loc + "." + attr, value, type="string")
+    cmds.setAttr(TOP + ".hiveGuides", json.dumps(data), type="string")
+    cmds.setAttr(NAME + "_controls_grp.visibility", 0)
+
+
+def mirror_guides(source="left"):
+    """Copy one side's guide positions onto the other, mirrored across the body."""
+    data = guides_of()
+    cx = data["body"]["center_x"]
+    other = "right" if source == "left" else "left"
+    suffix = {"left": "_l", "right": "_r"}
+    comps = {c["id"]: c for c in data["components"]}
+    for comp in data["components"]:
+        if comp.get("side") != source or not comp["id"].endswith(suffix[source]):
+            continue
+        twin = comps.get(comp["id"][: -len(suffix[source])] + suffix[other])
+        if twin is None or len(twin["guides"]) != len(comp["guides"]):
+            continue
+        for g, t in zip(comp["guides"], twin["guides"]):
+            x, y, z = g["position"]
+            t["position"] = [2 * cx - x, y, z]
+    show_guides(data)
+
+
+def run_hive(*args):
+    if not HIVE_EXE or not os.path.isfile(HIVE_EXE):
+        raise RuntimeError("hive-rig program not found; set HIVE_EXE at the top of this script (%r)" % HIVE_EXE)
+    done = subprocess.run([HIVE_EXE] + [str(a) for a in args], capture_output=True, text=True)
+    if done.returncode != 0:
+        raise RuntimeError("hive-rig %s failed: %s" % (args[0], (done.stderr or done.stdout).strip()))
+    return done.stdout
+
+
+def files():
+    folder = cmds.getAttr(TOP + ".hiveDir")
+    return os.path.join(folder, NAME + ".guides.json"), os.path.join(folder, NAME + ".hive.json")
+
+
+def write_guides(data):
+    path = files()[0]
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+    return path
+
+
+def change_components(*args):
+    """Run `hive-rig add|remove <guides> ...` and show the updated guides."""
+    path = write_guides(guides_of())
+    out = run_hive(args[0], path, *args[1:])
+    with open(path) as f:
+        show_guides(json.load(f))
+    return out.strip()
+
+
+def skin_fn(geo):
+    skins = cmds.ls(cmds.listHistory(geo) or [], type="skinCluster") or []
+    if not skins:
+        return None, None, None
+    shape = cmds.listRelatives(geo, shapes=True, fullPath=True)[0]
+    sel = om.MSelectionList()
+    sel.add(skins[0])
+    sel.add(shape)
+    fn = oma.MFnSkinCluster(sel.getDependNode(0))
+    names = [p.partialPathName().split("|")[-1] for p in fn.influenceObjects()]
+    return fn, sel.getDagPath(1), names
+
+
+def all_vertices(count):
+    comp_fn = om.MFnSingleIndexedComponent()
+    comp = comp_fn.create(om.MFn.kMeshVertComponent)
+    comp_fn.addElements(list(range(count)))
+    return comp
+
+
+def read_weights(geo):
+    fn, path, names = skin_fn(geo)
+    if fn is None:
+        return None
+    count = cmds.polyEvaluate(geo, vertex=True)
+    weights, n = fn.getWeights(path, all_vertices(count))
+    return [{names[k]: weights[v * n + k] for k in range(n) if weights[v * n + k] > 1e-6} for v in range(count)]
+
+
+def write_weights(geo, per_vertex):
+    fn, path, names = skin_fn(geo)
+    column = {name: k for k, name in enumerate(names)}
+    n = len(names)
+    weights = om.MDoubleArray(len(per_vertex) * n, 0.0)
+    for v, w in enumerate(per_vertex):
+        for name, value in w.items():
+            if name in column:
+                weights[v * n + column[name]] = value
+    fn.setWeights(path, all_vertices(len(per_vertex)), om.MIntArray(list(range(n))), weights, False)
+
+
+def rebuild(keep_weights=True):
+    """Rebuild the rig from its guides. With keep_weights, vertices keep their
+    current weights unless the new rig weights them to a joint that didn't exist."""
+    guides_path, hive_path = files()
+    write_guides(guides_of())
+    run_hive("rebuild", hive_path, "--guides", guides_path)
+    with open(hive_path) as f:
+        data = json.load(f)
+
+    geo = NAME + "_geo"
+    old = read_weights(geo) if keep_weights else None
+    old_joints = set(cmds.ls(cmds.listRelatives(NAME + "_skeleton_grp", allDescendents=True) or [], type="joint") or [])
+    skins = cmds.ls(cmds.listHistory(geo) or [], type="skinCluster") or []
+    if skins:
+        cmds.skinCluster(skins[0], edit=True, unbind=True)
+    geo = cmds.parent(geo, world=True)[0]
+    remove_guides()
+    cmds.delete(TOP)
+
+    top, geo = build(data, geo)
+    kept = 0
+    if old is not None:
+        new = read_weights(geo)
+        if new is not None and len(new) == len(old):
+            merged = []
+            for before, after in zip(old, new):
+                if before and set(after) <= old_joints:
+                    merged.append(before)
+                    kept += 1
+                else:
+                    merged.append(after)
+            write_weights(geo, merged)
+    print("hive-rig: rebuilt %s; kept the weights of %d vertices" % (NAME, kept))
+    return top
+
+
+# --------------------------------------------------------------------------- UI
+WINDOW = "hiveRigWindow"
+
+
+def _safe(fn, *args):
+    def call(*_):
+        try:
+            out = fn(*args)
+            if isinstance(out, str) and out:
+                print("hive-rig: " + out)
+        except RuntimeError as e:
+            cmds.warning(str(e))
+
+    return call
+
+
+def show_window():
+    if cmds.window(WINDOW, exists=True):
+        cmds.deleteUI(WINDOW)
+    cmds.window(WINDOW, title="Hive Rig: " + NAME, widthHeight=(220, 260))
+    cmds.columnLayout(adjustableColumn=True, rowSpacing=4)
+    cmds.button(label="Edit Guides", command=_safe(show_guides))
+    cmds.button(label="Mirror Left to Right", command=_safe(mirror_guides))
+    cmds.separator()
+    cmds.text(label="Components")
+    cmds.button(label="Add Fingers", command=_safe(change_components, "add", "fingers"))
+    cmds.button(label="Add Tail", command=_safe(change_components, "add", "tail"))
+
+    def remove_selected(*_):
+        sel = [n for n in (cmds.ls(selection=True) or []) if cmds.attributeQuery("hiveComponent", node=n, exists=True)]
+        if not sel:
+            cmds.warning("Select a guide of the component to remove")
+            return
+        _safe(change_components, "remove", cmds.getAttr(sel[0] + ".hiveComponent"))()
+
+    cmds.button(label="Remove Selected Component", command=remove_selected)
+    cmds.separator()
+    keep = cmds.checkBox(label="Keep Weights", value=True)
+    cmds.button(label="Rebuild Rig", command=lambda *_: _safe(rebuild, cmds.checkBox(keep, q=True, value=True))())
+    cmds.showWindow(WINDOW)
+
+
+def main():
+    if cmds.objExists(TOP) and cmds.attributeQuery("hiveGuides", node=TOP, exists=True):
+        print("hive-rig: %s is already in the scene" % NAME)
+    else:
+        build(RIG_DATA)
+    if "--save" in sys.argv:
+        path = sys.argv[sys.argv.index("--save") + 1]
+        cmds.file(rename=path)
+        cmds.file(save=True, type="mayaAscii" if path.endswith(".ma") else "mayaBinary")
+    elif not cmds.about(batch=True):
+        show_window()
+
+
+if __name__ == "__main__":
+    main()

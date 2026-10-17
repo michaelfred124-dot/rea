@@ -4,7 +4,10 @@ Catches Python-level mistakes (typos, wrong names, bad data access) in the
 generated scripts without needing the DCC installed. It does not prove the DCC
 API calls behave as intended; that needs the real application.
 
-Usage: python3 dcc_stub_run.py maya|unreal <script.py>
+Usage: python3 dcc_stub_run.py maya|unreal <script.py> [--guides]
+
+With --guides (Maya), also runs the guide tools, which call the hive-rig build
+that generated the script and rewrite files next to it.
 """
 
 import runpy
@@ -40,13 +43,22 @@ class Vec:
         return Vec(self.x / n, self.y / n, self.z / n)
 
 
+N_VERTS = [0]
+SCRIPT = [""]
+
+
 def stub_maya():
     calls = []
     counter = [0]
+    attrs = {}  # "node.attr" -> value, for the string attributes the guide tools use
+    positions = {}
+    nodes = set()
 
     def node(*args, **kwargs):
         counter[0] += 1
-        return kwargs.get("name", "node%d" % counter[0])
+        name = kwargs.get("name", "node%d" % counter[0])
+        nodes.add(name)
+        return name
 
     cmds = types.ModuleType("maya.cmds")
 
@@ -54,6 +66,8 @@ def stub_maya():
         def fn(*args, **kwargs):
             calls.append(name)
             if name in ("listRelatives",):
+                if kwargs.get("allDescendents"):
+                    return sorted(nodes)
                 return ["parent_or_shape"]
             if name in ("skinCluster", "ikHandle", "orientConstraint", "parentConstraint", "poleVectorConstraint"):
                 if kwargs.get("query") and kwargs.get("weightAliasList"):
@@ -63,10 +77,48 @@ def stub_maya():
                     return name + "_constraint"
                 calls.append((name, args))
                 return [kwargs.get("name", name + "1")]
-            if name == "xform" and kwargs.get("q"):
-                return [0.0, 0.0, 0.0]
+            if name == "xform":
+                if kwargs.get("q"):
+                    return list(positions.get(args[0], [0.0, 0.0, 0.0]))
+                if "t" in kwargs:
+                    positions[args[0]] = list(kwargs["t"])
+                return None
             if name == "getAttr":
-                return 10.0
+                return attrs.get(args[0], 10.0)
+            if name == "setAttr":
+                if kwargs.get("type") == "string":
+                    attrs[args[0]] = args[1]
+                return None
+            if name == "addAttr":
+                attrs.setdefault("%s.%s" % (args[0], kwargs["longName"]), None)
+                return None
+            if name == "attributeQuery":
+                return "%s.%s" % (kwargs["node"], args[0]) in attrs
+            if name == "objExists":
+                return args[0] in nodes
+            if name == "delete":
+                for n in args:
+                    nodes.discard(n)
+                    for k in [k for k in attrs if k.startswith(n + ".")]:
+                        del attrs[k]
+                if args and args[0].endswith("_guides_grp"):
+                    for n in [n for n in nodes if n.startswith("GDE_")]:
+                        nodes.discard(n)
+                return None
+            if name == "ls":
+                if args and isinstance(args[0], str) and args[0].endswith("*"):
+                    return sorted(n for n in nodes if n.startswith(args[0][:-1]))
+                if kwargs.get("type") == "skinCluster":
+                    return ["skinCluster1"]
+                return list(args[0]) if args and isinstance(args[0], list) else []
+            if name == "spaceLocator":
+                return [node(**kwargs)]
+            if name == "parent":
+                return [args[0]]
+            if name == "polyEvaluate":
+                return N_VERTS[0]
+            if name == "about":
+                return True
             if name in ("group", "curve", "createNode", "rename"):
                 return node(*args, **kwargs) if name != "rename" else args[1]
             return None
@@ -76,7 +128,8 @@ def stub_maya():
     for n in ["about", "group", "rename", "parent", "listRelatives", "sets", "polySoftEdge", "createNode", "xform",
               "joint", "setAttr", "skinCluster", "curve", "matchTransform", "move", "parentConstraint",
               "orientConstraint", "addAttr", "makeIdentity", "ikHandle", "poleVectorConstraint", "connectAttr",
-              "select", "file", "getAttr", "expression"]:
+              "select", "file", "getAttr", "expression", "attributeQuery", "objExists", "delete", "ls",
+              "spaceLocator", "listHistory", "polyEvaluate", "warning"]:
         setattr(cmds, n, generic(n))
 
     om = types.ModuleType("maya.api.OpenMaya")
@@ -114,12 +167,19 @@ def stub_maya():
         def influenceObjects(self):
             import json
 
-            rig = json.loads(open(sys.argv[2]).read().split('r"""', 1)[1].split('"""', 1)[0])
+            rig = json.loads(open(SCRIPT[0]).read().split('r"""', 1)[1].split('"""', 1)[0])
             names = [b["name"] for b in rig["skeleton"]["bones"] if b["deform"]]
             return [mock.Mock(partialPathName=mock.Mock(return_value=n)) for n in names]
 
         def setWeights(self, *a):
             calls.append("setWeights")
+
+        def getWeights(self, path, comp):
+            n = len(self.influenceObjects())
+            weights = [0.0] * (N_VERTS[0] * n)
+            for v in range(N_VERTS[0]):
+                weights[v * n + v % n] = 1.0
+            return weights, n
 
     oma.MFnSkinCluster = Skin
 
@@ -172,11 +232,31 @@ def stub_unreal():
 
 
 if __name__ == "__main__":
+    import os
+
+    sys_args = sys.argv[3:]
     kind, script = sys.argv[1], sys.argv[2]
+    SCRIPT[0] = script
     if kind == "maya":
+        import json
+
+        N_VERTS[0] = len(json.loads(open(script).read().split('r"""', 1)[1].split('"""', 1)[0])["mesh"]["positions"])
         calls = stub_maya()
-        runpy.run_path(script, run_name="__main__")
+        sys.argv = [script, "--save", "/dev/null"]  # batch: no window
+        ns = runpy.run_path(script, run_name="__main__")
         assert "setWeights" in calls and "ikHandle" in calls, calls
+        if os.path.isfile(ns["HIVE_EXE"]) and "--guides" in sys_args:
+            # Guide tools: edit, mirror, add a component, rebuild keeping weights.
+            ns["show_guides"]()
+            assert len(ns["guide_nodes"]()) > 20
+            ns["mirror_guides"]()
+            out = ns["change_components"]("add", "chain", "--parent", "head", "--joints", "2", "--id", "stub_ear")
+            assert "stub_ear" in out, out
+            calls.clear()
+            ns["rebuild"](True)
+            assert calls.count("setWeights") == 2, calls.count("setWeights")
+            assert not ns["guide_nodes"]()
+            print("maya guide tools ran against stubs: ok")
     elif kind == "unreal":
         vm = stub_unreal()
         runpy.run_path(script, run_name="__main__")
