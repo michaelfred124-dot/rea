@@ -62,7 +62,15 @@ def same(a, b):
 
 
 def chain_bones(limb):
-    return [limb[k] for k in ("upper", "lower", "end")]
+    """The limb's bones from the top down (a three-segment leg includes its hock)."""
+    return limb["bones"]
+
+
+def turn(ctrl, rot):
+    pose[ctrl].rotation_mode = "QUATERNION"
+    pose[ctrl].rotation_quaternion = Matrix.Rotation(rot[0], 3, "X").to_quaternion() @ \
+        Matrix.Rotation(rot[1], 3, "Y").to_quaternion() @ Matrix.Rotation(rot[2], 3, "Z").to_quaternion()
+    pose[ctrl].rotation_mode = "XYZ"
 
 
 def deformed():
@@ -79,7 +87,7 @@ def bend_axis(limb):
     """Hinge axis of the middle joint (the normal of the limb's rest plane) in its
     own rest frame. Positive angles bend the joint further the way it already bends."""
     upper, lower = bones[limb["upper"]], bones[limb["lower"]]
-    n = (lower.head_local - upper.head_local).cross(bones[limb["end"]].head_local - lower.head_local)
+    n = (lower.head_local - upper.head_local).cross(bones[limb["reach"]].head_local - lower.head_local)
     return lower.matrix_local.to_3x3().inverted() @ n.normalized()
 
 
@@ -106,6 +114,8 @@ for side in ("l", "r"):
         pole.matrix = pm
         if kind == "leg":
             ik["roll"] = 15.0
+        if limb.get("hock"):
+            turn(limb["hock"]["control"], (0.25, 0.0, 0.1))  # swing the hock
         update()
         ik_pose = [world(b) for b in chain_bones(limb)]
         check(differs(ik_pose[0], world(limb["fk"][0]))[1] > 0.05, "%s: IK pose differs from FK before matching" % name)
@@ -122,11 +132,10 @@ for side in ("l", "r"):
         pose[limb["ik"]]["ik_fk"] = 0.0
         if kind == "leg":
             pose[limb["ik"]]["roll"] = -20.0  # the IK goal sits off the control
-        for ctrl, rot in zip((limb["fk"][0], limb["fk"][2]), ((0.35, 0.2, -0.3), (0.2, -0.15, 0.25))):
-            pose[ctrl].rotation_mode = "QUATERNION"
-            pose[ctrl].rotation_quaternion = Matrix.Rotation(rot[0], 3, "X").to_quaternion() @ \
-                Matrix.Rotation(rot[1], 3, "Y").to_quaternion() @ Matrix.Rotation(rot[2], 3, "Z").to_quaternion()
-            pose[ctrl].rotation_mode = "XYZ"
+        turn(limb["fk"][0], (0.35, 0.2, -0.3))
+        turn(limb["fk"][-1], (0.2, -0.15, 0.25))
+        if limb.get("hock"):
+            turn(limb["fk"][2], (-0.3, 0.1, 0.15))  # the FK hock segment
         pose[limb["fk"][1]].rotation_mode = "QUATERNION"
         pose[limb["fk"][1]].rotation_quaternion = Quaternion(bend_axis(limb), 0.7)
         pose[limb["fk"][1]].rotation_mode = "XYZ"
@@ -160,6 +169,8 @@ pose[leg["ik"]].location = (0.04, 0.1, -0.05)
 pose[leg["ik"]].rotation_euler = (0.2, 0.3, -0.1)
 pose[leg["ik"]]["roll"] = 25.0
 pose[leg["pole"]].location = (0.05, 0.0, 0.02)
+if leg.get("hock"):
+    pose[leg["hock"]["control"]].rotation_euler = (0.2, 0.0, 0.1)
 update()
 n = ns["mirror_pose"](rig, None, "left")
 check(n == len(data["mirror"]), "mirror with nothing selected copies all %d left controls" % n)
