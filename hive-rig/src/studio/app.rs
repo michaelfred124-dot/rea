@@ -738,6 +738,77 @@ impl Studio {
         self.weight_colors = None;
     }
 
+    /// Components carried along when `comp` moves: it and everything hanging
+    /// from its bones, all the way down.
+    pub fn component_family(&self, comp: usize) -> Vec<usize> {
+        let Some(doc) = &self.doc else {
+            return Vec::new();
+        };
+        let comps = &doc.guides.components;
+        let owner = |bone: &str| -> Option<String> {
+            let b = doc.preview.as_ref().ok()?.skeleton.bone(bone)?;
+            Some(b.component.clone())
+        };
+        let mut family = vec![comp];
+        let mut grew = true;
+        while grew {
+            grew = false;
+            for (i, c) in comps.iter().enumerate() {
+                if family.contains(&i) {
+                    continue;
+                }
+                let hangs = c
+                    .parent
+                    .as_deref()
+                    .and_then(owner)
+                    .is_some_and(|o| family.iter().any(|&f| comps[f].id == o));
+                if hangs {
+                    family.push(i);
+                    grew = true;
+                }
+            }
+        }
+        family
+    }
+
+    /// Move a whole component, by its first guide, to `to`. Everything hanging
+    /// from it comes along, and with symmetry on its twin side mirrors the move.
+    pub fn move_component(&mut self, comp: usize, to: Vec3) {
+        let symmetry = self.symmetry;
+        let family = self.component_family(comp);
+        let Some(doc) = &mut self.doc else { return };
+        let Some(first) = doc
+            .guides
+            .components
+            .get(comp)
+            .and_then(|c| c.guides.first())
+            .map(|g| g.position)
+        else {
+            return;
+        };
+        let delta = to - first;
+        let mut moved = Vec::new();
+        for &c in &family {
+            for (gi, g) in doc.guides.components[c].guides.iter_mut().enumerate() {
+                g.position += delta;
+                moved.push((c, gi));
+            }
+        }
+        if symmetry {
+            for &(c, gi) in &moved {
+                if let Some((tc, tg)) = components::mirror_guide(&doc.guides, c, gi)
+                    && !family.contains(&tc)
+                {
+                    let p = doc.guides.components[c].guides[gi].position;
+                    doc.guides.components[tc].guides[tg].position =
+                        components::mirror_point(&doc.guides, p);
+                }
+            }
+        }
+        doc.refresh();
+        self.weight_colors = None;
+    }
+
     /// Toes on the feet, on the same side choice as fingers.
     pub fn add_toes(&mut self) {
         let side = match self.finger_sides {
@@ -1477,5 +1548,44 @@ mod tests {
         s.parent_picked();
         assert!(s.error);
         assert_eq!(parent_of(&s, "spine"), "root");
+    }
+
+    #[test]
+    fn dragging_a_component_moves_it_its_children_and_its_twin() {
+        let mut s = demo_studio();
+        s.add_fingers();
+        let guides = |s: &Studio, id: &str| -> Vec<Vec3> {
+            let d = s.doc.as_ref().unwrap();
+            d.guides
+                .component(id)
+                .unwrap()
+                .guides
+                .iter()
+                .map(|g| g.position)
+                .collect()
+        };
+        let (arm, fingers, arm_r, leg) = (
+            guides(&s, "arm_l"),
+            guides(&s, "index_l"),
+            guides(&s, "arm_r"),
+            guides(&s, "leg_l"),
+        );
+        let shift = Vec3::new(0.05, 0.1, 0.0);
+        s.move_component(comp(&s, "arm_l"), arm[0] + shift);
+        // The whole arm keeps its shape, the fingers on its hand come with it.
+        for (a, b) in guides(&s, "arm_l").iter().zip(&arm) {
+            assert!((*a - *b - shift).length() < 1e-5);
+        }
+        for (a, b) in guides(&s, "index_l").iter().zip(&fingers) {
+            assert!((*a - *b - shift).length() < 1e-5);
+        }
+        // The right arm mirrors it; the leg stays put.
+        let r = guides(&s, "arm_r");
+        assert!(
+            (r[0].x - (arm_r[0].x - shift.x)).abs() < 1e-5
+                && (r[0].y - arm_r[0].y - shift.y).abs() < 1e-5
+        );
+        assert_eq!(guides(&s, "leg_l"), leg);
+        assert!(s.build(), "{}", s.status);
     }
 }

@@ -29,7 +29,6 @@ const PICK_RADIUS: f32 = 10.0;
 const HANDLE_HALF: f32 = 11.0;
 const HANDLE_CORE: f32 = 6.5;
 const HANDLE_RADIUS: f32 = 16.0;
-const JOINT_RADIUS: f32 = 16.0;
 const HANDLE: Color32 = Color32::from_rgb(230, 52, 52);
 const JOINT: Color32 = Color32::from_rgb(255, 205, 60);
 /// Picked parts, Maya-style light blue.
@@ -2094,11 +2093,18 @@ impl Studio {
                 self.drag = Some(Drag { comp: c, guide: g });
             } else if let Some(c) = self.handle_at(&pr, p) {
                 self.keep_or_pick(c, None);
+                self.begin_change();
                 self.handle_drag = Some(c);
             }
         }
         if response.dragged_by(PointerButton::Primary) {
             match (&self.drag, pointer) {
+                // The red brackets carry the whole component.
+                (_, Some(p)) if let Some(c) = self.handle_drag => {
+                    let first = self.doc.as_ref().unwrap().guides.components[c].guides[0].position;
+                    let to = pr.drag_point(p, first);
+                    self.move_component(c, to);
+                }
                 _ if self.handle_drag.is_some() => {}
                 (Some(d), Some(p)) => {
                     let (c, g) = (d.comp, d.guide);
@@ -2110,14 +2116,8 @@ impl Studio {
                 _ => self.camera.orbit(response.drag_delta()),
             }
         }
-        if response.drag_stopped()
-            && let Some(c) = self.handle_drag.take()
-        {
-            // Dropped on a joint: hang the component from it.
-            match pointer.and_then(|p| self.joint_at(&pr, p)) {
-                Some(bone) => self.attach_component(c, &bone),
-                None => self.info("Drop a component's red handle on a yellow joint to attach it."),
-            }
+        if response.drag_stopped() && self.handle_drag.take().is_some() {
+            self.info("Moved the component. To hang it from a joint, Shift-pick it, then the joint, and press P.");
         }
         if response.dragged_by(PointerButton::Secondary)
             || response.dragged_by(PointerButton::Middle)
@@ -2262,21 +2262,6 @@ impl Studio {
             .map(|(_, ci)| ci)
     }
 
-    /// The bone whose joint (its head) is under the pointer.
-    fn joint_at(&self, pr: &Projector, at: Pos2) -> Option<String> {
-        let frame = self.frame()?;
-        let built = self.doc.as_ref()?.preview.as_ref().ok()?;
-        built
-            .skeleton
-            .bones
-            .iter()
-            .enumerate()
-            .filter_map(|(i, b)| Some((pr.pos(frame.bones[i].0)?.distance(at), &b.name)))
-            .filter(|(d, _)| *d <= JOINT_RADIUS)
-            .min_by(|a, b| a.0.total_cmp(&b.0))
-            .map(|(_, name)| name.clone())
-    }
-
     fn paint_handles(&self, painter: &egui::Painter, pr: &Projector, pointer: Option<Pos2>) {
         let Some(doc) = &self.doc else { return };
         if self.mode != Mode::Guides {
@@ -2305,22 +2290,6 @@ impl Studio {
             brackets(painter, at, half, Stroke::new(2.2, HANDLE));
             if picked {
                 brackets(painter, at, half + 3.5, Stroke::new(1.2, PICK));
-            }
-        }
-        if let (Some(ci), Some(p)) = (self.handle_drag, pointer)
-            && let Some(c) = doc.guides.components.get(ci)
-            && let Some(from) = c.guides.first().and_then(|g| pr.pos(g.position))
-        {
-            painter.line_segment([from, p], Stroke::new(1.5, HANDLE));
-            // The joint the handle would snap to.
-            let built = doc.preview.as_ref().ok();
-            let target = self.joint_at(pr, p).and_then(|bone| {
-                let i = built?.skeleton.index_of(&bone)?;
-                let frame = self.frame()?;
-                pr.pos(frame.bones[i].0)
-            });
-            if let Some(at) = target {
-                painter.circle_stroke(at, JOINT_RADIUS * 0.6, Stroke::new(2.0, ACCENT));
             }
         }
     }
@@ -2389,9 +2358,8 @@ impl Studio {
                 Color32::from_rgb(130, 134, 150)
             };
             bone_shape(painter, h, t, color.gamma_multiply(bone_alpha));
-            // In the guides stage the guides are the joints; bone joints only show
-            // as drop targets while a handle is being dragged.
-            if self.mode != Mode::Guides || self.handle_drag.is_some() {
+            // In the guides stage the guides are the joints.
+            if self.mode != Mode::Guides {
                 joint_marker(painter, h, if picked { ACCENT } else { JOINT });
             }
         }

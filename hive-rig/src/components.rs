@@ -1424,20 +1424,21 @@ fn limb_controls(
         color,
     );
 
-    let mid = (up.head + end.head) * 0.5;
-    let bend = (lo.head - mid).try_normalize().unwrap_or(bend_fallback);
-    let bend = if bend.dot(bend_fallback) < 0.0 {
-        bend_fallback
-    } else {
-        bend
-    };
+    // The pole sits straight ahead of the knee (behind the elbow): forward or
+    // back, square to the limb, at about half the limb's length. A sideways lean
+    // in the guides doesn't swing it out to the side.
+    let axis = (end.head - up.head).try_normalize().unwrap_or(Vec3::NEG_Y);
+    let bend = (bend_fallback - axis * bend_fallback.dot(axis))
+        .try_normalize()
+        .unwrap_or(bend_fallback);
+    let reach = 0.5 * (up.head.distance(lo.head) + lo.head.distance(end.head));
     let pole = format!("{}_pole_ctrl", lo.name);
     b.control(
         pole.clone(),
         ControlKind::Pole,
         root,
         None,
-        lo.head + bend * 0.3 * h,
+        lo.head + bend * reach.max(0.1 * h),
         bend,
         Shape::Diamond,
         0.025 * h,
@@ -1900,6 +1901,17 @@ mod tests {
             rig.control("lowerarm_l_pole_ctrl").unwrap().position.z
                 < sk.bone("lowerarm_l").unwrap().head.z
         );
+        // Straight ahead, not off to the side.
+        for (pole, joint) in [
+            ("calf_l_pole_ctrl", "calf_l"),
+            ("lowerarm_l_pole_ctrl", "lowerarm_l"),
+        ] {
+            let off = rig.control(pole).unwrap().position - sk.bone(joint).unwrap().head;
+            assert!(
+                off.x.abs() < 0.05 * off.length(),
+                "{pole} leans sideways: {off}"
+            );
+        }
     }
 
     #[test]

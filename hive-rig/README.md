@@ -184,9 +184,10 @@ used. Guides with no matching joint stay where body detection put them. Pass
 
 In the guides stage each guide is drawn as a yellow joint control, and each
 component has red corner brackets around its first guide. Click or drag a
-guide's centre to move it; grab the brackets to carry the whole component onto
-a joint and hang it there. Green plus markers show where each arm and leg's IK
-pole sits.
+guide's centre to move it; grab the brackets to move the whole component as
+one unit, with everything hanging from it (and its mirror twin, with symmetry
+on). Green plus markers show each arm and leg's IK pole, straight ahead of the
+knee and behind the elbow.
 
 To parent several parts at once, Shift-click them (in the view or the
 outliner), picking the parent last, then press **P** or right-click and choose
