@@ -110,7 +110,7 @@ pub fn script(rig: &Rig, target: Target, glb_path: &Path) -> Result<String> {
                 .skeleton
                 .bones
                 .iter()
-                .map(|b| json!({ "name": b.name, "parent": b.parent, "deform": b.deform, "head": b.head }))
+                .map(|b| json!({ "name": b.name, "parent": b.parent, "deform": b.deform, "head": b.head, "translate": b.translate }))
                 .collect();
             // Bones that recover the import's axes; the first also places the COG.
             let basis = ["pelvis", "hand_l", "head", "ball_l"].map(|b| rig.guides.naming.bone(b));

@@ -57,6 +57,7 @@ jobs:
           cargo run --locked -q -- add "$rig/hive_demo.guides.json" chain --parent head --joints 2 --id ear
           cargo run --locked -q -- add "$rig/hive_demo.guides.json" eyes
           cargo run --locked -q -- add "$rig/hive_demo.guides.json" jaw
+          cargo run --locked -q -- add "$rig/hive_demo.guides.json" face
           cargo run --locked -q -- remove "$rig/hive_demo.guides.json" ear
           cargo run --locked -q -- components "$rig/hive_demo.guides.json"
           cargo run --locked -q -- rebuild "$rig/hive_demo.hive.json"
@@ -114,11 +115,11 @@ jobs:
             cargo run -q -- demo -o "$RUNNER_TEMP/rig$drop" --arm-drop "$drop"
             python tests/blender_check.py "$RUNNER_TEMP/rig$drop/hive_demo_blender.py" "$RUNNER_TEMP/rig$drop/hive_demo.glb"
           done
-      - name: Eyes, jaw and fingers in Blender
+      - name: Eyes, jaw, face joints and fingers in Blender
         run: |
           rig="$RUNNER_TEMP/face"
           cargo run -q -- demo -o "$rig"
-          for part in eyes jaw fingers; do cargo run -q -- add "$rig/hive_demo.guides.json" "$part"; done
+          for part in eyes jaw face fingers; do cargo run -q -- add "$rig/hive_demo.guides.json" "$part"; done
           cargo run -q -- rebuild "$rig/hive_demo.hive.json"
           python tests/blender_check.py "$rig/hive_demo_blender.py" "$rig/hive_demo.glb"
       - name: Side-first naming in Blender
@@ -132,6 +133,27 @@ jobs:
           cargo run -q -- naming "$named/hive_demo.guides.json" prefix
           cargo run -q -- rebuild "$named/hive_demo.hive.json"
           python tests/blender_guides_check.py "$named/hive_demo_blender.py"
+      - name: Joints to guides - a Mixamo-named skeleton exported from Blender
+        run: |
+          rig="$RUNNER_TEMP/joints"
+          cargo run -q -- demo -o "$rig"
+          for part in eyes jaw face; do cargo run -q -- add "$rig/hive_demo.guides.json" "$part"; done
+          cargo run -q -- rebuild "$rig/hive_demo.hive.json"
+          python tests/blender_joints_export.py "$rig/hive_demo.glb" "$rig/mixamo.glb"
+          cargo run -q -- rig "$rig/mixamo.glb" -o "$rig/out" | tee "$rig/log.txt"
+          grep -q "and added eyes, jaw, face" "$rig/log.txt"
+          python3 - "$rig/hive_demo.guides.json" "$rig/out/mixamo.guides.json" <<'PY'
+          import json, sys
+          a, b = (json.load(open(p)) for p in sys.argv[1:])
+          def pos(g, comp, name):
+              c = next(c for c in g["components"] if c["id"] == comp)
+              return next(x["position"] for x in c["guides"] if x["name"] == name)
+          # The brow was raised 1 cm in Blender; the shoulder kept its place.
+          assert abs(pos(b, "face", "brow_in_l")[1] - pos(a, "face", "brow_in_l")[1] - 0.01) < 1e-3
+          assert all(abs(x - y) < 1e-3 for x, y in zip(pos(a, "arm_l", "shoulder"), pos(b, "arm_l", "shoulder")))
+          print("joints read back as guides")
+          PY
+          python tests/blender_check.py "$rig/out/mixamo_blender.py" "$rig/out/mixamo.glb"
       - name: Edit guides, add fingers and a tail, and rebuild in Blender
         run: |
           cargo run -q -- demo -o "$RUNNER_TEMP/guides"

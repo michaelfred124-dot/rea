@@ -52,7 +52,8 @@ def build(RIG, geo=None):
 
     def copy_rule(bone):
         parent = bone["parent"]
-        return "parent" if parent is None or not BONES[parent]["deform"] else "orient"
+        moves = bone.get("translate") or parent is None or not BONES[parent]["deform"]
+        return "parent" if moves else "orient"
 
     # --------------------------------------------------------------------------- groups
     top = cmds.group(empty=True, name=NAME + "_rig")

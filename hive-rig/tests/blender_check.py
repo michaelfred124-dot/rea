@@ -214,6 +214,32 @@ if "jaw_ctrl" in pb:
     check((pb["jaw"].tail - chin).length > 0.01, "the jaw control opens the jaw")
     reset()
 
+if "brow_in_l_ctrl" in pb:
+    # Face joints move with their controls and only deform the skin near them.
+    reset()
+    brow0 = head("brow_in_l")
+    before = deformed()
+    move("brow_in_l_ctrl", (0, 0, 0.01))
+    check((head("brow_in_l") - brow0 - Vector((0, 0, 0.01))).length < 1e-4, "a face control moves its joint")
+    after = deformed()
+    moved = [(b - a).length for a, b in zip(before, after)]
+    near = [i for i, m in enumerate(moved) if m > 1e-4]
+    world_brow = rig.matrix_world @ rest_head("brow_in_l")
+    reach = max((geo.matrix_world @ before[i] - world_brow).length for i in near) if near else 0.0
+    check(max(moved) > 0.002 and reach < 0.08, "moving a brow deforms only the skin near it (%d vertices within %.3f m)" % (len(near), reach))
+    reset()
+    lid = pb["lid_up_l"]
+    tip0 = (rig.matrix_world @ lid.tail).copy()
+    pb["lid_up_l_ctrl"].rotation_euler = (0.4, 0.0, 0.0)
+    update()
+    check(((rig.matrix_world @ lid.tail) - tip0).length > 0.002, "rotating an eyelid control swings the lid")
+    reset()
+    if "jaw_ctrl" in pb:
+        lip0 = head("lip_low")
+        pb["jaw_ctrl"].rotation_euler = (0.4, 0.0, 0.0)
+        check((head("lip_low") - lip0).length > 0.002, "the lower lip rides on the jaw")
+        reset()
+
 bpy.ops.wm.read_factory_settings(use_empty=True)
 bpy.ops.import_scene.gltf(filepath=glb)
 armatures = [o for o in bpy.data.objects if o.type == "ARMATURE"]

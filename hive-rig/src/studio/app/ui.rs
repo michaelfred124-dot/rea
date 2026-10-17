@@ -42,6 +42,7 @@ fn kind_label(k: Kind) -> &'static str {
         Kind::Chain => "Chain",
         Kind::Eyes => "Eyes",
         Kind::Jaw => "Jaw",
+        Kind::Face => "Face",
     }
 }
 
@@ -124,7 +125,15 @@ struct LibraryPart {
     once: Option<Kind>,
 }
 
-const LIBRARY: [LibraryPart; 8] = [
+const LIBRARY: [LibraryPart; 9] = [
+    LibraryPart {
+        art: Art::Face,
+        title: "Face",
+        text: "Brows, eyelids, cheeks, nose and lips as joints.",
+        category: Category::Face,
+        add: Studio::add_face,
+        once: Some(Kind::Face),
+    },
     LibraryPart {
         art: Art::Eyes,
         title: "Eyes",
@@ -785,6 +794,28 @@ impl Studio {
                     }
                 });
             weight_legend(ui);
+            ui.horizontal(|ui| {
+                let mirror = ui
+                    .add(egui::Button::new(RichText::new("Mirror L to R").size(12.5)).corner_radius(8))
+                    .on_hover_text("Copy the left side's weights onto the right. Right-click to copy right to left.");
+                if mirror.clicked() {
+                    self.mirror_weights(Side::Left);
+                }
+                mirror.context_menu(|ui| {
+                    if ui.button("Mirror R to L").clicked() {
+                        self.mirror_weights(Side::Right);
+                        ui.close();
+                    }
+                });
+                let what = if self.weights_bone.is_some() { "the shown bone" } else { "every bone" };
+                if ui
+                    .add(egui::Button::new(RichText::new("Smooth").size(12.5)).corner_radius(8))
+                    .on_hover_text(format!("Blur the weights of {what} with their neighbours."))
+                    .clicked()
+                {
+                    self.smooth_weights();
+                }
+            });
         }
 
         ui.add_space(8.0);
@@ -1235,7 +1266,7 @@ impl Studio {
             return;
         }
         let screen = ctx.content_rect();
-        let width = 820f32.min(screen.width() - 60.0);
+        let width = 900f32.min(screen.width() - 60.0);
         let kinds: Vec<Kind> = self
             .doc
             .as_ref()
@@ -1271,8 +1302,9 @@ impl Studio {
                     .filter(|p| self.category == Category::All || p.category == self.category)
                     .collect();
                 let gap = 12.0;
-                let card_w = ((width - 3.0 * gap) / 4.0).floor();
-                for row in parts.chunks(4) {
+                let cols = 5;
+                let card_w = ((width - (cols - 1) as f32 * gap) / cols as f32).floor();
+                for row in parts.chunks(cols) {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = gap;
                         for part in row {
@@ -1755,7 +1787,8 @@ impl Studio {
                         painter.extend(egui::Shape::dashed_line(&[e, t], line, 5.0, 4.0));
                     }
                 }
-            } else {
+            } else if c.kind != Kind::Face {
+                // Face guides are separate joints, not a chain.
                 for w in pts.windows(2) {
                     if let [Some(a), Some(b)] = w {
                         painter.line_segment([*a, *b], line);
@@ -1772,7 +1805,7 @@ impl Studio {
                     6.0
                 } else {
                     5.0
-                };
+                } * if c.kind == Kind::Face { 0.6 } else { 1.0 };
                 if sel || hot {
                     painter.circle_filled(*p, r + 5.0, color.gamma_multiply(0.25));
                 }
@@ -2268,6 +2301,7 @@ fn dock_icon(painter: &egui::Painter, c: Pos2, icon: Icon, color: Color32) {
 
 #[derive(Clone, Copy)]
 enum Art {
+    Face,
     Eyes,
     Jaw,
     Ears,
@@ -2430,7 +2464,7 @@ fn hot_chain(painter: &egui::Painter, pts: &[Pos2], width: f32, hot: bool) {
 /// parts, with the part the component adds picked out in honey.
 fn illustration(painter: &egui::Painter, r: Rect, art: Art, hot: bool) {
     match art {
-        Art::Eyes | Art::Jaw | Art::Ears | Art::Ponytail => bust(painter, r, art, hot),
+        Art::Face | Art::Eyes | Art::Jaw | Art::Ears | Art::Ponytail => bust(painter, r, art, hot),
         Art::Fingers | Art::Tail | Art::Prop | Art::Chain => figure(painter, r, art, hot),
     }
 }
@@ -2610,6 +2644,30 @@ fn bust(painter: &egui::Painter, r: Rect, art: Art, hot: bool) {
     joint(painter, p(0.0, 0.25), 0.0, 2.6);
 
     match art {
+        Art::Face => {
+            // A joint on each brow, lid, cheek and lip, like the face guides.
+            for sx in [-1.0f32, 1.0] {
+                let brow = [p(0.18 * sx, -0.42), p(0.4 * sx, -0.5), p(0.62 * sx, -0.42)];
+                hot_chain(painter, &brow, 1.4, hot);
+                painter.circle_stroke(
+                    p(0.4 * sx, -0.14),
+                    0.15 * rad,
+                    Stroke::new(1.0, Color32::from_rgb(28, 30, 36)),
+                );
+                for y in [-0.3, 0.02] {
+                    joint(painter, p(0.4 * sx, y), sx, 2.4);
+                }
+                joint(painter, p(0.55 * sx, 0.3), sx, 2.6);
+            }
+            joint(painter, p(0.0, 0.18), 0.0, 2.6);
+            let mouth = [p(-0.3, 0.6), p(0.0, 0.53), p(0.3, 0.6)];
+            painter.add(egui::Shape::line(
+                mouth.to_vec(),
+                Stroke::new(1.4, Color32::from_rgb(28, 30, 36)),
+            ));
+            hot_chain(painter, &mouth, 1.4, hot);
+            hot_chain(painter, &[p(0.0, 0.68)], 1.4, hot);
+        }
         Art::Eyes => {
             let target = p(1.6, -1.15);
             for sx in [-1.0f32, 1.0] {

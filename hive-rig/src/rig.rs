@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::components::{self, Guides};
 use crate::controls::ControlRig;
 use crate::export;
+use crate::joints::{self, Joint, JointReport};
 use crate::landmarks::{self, Detected};
 use crate::mesh::Mesh;
 use crate::skeleton::Skeleton;
@@ -40,6 +41,23 @@ pub fn detect_guides(mesh: &Mesh) -> (Guides, Detected) {
     let lm = landmarks::detect(mesh);
     let detected = lm.detected.clone();
     (components::biped(&lm), detected)
+}
+
+/// Guides for a character: detected on the mesh, then moved onto the joints of
+/// the skeleton it came with, if any. The third value is `None` without joints,
+/// and an error (with the detected guides returned) when they couldn't be used.
+pub fn character_guides(
+    mesh: &Mesh,
+    joints: &[Joint],
+) -> (Guides, Detected, Option<anyhow::Result<JointReport>>) {
+    let (guides, detected) = detect_guides(mesh);
+    if joints.is_empty() {
+        return (guides, detected, None);
+    }
+    match joints::guides_from_joints(guides.clone(), joints) {
+        Ok((g, report)) => (g, detected, Some(Ok(report))),
+        Err(e) => (guides, detected, Some(Err(e))),
+    }
 }
 
 /// Run the full pipeline on a humanoid mesh with the default biped layout.

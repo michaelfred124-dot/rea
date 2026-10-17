@@ -102,7 +102,8 @@ def vector_text(v):
 def copy_rule(bone_name):
     bone = next(b for b in BONES if b["name"] == bone_name)
     parent = bone["parent"]
-    return "transform" if parent is None or not BONES[parent]["deform"] else "rotation"
+    moves = bone.get("translate") or parent is None or not BONES[parent]["deform"]
+    return "transform" if moves else "rotation"
 
 
 mesh = import_skeletal_mesh()

@@ -18,7 +18,7 @@ pub enum Region {
     LegR,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Side {
     #[default]
@@ -66,6 +66,14 @@ pub struct Bone {
     /// Twist helper: rotates about its own length by `factor` times the twist of `source`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub twist: Option<Twist>,
+    /// The bone's control moves it as well as rotating it (face joints), even
+    /// though its parent deforms.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub translate: bool,
+    /// Only vertices within this distance of the bone take its weight (face
+    /// joints, so a brow doesn't pull the whole forehead).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reach: Option<f32>,
 }
 
 /// Twist distribution for forearm / upper-arm style helper bones.
@@ -138,6 +146,8 @@ impl Skeleton {
             links: Vec::new(),
             component: String::new(),
             twist: None,
+            translate: false,
+            reach: None,
         });
         self.bones.len() - 1
     }

@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use hive_rig::components::{self, AddOptions, Guides, Kind, Preset};
 use hive_rig::rig::detect_guides;
 use hive_rig::skeleton::Side;
-use hive_rig::{Rig, RigOptions, Target, build_rig, demo, export, import, mesh::Mesh, naming};
+use hive_rig::{Rig, RigOptions, Target, build_rig, demo, export, import, mesh::Mesh, naming, rig};
 
 #[derive(Parser)]
 #[command(
@@ -33,6 +33,10 @@ enum Command {
         /// Build from this guides file instead of detecting the body.
         #[arg(short, long)]
         guides: Option<PathBuf>,
+        /// Detect the body even when the file has a skeleton (by default its
+        /// joints become the guides).
+        #[arg(long)]
+        ignore_joints: bool,
         #[command(flatten)]
         common: Common,
     },
@@ -143,12 +147,62 @@ fn run(mesh: Mesh, name: &str, guides: Guides, out: &Path, common: &Common) -> R
 
 fn detect(mesh: &Mesh) -> Guides {
     let (guides, d) = detect_guides(mesh);
+    warn_undetected(&d);
+    guides
+}
+
+fn warn_undetected(d: &hive_rig::landmarks::Detected) {
     for (found, what) in [(d.crotch, "legs"), (d.arms, "arms"), (d.neck, "neck")] {
         if !found {
             eprintln!("warning: could not detect the {what}; used average proportions instead");
         }
     }
-    guides
+}
+
+/// Guides for a character file: from its joints when it has a skeleton,
+/// otherwise detected on the mesh.
+fn character(mesh: &Mesh, path: &Path) -> Result<Guides> {
+    let joints = import::load_joints(path)?;
+    let (guides, d, used) = rig::character_guides(mesh, &joints);
+    match used {
+        None => {
+            warn_undetected(&d);
+        }
+        Some(Ok(report)) => {
+            println!(
+                "Read {} guides from the file's {} joints{}.",
+                report.placed.len(),
+                joints.len(),
+                if report.added.is_empty() {
+                    String::new()
+                } else {
+                    format!(" and added {}", report.added.join(", "))
+                }
+            );
+            if !report.unused.is_empty() {
+                println!(
+                    "  not used: {}",
+                    report
+                        .unused
+                        .iter()
+                        .take(12)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                        + if report.unused.len() > 12 {
+                            ", ..."
+                        } else {
+                            ""
+                        }
+                );
+            }
+        }
+        Some(Err(e)) => {
+            eprintln!("warning: couldn't use the file's joints ({e:#}); detected the body instead");
+            warn_undetected(&d);
+        }
+    }
+    Ok(guides)
 }
 
 fn save_guides(path: &Path, g: &Guides) -> Result<()> {
@@ -207,7 +261,7 @@ fn guided_rig(dropped: Option<PathBuf>) -> Result<()> {
                 .unwrap_or(Path::new("."))
                 .join(format!("{stem}_rig"));
             println!();
-            let guides = detect(&mesh);
+            let guides = character(&mesh, &input)?;
             run(mesh, &stem, guides, &out, &common)?;
             out
         }
@@ -245,6 +299,7 @@ fn main() -> Result<()> {
             out,
             name,
             guides,
+            ignore_joints,
             common,
         } => {
             let mesh = import::load_mesh(&input)?;
@@ -257,7 +312,8 @@ fn main() -> Result<()> {
             });
             let guides = match guides {
                 Some(path) => Guides::load(&path)?,
-                None => detect(&mesh),
+                None if ignore_joints => detect(&mesh),
+                None => character(&mesh, &input)?,
             };
             run(mesh, &name, guides, &out, &common)
         }

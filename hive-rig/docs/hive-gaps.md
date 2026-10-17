@@ -10,24 +10,33 @@ describes the feature; the details of how it behaves are our reading, not tested
 Biped from guides, IK/FK with blend, stretch, reverse foot, space switching, twist
 bones, build and rebuild from editable guides, keep weights on rebuild, premade
 parts (eyes with look-at, jaw, fingers, tail, ears, ponytail, prop, chain),
-mirroring, symmetry, and now naming conventions (Game, Side first, Side last,
-custom patterns) applied to every export.
+mirroring, symmetry, naming conventions (Game, Side first, Side last, custom
+patterns) applied to every export, and now:
+
+- **Face joints**: brows, eyelids, cheeks, nose and lips as joints with
+  move-and-rotate controls. Joints rather than blendshapes, as Maya face rigs
+  usually are, so the face reaches Blender and Unreal in the same .glb.
+- **Joints to guides**: a .glb that already has a skeleton (Mixamo, Unreal,
+  3ds Max biped, Maya or Blender names) becomes guides, with its eyes, jaw,
+  face and fingers. Checked by renaming and editing a rig in real Blender.
+- **Weight tools**: mirror weights left to right (or back) and smooth one
+  bone's weights or all of them.
 
 ## Gaps, ranked by how much they'd help a rigger
 
 | # | Area | What Hive/Zoo offer publicly | What we'd build | Size |
 |---|------|------------------------------|-----------------|------|
 | 1 | Quadrupeds and creatures | Dog, horse, spider, dinosaur, werewolf templates; quad legs | A `quad_leg` component (3-bone IK with hock and paw roll) and creature templates | Large |
-| 2 | Face | Joint-based brows, eyelids, cheeks, mouth corners and lips | Brow, eyelid and lip components on the head, built on the eyes/jaw pattern | Large |
+| 2 | Face, next steps | Joint-based face plus face controls on a panel | Done: face joints. Next: a 2D face control board, lip zippers, sticky lips | Medium |
 | 3 | Bendy limbs | Bendy/ribbon arms and legs, soft IK | Extra mid-limb controls driving the twist bones; soft IK to stop knee pop | Medium |
 | 4 | Spine and tentacles | Spline (IK) spine, tentacles, multi-branch FK | A spline-chain component with stretch and volume | Medium |
 | 5 | IK/FK and space matching | Snap IK to FK and back without a pop | A match button in the Blender tab and Maya window | Medium |
 | 6 | Animator tools | Mirror poses, select-all-controls, reset pose | Pose mirror using our L/R naming, reset to bind | Small |
-| 7 | Joints to guides | Turn an existing skeleton into guides | Import a skinned glb and read its joints back into components | Medium |
+| 7 | Joints to guides, next steps | Turn an existing skeleton into guides | Done for .glb. Next: unknown chains (ears, tails, hair) read back as chain components, and FBX input | Small |
 | 8 | FBX and more targets | FBX export; Unity and Houdini use | FBX writer, or document the glTF route for Unity/Houdini | Medium |
-| 9 | Corrective shapes | Corrective blendshapes driven by joint angles | Pose-space drivers in Blender/Maya builders | Large |
+| 9 | Pose-driven correctives | Corrective shapes and helper joints driven by joint angles (Brave Rabbit's weightDriver is the well-known Maya RBF/pose reader) | Our own pose reader: a cone angle between a joint and its rest pose drives a helper joint or shape, written as Blender drivers and Maya nodes | Large |
 | 10 | Control shapes | A library of control curve shapes, recolouring | More shapes and per-control colour/size in the app | Small |
-| 11 | Skin tools | Auto skin plus weight tools | Smooth, mirror and copy weights in the app | Medium |
+| 11 | Skin tools, next steps | Auto skin plus weight tools | Done: mirror and smooth. Next: copy weights between characters, prune tiny weights, a max-influences limit per engine, paint brush | Medium |
 | 12 | Proximity controls | Controls appear as the mouse comes near (lesterbanks) | Blender-only overlay; Maya has no clean equivalent | Small |
 | 13 | Developer API | Scriptable rig building | Already partly there: the CLI and the guides JSON; document it | Small |
 

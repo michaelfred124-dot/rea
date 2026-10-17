@@ -27,11 +27,11 @@ a joint; with Symmetry on, its twin on the other side follows.
   X-ray, Weights, Undo, Redo, Frame and Export. The honeycomb button in the
   middle builds the rig.
 * **The outliner** (left) lists the components as a tree. **Properties** (right)
-  shows the rig summary, skin weights and naming, or, with a component
+  shows the rig summary, skin weights (with Mirror and Smooth) and naming, or, with a component
   selected, its attachment, options, exact guide positions and the names its
   bones will export as. Click a panel's title to fold it away.
 * **The rigging window** (Add, or Shift+A) is the library of premade parts, each
-  with an illustration: eyes with a look-at control, a jaw, ears, fingers, a
+  with an illustration: face joints, eyes with a look-at control, a jaw, ears, fingers, a
   tail, a ponytail, a prop socket in the right hand, and a custom chain.
 * **The export window** (Ctrl+E) picks the programs, the naming convention, the
   file name and the folder.
@@ -142,6 +142,7 @@ A rig is a list of components, each placed by a few guide points:
 | chain | two or more | an FK chain: fingers, tails, ears, hair, props |
 | eyes | eye_l, eye_r, target | `eye_l`, `eye_r` aimed by a look-at control that follows the head or stays in the world |
 | jaw | jaw, chin | `jaw` with a rotate control |
+| face | brows (3 a side), upper and lower lids, cheeks, nose, upper and lower lip, lip corners | 17 face joints on the head, each with a small control that moves and rotates it; lids pivot on the eye, the lower lip rides on the jaw |
 
 The first rig detects the body and places the default biped. From then on you
 can change the layout and rebuild:
@@ -151,12 +152,40 @@ hive-rig add out/hero.guides.json fingers           # five fingers on each hand
 hive-rig add out/hero.guides.json tail --joints 6
 hive-rig add out/hero.guides.json eyes              # look-at eyes on the head
 hive-rig add out/hero.guides.json jaw
+hive-rig add out/hero.guides.json face              # brow, lid, cheek, nose and lip joints
 hive-rig add out/hero.guides.json chain --parent head --joints 2 --id ear_l
 hive-rig remove out/hero.guides.json tail           # also removes anything attached to it
 hive-rig components out/hero.guides.json            # list the layout
 hive-rig rebuild out/hero.hive.json                 # rebuild from the edited guides
 hive-rig rig other_character.glb --guides out/hero.guides.json   # reuse a layout
 ```
+
+### Face joints in Blender, Maya and Unreal
+
+The face is joints, not blendshapes, the way a Maya face rig is usually built,
+so it travels in the .glb like any other bone and every program reads it. Each
+face joint gets a small diamond control that moves and rotates it (the Blender
+builder uses Copy Transforms, Maya a parent constraint, Unreal a transform
+copy), and its skin weights fade out within a few centimetres so a brow never
+pulls the eye. The eyelids pivot on the eye joint and the lower lip follows the
+jaw when the rig has them.
+
+### Bring your own skeleton (joints to guides)
+
+Open or rig a .glb that already has a skeleton and its joints become the
+guides: Unreal mannequin, Mixamo (`mixamorig:LeftArm`), 3ds Max biped
+(`Bip01 L UpperArm`), and side-first or side-last Maya names (`L_arm_jnt`,
+`arm_L_JNT`, `thigh.L`) are recognised. Eyes, a jaw, face joints and fingers
+are added when the skeleton has them; twist and helper joints are listed as not
+used. Guides with no matching joint stay where body detection put them. Pass
+`--ignore-joints` to place the guides on the mesh instead.
+
+### Weight tools
+
+After Build, the Properties panel's skin weights section has **Mirror L to R**
+(right-click for R to L), which copies one side's weights onto the other by
+mirrored vertex position, and **Smooth**, which blurs the shown bone's weights
+(or every bone's) with their neighbours.
 
 `guides.json` is plain JSON, so you can also edit guide positions, the spine's
 `joints` option, or `twist: false` on a limb by hand.
@@ -247,7 +276,7 @@ as intended. They haven't been run inside Maya or Unreal yet.
 ## Not yet included
 
 See [the gap list](docs/hive-gaps.md)
-for what's planned. In short: facial bones beyond eyes and jaw, quadruped and creature templates, extra arms or legs on the same
+for what's planned. In short: corrective shapes, quadruped and creature templates, extra arms or legs on the same
 side, guide editing in Unreal (rebuild with the CLI and rerun the script), IK/FK
 and space *matching* (snapping without a pop when switching mid-animation), and
 FBX output.

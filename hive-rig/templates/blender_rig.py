@@ -47,9 +47,10 @@ def build(RIG, geo=None):
     CHAINS = RIG["controls"]["ik_chains"]
 
     def copy_rule(bone):
-        """Bones without a deforming parent follow position too; the rest only rotate."""
+        """Bones without a deforming parent, and face joints, follow position too; the rest only rotate."""
         parent = bone["parent"]
-        return "COPY_TRANSFORMS" if parent is None or not BONES[parent]["deform"] else "COPY_ROTATION"
+        moves = bone.get("translate") or parent is None or not BONES[parent]["deform"]
+        return "COPY_TRANSFORMS" if moves else "COPY_ROTATION"
 
     # --------------------------------------------------------------------------- scene
     def new_collection(name, parent):

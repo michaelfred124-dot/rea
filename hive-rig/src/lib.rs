@@ -17,6 +17,7 @@ pub mod controls;
 pub mod demo;
 pub mod export;
 pub mod import;
+pub mod joints;
 pub mod landmarks;
 pub mod mesh;
 pub mod naming;

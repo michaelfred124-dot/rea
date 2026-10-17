@@ -5,6 +5,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use glam::{Mat4, Vec3};
 
+use crate::joints::Joint;
 use crate::mesh::Mesh;
 
 /// Load a mesh, picking the importer from the file extension.
@@ -119,6 +120,67 @@ fn collect_node(node: &gltf::Node, parent: Mat4, buffers: &[gltf::buffer::Data],
     for child in node.children() {
         collect_node(&child, world, buffers, out);
     }
+}
+
+/// The joints of the first skin in a glTF file, at their bind pose in the same
+/// space [`load_gltf`] puts the mesh in. Empty for files without a skin.
+pub fn load_joints(path: &Path) -> Result<Vec<Joint>> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    if ext != "gltf" && ext != "glb" {
+        return Ok(Vec::new());
+    }
+    let (doc, buffers, _) =
+        gltf::import(path).with_context(|| format!("reading {}", path.display()))?;
+    let scene = doc
+        .default_scene()
+        .or_else(|| doc.scenes().next())
+        .context("glTF file has no scene")?;
+    // World matrix of every node in the scene.
+    let mut world = vec![None; doc.nodes().len()];
+    fn walk(node: &gltf::Node, parent: Mat4, world: &mut [Option<Mat4>]) {
+        let m = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
+        world[node.index()] = Some(m);
+        for child in node.children() {
+            walk(&child, m, world);
+        }
+    }
+    for node in scene.nodes() {
+        walk(&node, Mat4::IDENTITY, &mut world);
+    }
+    let Some((mesh_node, skin)) = doc.nodes().find_map(|n| n.skin().map(|s| (n.index(), s))) else {
+        return Ok(Vec::new());
+    };
+    let mesh_world = world[mesh_node].unwrap_or(Mat4::IDENTITY);
+    let reader = skin.reader(|b| Some(&buffers[b.index()]));
+    let inverse_binds: Vec<Mat4> = reader
+        .read_inverse_bind_matrices()
+        .map(|it| it.map(|m| Mat4::from_cols_array_2d(&m)).collect())
+        .unwrap_or_default();
+    Ok(skin
+        .joints()
+        .enumerate()
+        .map(|(i, node)| {
+            // The bind pose, where the mesh was skinned; the node's own transform
+            // when the file has no inverse bind matrices.
+            let position = match inverse_binds.get(i) {
+                Some(ibm) => mesh_world.transform_point3(ibm.inverse().w_axis.truncate()),
+                None => world[node.index()]
+                    .unwrap_or(Mat4::IDENTITY)
+                    .w_axis
+                    .truncate(),
+            };
+            Joint {
+                name: node
+                    .name()
+                    .map_or_else(|| format!("joint_{i}"), str::to_string),
+                position,
+            }
+        })
+        .collect())
 }
 
 #[cfg(test)]

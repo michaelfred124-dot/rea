@@ -223,7 +223,8 @@ impl Studio {
             .parent()
             .unwrap_or(Path::new("."))
             .join(format!("{stem}_rig"));
-        let (guides, found) = detect_guides(&mesh);
+        let joints = import::load_joints(path)?;
+        let (guides, found, from_joints) = hive_rig::rig::character_guides(&mesh, &joints);
         let missing: Vec<&str> = [
             (found.crotch, "legs"),
             (found.arms, "arms"),
@@ -235,6 +236,28 @@ impl Studio {
         .collect();
         let verts = mesh.vertex_count();
         self.set_doc(Doc::new(stem, mesh, guides, out_dir));
+        match from_joints {
+            Some(Ok(report)) if !report.placed.is_empty() => {
+                let added = if report.added.is_empty() {
+                    String::new()
+                } else {
+                    format!(", with {}", report.added.join(", "))
+                };
+                self.info(format!(
+                    "Loaded {verts} vertices and read {} guides from its {} joints{added}. Check them, then Build Rig.",
+                    report.placed.len(),
+                    joints.len()
+                ));
+                return Ok(());
+            }
+            Some(Err(e)) => {
+                self.fail(format!(
+                    "Couldn't use this file's joints ({e:#}), so the guides were placed on the body instead."
+                ));
+                return Ok(());
+            }
+            _ => {}
+        }
         if missing.is_empty() {
             self.info(format!(
                 "Loaded {} ({verts} vertices). Guides placed on the body: drag them to adjust, then Build Rig.",
@@ -444,6 +467,56 @@ impl Studio {
     pub fn add_jaw(&mut self) {
         self.add(Preset::Jaw, AddOptions::default());
         self.snap_to_face(Kind::Jaw, &["chin"], 0.0);
+    }
+
+    /// Face joints (brows, eyelids, cheeks, nose, lips), pushed onto the face.
+    pub fn add_face(&mut self) {
+        self.add(Preset::Face, AddOptions::default());
+        self.snap_to_face(Kind::Face, &components::FACE_GUIDES, 0.003);
+    }
+
+    /// Copy one side's skin weights onto the other on the built rig.
+    pub fn mirror_weights(&mut self, source: Side) {
+        let Some(doc) = &mut self.doc else { return };
+        let Some(rig) = &mut doc.rig else {
+            self.fail("Build the rig first, then mirror its weights.");
+            return;
+        };
+        let body = rig.guides.body;
+        rig.skin = hive_rig::skin::mirror_weights(
+            &rig.skin,
+            &rig.mesh,
+            &rig.skeleton,
+            body.center_x,
+            body.height,
+            source,
+        );
+        doc.exported = false;
+        self.weight_colors = None;
+        let (from, to) = match source {
+            Side::Right => ("right", "left"),
+            _ => ("left", "right"),
+        };
+        self.info(format!("Copied the {from} side's weights onto the {to}."));
+    }
+
+    /// Smooth the built rig's weights, around the bone shown in the weights view
+    /// or everywhere.
+    pub fn smooth_weights(&mut self) {
+        let Some(doc) = &mut self.doc else { return };
+        let Some(rig) = &mut doc.rig else {
+            self.fail("Build the rig first, then smooth its weights.");
+            return;
+        };
+        let bone = self
+            .weights_bone
+            .as_deref()
+            .and_then(|b| rig.skeleton.index_of(b));
+        rig.skin = hive_rig::skin::smooth(&rig.skin, &rig.mesh, &rig.skeleton, bone, 2);
+        doc.exported = false;
+        self.weight_colors = None;
+        let what = self.weights_bone.as_deref().unwrap_or("every bone");
+        self.info(format!("Smoothed the weights of {what}."));
     }
 
     /// Move the named guides of the just-added component forward or back to the
@@ -937,5 +1010,25 @@ mod tests {
             g.component("head").unwrap().parent.as_deref(),
             Some("spine_05")
         );
+    }
+
+    #[test]
+    fn face_and_weight_tools() {
+        let mut s = demo_studio();
+        s.add_face();
+        assert!(!s.error, "{}", s.status);
+        s.add_face();
+        assert!(s.error, "a rig has one face");
+        assert!(s.build(), "{}", s.status);
+        let rig = s.doc.as_ref().unwrap().rig.as_ref().unwrap();
+        assert!(rig.skeleton.bone("brow_in_l").is_some_and(|b| b.translate));
+        let before = serde_json::to_string(&rig.skin).unwrap();
+        s.weights_bone = Some("brow_in_l".into());
+        s.smooth_weights();
+        s.mirror_weights(Side::Left);
+        assert!(!s.error, "{}", s.status);
+        let rig = s.doc.as_ref().unwrap().rig.as_ref().unwrap();
+        assert_ne!(serde_json::to_string(&rig.skin).unwrap(), before);
+        assert!(!s.doc.as_ref().unwrap().exported);
     }
 }
