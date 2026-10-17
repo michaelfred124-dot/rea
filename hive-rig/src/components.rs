@@ -1009,6 +1009,7 @@ pub fn build(g: &Guides) -> Result<Built> {
         }
     }
     assign_spaces(&mut b);
+    b.rig.find_mirror_pairs();
     for (name, style) in &g.control_styles {
         let Some(c) = b.rig.controls.iter_mut().find(|c| &c.name == name) else {
             continue;
@@ -1884,6 +1885,16 @@ mod tests {
             }
         }
         assert_eq!(rig.ik_chains.len(), 4);
+        // Every left limb control has its right twin for pose mirroring.
+        for chain in rig.ik_chains.iter().filter(|c| c.name.ends_with("_l")) {
+            let mut limb = vec![chain.ik_control.clone(), chain.pole_control.clone()];
+            limb.extend(chain.fk_controls.iter().cloned());
+            for left in limb {
+                let right = left.replace("_l_", "_r_");
+                assert!(rig.mirror_pairs.contains(&[left.clone(), right]), "{left}");
+            }
+        }
+        assert!(rig.mirror_pairs.iter().all(|[l, r]| l != r));
         assert_eq!(rig.control("hand_l_ik_ctrl").unwrap().spaces.len(), 4);
         assert_eq!(
             rig.control("head_ctrl").unwrap().spaces,

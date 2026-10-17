@@ -245,6 +245,32 @@ Rebuilding runs the `hive-rig` program that generated the script. If you've
 moved it since, set `HIVE_EXE` at the top of the script. Running the script
 again in a file that already has the rig only brings back the tab or window.
 
+### Animator tools in Blender and Maya
+
+Below the guide tools, the Hive tab (Blender) and the Hive Rig window (Maya)
+have an **Animation** section:
+
+* **IK to FK / FK to IK** for each arm and leg. IK to FK turns the FK controls
+  to the pose the IK limb has now; FK to IK moves the IK control onto the FK
+  hand or foot and puts the pole in front of the elbow or knee, in the plane of
+  the limb. Either way the `ik_fk` blend flips afterwards and the limb doesn't
+  move. A rolled foot keeps its roll. FK has no stretch, so a stretched IK limb
+  can't be matched exactly in FK.
+* **Mirror Pose** copies the selected controls' pose onto their twins on the
+  other side, or every left (right) control's pose when nothing is selected.
+  Poses are mirrored relative to each control's parent, along with `ik_fk`,
+  `stretch`, `roll` and `space`. Centre controls are left alone.
+* **Reset** puts every control, or only the selected ones, back to the bind
+  pose and default settings. **Select All Controls** selects the controls only.
+* **Switch space without a pop**: Blender shows a button per space for the
+  active control; Maya asks which space to follow for the selected control. The
+  control keeps its place in the world.
+
+With auto key on, the tools key what they changed. Which controls make up each
+limb and which controls are left/right twins come from hive-rig (`ik_chains` and
+`mirror_pairs` in the rig data), so the tools work with any naming convention.
+Unreal doesn't have these tools yet.
+
 ## Input requirements
 
 * `.obj`, `.gltf` or `.glb`
@@ -285,6 +311,7 @@ python3 tests/dcc_stub_run.py unreal out/hive_demo_unreal.py  # Python-level che
 pip install bpy && python tests/blender_check.py out/hive_demo_blender.py out/hive_demo.glb
 python tests/blender_guides_check.py out/hive_demo_blender.py           # guides and rebuild
 python3 tests/dcc_stub_run.py maya out/hive_demo_maya.py --guides       # Maya guide tools
+python tests/blender_anim_check.py out/hive_demo_blender.py             # animator tools
 ```
 
 `blender_check.py` builds the rig in real Blender and checks that it works as
@@ -299,13 +326,19 @@ mesh deforms, and the `.glb` re-imports with weights on every bone.
 mirrors it, paints a weight, adds fingers and a tail, and rebuilds. Then it
 checks that the bones moved, the painted weight survived, the new fingers got
 weights and controls, and a finger control bends the finger.
+`blender_anim_check.py` poses each IK arm and leg (moved, turned, pole pushed
+aside, foot rolled), runs IK to FK and checks the FK controls and bones land on
+the IK pose; then poses each FK limb and checks FK to IK leaves every bone in
+place, including a straight limb. It mirrors a posed left side and checks the
+right side is its mirror image, mirrors one selected control, switches the IK
+hand's space with the chest turned, and resets the rig back to its rest mesh.
 The app's editing operations (add, remove, mirror, symmetric moves, undo, build,
 export and reopening a rig) have unit tests in `src/studio/app.rs`, and CI opens
 the app on a virtual screen and screenshots it after building the demo rig.
 CI runs all of this (`.github/workflows/hive-rig.yml`), and builds both Windows
 executables as a downloadable artifact.
 
-The Maya and Unreal builders, and the Maya guide tools, are checked against stub
+The Maya and Unreal builders, and the Maya guide and animator tools, are checked against stub
 APIs. That catches script errors but doesn't prove the application calls behave
 as intended. They haven't been run inside Maya or Unreal yet.
 
@@ -313,6 +346,5 @@ as intended. They haven't been run inside Maya or Unreal yet.
 
 See [the gap list](docs/hive-gaps.md)
 for what's planned. In short: corrective shapes, quadruped and creature templates, extra arms or legs on the same
-side, guide editing in Unreal (rebuild with the CLI and rerun the script), IK/FK
-and space *matching* (snapping without a pop when switching mid-animation), and
-FBX output.
+side, guide editing in Unreal (rebuild with the CLI and rerun the script), the
+animator tools (IK/FK matching, mirror and reset pose) in Unreal, and FBX output.

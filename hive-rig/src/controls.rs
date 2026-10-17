@@ -102,12 +102,46 @@ pub struct FootRoll {
 pub struct ControlRig {
     pub controls: Vec<Control>,
     pub ik_chains: Vec<IkChain>,
+    /// Left/right control twins as `[left, right]`, for the animator tools' pose
+    /// mirroring. Found from the internal names when the rig is built, so the DCC
+    /// scripts never guess sides from the exported naming convention.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mirror_pairs: Vec<[String; 2]>,
 }
 
 impl ControlRig {
     pub fn control(&self, name: &str) -> Option<&Control> {
         self.controls.iter().find(|c| c.name == name)
     }
+
+    /// Pair every left control with its right twin. Must run on internal names
+    /// (`hand_l_ik_ctrl`), before a naming convention renames them.
+    pub fn find_mirror_pairs(&mut self) {
+        let names: std::collections::HashSet<&str> =
+            self.controls.iter().map(|c| c.name.as_str()).collect();
+        self.mirror_pairs = self
+            .controls
+            .iter()
+            .filter_map(|c| {
+                let right = right_twin(&c.name)?;
+                names
+                    .contains(right.as_str())
+                    .then(|| [c.name.clone(), right])
+            })
+            .collect();
+    }
+}
+
+/// The right-side twin of a left internal name, or `None` when the name isn't on
+/// the left. The side is the last `l`/`r` token after the first, as `naming` reads it.
+fn right_twin(internal: &str) -> Option<String> {
+    let mut tokens: Vec<&str> = internal.split('_').collect();
+    let at = tokens.iter().rposition(|t| *t == "l" || *t == "r")?;
+    if at == 0 || tokens[at] != "l" {
+        return None;
+    }
+    tokens[at] = "r";
+    Some(tokens.join("_"))
 }
 
 pub fn ctrl_name(bone: &str) -> String {
@@ -116,4 +150,24 @@ pub fn ctrl_name(bone: &str) -> String {
 
 pub fn fk_name(bone: &str) -> String {
     format!("{bone}_fk_ctrl")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_right_twins() {
+        assert_eq!(
+            right_twin("hand_l_ik_ctrl").as_deref(),
+            Some("hand_r_ik_ctrl")
+        );
+        assert_eq!(
+            right_twin("index_02_l_ctrl").as_deref(),
+            Some("index_02_r_ctrl")
+        );
+        assert_eq!(right_twin("hand_r_ik_ctrl"), None);
+        assert_eq!(right_twin("cog_ctrl"), None);
+        assert_eq!(right_twin("l_ctrl"), None);
+    }
 }
