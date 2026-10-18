@@ -21,15 +21,58 @@ use crate::naming::Naming;
 use crate::skeleton::{Region, Side, Skeleton, Twist};
 
 pub const GUIDES_FORMAT: &str = "hive-rig-guides";
+/// The newest guides version this program knows. A guides file's `version`
+/// pins the builder [`Rules`] it is built with; new files get this one.
 pub const GUIDES_VERSION: u32 = 1;
-pub const SPINE_JOINTS: usize = 3;
+/// The default spine joint count of the current [`Rules`].
+pub const SPINE_JOINTS: usize = RULES_V1.spine_joints;
+
+/// Builder behaviours that aren't written in the guides themselves, pinned by
+/// the guides `version` so a layout rebuilds the same way in later releases.
+/// When a release changes one of these, it adds a guides version with the new
+/// value; files of older versions keep the rules they were written with.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rules {
+    /// Spine joints when the spine component doesn't set `joints`.
+    pub spine_joints: usize,
+    /// Foot and paw roll: degrees of heel lift before the roll moves to the toe tip.
+    pub foot_break_degrees: f32,
+    /// IK pole distance from the elbow or knee, as a fraction of the limb's length.
+    pub pole_reach: f32,
+    /// The least pole distance, as a fraction of the body height.
+    pub pole_min_reach: f32,
+    /// An arm whose elbow and wrist are below the belly line (`crotch_y`) is a
+    /// front leg: skinned as a leg, starting in IK, with an upright IK control.
+    pub planted_front_legs: bool,
+}
+
+/// The rules of guides version 1 (hive-rig 0.1.0 onwards).
+pub const RULES_V1: Rules = Rules {
+    spine_joints: 3,
+    foot_break_degrees: 30.0,
+    pole_reach: 0.5,
+    pole_min_reach: 0.1,
+    planted_front_legs: true,
+};
+
+/// The builder rules pinned by a guides `version`. Every version so far has
+/// the version 1 rules; a version newer than this program builds with the
+/// newest rules it knows (and loading it warns).
+pub fn rules(_version: u32) -> Rules {
+    RULES_V1
+}
 
 /// The editable rig layout: components and their guide positions (model space,
 /// Y-up, metres, facing +Z).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Guides {
     pub format: String,
+    /// Pins the builder [`Rules`]; kept as read when the file is saved again.
     pub version: u32,
+    /// The hive-rig that last wrote the file (absent before 0.1.0 stamped it).
+    /// Writing always stamps this program's version.
+    #[serde(default, rename = "hive_rig", serialize_with = "crate::version::stamp")]
+    pub written_by: Option<String>,
     pub body: Body,
     pub components: Vec<Component>,
     /// How exported joints and controls are named. Absent means the default
@@ -217,13 +260,51 @@ impl Guides {
             "{} is not a hive-rig guides file",
             path.display()
         );
-        ensure!(
-            g.version <= GUIDES_VERSION,
-            "{} was written by a newer hive-rig (guides version {})",
-            path.display(),
-            g.version
-        );
         Ok(g)
+    }
+
+    /// Write the guides as pretty JSON, stamped with this program's version.
+    pub fn save(&self, path: &std::path::Path) -> Result<()> {
+        std::fs::write(path, serde_json::to_vec_pretty(self)?)
+            .with_context(|| format!("writing {}", path.display()))
+    }
+
+    /// The builder rules this layout's `version` pins.
+    pub fn rules(&self) -> Rules {
+        rules(self.version)
+    }
+
+    /// The spine joint count of a spine component.
+    pub fn spine_joints(&self, c: &Component) -> usize {
+        c.options.joints.unwrap_or(self.rules().spine_joints)
+    }
+
+    /// A warning when the file came from a newer hive-rig: a guides version
+    /// this program doesn't know (built with the newest rules it has), or a
+    /// newer program's stamp.
+    pub fn newer_warning(&self) -> Option<String> {
+        if self.version > GUIDES_VERSION {
+            return Some(format!(
+                "these guides are version {} from a newer hive-rig{}; this {} knows up to version {GUIDES_VERSION}, so they build with its rules and may differ",
+                self.version,
+                self.written_by
+                    .as_deref()
+                    .map(|v| format!(" ({v})"))
+                    .unwrap_or_default(),
+                crate::version::CURRENT
+            ));
+        }
+        crate::version::newer_note("these guides", self.written_by.as_deref())
+    }
+
+    /// Where the layout came from, for display: "guides version 1, written by
+    /// hive-rig 0.1.0".
+    pub fn origin(&self) -> String {
+        let by = match &self.written_by {
+            Some(v) => format!("hive-rig {v}"),
+            None => "a hive-rig from before version stamps".into(),
+        };
+        format!("guides version {}, written by {by}", self.version)
     }
 }
 
@@ -329,6 +410,7 @@ pub fn biped(lm: &Landmarks) -> Guides {
     Guides {
         format: GUIDES_FORMAT.into(),
         version: GUIDES_VERSION,
+        written_by: None,
         body: Body {
             floor: lm.floor,
             height: lm.height,
@@ -412,6 +494,7 @@ pub fn quadruped(height: f32) -> Guides {
     Guides {
         format: GUIDES_FORMAT.into(),
         version: GUIDES_VERSION,
+        written_by: None,
         body: Body {
             floor: 0.0,
             height: h,
@@ -1002,12 +1085,13 @@ pub fn mirror_side(g: &mut Guides, source: Side) -> usize {
 /// from the old top joint to the new one.
 pub fn set_spine_joints(g: &mut Guides, spine_id: &str, joints: usize) -> Result<()> {
     ensure!((1..=16).contains(&joints), "spine joints must be 1 to 16");
+    let default_joints = g.rules().spine_joints;
     let spine = g
         .components
         .iter_mut()
         .find(|c| c.id == spine_id && c.kind == Kind::Spine)
         .with_context(|| format!("no spine component named {spine_id}"))?;
-    let old_top = spine_name(spine.options.joints.unwrap_or(SPINE_JOINTS) - 1);
+    let old_top = spine_name(spine.options.joints.unwrap_or(default_joints) - 1);
     spine.options.joints = Some(joints);
     let new_top = spine_name(joints - 1);
     for c in &mut g.components {
@@ -1052,6 +1136,7 @@ struct Builder {
     component: String,
     /// The body's belly or crotch line: skin below it belongs to a leg.
     crotch_y: f32,
+    rules: Rules,
 }
 
 impl Builder {
@@ -1154,6 +1239,7 @@ pub fn build(g: &Guides) -> Result<Built> {
         head_chest: None,
         component: String::new(),
         crotch_y: g.body.crotch_y,
+        rules: g.rules(),
     };
     for c in &g.components {
         b.component = c.id.clone();
@@ -1244,7 +1330,7 @@ fn validate(g: &Guides) -> Result<()> {
             );
         }
         if c.kind == Kind::Spine {
-            let n = c.options.joints.unwrap_or(SPINE_JOINTS);
+            let n = g.spine_joints(c);
             ensure!(
                 (1..=16).contains(&n),
                 "component {}: spine joints must be 1 to 16",
@@ -1292,7 +1378,7 @@ fn build_spine(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
     let h = b.h;
     let pelvis = c.position("pelvis").unwrap();
     let chest = c.position("chest").unwrap();
-    let joints = c.options.joints.unwrap_or(SPINE_JOINTS);
+    let joints = c.options.joints.unwrap_or(b.rules.spine_joints);
     // The pelvis points up into the first spine joint.
     let start = pelvis + Vec3::Y * 0.04 * h;
     b.bone(
@@ -1402,7 +1488,8 @@ fn build_arm(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
     let p = |n: &str| c.position(n).unwrap();
     // A quadruped's front leg: elbow and wrist below the belly line. Its skin
     // falls in the leg region, it starts in IK and its IK control stands upright.
-    let planted = p("elbow").y < b.crotch_y && p("wrist").y < b.crotch_y;
+    let planted =
+        b.rules.planted_front_legs && p("elbow").y < b.crotch_y && p("wrist").y < b.crotch_y;
     let region = limb_region(if planted { Kind::Leg } else { Kind::Arm }, side);
     let clav = format!("clavicle{s}");
     b.bone(
@@ -1474,7 +1561,7 @@ fn build_leg(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
         toe_tip: p("toe"),
         ball_bone: ball.clone(),
         ball_control: ctrl_name(&ball),
-        break_angle: 30.0,
+        break_angle: b.rules.foot_break_degrees,
     };
     limb_controls(
         b,
@@ -1535,7 +1622,7 @@ fn build_quad_leg(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
         toe_tip: p("toe"),
         ball_bone: ball.clone(),
         ball_control: ctrl_name(&ball),
-        break_angle: 30.0,
+        break_angle: b.rules.foot_break_degrees,
     };
     let names = [segments[0].clone(), segments[1].clone(), foot.clone()];
     limb_controls(
@@ -1679,14 +1766,14 @@ fn limb_controls(
     let bend = (bend_fallback - axis * bend_fallback.dot(axis))
         .try_normalize()
         .unwrap_or(bend_fallback);
-    let reach = 0.5 * (up.head.distance(lo.head) + lo.head.distance(solve_end));
+    let reach = b.rules.pole_reach * (up.head.distance(lo.head) + lo.head.distance(solve_end));
     let pole = format!("{}_pole_ctrl", lo.name);
     b.control(
         pole.clone(),
         ControlKind::Pole,
         root,
         None,
-        lo.head + bend * reach.max(0.1 * h),
+        lo.head + bend * reach.max(b.rules.pole_min_reach * h),
         bend,
         Shape::Diamond,
         0.025 * h,
@@ -2328,6 +2415,105 @@ mod tests {
         let back: Guides = serde_json::from_str(&text).unwrap();
         assert_eq!(back.components.len(), g.components.len());
         assert!(back.components.iter().all(|c| c.options.twist));
+    }
+
+    /// Bones and controls as comparable values.
+    fn fingerprint(g: &Guides) -> Vec<String> {
+        let b = build(g).unwrap();
+        let bones = b.skeleton.bones.iter().map(|x| {
+            format!(
+                "{} {:?} {:.5} {:.5} {}",
+                x.name,
+                x.parent,
+                x.head,
+                x.tail,
+                x.links.len()
+            )
+        });
+        let controls = b.controls.controls.iter().map(|c| {
+            format!(
+                "{} {:?} {:.5} {:.5} {:.5}",
+                c.name, c.parent, c.position, c.axis, c.size
+            )
+        });
+        let chains = b.controls.ik_chains.iter().map(|k| {
+            format!(
+                "{} {} {:?}",
+                k.name,
+                k.default_blend,
+                k.foot.as_ref().map(|f| f.break_angle)
+            )
+        });
+        bones.chain(controls).chain(chains).collect()
+    }
+
+    #[test]
+    fn files_are_stamped_and_old_ones_keep_their_rules() {
+        assert_eq!(rules(1), RULES_V1);
+        assert_eq!(SPINE_JOINTS, RULES_V1.spine_joints);
+        let dir = std::env::temp_dir().join(format!("hive_versions_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for g in [demo_guides(), quadruped(1.0)] {
+            // Written: stamped with this version.
+            let path = dir.join("a.guides.json");
+            g.save(&path).unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(json["hive_rig"], crate::version::CURRENT);
+            assert_eq!(json["version"], GUIDES_VERSION);
+            let back = Guides::load(&path).unwrap();
+            assert_eq!(back.written_by.as_deref(), Some(crate::version::CURRENT));
+            assert!(back.newer_warning().is_none());
+            assert_eq!(fingerprint(&back), fingerprint(&g));
+
+            // A file from before stamps (no `hive_rig`, version 1) opens and
+            // builds exactly as before; saving it stamps it and keeps its version.
+            let mut old = json.clone();
+            old.as_object_mut().unwrap().remove("hive_rig");
+            std::fs::write(&path, old.to_string()).unwrap();
+            let back = Guides::load(&path).unwrap();
+            assert_eq!(back.written_by, None);
+            assert!(
+                back.origin().contains("before version stamps"),
+                "{}",
+                back.origin()
+            );
+            assert!(back.newer_warning().is_none());
+            assert_eq!(fingerprint(&back), fingerprint(&g));
+            back.save(&path).unwrap();
+            let again = Guides::load(&path).unwrap();
+            assert_eq!(again.version, 1);
+            assert_eq!(again.written_by.as_deref(), Some(crate::version::CURRENT));
+
+            // From a newer hive-rig: loads (unknown settings ignored), warns, and
+            // builds with the newest rules this one knows.
+            for (key, value) in [
+                ("hive_rig", serde_json::json!("99.0.0")),
+                ("version", serde_json::json!(GUIDES_VERSION + 1)),
+            ] {
+                let mut newer = json.clone();
+                newer[key] = value;
+                newer["a_setting_from_the_future"] = serde_json::json!({ "x": 1 });
+                std::fs::write(&path, newer.to_string()).unwrap();
+                let back = Guides::load(&path).unwrap();
+                let w = back.newer_warning().expect("a newer file warns");
+                assert!(w.contains("newer"), "{w}");
+                assert_eq!(back.rules(), RULES_V1);
+                assert_eq!(fingerprint(&back), fingerprint(&g));
+            }
+        }
+        // The rig file is stamped too, and warns when a newer hive-rig wrote it.
+        let mesh = crate::demo::demo_humanoid();
+        let rig = crate::rig::build_rig(mesh, "v", demo_guides(), Default::default()).unwrap();
+        let mut json = serde_json::to_value(&rig).unwrap();
+        assert_eq!(json["hive_rig"], crate::version::CURRENT);
+        assert_eq!(json["guides"]["hive_rig"], crate::version::CURRENT);
+        let back: crate::rig::Rig = serde_json::from_value(json.clone()).unwrap();
+        assert!(back.newer_warning().is_none());
+        json["hive_rig"] = "99.0.0".into();
+        let back: crate::rig::Rig = serde_json::from_value(json).unwrap();
+        assert!(back.newer_warning().unwrap().contains("99.0.0"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

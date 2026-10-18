@@ -1,13 +1,15 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use hive_rig::components::{self, AddOptions, Guides, Kind, Preset};
 use hive_rig::rig::detect_guides;
 use hive_rig::skeleton::Side;
 use hive_rig::template::{self, Template};
-use hive_rig::{Rig, RigOptions, Target, build_rig, demo, export, import, mesh::Mesh, naming, rig};
+use hive_rig::{
+    Rig, RigOptions, Target, build_rig, checks, demo, export, import, mesh::Mesh, naming, rig,
+};
 
 #[derive(Parser)]
 #[command(
@@ -106,6 +108,21 @@ enum Command {
     Remove { guides: PathBuf, id: String },
     /// List the components in a guides file.
     Components { guides: PathBuf },
+    /// Look for likely mistakes before building: guides on the wrong side,
+    /// limbs bending the wrong way or not at all, joints outside the body or on
+    /// top of each other, lopsided twins and odd parents. Exits non-zero only
+    /// when the guides can't build.
+    Check {
+        /// A `.guides.json`, or a `.hive.json` (its mesh is checked against,
+        /// and the guides next to it, which a rebuild would use).
+        file: PathBuf,
+        /// A character mesh (.obj, .gltf, .glb) to check the guides against.
+        #[arg(long)]
+        mesh: Option<PathBuf>,
+        /// Apply the fixes that are mechanical and save the guides file.
+        #[arg(long)]
+        fix: bool,
+    },
     /// Save a layout as a template, load one onto a layout, or list them.
     Template {
         #[command(subcommand)]
@@ -185,6 +202,7 @@ struct Common {
 }
 
 fn run(mesh: Mesh, name: &str, guides: Guides, out: &Path, common: &Common) -> Result<()> {
+    print_warnings(&guides, &mesh);
     let mut opts = RigOptions::default();
     opts.skin.smooth_iterations = common.smooth;
     let rig = build_rig(mesh, name, guides, opts)?;
@@ -263,9 +281,86 @@ fn character(mesh: &Mesh, path: &Path) -> Result<Guides> {
     Ok(guides)
 }
 
-fn save_guides(path: &Path, g: &Guides) -> Result<()> {
-    std::fs::write(path, serde_json::to_vec_pretty(g)?)
-        .with_context(|| format!("writing {}", path.display()))
+/// Read a guides file, warning when a newer hive-rig wrote it.
+fn load_guides(path: &Path) -> Result<Guides> {
+    let g = Guides::load(path)?;
+    if let Some(w) = g.newer_warning() {
+        eprintln!("warning: {}: {w}", path.display());
+    }
+    Ok(g)
+}
+
+/// Read a `.hive.json`, warning when a newer hive-rig wrote it.
+fn load_rig(path: &Path) -> Result<Rig> {
+    let rig = Rig::load(path)?;
+    if let Some(w) = rig.newer_warning() {
+        eprintln!("warning: {}: {w}", path.display());
+    }
+    Ok(rig)
+}
+
+/// Print the pre-build checks' warnings (a layout that can't build fails the
+/// build itself, with the reason).
+fn print_warnings(guides: &Guides, mesh: &Mesh) {
+    let issues = checks::check(guides, Some(&mut checks::Surface::new(mesh)));
+    for i in issues
+        .iter()
+        .filter(|i| i.severity == checks::Severity::Warning)
+    {
+        eprintln!("{}", i.line());
+    }
+}
+
+fn check_command(file: &Path, mesh: Option<&Path>, fix: bool) -> Result<()> {
+    let is_rig = file
+        .to_string_lossy()
+        .to_lowercase()
+        .ends_with(".hive.json");
+    let (guides_path, mut guides, rig_mesh) = if is_rig {
+        let rig = load_rig(file)?;
+        let dir = file.parent().unwrap_or(Path::new("."));
+        let next_to = dir.join(format!("{}.guides.json", rig.name));
+        // A rebuild reads the guides next to the rig, so those are the ones to check.
+        if next_to.is_file() {
+            let g = load_guides(&next_to)?;
+            (Some(next_to), g, Some(rig.mesh))
+        } else {
+            (None, rig.guides, Some(rig.mesh))
+        }
+    } else {
+        (Some(file.to_path_buf()), load_guides(file)?, None)
+    };
+    let mesh = match mesh {
+        Some(m) => Some(import::load_mesh(m)?),
+        None => rig_mesh,
+    };
+    let mut surface = mesh.as_ref().map(checks::Surface::new);
+    let shown = guides_path.as_deref().unwrap_or(file);
+    println!("{}: {}", shown.display(), guides.origin());
+    if surface.is_none() {
+        println!("  (no mesh given: pass --mesh or a .hive.json to check guides against the body)");
+    }
+    let mut issues = checks::check(&guides, surface.as_mut());
+    if fix && issues.iter().any(|i| i.fix.is_some()) {
+        let Some(path) = &guides_path else {
+            anyhow::bail!("--fix needs a guides file to save to");
+        };
+        let n = checks::fix_all(&mut guides, &issues)?;
+        guides.save(path)?;
+        println!("Applied {n} fix(es) and saved {}", path.display());
+        issues = checks::check(&guides, surface.as_mut());
+    }
+    for i in &issues {
+        println!("{}", i.line());
+    }
+    let (w, e) = (checks::warnings(&issues), checks::errors(&issues));
+    if issues.is_empty() {
+        println!("No problems found.");
+    } else {
+        println!("{e} error(s), {w} warning(s)");
+    }
+    anyhow::ensure!(e == 0, "the guides can't build");
+    Ok(())
 }
 
 /// Opened by double-clicking (no arguments) or by dropping a file on the program:
@@ -352,7 +447,7 @@ fn template_command(action: TemplateCommand) -> Result<()> {
             name,
             description,
         } => {
-            let g = Guides::load(&guides)?;
+            let g = load_guides(&guides)?;
             let name = name.unwrap_or_else(|| {
                 if out.is_dir() {
                     guides
@@ -393,10 +488,10 @@ fn template_command(action: TemplateCommand) -> Result<()> {
             template: spec,
             parent,
         } => {
-            let mut g = Guides::load(&guides)?;
+            let mut g = load_guides(&guides)?;
             let t = template::find(&spec)?;
             let applied = t.apply(&mut g, parent.as_deref())?;
-            save_guides(&guides, &g)?;
+            g.save(&guides)?;
             match t.scope {
                 template::Scope::Layout => println!(
                     "Loaded the '{}' layout ({} components)",
@@ -461,7 +556,7 @@ fn main() -> Result<()> {
                     .unwrap_or_else(|| "character".into())
             });
             let guides = match guides {
-                Some(path) => Guides::load(&path)?,
+                Some(path) => load_guides(&path)?,
                 None if ignore_joints => detect(&mesh),
                 None => character(&mesh, &input)?,
             };
@@ -492,11 +587,11 @@ fn main() -> Result<()> {
             out,
             common,
         } => {
-            let old = Rig::load(&rig)?;
+            let old = load_rig(&rig)?;
             let dir = rig.parent().unwrap_or(Path::new("."));
             let guides_path =
                 guides.unwrap_or_else(|| dir.join(format!("{}.guides.json", old.name)));
-            let guides = Guides::load(&guides_path)?;
+            let guides = load_guides(&guides_path)?;
             let out = out.unwrap_or_else(|| dir.to_path_buf());
             run(old.mesh, &old.name, guides, &out, &common)
         }
@@ -508,7 +603,7 @@ fn main() -> Result<()> {
             joints,
             id,
         } => {
-            let mut g = Guides::load(&guides)?;
+            let mut g = load_guides(&guides)?;
             let opts = AddOptions {
                 side: side.map(|s| match s {
                     SideArg::Left => Side::Left,
@@ -519,14 +614,14 @@ fn main() -> Result<()> {
                 id,
             };
             let added = components::add_preset(&mut g, preset, &opts)?;
-            save_guides(&guides, &g)?;
+            g.save(&guides)?;
             println!("Added {}", added.join(", "));
             Ok(())
         }
         Command::Attach { guides, id, bone } => {
-            let mut g = Guides::load(&guides)?;
+            let mut g = load_guides(&guides)?;
             components::attach(&mut g, &id, &bone)?;
-            save_guides(&guides, &g)?;
+            g.save(&guides)?;
             println!("{id} now hangs from {bone}");
             Ok(())
         }
@@ -535,37 +630,35 @@ fn main() -> Result<()> {
             from,
             parent,
         } => {
-            let mut g = Guides::load(&guides)?;
-            let src = Guides::load(&from)?;
+            let mut g = load_guides(&guides)?;
+            let src = load_guides(&from)?;
             let added = components::import(&mut g, &src, &parent)?;
-            save_guides(&guides, &g)?;
+            g.save(&guides)?;
             println!("Imported {} from {from:?} onto {parent}", added.join(", "));
             Ok(())
         }
         Command::Remove { guides, id } => {
-            let mut g = Guides::load(&guides)?;
+            let mut g = load_guides(&guides)?;
             let removed = components::remove(&mut g, &id)?;
-            save_guides(&guides, &g)?;
+            g.save(&guides)?;
             println!("Removed {}", removed.join(", "));
             Ok(())
         }
         Command::Components { guides } => {
-            let g = Guides::load(&guides)?;
+            let g = load_guides(&guides)?;
             for c in &g.components {
                 let kind = format!("{:?}", c.kind).to_lowercase();
                 let parent = c.parent.as_deref().unwrap_or("-");
                 let extra = match c.kind {
                     Kind::Chain => format!("{} bones", c.guides.len() - 1),
-                    Kind::Spine => format!(
-                        "{} joints",
-                        c.options.joints.unwrap_or(components::SPINE_JOINTS)
-                    ),
+                    Kind::Spine => format!("{} joints", g.spine_joints(c)),
                     _ => String::new(),
                 };
                 println!("{:<12} {:<7} on {:<12} {extra}", c.id, kind, parent);
             }
             Ok(())
         }
+        Command::Check { file, mesh, fix } => check_command(&file, mesh.as_deref(), fix),
         Command::Template { action } => template_command(action),
         Command::Naming {
             guides,
@@ -576,7 +669,7 @@ fn main() -> Result<()> {
             right,
             center,
         } => {
-            let mut g = Guides::load(&guides)?;
+            let mut g = load_guides(&guides)?;
             let mut n = match &preset {
                 Some(p) => p.parse::<naming::Preset>()?.naming(),
                 None => g.naming.clone(),
@@ -597,7 +690,7 @@ fn main() -> Result<()> {
             if changed {
                 n.validate()?;
                 g.naming = n.clone();
-                save_guides(&guides, &g)?;
+                g.save(&guides)?;
             }
             let label = n.preset().map_or("custom", |p| p.key());
             println!("naming: {label}");

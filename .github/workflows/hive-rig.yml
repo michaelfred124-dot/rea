@@ -38,6 +38,28 @@ jobs:
           xvfb-run -a -s "-screen 0 1400x900x24" cargo run --locked -q --bin HiveRig -- \
             --demo --build --weights upperarm_l --screenshot "$RUNNER_TEMP/hive-rig-app.ppm"
           test "$(head -c 2 "$RUNNER_TEMP/hive-rig-app.ppm")" = P6
+      - name: Pre-build checks on the demo and the dog
+        run: |
+          c="$RUNNER_TEMP/checks"
+          cargo run --locked -q -- demo -o "$c/demo"
+          cargo run --locked -q -- demo --quadruped -o "$c/dog"
+          for rig in demo/hive_demo dog/hive_dog; do
+            cargo run --locked -q -- check "$c/$rig.hive.json" | tee "$c/log.txt"
+            grep -q "No problems found" "$c/log.txt"
+            grep -q "written by hive-rig" "$c/log.txt"
+          done
+          # A wrist on top of its elbow can't build: check fails, and --fix repairs it.
+          python3 -I - "$c/demo/hive_demo.guides.json" <<'EOF'
+          import json, sys
+          g = json.load(open(sys.argv[1]))
+          arm = next(c for c in g["components"] if c["id"] == "arm_l")
+          pos = {x["name"]: x for x in arm["guides"]}
+          pos["wrist"]["position"] = list(pos["elbow"]["position"])
+          json.dump(g, open(sys.argv[1], "w"))
+          EOF
+          if cargo run --locked -q -- check "$c/demo/hive_demo.guides.json"; then exit 1; fi
+          cargo run --locked -q -- check "$c/demo/hive_demo.guides.json" --mesh "$c/demo/hive_demo.glb" --fix
+          cargo run --locked -q -- rebuild "$c/demo/hive_demo.hive.json"
       - name: Generate demo rigs (T-pose and A-pose)
         run: |
           cargo run --locked -q -- demo -o "$RUNNER_TEMP/t_pose"

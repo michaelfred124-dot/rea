@@ -12,6 +12,7 @@
 //! * `<name>.guides.json` – the editable component layout, for rebuilding
 //! * `<name>.hive.json` – the full rig description for other tools
 
+pub mod checks;
 pub mod components;
 pub mod controls;
 pub mod demo;
@@ -25,6 +26,7 @@ pub mod rig;
 pub mod skeleton;
 pub mod skin;
 pub mod template;
+pub mod version;
 
 pub use export::Target;
 pub use rig::{Rig, RigOptions, auto_rig, build_rig};

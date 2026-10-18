@@ -18,6 +18,8 @@ pub const ACCENT: Color32 = Color32::from_rgb(247, 185, 64);
 pub const ACCENT_TEXT: Color32 = Color32::from_rgb(28, 20, 6);
 pub const OK: Color32 = Color32::from_rgb(88, 206, 142);
 pub const ERR: Color32 = Color32::from_rgb(242, 98, 98);
+/// Warnings: the pre-build checks and the toast for an operation that worked with a caveat.
+pub const WARN: Color32 = Color32::from_rgb(255, 168, 48);
 pub const CENTER: Color32 = Color32::from_rgb(247, 200, 64);
 pub const LEFT: Color32 = Color32::from_rgb(80, 150, 255);
 pub const RIGHT: Color32 = Color32::from_rgb(255, 94, 94);

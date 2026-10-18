@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use eframe::egui::Color32;
 use glam::Vec3;
 
+use hive_rig::checks::{self, Issue, Surface};
 use hive_rig::components::{
     self, AddOptions, Built, Component, ControlStyle, Guide, Guides, Kind, Options, Preset,
 };
@@ -34,12 +35,16 @@ pub struct Doc {
     pub out_dir: PathBuf,
     /// Whether the current rig has been exported.
     pub exported: bool,
+    /// The pre-build checks on the current guides.
+    pub checks: Vec<Issue>,
+    surface: Surface,
     undo: Vec<Guides>,
     redo: Vec<Guides>,
 }
 
 impl Doc {
     fn new(name: String, mesh: Mesh, guides: Guides, out_dir: PathBuf) -> Doc {
+        let surface = Surface::new(&mesh);
         let mut doc = Doc {
             name: export::sanitize_name(&name),
             mesh,
@@ -48,6 +53,8 @@ impl Doc {
             rig: None,
             out_dir,
             exported: false,
+            checks: Vec::new(),
+            surface,
             undo: Vec::new(),
             redo: Vec::new(),
         };
@@ -57,6 +64,11 @@ impl Doc {
 
     fn refresh(&mut self) {
         self.preview = components::build(&self.guides).map_err(|e| format!("{e:#}"));
+        self.checks = checks::check_built(
+            &self.guides,
+            self.preview.as_ref().map_err(String::as_str),
+            Some(&mut self.surface),
+        );
         self.rig = None;
         self.exported = false;
     }
@@ -155,6 +167,8 @@ pub struct Studio {
     pub targets: [bool; 3],
     pub status: String,
     pub error: bool,
+    /// The status is a warning: the operation worked, with something to look at.
+    pub warn: bool,
     /// Bumped on every status change, so the UI can show it as a notification.
     pub status_serial: u64,
     pub finger_sides: FingerSides,
@@ -204,6 +218,7 @@ impl Default for Studio {
             targets: [true; 3],
             status: "Open a character to start, or try the demo.".into(),
             error: false,
+            warn: false,
             status_serial: 0,
             finger_sides: FingerSides::Both,
             tail_joints: 5,
@@ -218,6 +233,15 @@ impl Default for Studio {
 
 // --------------------------------------------------------------------------- operations
 
+/// "1 warning", "3 warnings".
+fn count(n: usize, what: &str) -> String {
+    if n == 1 {
+        format!("1 {what}")
+    } else {
+        format!("{n} {what}s")
+    }
+}
+
 fn hang(n: usize) -> &'static str {
     if n == 1 { "hangs" } else { "hang" }
 }
@@ -226,13 +250,18 @@ impl Studio {
     fn info(&mut self, msg: impl Into<String>) {
         self.status = msg.into();
         self.error = false;
+        self.warn = false;
         self.status_serial += 1;
     }
 
+    fn warning(&mut self, msg: impl Into<String>) {
+        self.info(msg);
+        self.warn = true;
+    }
+
     fn fail(&mut self, msg: impl Into<String>) {
-        self.status = msg.into();
+        self.info(msg);
         self.error = true;
-        self.status_serial += 1;
     }
 
     fn set_doc(&mut self, doc: Doc) {
@@ -330,25 +359,36 @@ impl Studio {
 
     fn open_rig(&mut self, path: &Path) -> anyhow::Result<()> {
         let rig = Rig::load(path)?;
+        let newer = rig.newer_warning();
         let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
         let mut doc = Doc::new(rig.name.clone(), rig.mesh.clone(), rig.guides.clone(), dir);
         doc.rig = Some(rig);
         self.set_doc(doc);
-        self.info(format!("Opened rig {}", path.display()));
+        match newer {
+            Some(w) => self.warning(format!("Opened rig {}, but {w}.", path.display())),
+            None => self.info(format!("Opened rig {}", path.display())),
+        }
         Ok(())
     }
 
     fn open_guides(&mut self, path: &Path) -> anyhow::Result<()> {
         let guides = Guides::load(path)?;
         components::build(&guides)?;
+        let newer = guides.newer_warning();
         let Some(doc) = &mut self.doc else {
             anyhow::bail!("open a character first, then its guides");
         };
         push_undo(&mut doc.undo, &doc.guides);
         doc.guides = guides;
         doc.refresh();
+        let warnings = checks::warnings(&doc.checks);
         self.selected = None;
-        self.info(format!("Loaded guides from {}", path.display()));
+        let loaded = format!("Loaded guides from {}", path.display());
+        match (newer, warnings) {
+            (Some(w), _) => self.warning(format!("{loaded}, but {w}.")),
+            (None, 0) => self.info(loaded),
+            (None, n) => self.warning(format!("{loaded}: {}, see Checks.", count(n, "warning"))),
+        }
         Ok(())
     }
 
@@ -366,10 +406,7 @@ impl Studio {
 
     pub fn save_guides(&mut self, path: &Path) {
         let Some(doc) = &self.doc else { return };
-        let result = serde_json::to_vec_pretty(&doc.guides)
-            .map_err(anyhow::Error::from)
-            .and_then(|bytes| Ok(std::fs::write(path, bytes)?));
-        match result {
+        match doc.guides.save(path) {
             Ok(()) => self.info(format!("Saved guides to {}", path.display())),
             Err(e) => self.fail(format!("Couldn't save {}: {e:#}", path.display())),
         }
@@ -1199,8 +1236,9 @@ impl Studio {
             RigOptions::default(),
         ) {
             Ok(rig) => {
+                let warnings = checks::warnings(&doc.checks);
                 let msg = format!(
-                    "Rig built: {} bones, {} controls, {} IK limbs, weights on {} vertices. Pick a bone under Weights to check them, or Export.",
+                    "Rig built: {} bones, {} controls, {} IK limbs, weights on {} vertices.",
                     rig.skeleton.bones.len(),
                     rig.controls.controls.len(),
                     rig.controls.ik_chains.len(),
@@ -1209,7 +1247,16 @@ impl Studio {
                 doc.rig = Some(rig);
                 self.weight_colors = None;
                 self.mode = Mode::Rig;
-                self.info(msg);
+                if warnings == 0 {
+                    self.info(format!(
+                        "{msg} Pick a bone under Weights to check them, or Export."
+                    ));
+                } else {
+                    self.warning(format!(
+                        "{msg} {} to look at: see Checks in Properties.",
+                        count(warnings, "warning")
+                    ));
+                }
                 true
             }
             Err(e) => {
@@ -1256,6 +1303,58 @@ impl Studio {
             }
             Err(e) => self.fail(format!("Export failed: {e:#}")),
         }
+    }
+
+    /// Select the guide (or component) a check is about.
+    pub fn select_issue(&mut self, i: usize) {
+        let Some(doc) = &self.doc else { return };
+        let Some(issue) = doc.checks.get(i) else {
+            return;
+        };
+        let Some(c) = doc
+            .guides
+            .components
+            .iter()
+            .position(|c| c.id == issue.component)
+        else {
+            return;
+        };
+        let guide = issue.guide.as_ref().and_then(|g| {
+            doc.guides.components[c]
+                .guides
+                .iter()
+                .position(|x| &x.name == g)
+        });
+        self.mode = Mode::Guides;
+        self.pick_one(c, guide);
+    }
+
+    /// Apply one check's fix, as one undo step.
+    pub fn fix_issue(&mut self, i: usize) -> bool {
+        let Some(fix) = self
+            .doc
+            .as_ref()
+            .and_then(|d| d.checks.get(i))
+            .and_then(|i| i.fix.clone())
+        else {
+            return false;
+        };
+        self.edit("apply the fix", |g| checks::apply_fix(g, &fix))
+    }
+
+    /// Apply every fix the checks offer, as one undo step.
+    pub fn fix_all_issues(&mut self) -> bool {
+        let Some(issues) = self.doc.as_ref().map(|d| d.checks.clone()) else {
+            return false;
+        };
+        self.edit("apply the fixes", |g| {
+            let n = checks::fix_all(g, &issues)?;
+            Ok(if n == 1 {
+                "Applied 1 fix.".to_string()
+            } else {
+                format!("Applied {n} fixes.")
+            })
+        })
     }
 
     fn weights_for(&mut self, bone: &str) -> Option<&[Color32]> {
@@ -1742,6 +1841,79 @@ mod tests {
         assert!(s.doc.as_ref().unwrap().guides.component("tail").is_none());
         s.undo();
         assert!(s.doc.as_ref().unwrap().guides.component("tail2").is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn checks_select_fix_and_still_build() {
+        let mut s = demo_studio();
+        assert!(s.doc.as_ref().unwrap().checks.is_empty());
+        // Bend the left elbow forward and hang the right leg from the head.
+        let (arm, leg) = (comp(&s, "arm_l"), comp(&s, "leg_r"));
+        let elbow = s.doc.as_ref().unwrap().guides.components[arm].guides[2].position;
+        s.symmetry = false;
+        s.move_guide(arm, 2, elbow + Vec3::Z * 0.08);
+        s.attach_component(leg, "head");
+        let checks = &s.doc.as_ref().unwrap().checks;
+        assert_eq!(checks.len(), 2, "{checks:#?}");
+
+        // Build still works and says how many warnings there are.
+        assert!(s.build());
+        assert!(s.warn && !s.error, "{}", s.status);
+        assert!(s.status.contains("2 warnings"), "{}", s.status);
+
+        // Clicking a check selects its guide.
+        let i = s
+            .doc
+            .as_ref()
+            .unwrap()
+            .checks
+            .iter()
+            .position(|i| i.component == "arm_l");
+        s.select_issue(i.unwrap());
+        assert_eq!(s.selected, Some((arm, Some(2))));
+        assert_eq!(s.mode, Mode::Guides);
+
+        // Fix one (mirroring the other elbow), then the rest; each is one undo step.
+        assert!(s.fix_issue(i.unwrap()), "{}", s.status);
+        assert_eq!(s.doc.as_ref().unwrap().checks.len(), 1);
+        assert!(s.fix_all_issues(), "{}", s.status);
+        assert!(s.doc.as_ref().unwrap().checks.is_empty());
+        assert_eq!(
+            s.doc
+                .as_ref()
+                .unwrap()
+                .guides
+                .component("leg_r")
+                .unwrap()
+                .parent
+                .as_deref(),
+            Some("pelvis")
+        );
+        s.undo();
+        assert_eq!(s.doc.as_ref().unwrap().checks.len(), 1);
+        assert!(s.build());
+        assert!(s.status.contains("1 warning "), "{}", s.status);
+    }
+
+    #[test]
+    fn opening_guides_from_a_newer_hive_rig_warns() {
+        let mut s = demo_studio();
+        let dir = std::env::temp_dir().join(format!("hive_studio_newer_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("newer.guides.json");
+        let mut json: serde_json::Value =
+            serde_json::to_value(&s.doc.as_ref().unwrap().guides).unwrap();
+        json["hive_rig"] = "99.0.0".into();
+        json["a_setting_from_the_future"] = true.into();
+        std::fs::write(&path, json.to_string()).unwrap();
+        s.open(&path);
+        assert!(s.warn && !s.error, "{}", s.status);
+        assert!(s.status.contains("99.0.0"), "{}", s.status);
+        // Saving stamps this version.
+        s.save_guides(&path);
+        let back = Guides::load(&path).unwrap();
+        assert_eq!(back.written_by.as_deref(), Some(hive_rig::version::CURRENT));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

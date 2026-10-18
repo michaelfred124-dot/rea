@@ -18,6 +18,10 @@ pub const FORMAT_VERSION: u32 = 2;
 pub struct Rig {
     pub format: String,
     pub version: u32,
+    /// The hive-rig that wrote the file (absent before 0.1.0 stamped it).
+    /// Writing always stamps this program's version.
+    #[serde(default, rename = "hive_rig", serialize_with = "crate::version::stamp")]
+    pub written_by: Option<String>,
     pub name: String,
     /// Always "Y": model space is Y-up, metres, facing +Z (glTF convention).
     pub up_axis: String,
@@ -79,6 +83,7 @@ pub fn build_rig(mesh: Mesh, name: &str, guides: Guides, opts: RigOptions) -> an
     Ok(Rig {
         format: FORMAT.into(),
         version: FORMAT_VERSION,
+        written_by: None,
         name,
         up_axis: "Y".into(),
         units: "m".into(),
@@ -108,5 +113,19 @@ impl Rig {
             path.display()
         );
         Ok(rig)
+    }
+
+    /// A warning when the rig file came from a newer hive-rig, or holds guides
+    /// from one.
+    pub fn newer_warning(&self) -> Option<String> {
+        if self.version > FORMAT_VERSION {
+            return Some(format!(
+                "this rig file is format version {} from a newer hive-rig; this {} reads up to version {FORMAT_VERSION}, so parts of it may be ignored",
+                self.version,
+                crate::version::CURRENT
+            ));
+        }
+        crate::version::newer_note("this rig file", self.written_by.as_deref())
+            .or_else(|| self.guides.newer_warning())
     }
 }

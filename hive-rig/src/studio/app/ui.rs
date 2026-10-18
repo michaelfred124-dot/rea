@@ -14,14 +14,17 @@ use eframe::egui::{
 };
 use glam::Vec3;
 
+use hive_rig::checks::{self, Severity};
 use hive_rig::components::{self, ControlStyle, Guides, Kind};
 use hive_rig::controls::{ControlKind, Shape};
 use hive_rig::naming::{Naming, Preset};
 use hive_rig::skeleton::Side;
 use hive_rig::template::{self, Listed, Scope, Source, Template};
 
-use super::{Category, Doc, Drag, FingerSides, Mode, Pose, RigPick, Studio, push_undo};
-use crate::theme::{self, ACCENT, BORDER, CARD, CARD_HI, ERR, OK, TEXT, TEXT_DIM, TEXT_FAINT};
+use super::{Category, Doc, Drag, FingerSides, Mode, Pose, RigPick, Studio, count, push_undo};
+use crate::theme::{
+    self, ACCENT, BORDER, CARD, CARD_HI, ERR, OK, TEXT, TEXT_DIM, TEXT_FAINT, WARN,
+};
 use crate::view::{self, Projector};
 
 const PICK_RADIUS: f32 = 10.0;
@@ -563,7 +566,13 @@ impl Studio {
             return;
         }
         ctx.request_repaint_after(std::time::Duration::from_millis(200));
-        let color = if self.error { ERR } else { OK };
+        let color = if self.error {
+            ERR
+        } else if self.warn {
+            WARN
+        } else {
+            OK
+        };
         // Above the dock, or under the top pills while a dialog covers the middle.
         let (anchor, offset) = if self.library_open || self.export_open {
             (Align2::CENTER_TOP, Vec2::new(0.0, PANEL_TOP - 8.0))
@@ -1297,6 +1306,9 @@ impl Studio {
         );
 
         ui.add_space(8.0);
+        self.checks_card(ui);
+
+        ui.add_space(8.0);
         theme::label_caps(ui, "Skin weights");
         if deform.is_empty() {
             ui.label(
@@ -1357,12 +1369,135 @@ impl Studio {
         naming_examples(ui, &naming, 3);
     }
 
+    /// The pre-build checks: every warning, a click to select its guide, and a
+    /// Fix button where the fix is mechanical.
+    fn checks_card(&mut self, ui: &mut Ui) {
+        let Some(doc) = &self.doc else { return };
+        let issues = doc.checks.clone();
+        let origin = doc.guides.origin();
+        let fixable = issues.iter().filter(|i| i.fix.is_some()).count();
+        ui.horizontal(|ui| {
+            theme::label_caps(ui, "Checks");
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if issues.is_empty() {
+                    theme::badge(ui, "All clear", OK);
+                } else {
+                    let w = checks::warnings(&issues);
+                    let e = checks::errors(&issues);
+                    if w > 0 {
+                        theme::badge(ui, &count(w, "warning"), WARN);
+                    }
+                    if e > 0 {
+                        theme::badge(ui, &count(e, "error"), ERR);
+                    }
+                }
+            });
+        });
+        egui::Frame::new()
+            .fill(Color32::from_rgb(20, 23, 30))
+            .corner_radius(10)
+            .inner_margin(Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                if issues.is_empty() {
+                    ui.label(
+                        RichText::new("No problems found in the guides.")
+                            .size(12.5)
+                            .color(TEXT_DIM),
+                    );
+                } else {
+                    self.issue_rows(ui, &(0..issues.len()).collect::<Vec<_>>());
+                    if fixable > 1
+                        && ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(format!("Fix all ({fixable})")).size(12.5),
+                                )
+                                .corner_radius(8),
+                            )
+                            .on_hover_text("Apply every offered fix as one undo step")
+                            .clicked()
+                    {
+                        self.fix_all_issues();
+                    }
+                }
+                ui.label(RichText::new(origin).size(11.0).color(TEXT_FAINT));
+            });
+    }
+
+    /// Rows for the checks at `indices`: the place (click to select it), what's
+    /// wrong, what to do on hover, and a Fix button.
+    fn issue_rows(&mut self, ui: &mut Ui, indices: &[usize]) {
+        let Some(doc) = &self.doc else { return };
+        let issues: Vec<(usize, checks::Issue)> = indices
+            .iter()
+            .filter_map(|&i| doc.checks.get(i).map(|x| (i, x.clone())))
+            .collect();
+        let mut select = None;
+        let mut fix = None;
+        for (i, issue) in &issues {
+            let color = match issue.severity {
+                Severity::Error => ERR,
+                Severity::Warning => WARN,
+            };
+            ui.horizontal(|ui| {
+                theme::dot(ui, color);
+                let place = ui
+                    .add(
+                        egui::Label::new(RichText::new(issue.place()).strong().color(TEXT))
+                            .sense(Sense::click()),
+                    )
+                    .on_hover_text(format!("{}. Click to select it.", issue.check.label()));
+                if place.clicked() {
+                    select = Some(*i);
+                }
+                if let Some(label) = issue.fix_label() {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new(&label).size(11.5))
+                                    .corner_radius(7),
+                            )
+                            .on_hover_text(&issue.suggestion)
+                            .clicked()
+                        {
+                            fix = Some(*i);
+                        }
+                    });
+                }
+            });
+            let text = ui
+                .add(
+                    egui::Label::new(RichText::new(&issue.message).size(12.0).color(TEXT_DIM))
+                        .wrap()
+                        .sense(Sense::click()),
+                )
+                .on_hover_text(&issue.suggestion);
+            if text.clicked() {
+                select = Some(*i);
+            }
+            ui.add_space(3.0);
+        }
+        if let Some(i) = fix {
+            self.fix_issue(i);
+        } else if let Some(i) = select {
+            self.select_issue(i);
+        }
+    }
+
     fn component_inspector(&mut self, ui: &mut Ui, c: usize, guide: Option<usize>) {
         let Some(doc) = &self.doc else { return };
         let Some(comp) = doc.guides.components.get(c).cloned() else {
             return;
         };
         let naming = doc.guides.naming.clone();
+        let comp_issues: Vec<usize> = doc
+            .checks
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| i.component == comp.id)
+            .map(|(k, _)| k)
+            .collect();
         let own: Vec<String> = match &doc.preview {
             Ok(b) => b
                 .skeleton
@@ -1392,6 +1527,17 @@ impl Studio {
                 }
             });
         });
+        if !comp_issues.is_empty() {
+            egui::Frame::new()
+                .fill(WARN.gamma_multiply(0.08))
+                .stroke(Stroke::new(1.0, WARN.gamma_multiply(0.35)))
+                .corner_radius(10)
+                .inner_margin(Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    self.issue_rows(ui, &comp_issues);
+                });
+        }
         ui.horizontal(|ui| {
             theme::badge(ui, kind_label(comp.kind), ACCENT);
             theme::badge(ui, side_label(comp.side), side_color(comp.side));
@@ -1427,7 +1573,10 @@ impl Studio {
         }
         match comp.kind {
             Kind::Spine => {
-                let mut joints = comp.options.joints.unwrap_or(components::SPINE_JOINTS);
+                let mut joints = self
+                    .doc
+                    .as_ref()
+                    .map_or(components::SPINE_JOINTS, |d| d.guides.spine_joints(&comp));
                 let before = joints;
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Spine joints").color(TEXT_DIM));
@@ -2555,6 +2704,30 @@ impl Studio {
         }
         let hover = pointer.and_then(|p| self.pick_guide(pr, p));
         let several = self.picked.len() > 1;
+        // Warning markers: on the guide a check is about, or on a component's
+        // first guide for a check about the whole component.
+        let mut marks: std::collections::HashMap<(usize, usize), &checks::Issue> =
+            std::collections::HashMap::new();
+        for issue in &doc.checks {
+            let Some(ci) = doc
+                .guides
+                .components
+                .iter()
+                .position(|c| c.id == issue.component)
+            else {
+                continue;
+            };
+            let gi = match &issue.guide {
+                Some(name) => doc.guides.components[ci]
+                    .guides
+                    .iter()
+                    .position(|x| &x.name == name),
+                None => Some(0),
+            };
+            if let Some(gi) = gi {
+                marks.entry((ci, gi)).or_insert(issue);
+            }
+        }
         for (ci, c) in doc.guides.components.iter().enumerate() {
             let order = self.picked.iter().position(|(id, _)| *id == c.id);
             let picked = order.is_some();
@@ -2618,12 +2791,23 @@ impl Studio {
                     );
                 }
                 guide_control(painter, *p, r, ring, side_color(c.side));
+                let mark = marks.get(&(ci, gi));
+                if let Some(issue) = mark {
+                    let color = match issue.severity {
+                        Severity::Error => ERR,
+                        Severity::Warning => WARN,
+                    };
+                    warning_marker(painter, *p + Vec2::new(r + 5.0, -(r + 5.0)), color);
+                }
                 if sel || hot {
                     label_chip(
                         painter,
                         *p + Vec2::new(14.0, -14.0),
                         &format!("{}  ·  {}", c.id, c.guides[gi].name),
                     );
+                    if let Some(issue) = mark {
+                        label_chip(painter, *p + Vec2::new(14.0, 12.0), &issue.message);
+                    }
                 }
             }
             // Pick order, so it's clear which part becomes the parent.
@@ -4238,6 +4422,30 @@ fn guide_control(painter: &egui::Painter, at: Pos2, r: f32, ring: Stroke, core: 
         core,
         Stroke::NONE,
     ));
+}
+
+/// A check's marker beside a guide: a small warning triangle with a "!".
+fn warning_marker(painter: &egui::Painter, at: Pos2, color: Color32) {
+    let s = 7.5;
+    let pts = vec![
+        at + Vec2::new(0.0, -s),
+        at + Vec2::new(s * 0.95, s * 0.7),
+        at + Vec2::new(-s * 0.95, s * 0.7),
+    ];
+    painter.add(egui::Shape::convex_polygon(
+        pts,
+        color,
+        Stroke::new(1.0, Color32::from_black_alpha(170)),
+    ));
+    let ink = Stroke::new(1.6, Color32::from_rgb(30, 22, 8));
+    painter.line_segment(
+        [
+            at + Vec2::new(0.0, -s * 0.45),
+            at + Vec2::new(0.0, s * 0.15),
+        ],
+        ink,
+    );
+    painter.circle_filled(at + Vec2::new(0.0, s * 0.42), 0.9, ink.color);
 }
 
 /// An IK pole marker: a green plus in a thin ring.

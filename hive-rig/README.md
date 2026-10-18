@@ -28,7 +28,7 @@ a joint; with Symmetry on, its twin on the other side follows.
   X-ray, Weights, Undo, Redo, Frame and Export. The honeycomb button in the
   middle builds the rig.
 * **The outliner** (left) lists the components as a tree. **Properties** (right)
-  shows the rig summary, skin weights (with Mirror and Smooth) and naming, or, with a component
+  shows the rig summary, the pre-build [checks](#checks-before-building), skin weights (with Mirror and Smooth) and naming, or, with a component
   selected, its attachment, options, exact guide positions and the names its
   bones will export as. Click a panel's title to fold it away.
 * **The rigging window** (Add, or Shift+A) is the library of premade parts, each
@@ -46,7 +46,7 @@ also open a `.hive.json` to keep editing an exported rig, or a `.guides.json` to
 apply a saved layout.
 
 ```bash
-cargo run --release --bin HiveRig               # or: HiveRig character.glb / HiveRig --demo
+cargo run --release --bin HiveRig               # or: HiveRig character.glb / HiveRig --demo [layout.guides.json]
 ```
 
 The viewport is drawn with egui shapes on the CPU and the window uses OpenGL
@@ -323,6 +323,64 @@ hive-rig template apply other.guides.json hands.template.json --parent head
 hive-rig template list
 ```
 
+### Checks before building
+
+Every change to the guides is checked for the mistakes that build a rig that
+works, just not the way you meant. They're warnings: Build still runs.
+
+| Check | Warns when | Fix offered |
+| --- | --- | --- |
+| Wrong side | a left or right guide is more than 0.5% of the body height across the mid-line | mirror the twin's guide, or flip it back across |
+| Bends the wrong way | an elbow (or a front leg's elbow, or a hind leg's hock) bends forward, or a knee bends backward, so IK would flip it | mirror the twin's joint, or bend it the right way |
+| Straight limb | the elbow, knee or hock is within 0.5% of the limb's length of the straight line, so IK can't tell which way to fold | mirror the twin's joint, or bend it 4% the right way |
+| Outside the mesh | a joint that belongs inside the body (pelvis, chest, neck, head, clavicle to wrist, hip to ankle, hock, jaw) is more than 3% of the body height outside the mesh | mirror the twin's guide (otherwise drag it in) |
+| Joints too close | two joints of a bone are within 0.2% of the body height (on top of each other is also the build error) | mirror the twin's guide, or push the joint on along the bone |
+| Not symmetric | a right component (or the right half of the eyes or face) is more than 2% of the body height from the mirror image of the left | mirror the left side onto the right |
+| Off centre | a spine, head, jaw, root or centre face guide is more than 2% of the body height off the mid-line | centre it |
+| Odd parent | a component hangs from an unusual bone: a leg under the head, an arm under a leg, eyes on the chest, a left part on a right limb (chains such as tails and props may hang anywhere) | re-attach it to the usual bone (pelvis, top spine joint, head, or the same bone on its own side) |
+
+Each guide gets at most one warning: wrong side, off centre, too close, bend and
+outside are checked in that order, and the symmetry check skips guides that
+already have one. The one error is a layout that can't build at all.
+
+In the app, the **Checks** card in Properties (with nothing selected) lists the
+warnings. Click one to select its guide; **Fix** buttons apply the offered fix
+and **Fix all** applies every one, each as one undo step. Guides with a warning
+carry an orange triangle in the viewport, and hovering one shows the problem. A
+selected component lists its own warnings at the top of its panel. Build says
+how many warnings there are.
+
+```bash
+hive-rig check out/hero.guides.json --mesh hero.glb   # or: hive-rig check out/hero.hive.json
+hive-rig check out/hero.guides.json --fix             # apply the offered fixes and save
+```
+
+`check` prints each warning with what to do, and exits non-zero only when the
+guides can't build. Given a `.hive.json` it uses the rig's mesh and the guides
+next to it (the ones `rebuild` reads). `rig`, `rebuild` and `demo` print the
+same warnings before building.
+
+### Versions and compatibility
+
+`guides.json` and `.hive.json` record the hive-rig that last wrote them in
+`hive_rig` (`"hive_rig": "0.1.0"`); every write stamps the running version. The
+guides `version` is what keeps a layout building the same way: it pins the
+builder's rules that the file doesn't spell out, and saving a file again keeps
+its version. Guides version 1 pins:
+
+* 3 spine joints when the spine doesn't set `joints`;
+* a foot and paw roll that moves from the ball to the toe tip at 30°;
+* IK poles half the limb's length straight ahead of the knee (behind the
+  elbow), at least 10% of the body height away;
+* arms whose elbow and wrist are below the belly line (`crotch_y`) built as
+  front legs: leg skin, IK by default, an upright IK control.
+
+A release that changes one of these adds a guides version for the new
+behaviour, and older files keep theirs. A file from a newer hive-rig still
+opens: settings this one doesn't know are ignored, an unknown guides version
+builds with the newest rules this one has, and the app, the command line and
+`check` warn about it. Files from before the stamp (no `hive_rig`) are version 1.
+
 ### Weight tools
 
 After Build, the Properties panel's skin weights section has **Mirror L to R**
@@ -453,7 +511,13 @@ lifting a hind paw leaves the front paw's skin alone, and the `.glb` re-imports.
 The app's editing operations (add, remove, mirror, symmetric moves, undo, build,
 export, reopening a rig and loading templates) have unit tests in `src/studio/app.rs`;
 templates have their own (`src/template.rs`: JSON round trip, scaling to another
-body height, id clashes, inner parent links and the folders). CI opens
+body height, id clashes, inner parent links and the folders). The pre-build
+checks are tested in `src/checks.rs`: the demo biped (T- and A-pose, with every
+premade part) and the dog have no warnings, each broken case gives exactly its
+own warning, and its fix clears it; the app's tests select and fix them and
+build with them. Versioning has tests for the stamp, files from before it
+building exactly as before, and files from a newer hive-rig warning. CI runs
+`hive-rig check` on the demo and the dog, and opens
 the app on a virtual screen and screenshots it after building the demo rig.
 CI runs all of this (`.github/workflows/hive-rig.yml`), and builds both Windows
 executables as a downloadable artifact.

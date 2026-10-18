@@ -1,7 +1,7 @@
 //! Hive Rig: the desktop rigging app. Double-click it, open a character, adjust
 //! the guides, build and export.
 //!
-//! `HiveRig [character file] [--demo] [--build] [--weights BONE] [--library] [--templates] [--export]
+//! `HiveRig [character, rig or guides file] [--demo] [--build] [--weights BONE] [--library] [--templates] [--export]
 //! [--select COMPONENT[,COMPONENT...]] [--pick NAME] [--pose BONE] [--screenshot OUT.ppm]`
 //! (the flags exist so the window can be checked automatically).
 
@@ -107,10 +107,12 @@ fn write_ppm(path: &std::path::Path, image: &egui::ColorImage) -> std::io::Resul
 fn main() -> eframe::Result {
     let launch = parse_args();
     let mut studio = app::Studio::default();
+    // `--demo layout.guides.json` opens the demo, then the guides onto it.
+    if launch.demo {
+        studio.load_demo();
+    }
     if let Some(file) = &launch.file {
         studio.open(file);
-    } else if launch.demo {
-        studio.load_demo();
     }
     if launch.build {
         studio.build();

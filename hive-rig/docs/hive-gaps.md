@@ -26,6 +26,16 @@ patterns) applied to every export, and now:
   switching without a pop. Checked in real Blender; Maya only against stubs.
 - **Quadruped hind legs and a dog**: the `quad_leg` component and a built-in
   dog layout and test mesh (`hive-rig demo --quadruped`); see gap 1.
+- **Checks before building**: warnings for a guide across the mid-line, an
+  elbow, knee or hock bending the wrong way, a straight limb, a joint outside
+  the mesh, joints on top of each other, lopsided twins, off-centre spine and
+  head guides, and odd parents (a leg under the head), each with a suggestion
+  and, where it's mechanical, a fix. In the app (a Checks card, viewport
+  markers, a warning count on Build) and the CLI (`hive-rig check`, and
+  warnings from `rig` and `rebuild`).
+- **Versioning**: guides and rig files carry the hive-rig version that wrote
+  them; the guides version pins the builder rules the file doesn't spell out,
+  and files from a newer hive-rig open with a warning.
 
 ## Gaps, ranked by how much they'd help a rigger
 
@@ -47,14 +57,15 @@ patterns) applied to every export, and now:
 
 ## Things we haven't been thinking about
 
-- Validation before build: warn when a guide crosses the mid-line, an elbow
-  bends the wrong way, or a joint sits outside the mesh.
+- Validation before build: done (see Already covered). Next: checks on the
+  built skin (vertices with no weight, a bone with no skin), and per-studio
+  tolerances.
 - Rig presets per engine: Unreal mannequin is done; Unity Humanoid and Mixamo
   bone names would let one rig retarget everywhere.
-- Saving the rigging window's setups as user templates (Hive calls these
-  templates), so a studio can share its own biped.
-- Versioning: a rig built today should rebuild the same way next year; store the
-  hive-rig version in the guides file and keep old behaviour behind it.
+- Saving the rigging window's setups as user templates: done (rig templates).
+- Versioning: done for the guides and rig files (see Already covered). Next:
+  a way to move an old layout onto newer rules on purpose, once a release
+  changes one; templates still refuse a newer template version.
 - Multiple characters in one file, and props parented across characters.
 
 ## Suggested order
