@@ -19,6 +19,7 @@ use hive_rig::components::{self, ControlStyle, Guides, Kind};
 use hive_rig::controls::{ControlKind, Shape};
 use hive_rig::naming::{Naming, Preset};
 use hive_rig::skeleton::Side;
+use hive_rig::skin::{BrushMode, Engine, INFLUENCE_CAP};
 use hive_rig::template::{self, Listed, Scope, Source, Template};
 
 use super::{Category, Doc, Drag, FingerSides, Mode, Pose, RigPick, Studio, count, push_undo};
@@ -1319,6 +1320,7 @@ impl Studio {
 
         ui.add_space(8.0);
         theme::label_caps(ui, "Skin weights");
+        self.skin_limits(ui);
         if deform.is_empty() {
             ui.label(
                 RichText::new("Build the rig to paint each bone's weights on the mesh.")
@@ -1337,6 +1339,7 @@ impl Studio {
                     }
                 });
             weight_legend(ui);
+            self.brush_controls(ui);
             ui.horizontal(|ui| {
                 let mirror = ui
                     .add(egui::Button::new(RichText::new("Mirror L to R").size(12.5)).corner_radius(8))
@@ -1359,6 +1362,14 @@ impl Studio {
                     self.smooth_weights();
                 }
             });
+            ui.checkbox(
+                &mut self.keep_weights,
+                RichText::new("Keep edited weights on rebuild").size(12.5),
+            )
+            .on_hover_text(
+                "Painted, mirrored and smoothed weights stay when the rig is built again, \
+                 except where a new bone takes the vertex.",
+            );
         }
 
         ui.add_space(8.0);
@@ -1376,6 +1387,116 @@ impl Studio {
             });
         });
         naming_examples(ui, &naming, 3);
+    }
+
+    /// Most influences per vertex (with the engines that want that many) and
+    /// the prune threshold, stored with the guides.
+    fn skin_limits(&mut self, ui: &mut Ui) {
+        let Some(doc) = &self.doc else { return };
+        let mut limits = doc.guides.skin;
+        let engines = |n: usize| -> String {
+            let names: Vec<&str> = Engine::ALL
+                .iter()
+                .filter(|e| e.max_influences() == n)
+                .map(|e| e.label())
+                .collect();
+            if names.is_empty() {
+                n.to_string()
+            } else {
+                format!("{n}  ({})", names.join(", "))
+            }
+        };
+        let half = (ui.available_width() - 16.0) / 2.0;
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new("Max influences").size(11.5).color(TEXT_FAINT));
+                egui::ComboBox::from_id_salt("max_influences")
+                    .width(half)
+                    .selected_text(engines(limits.max_influences))
+                    .show_ui(ui, |ui| {
+                        for n in 1..=INFLUENCE_CAP {
+                            ui.selectable_value(&mut limits.max_influences, n, engines(n));
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Most bones per vertex. Unreal takes 8 (12 with extra influences on), \
+                         Unity and glTF 4. Past 4 the .glb carries a second set.",
+                    );
+            });
+            ui.vertical(|ui| {
+                ui.label(RichText::new("Prune below").size(11.5).color(TEXT_FAINT));
+                let label = |p: f32| {
+                    if p > 0.0 {
+                        format!("{p}")
+                    } else {
+                        "Off".to_string()
+                    }
+                };
+                egui::ComboBox::from_id_salt("prune")
+                    .width(half)
+                    .selected_text(label(limits.prune))
+                    .show_ui(ui, |ui| {
+                        for p in [0.0, 0.005, 0.01, 0.02, 0.05, 0.1] {
+                            ui.selectable_value(&mut limits.prune, p, label(p));
+                        }
+                    })
+                    .response
+                    .on_hover_text("Drop influences smaller than this and share their weight out.");
+            });
+        });
+        if limits != doc.guides.skin {
+            self.set_skin_limits(limits);
+        }
+    }
+
+    /// The weight brush: on/off, what it does, its size and strength.
+    fn brush_controls(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            let mut on = self.painting;
+            theme::pill(ui, &mut on, "Paint").on_hover_text(
+                "Drag on the mesh to paint the shown bone's weight ([ and ] resize)",
+            );
+            if on != self.painting {
+                self.painting = on;
+                if !on {
+                    self.brush_at = None;
+                }
+            }
+            theme::segmented(
+                ui,
+                &mut self.brush.mode,
+                &[
+                    (BrushMode::Add, "Add"),
+                    (BrushMode::Subtract, "Subtract"),
+                    (BrushMode::Smooth, "Smooth"),
+                ],
+            );
+        });
+        let height = self
+            .doc
+            .as_ref()
+            .map_or(1.8, |d| d.guides.body.height)
+            .max(1e-3);
+        let mut cm = self.brush.radius * height * 100.0;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Radius").size(12.0).color(TEXT_DIM));
+            let max = 0.25 * height * 100.0;
+            if ui
+                .add(
+                    egui::Slider::new(&mut cm, 0.5..=max)
+                        .suffix(" cm")
+                        .max_decimals(1),
+                )
+                .changed()
+            {
+                self.brush.radius = cm / 100.0 / height;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Strength").size(12.0).color(TEXT_DIM));
+            ui.add(egui::Slider::new(&mut self.brush.strength, 0.01..=1.0).max_decimals(2));
+        });
     }
 
     /// The pre-build checks: every warning, a click to select its guide, and a
@@ -2456,8 +2577,71 @@ impl Studio {
         let pointer = response.interact_pointer_pos().or(response.hover_pos());
         let press = ui.input(|i| i.pointer.press_origin());
 
+        // The weight brush (after Build, with a bone shown): dragging on the mesh
+        // paints, dragging off it still orbits.
+        let brush_on = self.painting && self.mode != Mode::Guides && self.paint_bone().is_some();
+        let hit_at = |s: &Studio, p: Pos2| {
+            let (o, d) = pr.ray(p);
+            s.hit_mesh(o, d)
+        };
+        if brush_on {
+            if !blocked {
+                let resize = ui.input(|i| {
+                    if i.key_pressed(Key::OpenBracket) {
+                        0.8
+                    } else if i.key_pressed(Key::CloseBracket) {
+                        1.25
+                    } else {
+                        1.0
+                    }
+                });
+                self.brush.radius = (self.brush.radius * resize).clamp(0.003, 0.25);
+            }
+            // Follow the pointer once it moves (a still pointer leaves the brush
+            // where it was put).
+            let moving = ui.input(|i| i.pointer.is_moving() || i.pointer.any_down());
+            if response.hovered()
+                && moving
+                && let Some(p) = pointer
+            {
+                self.brush_at = hit_at(self, p);
+            }
+            if response.drag_started_by(PointerButton::Primary)
+                && let Some(p) = press.or(pointer)
+                && let Some(hit) = hit_at(self, p)
+                && self.begin_stroke()
+            {
+                self.paint_at(hit);
+                self.stroke = Some(hit);
+            }
+            if let Some(last) = self.stroke
+                && response.dragged_by(PointerButton::Primary)
+                && let Some(hit) = self.brush_at
+            {
+                // Dabs a quarter of the brush apart, so strokes are even at any speed.
+                let height = self.doc.as_ref().map_or(1.8, |d| d.guides.body.height);
+                if hit.distance(last) >= 0.25 * self.brush.radius * height {
+                    self.paint_at(hit);
+                    self.stroke = Some(hit);
+                }
+            }
+            if response.clicked()
+                && let Some(hit) = pointer.and_then(|p| hit_at(self, p))
+                && self.begin_stroke()
+            {
+                self.paint_at(hit);
+            }
+        } else {
+            self.stroke = None;
+        }
+        let stroking = self.stroke.is_some();
+        if response.drag_stopped() {
+            self.stroke = None;
+        }
+
         // Pick where the button went down: a drag only starts once the pointer has moved.
         if response.drag_started_by(PointerButton::Primary)
+            && !stroking
             && let Some(p) = press.or(pointer)
         {
             // The guide's centre moves it; the red brackets around a component's
@@ -2472,7 +2656,7 @@ impl Studio {
                 self.handle_drag = Some(c);
             }
         }
-        if response.dragged_by(PointerButton::Primary) {
+        if response.dragged_by(PointerButton::Primary) && !stroking {
             match (&self.drag, pointer) {
                 // The red brackets carry the whole component.
                 (_, Some(p)) if let Some(c) = self.handle_drag => {
@@ -2503,6 +2687,7 @@ impl Studio {
             self.drag = None;
         }
         if response.clicked()
+            && !brush_on
             && let Some(p) = pointer
         {
             if self.mode == Mode::Guides {
@@ -2544,6 +2729,9 @@ impl Studio {
             paint_grid(&painter, &pr, min.y, (max - min).max_element().max(0.5));
         }
         self.paint(&painter, &pr, pointer);
+        if brush_on {
+            self.paint_brush(&painter, &pr);
+        }
         paint_axes(
             &painter,
             &pr,
@@ -2635,6 +2823,39 @@ impl Studio {
             })
             .min_by(|a, b| a.0.total_cmp(&b.0))
             .map(|(_, ci)| ci)
+    }
+
+    /// The weight brush on the mesh: its reach, a centre dot and what it does.
+    fn paint_brush(&self, painter: &egui::Painter, pr: &Projector) {
+        let (Some(at), Some(doc)) = (self.brush_at, &self.doc) else {
+            return;
+        };
+        let radius = self.brush.radius * doc.guides.body.height;
+        let right = pr.forward.cross(Vec3::Y).normalize_or(Vec3::X);
+        let (Some(c), Some(edge)) = (pr.pos(at), pr.pos(at + right * radius)) else {
+            return;
+        };
+        let r = c.distance(edge).max(2.0);
+        let (glyph, color) = match self.brush.mode {
+            BrushMode::Add => ("+", ACCENT),
+            BrushMode::Subtract => ("\u{2212}", Color32::from_rgb(110, 200, 255)),
+            BrushMode::Smooth => ("~", Color32::from_rgb(190, 160, 255)),
+        };
+        painter.circle_filled(c, r, color.gamma_multiply(0.10));
+        // The inner ring shows where the brush is at full strength.
+        painter.circle_stroke(c, r * 0.45, Stroke::new(1.0, color.gamma_multiply(0.6)));
+        painter.circle_stroke(c, r, Stroke::new(2.0, color));
+        painter.circle_filled(c, 2.5, color);
+        painter.text(
+            c + Vec2::new(r * 0.72 + 6.0, -r * 0.72 - 6.0),
+            Align2::CENTER_CENTER,
+            glyph,
+            FontId::proportional(18.0),
+            color,
+        );
+        if let Some(bone) = &self.weights_bone {
+            label_chip(painter, c + Vec2::new(r + 10.0, 12.0), bone);
+        }
     }
 
     fn paint_handles(&self, painter: &egui::Painter, pr: &Projector, pointer: Option<Pos2>) {

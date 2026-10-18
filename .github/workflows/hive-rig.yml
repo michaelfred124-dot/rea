@@ -38,6 +38,27 @@ jobs:
           xvfb-run -a -s "-screen 0 1400x900x24" cargo run --locked -q --bin HiveRig -- \
             --demo --build --weights upperarm_l --screenshot "$RUNNER_TEMP/hive-rig-app.ppm"
           test "$(head -c 2 "$RUNNER_TEMP/hive-rig-app.ppm")" = P6
+          # The weight brush, with one subtracting dab on the upper arm.
+          xvfb-run -a -s "-screen 0 1400x900x24" cargo run --locked -q --bin HiveRig -- \
+            --demo --build --weights upperarm_l --dab subtract --screenshot "$RUNNER_TEMP/hive-rig-brush.ppm"
+          test "$(head -c 2 "$RUNNER_TEMP/hive-rig-brush.ppm")" = P6
+      - name: Skin tools - influence limits, prune, copy weights, keep weights on rebuild
+        run: |
+          s="$RUNNER_TEMP/skin"
+          cargo run --locked -q -- demo -o "$s/src" --engine unreal --prune 0.01 | tee "$s.log"
+          grep -q "up to 8 influences" "$s.log"
+          grep -q '"max_influences": 8' "$s/src/hive_demo.guides.json"
+          cargo run --locked -q -- demo -o "$s/dst" --arm-drop 45
+          cargo run --locked -q -- naming "$s/dst/hive_demo.guides.json" suffix
+          cargo run --locked -q -- rebuild "$s/dst/hive_demo.hive.json"
+          cargo run --locked -q -- weights copy "$s/src/hive_demo.hive.json" "$s/dst/hive_demo.hive.json" | tee "$s.log"
+          grep -q "31 of 31 bones matched" "$s.log"
+          cargo run --locked -q -- weights limit "$s/dst/hive_demo.hive.json" --engine unity
+          cargo run --locked -q -- add "$s/dst/hive_demo.guides.json" tail
+          cargo run --locked -q -- rebuild "$s/dst/hive_demo.hive.json" --keep-weights | tee "$s.log"
+          grep -q "Kept the hand-edited weights of" "$s.log"
+          python3 -I tests/dcc_stub_run.py maya "$s/dst/hive_demo_maya.py"
+          python3 -I tests/dcc_stub_run.py unreal "$s/dst/hive_demo_unreal.py"
       - name: Pre-build checks on the demo and the dog
         run: |
           c="$RUNNER_TEMP/checks"
@@ -201,6 +222,20 @@ jobs:
           EOF
           cargo run -q -- rebuild "$rig/hive_demo.hive.json"
           python tests/blender_check.py "$rig/hive_demo_blender.py" "$rig/hive_demo.glb"
+      - name: Skin weights in Blender - 8 influences (JOINTS_1), 4 with pruning, copied weights
+        run: |
+          s="$RUNNER_TEMP/skin"
+          cargo run -q -- demo -o "$s/m8" --engine unreal
+          python tests/blender_check.py "$s/m8/hive_demo_blender.py" "$s/m8/hive_demo.glb"
+          python tests/blender_anim_check.py "$s/m8/hive_demo_blender.py"
+          cargo run -q -- demo -o "$s/m4" --arm-drop 45 --max-influences 4 --prune 0.02
+          python tests/blender_check.py "$s/m4/hive_demo_blender.py" "$s/m4/hive_demo.glb"
+          cargo run -q -- demo -o "$s/src"
+          cargo run -q -- demo -o "$s/dst" --arm-drop 45
+          cargo run -q -- naming "$s/dst/hive_demo.guides.json" suffix
+          cargo run -q -- rebuild "$s/dst/hive_demo.hive.json"
+          cargo run -q -- weights copy "$s/src/hive_demo.hive.json" "$s/dst/hive_demo.hive.json" --engine unreal12
+          python tests/blender_check.py "$s/dst/hive_demo_blender.py" "$s/dst/hive_demo.glb"
       - name: Animator tools - IK/FK matching, mirror, reset and space switching in Blender
         run: |
           for drop in 0 45; do

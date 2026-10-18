@@ -98,29 +98,44 @@ pub fn write(rig: &Rig) -> Vec<u8> {
         "VEC3",
         json!({}),
     );
-    let joints: Vec<u8> = rig
-        .skin
-        .joints
-        .iter()
-        .flatten()
-        .flat_map(|j| j.to_le_bytes())
-        .collect();
-    let jnt = b.accessor(
-        &joints,
-        Some(ARRAY_BUFFER),
-        UNSIGNED_SHORT,
-        mesh.vertex_count(),
-        "VEC4",
-        json!({}),
-    );
-    let wgt = b.accessor(
-        &f32_bytes(rig.skin.weights.iter().flatten().copied()),
-        Some(ARRAY_BUFFER),
-        FLOAT,
-        mesh.vertex_count(),
-        "VEC4",
-        json!({}),
-    );
+    // glTF carries influences in sets of four (JOINTS_0/WEIGHTS_0, JOINTS_1/
+    // WEIGHTS_1, ...); unused slots are joint 0 with weight 0.
+    let sets = rig.skin.width().div_ceil(4).max(1);
+    let mut skin_attributes = serde_json::Map::new();
+    for set in 0..sets {
+        let mut joints: Vec<u8> = Vec::with_capacity(mesh.vertex_count() * 8);
+        let mut weights: Vec<f32> = Vec::with_capacity(mesh.vertex_count() * 4);
+        for v in 0..mesh.vertex_count() {
+            let pairs: Vec<(usize, f32)> = if v < rig.skin.vertex_count() {
+                rig.skin.influences(v).collect()
+            } else {
+                Vec::new()
+            };
+            for slot in set * 4..set * 4 + 4 {
+                let (j, w) = pairs.get(slot).copied().unwrap_or((0, 0.0));
+                joints.extend_from_slice(&(j as u16).to_le_bytes());
+                weights.push(w);
+            }
+        }
+        let jnt = b.accessor(
+            &joints,
+            Some(ARRAY_BUFFER),
+            UNSIGNED_SHORT,
+            mesh.vertex_count(),
+            "VEC4",
+            json!({}),
+        );
+        let wgt = b.accessor(
+            &f32_bytes(weights),
+            Some(ARRAY_BUFFER),
+            FLOAT,
+            mesh.vertex_count(),
+            "VEC4",
+            json!({}),
+        );
+        skin_attributes.insert(format!("JOINTS_{set}"), json!(jnt));
+        skin_attributes.insert(format!("WEIGHTS_{set}"), json!(wgt));
+    }
     let idx_bytes: Vec<u8> = mesh.indices.iter().flat_map(|i| i.to_le_bytes()).collect();
     let idx = b.accessor(
         &idx_bytes,
@@ -166,6 +181,11 @@ pub fn write(rig: &Rig) -> Vec<u8> {
         .chain([mesh_node])
         .collect();
 
+    let mut attributes = serde_json::Map::new();
+    attributes.insert("POSITION".into(), json!(pos));
+    attributes.insert("NORMAL".into(), json!(nrm));
+    attributes.extend(skin_attributes);
+
     let doc = json!({
         "asset": { "version": "2.0", "generator": concat!("hive-rig ", env!("CARGO_PKG_VERSION")) },
         "scene": 0,
@@ -174,7 +194,7 @@ pub fn write(rig: &Rig) -> Vec<u8> {
         "meshes": [{
             "name": rig.name,
             "primitives": [{
-                "attributes": { "POSITION": pos, "NORMAL": nrm, "JOINTS_0": jnt, "WEIGHTS_0": wgt },
+                "attributes": attributes,
                 "indices": idx,
                 "material": 0,
             }],
@@ -249,5 +269,42 @@ mod tests {
         let back = crate::import::load_mesh(&path).unwrap();
         assert_eq!(back.vertex_count(), r.mesh.vertex_count());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn more_than_four_influences_go_into_a_second_set() {
+        let mesh = demo_humanoid();
+        let (mut guides, _) = rig::detect_guides(&mesh);
+        guides.skin.max_influences = 8;
+        let r = rig::build_rig(mesh, "demo", guides, Default::default()).unwrap();
+        assert!(r.skin.width() > 4);
+        let bytes = write(&r);
+        let g = gltf::Gltf::from_slice(&bytes).expect("valid glb");
+        let blob = g.blob.as_deref().unwrap();
+        let prim = g.meshes().next().unwrap().primitives().next().unwrap();
+        let reader = prim.reader(|_| Some(blob));
+        let j0: Vec<[u16; 4]> = reader.read_joints(0).unwrap().into_u16().collect();
+        let j1: Vec<[u16; 4]> = reader.read_joints(1).unwrap().into_u16().collect();
+        let w0: Vec<[f32; 4]> = reader.read_weights(0).unwrap().into_f32().collect();
+        let w1: Vec<[f32; 4]> = reader.read_weights(1).unwrap().into_f32().collect();
+        assert!(reader.read_joints(2).is_none());
+        for v in 0..r.mesh.vertex_count() {
+            let sum: f32 = w0[v].iter().chain(&w1[v]).sum();
+            assert!((sum - 1.0).abs() < 1e-4, "vertex {v} sums to {sum}");
+            for (k, (j, w)) in r.skin.influences(v).enumerate() {
+                let (gj, gw) = if k < 4 {
+                    (j0[v][k], w0[v][k])
+                } else {
+                    (j1[v][k - 4], w1[v][k - 4])
+                };
+                assert_eq!((gj as usize, gw), (j, w));
+            }
+        }
+        // Four influences need only the first set.
+        let four = rig::auto_rig(demo_humanoid(), "demo", Default::default()).unwrap();
+        let g = gltf::Gltf::from_slice(&write(&four)).unwrap();
+        let blob = g.blob.as_deref().unwrap();
+        let prim = g.meshes().next().unwrap().primitives().next().unwrap();
+        assert!(prim.reader(|_| Some(blob)).read_joints(1).is_none());
     }
 }

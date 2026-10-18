@@ -19,8 +19,9 @@ patterns) applied to every export, and now:
 - **Joints to guides**: a .glb that already has a skeleton (Mixamo, Unreal,
   3ds Max biped, Maya or Blender names) becomes guides, with its eyes, jaw,
   face and fingers. Checked by renaming and editing a rig in real Blender.
-- **Weight tools**: mirror weights left to right (or back) and smooth one
-  bone's weights or all of them.
+- **Weight tools**: mirror weights left to right (or back), smooth one bone's
+  weights or all of them, a paint brush in the app, prune, a max-influences
+  limit per engine, and copying weights from another character (gap 11).
 - **Animator tools** (Blender tab and Maya window): IK to FK and FK to IK
   matching per limb, mirror pose, reset pose, select all controls and space
   switching without a pop. Checked in real Blender; Maya only against stubs.
@@ -53,7 +54,7 @@ patterns) applied to every export, and now:
 | 8 | FBX and more targets | FBX export; Unity and Houdini use | FBX writer, or document the glTF route for Unity/Houdini | Medium |
 | 9 | Pose-driven correctives | Corrective shapes and helper joints driven by joint angles (Brave Rabbit's weightDriver is the well-known Maya RBF/pose reader) | Our own pose reader: a cone angle between a joint and its rest pose drives a helper joint or shape, written as Blender drivers and Maya nodes | Large |
 | 10 | Control shapes | A library of control curve shapes, recolouring | More shapes and per-control colour/size in the app | Small |
-| 11 | Skin tools, next steps | Auto skin plus weight tools | Done: mirror and smooth. Next: copy weights between characters, prune tiny weights, a max-influences limit per engine, paint brush | Medium |
+| 11 | Skin tools, next steps | Auto skin plus weight tools | Done: mirror, smooth, paint brush (add, subtract, smooth, symmetry, undo; edits kept on rebuild), prune, max influences per engine (glTF writes a second joints/weights set past four), and copy weights between characters by closest surface point with naming-aware bone matching. Next: weight transfer for unmatched extra chains (tails, ears) by position, a flood/set-value tool, locking bones while painting, painting in Blender/Maya round-tripping into the guides | Small |
 | 12 | Proximity controls | Controls appear as the mouse comes near (lesterbanks) | Blender-only overlay; Maya has no clean equivalent | Small |
 | 13 | Developer API | Scriptable rig building | Already partly there: the CLI and the guides JSON; document it | Small |
 

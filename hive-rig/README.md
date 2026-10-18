@@ -28,7 +28,7 @@ a joint; with Symmetry on, its twin on the other side follows.
   X-ray, Weights, Undo, Redo, Frame and Export. The honeycomb button in the
   middle builds the rig.
 * **The outliner** (left) lists the components as a tree. **Properties** (right)
-  shows the rig summary, the pre-build [checks](#checks-before-building), skin weights (with Mirror and Smooth) and naming, or, with a component
+  shows the rig summary, the pre-build [checks](#checks-before-building), skin weights (influence limits, the paint brush, Mirror and Smooth) and naming, or, with a component
   selected, its attachment, options (the spine's joint count and **Spline (curve)**
   toggle, a tentacle's joint and curve-control counts), exact guide positions and the names its
   bones will export as. Click a panel's title to fold it away.
@@ -42,7 +42,7 @@ a joint; with Symmetry on, its twin on the other side follows.
 
 Every change rebuilds the bone and control preview at once; Ctrl+Z and Ctrl+Y
 undo and redo, Ctrl+B builds, 1/2/3 switch views and F frames the character.
-Building computes the skin weights, which you can inspect per bone. The app can
+Building computes the skin weights, which you can inspect and paint per bone. The app can
 also open a `.hive.json` to keep editing an exported rig, or a `.guides.json` to
 apply a saved layout.
 
@@ -439,6 +439,46 @@ After Build, the Properties panel's skin weights section has **Mirror L to R**
 mirrored vertex position, and **Smooth**, which blurs the shown bone's weights
 (or every bone's) with their neighbours.
 
+* **Paint**: pick a bone in the weights list, turn on **Paint** and drag on the
+  mesh. **Add** raises the bone's weight (the vertex's other bones give way),
+  **Subtract** lowers it (the other bones take it up; a vertex held by that bone
+  alone passes to its parent), **Smooth** blends towards the neighbours. The
+  brush fades to nothing at its rim; set its radius (or press `[` and `]`) and
+  strength. With Symmetry on, the twin bone is painted on the other side. Each
+  stroke, mirror and smooth is one Undo step. Dragging off the mesh still orbits.
+* **Max influences and prune**: the most bones per vertex, 1 to 12, with the
+  engines named: Unreal 8 (12 with its extra-influences setting), Unity and
+  glTF 4. Past four, the `.glb` writes a second `JOINTS_1`/`WEIGHTS_1` set (a
+  third for more than 8). **Prune below** drops influences smaller than the
+  threshold and shares their weight among the rest. Both are stored in the
+  guides (`"skin": {"max_influences": 8, "prune": 0.01}`), so rebuilds and
+  layout templates keep them. Changing them needs a Build.
+* **Keep edited weights on rebuild** (on by default): when the rig is built again
+  after a guide edit, every vertex whose weights you changed (painted, mirrored,
+  smoothed or copied) keeps them, as Blender's and Maya's Rebuild do, unless the
+  new rig gives the vertex to a bone the old one didn't have. Vertices you
+  didn't touch take the new guides' automatic weights.
+
+On the command line:
+
+```bash
+hive-rig demo -o out --engine unreal               # 8 influences (unreal12, unity, gltf)
+hive-rig rig hero.glb -o out --max-influences 6 --prune 0.01
+hive-rig weights limit out/hero.hive.json --engine unity --prune 0.02
+hive-rig weights copy base/base.hive.json hero/hero.hive.json   # copy weights onto another rig
+hive-rig rebuild out/hero.hive.json --keep-weights  # keep hand-edited weights
+```
+
+`weights copy` moves one character's weights onto another with the same or a
+similar skeleton, in any pose or size (an A-pose character from a T-pose one,
+say). Bones are matched by their hive-rig name whatever the naming convention,
+then by name after side tokens, prefixes and suffixes are read (`L_arm_jnt`,
+`upperarm_l`). Each target vertex is carried into the source's pose by its own
+bones (each matched bone turned onto its source bone), then takes the weights
+at the closest point of the source surface, blended across that triangle.
+Source bones with no match hand their weight to the nearest matched parent. The
+target is written again in its own folder (or `-o`).
+
 `guides.json` is plain JSON, so you can also edit guide positions, the spine's
 `joints` option, or `twist: false` on a limb by hand.
 
@@ -514,7 +554,8 @@ back to average human proportions and prints a warning.
 3. **Skin** (`src/skin.rs`): every vertex is assigned to a body region (torso,
    left/right arm or leg), so weights can't bleed between limbs that are close
    together. Weights fall off with inverse distance to each bone, are limited
-   to 4 influences, and are smoothed over the surface.
+   to the rig's max influences (4 unless set), are smoothed over the surface,
+   and influences below the prune threshold (if any) are dropped.
 4. **Controls** (`src/controls.rs`): the DCC-neutral description of every control
    (its parent, shape, colour and driven bone) and the IK chains, as built by the components.
 5. **Export** (`src/export/`): the glTF writer and the three builder templates
@@ -542,7 +583,11 @@ ball and toe roll stages, stretchy IK, the forearm twist share, and space
 switching (no pop at rest, and the IK hand follows the chest only in chest
 space). It also checks that every driver uses a simple expression, so the rig
 works without enabling Python auto-run. Finally, the COG moves the body, the
-mesh deforms, and the `.glb` re-imports with weights on every bone.
+mesh deforms, and the `.glb` re-imports with weights on every bone. It also
+compares every vertex's weights, as the builder script sets them and as the
+`.glb` importer reads them (all `JOINTS_n`/`WEIGHTS_n` sets), with the rig's,
+and checks no vertex has more influences than the rig's limit. CI runs it on
+rigs with 8 influences, 4 with pruning, and copied weights.
 `blender_guides_check.py` edits the guides in real Blender. It moves the elbow,
 mirrors it, paints a weight, adds fingers and a tail, and rebuilds. Then it
 checks that the bones moved, the painted weight survived, the new fingers got
@@ -581,7 +626,12 @@ own warning, and its fix clears it; the app's tests select and fix them and
 build with them. Versioning has tests for the stamp, files from before it
 building exactly as before, and files from a newer hive-rig warning. CI runs
 `hive-rig check` on the demo and the dog, and opens
-the app on a virtual screen and screenshots it after building the demo rig.
+the app on a virtual screen and screenshots it after building the demo rig, and
+again with the weight brush after one dab (`--dab subtract`). The skin tools
+(prune, influence caps, the brush's add, subtract, smooth and its undo, keeping
+edits across a rebuild, and copying weights between the T-pose and A-pose demo)
+have unit tests in `src/skin.rs`, `src/rig.rs` and `src/studio/app.rs`; the
+`.glb`'s second joints/weights set is read back in `src/export/glb.rs`.
 CI runs all of this (`.github/workflows/hive-rig.yml`), and builds both Windows
 executables as a downloadable artifact.
 

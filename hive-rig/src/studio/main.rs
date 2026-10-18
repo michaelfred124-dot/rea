@@ -1,7 +1,7 @@
 //! Hive Rig: the desktop rigging app. Double-click it, open a character, adjust
 //! the guides, build and export.
 //!
-//! `HiveRig [character, rig or guides file] [--demo] [--build] [--weights BONE] [--library] [--templates] [--export]
+//! `HiveRig [character, rig or guides file] [--demo] [--build] [--weights BONE] [--paint] [--dab add|subtract|smooth] [--library] [--templates] [--export]
 //! [--select COMPONENT[,COMPONENT...]] [--pick NAME] [--pose BONE] [--screenshot OUT.ppm]`
 //! (the flags exist so the window can be checked automatically).
 
@@ -24,6 +24,10 @@ struct Launch {
     demo: bool,
     build: bool,
     weights: Option<String>,
+    /// Turn the weight brush on and show it over the `--weights` bone.
+    paint: bool,
+    /// Paint one dab there: add, subtract or smooth.
+    dab: Option<String>,
     library: bool,
     templates: bool,
     export: bool,
@@ -42,6 +46,11 @@ fn parse_args() -> Launch {
             Some("--build") => launch.build = true,
             Some("--weights") => {
                 launch.weights = args.next().map(|s| s.to_string_lossy().into_owned())
+            }
+            Some("--paint") => launch.paint = true,
+            Some("--dab") => {
+                launch.paint = true;
+                launch.dab = args.next().map(|s| s.to_string_lossy().into_owned());
             }
             Some("--library") => launch.library = true,
             Some("--templates") => {
@@ -118,6 +127,22 @@ fn main() -> eframe::Result {
         studio.build();
     }
     studio.weights_bone = launch.weights;
+    if launch.paint {
+        studio.show_brush();
+    }
+    if let Some(mode) = &launch.dab {
+        studio.brush.mode = match mode.as_str() {
+            "subtract" => hive_rig::skin::BrushMode::Subtract,
+            "smooth" => hive_rig::skin::BrushMode::Smooth,
+            _ => hive_rig::skin::BrushMode::Add,
+        };
+        studio.brush.strength = 0.8;
+        if let Some(at) = studio.brush_at
+            && studio.begin_stroke()
+        {
+            studio.paint_at(at);
+        }
+    }
     studio.library_open = launch.library;
     if launch.templates {
         studio.category = app::Category::Templates;

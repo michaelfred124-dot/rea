@@ -20,6 +20,7 @@ use crate::components::{
     self, AddOptions, Component, ControlStyle, Guides, Kind, Preset, id_names, is_premade_part,
 };
 use crate::naming::Naming;
+use crate::skin::SkinLimits;
 
 pub const TEMPLATE_FORMAT: &str = "hive-rig-template";
 pub const TEMPLATE_VERSION: u32 = 1;
@@ -49,6 +50,9 @@ pub struct Template {
     /// The naming convention of a layout, when it isn't the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub naming: Option<Naming>,
+    /// The skin influence limits of a layout, when they aren't the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skin: Option<SkinLimits>,
     /// Control looks keyed by control name, with sizes in body heights.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub control_styles: BTreeMap<String, ControlStyle>,
@@ -185,6 +189,7 @@ impl Template {
             scope,
             components,
             naming: (scope == Scope::Layout && !g.naming.is_default()).then(|| g.naming.clone()),
+            skin: (scope == Scope::Layout && !g.skin.is_default()).then_some(g.skin),
             control_styles,
         })
     }
@@ -274,6 +279,10 @@ impl Template {
                     .collect();
                 if let Some(n) = &self.naming {
                     out.naming = n.clone();
+                }
+                if let Some(limits) = self.skin {
+                    limits.validate()?;
+                    out.skin = limits;
                 }
                 out.control_styles = self
                     .control_styles
@@ -612,6 +621,10 @@ mod tests {
             .options
             .twist = false;
         g.naming = crate::naming::Preset::Prefix.naming();
+        g.skin = SkinLimits {
+            max_influences: 8,
+            prune: 0.02,
+        };
         let style = ControlStyle {
             shape: Some(Shape::Cube),
             size: Some(0.2),
@@ -641,6 +654,7 @@ mod tests {
             }
         }
         assert_eq!(target.naming, g.naming);
+        assert_eq!(target.skin, g.skin);
         let got = target.control_styles["tail_01_ctrl"];
         assert_eq!((got.shape, got.color), (style.shape, style.color));
         assert!((got.size.unwrap() - 0.2).abs() < 1e-6);

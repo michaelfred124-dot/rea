@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use hive_rig::components::{self, AddOptions, Guides, Kind, Preset};
 use hive_rig::rig::detect_guides;
 use hive_rig::skeleton::Side;
+use hive_rig::skin::{Engine, SkinLimits, SkinOptions};
 use hive_rig::template::{self, Template};
 use hive_rig::{
     Rig, RigOptions, Target, build_rig, checks, demo, export, import, mesh::Mesh, naming, rig,
@@ -67,8 +68,18 @@ enum Command {
         /// Output directory (default: the rig's directory).
         #[arg(short, long)]
         out: Option<PathBuf>,
+        /// Keep the weights edited by hand (painted, mirrored, smoothed or copied)
+        /// in the old rig, except where the new guides add a bone that claims
+        /// the vertex.
+        #[arg(long)]
+        keep_weights: bool,
         #[command(flatten)]
         common: Common,
+    },
+    /// Skin weight tools for a rig that has been built.
+    Weights {
+        #[command(subcommand)]
+        action: WeightsCommand,
     },
     /// Add a premade component to a guides file.
     Add {
@@ -197,6 +208,39 @@ enum TemplateCommand {
     List,
 }
 
+#[derive(Subcommand)]
+enum WeightsCommand {
+    /// Copy one rig's weights onto another character's rig with the same or a
+    /// similar skeleton, in any pose or size, and write the target rig again.
+    Copy {
+        /// The `<name>.hive.json` to copy from.
+        from: PathBuf,
+        /// The `<name>.hive.json` to copy onto.
+        to: PathBuf,
+        /// Output directory (default: the target rig's directory).
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        #[command(flatten)]
+        skin: SkinFlags,
+        #[command(flatten)]
+        output: Outputs,
+    },
+    /// Prune small weights and cap the influences per vertex of a built rig,
+    /// keeping its painted weights. The limits are stored with the guides, so
+    /// rebuilds keep them.
+    Limit {
+        /// The `<name>.hive.json` of the rig.
+        rig: PathBuf,
+        /// Output directory (default: the rig's directory).
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        #[command(flatten)]
+        skin: SkinFlags,
+        #[command(flatten)]
+        output: Outputs,
+    },
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum SideArg {
     Left,
@@ -204,7 +248,7 @@ enum SideArg {
 }
 
 #[derive(clap::Args)]
-struct Common {
+struct Outputs {
     /// Which DCC builder scripts to write.
     #[arg(
         short,
@@ -213,24 +257,79 @@ struct Common {
         default_value = "blender,maya,unreal"
     )]
     targets: Vec<Target>,
+}
+
+/// Skin influence limits. Unset flags keep what the guides file says (four
+/// influences and no pruning unless it was changed).
+#[derive(clap::Args, Default)]
+struct SkinFlags {
+    /// Most bones that may influence one vertex (1 to 12). glTF writes them in
+    /// sets of four.
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=12))]
+    max_influences: Option<u8>,
+    /// Set max influences for an engine: unreal (8), unreal12 (12), unity (4)
+    /// or gltf (4).
+    #[arg(long, conflicts_with = "max_influences")]
+    engine: Option<Engine>,
+    /// Drop influences below this weight (such as 0.01) and renormalise.
+    #[arg(long)]
+    prune: Option<f32>,
+}
+
+impl SkinFlags {
+    /// Apply the flags to the limits stored in the guides; true if they changed.
+    fn apply(&self, limits: &mut SkinLimits) -> Result<bool> {
+        let before = *limits;
+        if let Some(n) = self.max_influences {
+            limits.max_influences = n as usize;
+        }
+        if let Some(e) = self.engine {
+            limits.max_influences = e.max_influences();
+        }
+        if let Some(p) = self.prune {
+            limits.prune = p;
+        }
+        limits.validate()?;
+        Ok(*limits != before)
+    }
+}
+
+#[derive(clap::Args)]
+struct Common {
+    #[command(flatten)]
+    output: Outputs,
+    #[command(flatten)]
+    skin: SkinFlags,
     /// Skin weight smoothing passes.
     #[arg(long, default_value_t = 3)]
     smooth: usize,
 }
 
-fn run(mesh: Mesh, name: &str, guides: Guides, out: &Path, common: &Common) -> Result<()> {
+impl Common {
+    fn options(&self) -> RigOptions {
+        let mut opts = RigOptions::default();
+        opts.skin.smooth_iterations = self.smooth;
+        opts
+    }
+}
+
+fn run(mesh: Mesh, name: &str, mut guides: Guides, out: &Path, common: &Common) -> Result<()> {
+    common.skin.apply(&mut guides.skin)?;
     print_warnings(&guides, &mesh);
-    let mut opts = RigOptions::default();
-    opts.skin.smooth_iterations = common.smooth;
-    let rig = build_rig(mesh, name, guides, opts)?;
-    let files = export::write_all(&rig, out, &common.targets)?;
+    let rig = build_rig(mesh, name, guides, common.options())?;
+    write(&rig, out, &common.output)
+}
+
+fn write(rig: &Rig, out: &Path, output: &Outputs) -> Result<()> {
+    let files = export::write_all(rig, out, &output.targets)?;
     println!(
-        "Rigged '{}': {} vertices, {} bones, {} controls, {} IK limbs",
+        "Rigged '{}': {} vertices, {} bones, {} controls, {} IK limbs, up to {} influences per vertex",
         rig.name,
         rig.mesh.vertex_count(),
         rig.skeleton.bones.len(),
         rig.controls.controls.len(),
-        rig.controls.ik_chains.len()
+        rig.controls.ik_chains.len(),
+        rig.skin.width()
     );
     for f in files {
         println!("  {}", f.display());
@@ -415,7 +514,10 @@ fn guided_rig(dropped: Option<PathBuf>) -> Result<()> {
         }
     };
     let common = Common {
-        targets: Target::ALL.to_vec(),
+        output: Outputs {
+            targets: Target::ALL.to_vec(),
+        },
+        skin: SkinFlags::default(),
         smooth: 3,
     };
     let out = match input {
@@ -547,6 +649,64 @@ fn template_command(action: TemplateCommand) -> Result<()> {
     }
 }
 
+fn weights_command(action: WeightsCommand) -> Result<()> {
+    match action {
+        WeightsCommand::Copy {
+            from,
+            to,
+            out,
+            skin,
+            output,
+        } => {
+            let source = load_rig(&from)?;
+            let mut target = load_rig(&to)?;
+            if skin.apply(&mut target.guides.skin)? {
+                // New limits change the automatic weights the copy is posed by.
+                target.skin = target.auto_weights(SkinOptions::default());
+            }
+            let (weights, report) = rig::copy_weights(&source, &target);
+            target.skin = weights;
+            println!(
+                "Copied the weights of '{}' onto '{}': {} of {} bones matched.",
+                source.name,
+                target.name,
+                report.matched,
+                target.skeleton.bones.len()
+            );
+            if !report.unmatched.is_empty() {
+                println!(
+                    "  no match (skinned from the nearest matched bones): {}",
+                    report.unmatched.join(", ")
+                );
+            }
+            let dir = out.unwrap_or_else(|| to.parent().unwrap_or(Path::new(".")).to_path_buf());
+            write(&target, &dir, &output)
+        }
+        WeightsCommand::Limit {
+            rig: path,
+            out,
+            skin,
+            output,
+        } => {
+            let mut r = load_rig(&path)?;
+            skin.apply(&mut r.guides.skin)?;
+            let before = r.skin.width();
+            r.skin = hive_rig::skin::limit(&r.skin, r.guides.skin);
+            println!(
+                "Limited the weights of '{}' to {} influences per vertex (had up to {}), pruning below {}.",
+                r.name, r.guides.skin.max_influences, before, r.guides.skin.prune
+            );
+            if r.guides.skin.max_influences > before {
+                println!(
+                    "  A higher limit takes effect on the next rebuild; the weights were kept."
+                );
+            }
+            let dir = out.unwrap_or_else(|| path.parent().unwrap_or(Path::new(".")).to_path_buf());
+            write(&r, &dir, &output)
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     match args.as_slice() {
@@ -602,16 +762,28 @@ fn main() -> Result<()> {
             rig,
             guides,
             out,
+            keep_weights,
             common,
         } => {
             let old = load_rig(&rig)?;
             let dir = rig.parent().unwrap_or(Path::new("."));
             let guides_path =
                 guides.unwrap_or_else(|| dir.join(format!("{}.guides.json", old.name)));
-            let guides = load_guides(&guides_path)?;
+            let mut guides = load_guides(&guides_path)?;
             let out = out.unwrap_or_else(|| dir.to_path_buf());
-            run(old.mesh, &old.name, guides, &out, &common)
+            if !keep_weights {
+                return run(old.mesh, &old.name, guides, &out, &common);
+            }
+            common.skin.apply(&mut guides.skin)?;
+            let opts = common.options();
+            let mut new = build_rig(old.mesh.clone(), &old.name, guides, opts)?;
+            // The old rig's automatic weights tell its hand edits apart.
+            let base = old.auto_weights(opts.skin);
+            let kept = rig::keep_weights(&old, Some(&base), &mut new);
+            println!("Kept the hand-edited weights of {kept} vertices.");
+            write(&new, &out, &common.output)
         }
+        Command::Weights { action } => weights_command(action),
         Command::Add {
             guides,
             preset,

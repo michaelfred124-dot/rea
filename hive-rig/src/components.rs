@@ -19,6 +19,7 @@ use crate::controls::{
 use crate::landmarks::{Landmarks, mirror};
 use crate::naming::Naming;
 use crate::skeleton::{Region, Side, Skeleton, Twist};
+use crate::skin::SkinLimits;
 
 pub const GUIDES_FORMAT: &str = "hive-rig-guides";
 /// The newest guides version this program knows. A guides file's `version`
@@ -83,6 +84,10 @@ pub struct Guides {
     /// They survive rebuilds; a control that no longer exists is ignored.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub control_styles: BTreeMap<String, ControlStyle>,
+    /// Influence limits for the skin weights (most bones per vertex, smallest
+    /// weight kept). Absent means four influences and no pruning.
+    #[serde(default, skip_serializing_if = "SkinLimits::is_default")]
+    pub skin: SkinLimits,
 }
 
 /// How one control looks. Unset fields keep the component's default.
@@ -476,6 +481,7 @@ pub fn biped(lm: &Landmarks) -> Guides {
         },
         components,
         naming: Naming::default(),
+        skin: SkinLimits::default(),
         control_styles: BTreeMap::new(),
     }
 }
@@ -562,6 +568,7 @@ pub fn quadruped(height: f32) -> Guides {
         },
         components,
         naming: Naming::default(),
+        skin: SkinLimits::default(),
         control_styles: BTreeMap::new(),
     }
 }

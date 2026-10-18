@@ -16,6 +16,7 @@ use hive_rig::components::{
 use hive_rig::naming::Naming;
 use hive_rig::rig::detect_guides;
 use hive_rig::skeleton::{Side, turn_about};
+use hive_rig::skin::{BrushMode, Dab, SkinLimits, SkinOptions, SkinWeights};
 use hive_rig::template::{self, Listed, Scope, Template};
 use hive_rig::{Rig, RigOptions, Target, build_rig, demo, export, import, mesh::Mesh, skin};
 
@@ -40,6 +41,16 @@ pub struct Doc {
     surface: Surface,
     undo: Vec<Guides>,
     redo: Vec<Guides>,
+    /// The automatic weights of `rig`, before painting or other weight edits,
+    /// so a rebuild can tell the edited vertices apart.
+    auto_skin: Option<SkinWeights>,
+    /// The last built rig (and its automatic weights) after an edit cleared it,
+    /// so the next build keeps its hand-edited weights.
+    kept: Option<(Rig, Option<SkinWeights>)>,
+    /// Weight edits on the built rig (paint strokes, mirror, smooth), undone
+    /// before any guide edit.
+    skin_undo: Vec<SkinWeights>,
+    skin_redo: Vec<SkinWeights>,
 }
 
 impl Doc {
@@ -57,6 +68,10 @@ impl Doc {
             surface,
             undo: Vec::new(),
             redo: Vec::new(),
+            auto_skin: None,
+            kept: None,
+            skin_undo: Vec::new(),
+            skin_redo: Vec::new(),
         };
         doc.refresh();
         doc
@@ -69,8 +84,23 @@ impl Doc {
             self.preview.as_ref().map_err(String::as_str),
             Some(&mut self.surface),
         );
-        self.rig = None;
+        if let Some(rig) = self.rig.take() {
+            self.kept = Some((rig, self.auto_skin.take()));
+        }
+        self.skin_undo.clear();
+        self.skin_redo.clear();
         self.exported = false;
+    }
+
+    /// Record the built rig's weights before a weight edit, for undo.
+    fn push_skin_undo(&mut self) {
+        if let Some(rig) = &self.rig {
+            self.skin_undo.push(rig.skin.clone());
+            if self.skin_undo.len() > UNDO_LIMIT {
+                self.skin_undo.remove(0);
+            }
+            self.skin_redo.clear();
+        }
     }
 
     fn bone_names(&self) -> Vec<String> {
@@ -140,6 +170,26 @@ pub struct Frame {
     pub mesh: Option<Vec<Vec3>>,
 }
 
+/// The weight brush: what it does, how big and how strong.
+#[derive(Clone, Copy, Debug)]
+pub struct Brush {
+    pub mode: BrushMode,
+    /// Radius as a fraction of the body height.
+    pub radius: f32,
+    /// 0..1 per dab at the brush centre.
+    pub strength: f32,
+}
+
+impl Default for Brush {
+    fn default() -> Self {
+        Brush {
+            mode: BrushMode::Add,
+            radius: 0.04,
+            strength: 0.3,
+        }
+    }
+}
+
 pub struct Studio {
     pub doc: Option<Doc>,
     pub camera: Camera,
@@ -164,6 +214,13 @@ pub struct Studio {
     pub xray: bool,
     /// Deform bone whose weights colour the mesh (needs a built rig).
     pub weights_bone: Option<String>,
+    /// The weight brush is on: dragging on the mesh paints `weights_bone`.
+    pub painting: bool,
+    pub brush: Brush,
+    /// Where the brush last touched (or hovers over) the mesh.
+    pub brush_at: Option<Vec3>,
+    /// Keep hand-edited weights when the rig is built again.
+    pub keep_weights: bool,
     pub targets: [bool; 3],
     pub status: String,
     pub error: bool,
@@ -188,6 +245,8 @@ pub struct Studio {
     /// that couldn't be read. `None` until the first scan.
     pub templates: Option<(Vec<Listed>, Vec<String>)>,
     drag: Option<Drag>,
+    /// Where the brush last dabbed in the stroke being painted.
+    stroke: Option<Vec3>,
     weight_colors: Option<(String, Vec<Color32>)>,
 }
 
@@ -215,6 +274,10 @@ impl Default for Studio {
             show_mesh: true,
             xray: false,
             weights_bone: None,
+            painting: false,
+            brush: Brush::default(),
+            brush_at: None,
+            keep_weights: true,
             targets: [true; 3],
             status: "Open a character to start, or try the demo.".into(),
             error: false,
@@ -226,6 +289,7 @@ impl Default for Studio {
             chain_joints: 3,
             chain_id: String::new(),
             drag: None,
+            stroke: None,
             weight_colors: None,
         }
     }
@@ -274,6 +338,8 @@ impl Studio {
         self.pose = None;
         self.weights_bone = None;
         self.weight_colors = None;
+        self.painting = false;
+        self.brush_at = None;
         self.drag = None;
         self.doc = Some(doc);
     }
@@ -362,6 +428,8 @@ impl Studio {
         let newer = rig.newer_warning();
         let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
         let mut doc = Doc::new(rig.name.clone(), rig.mesh.clone(), rig.guides.clone(), dir);
+        // The automatic weights of the saved guides tell its painted vertices apart.
+        doc.auto_skin = Some(rig.auto_weights(SkinOptions::default()));
         doc.rig = Some(rig);
         self.set_doc(doc);
         match newer {
@@ -799,6 +867,15 @@ impl Studio {
 
     pub fn undo(&mut self) {
         let Some(doc) = &mut self.doc else { return };
+        if let Some(rig) = &mut doc.rig
+            && let Some(skin) = doc.skin_undo.pop()
+        {
+            doc.skin_redo.push(std::mem::replace(&mut rig.skin, skin));
+            doc.exported = false;
+            self.weight_colors = None;
+            self.info("Undid the weight edit.");
+            return;
+        }
         match doc.undo.pop() {
             Some(g) => {
                 let current = std::mem::replace(&mut doc.guides, g);
@@ -814,6 +891,15 @@ impl Studio {
 
     pub fn redo(&mut self) {
         let Some(doc) = &mut self.doc else { return };
+        if let Some(rig) = &mut doc.rig
+            && let Some(skin) = doc.skin_redo.pop()
+        {
+            doc.skin_undo.push(std::mem::replace(&mut rig.skin, skin));
+            doc.exported = false;
+            self.weight_colors = None;
+            self.info("Redid the weight edit.");
+            return;
+        }
         match doc.redo.pop() {
             Some(g) => {
                 let current = std::mem::replace(&mut doc.guides, g);
@@ -828,11 +914,15 @@ impl Studio {
     }
 
     pub fn can_undo(&self) -> bool {
-        self.doc.as_ref().is_some_and(|d| !d.undo.is_empty())
+        self.doc
+            .as_ref()
+            .is_some_and(|d| !d.undo.is_empty() || (d.rig.is_some() && !d.skin_undo.is_empty()))
     }
 
     pub fn can_redo(&self) -> bool {
-        self.doc.as_ref().is_some_and(|d| !d.redo.is_empty())
+        self.doc
+            .as_ref()
+            .is_some_and(|d| !d.redo.is_empty() || (d.rig.is_some() && !d.skin_redo.is_empty()))
     }
 
     /// Move one guide (and its mirror twin when symmetry is on) without an undo
@@ -1030,6 +1120,7 @@ impl Studio {
     /// Copy one side's skin weights onto the other on the built rig.
     pub fn mirror_weights(&mut self, source: Side) {
         let Some(doc) = &mut self.doc else { return };
+        doc.push_skin_undo();
         let Some(rig) = &mut doc.rig else {
             self.fail("Build the rig first, then mirror its weights.");
             return;
@@ -1056,6 +1147,7 @@ impl Studio {
     /// or everywhere.
     pub fn smooth_weights(&mut self) {
         let Some(doc) = &mut self.doc else { return };
+        doc.push_skin_undo();
         let Some(rig) = &mut doc.rig else {
             self.fail("Build the rig first, then smooth its weights.");
             return;
@@ -1064,11 +1156,150 @@ impl Studio {
             .weights_bone
             .as_deref()
             .and_then(|b| rig.skeleton.index_of(b));
-        rig.skin = hive_rig::skin::smooth(&rig.skin, &rig.mesh, &rig.skeleton, bone, 2);
+        rig.skin = hive_rig::skin::smooth(
+            &rig.skin,
+            &rig.mesh,
+            &rig.skeleton,
+            bone,
+            2,
+            rig.guides.skin,
+        );
         doc.exported = false;
         self.weight_colors = None;
         let what = self.weights_bone.as_deref().unwrap_or("every bone");
         self.info(format!("Smoothed the weights of {what}."));
+    }
+
+    /// Change the rig's skin influence limits (stored with the guides, so it
+    /// needs a rebuild; edited weights are kept).
+    pub fn set_skin_limits(&mut self, limits: SkinLimits) -> bool {
+        if self.doc.as_ref().is_some_and(|d| d.guides.skin == limits) {
+            return true;
+        }
+        self.edit("change the skin limits", |g| {
+            limits.validate()?;
+            g.skin = limits;
+            Ok(format!(
+                "Skin limits: up to {} influences per vertex{}. Build to apply them.",
+                limits.max_influences,
+                if limits.prune > 0.0 {
+                    format!(", pruning below {}", limits.prune)
+                } else {
+                    String::new()
+                }
+            ))
+        })
+    }
+
+    /// The mesh positions as drawn: posed by the test pose, or at rest.
+    fn shown_positions(&self) -> Option<Vec<Vec3>> {
+        let doc = self.doc.as_ref()?;
+        Some(
+            self.frame()
+                .and_then(|f| f.mesh)
+                .unwrap_or_else(|| doc.mesh.positions.clone()),
+        )
+    }
+
+    /// The nearest point where a ray meets the mesh as drawn.
+    pub fn hit_mesh(&self, origin: Vec3, dir: Vec3) -> Option<Vec3> {
+        let doc = self.doc.as_ref()?;
+        let positions = self.shown_positions()?;
+        let mut best: Option<f32> = None;
+        for [a, b, c] in doc.mesh.triangles() {
+            if let Some(t) = ray_triangle(origin, dir, positions[a], positions[b], positions[c])
+                && best.is_none_or(|b| t < b)
+            {
+                best = Some(t);
+            }
+        }
+        best.map(|t| origin + dir * t)
+    }
+
+    /// The bone the brush paints: the one shown in the weights view.
+    fn paint_bone(&self) -> Option<usize> {
+        let rig = self.doc.as_ref()?.rig.as_ref()?;
+        rig.skeleton.index_of(self.weights_bone.as_deref()?)
+    }
+
+    /// Start a brush stroke: one undo step for the whole stroke.
+    pub fn begin_stroke(&mut self) -> bool {
+        if self.paint_bone().is_none() {
+            self.fail("Build the rig and pick a bone under Weights, then paint it.");
+            return false;
+        }
+        if let Some(doc) = &mut self.doc {
+            doc.push_skin_undo();
+        }
+        true
+    }
+
+    /// One dab of the brush at `at` on the mesh, and its mirror image on the
+    /// twin bone when symmetry is on.
+    pub fn paint_at(&mut self, at: Vec3) -> usize {
+        let Some(bone) = self.paint_bone() else {
+            return 0;
+        };
+        let positions = self.shown_positions().unwrap_or_default();
+        let (symmetry, brush) = (self.symmetry, self.brush);
+        let Some(doc) = &mut self.doc else { return 0 };
+        let Some(rig) = &mut doc.rig else { return 0 };
+        let body = rig.guides.body;
+        let adjacency = doc.mesh.adjacency();
+        let mut dabs = vec![(bone, at)];
+        if symmetry {
+            let twins = skin::bone_twins(&rig.skeleton, body.center_x, 0.05 * body.height);
+            let mirrored = hive_rig::landmarks::mirror(at, body.center_x);
+            if mirrored.distance(at) > 1e-4 * body.height {
+                dabs.push((twins[bone], mirrored));
+            }
+        }
+        let mut changed = 0;
+        for (b, center) in dabs {
+            changed += skin::paint(
+                &mut rig.skin,
+                &positions,
+                &adjacency,
+                &rig.skeleton,
+                b,
+                Dab {
+                    center,
+                    radius: brush.radius * body.height,
+                    strength: brush.strength,
+                    mode: brush.mode,
+                },
+                rig.guides.skin,
+            );
+        }
+        if changed > 0 {
+            doc.exported = false;
+            self.weight_colors = None;
+        }
+        self.brush_at = Some(at);
+        changed
+    }
+
+    /// Put the brush on the surface over the middle of the painted bone, so it
+    /// shows without a pointer (for the `--paint` screenshot).
+    pub fn show_brush(&mut self) {
+        self.painting = true;
+        let Some(bone) = self.paint_bone() else {
+            return;
+        };
+        let Some(positions) = self.shown_positions() else {
+            return;
+        };
+        let rig = self.doc.as_ref().unwrap().rig.as_ref().unwrap();
+        let b = &rig.skeleton.bones[bone];
+        let mid = (b.head + b.tail) * 0.5;
+        // The front of the mesh over the bone's middle, else its nearest vertex.
+        let front = mid + Vec3::Z * (2.0 * rig.guides.body.height);
+        self.brush_at = self.hit_mesh(front, -Vec3::Z).or_else(|| {
+            positions
+                .iter()
+                .min_by(|p, q| p.distance(mid).total_cmp(&q.distance(mid)))
+                .copied()
+        });
     }
 
     /// Move the named guides of the just-added component forward or back to the
@@ -1232,6 +1463,7 @@ impl Studio {
     }
 
     pub fn build(&mut self) -> bool {
+        let keep = self.keep_weights;
         let Some(doc) = &mut self.doc else {
             return false;
         };
@@ -1241,15 +1473,34 @@ impl Studio {
             doc.guides.clone(),
             RigOptions::default(),
         ) {
-            Ok(rig) => {
+            Ok(mut rig) => {
+                let auto = rig.skin.clone();
+                // Building again over a built rig keeps its edits too.
+                let old = match doc.rig.take() {
+                    Some(r) => Some((r, doc.auto_skin.take())),
+                    None => doc.kept.take(),
+                };
+                doc.kept = None;
+                let kept = match old {
+                    Some((old, old_auto)) if keep => {
+                        hive_rig::rig::keep_weights(&old, old_auto.as_ref(), &mut rig)
+                    }
+                    _ => 0,
+                };
                 let warnings = checks::warnings(&doc.checks);
-                let msg = format!(
+                let mut msg = format!(
                     "Rig built: {} bones, {} controls, {} IK limbs, weights on {} vertices.",
                     rig.skeleton.bones.len(),
                     rig.controls.controls.len(),
                     rig.controls.ik_chains.len(),
                     rig.mesh.vertex_count()
                 );
+                if kept > 0 {
+                    msg = format!("{msg} Kept your edited weights on {kept} vertices.");
+                }
+                doc.auto_skin = Some(auto);
+                doc.skin_undo.clear();
+                doc.skin_redo.clear();
                 doc.rig = Some(rig);
                 self.weight_colors = None;
                 self.mode = Mode::Rig;
@@ -1367,21 +1618,9 @@ impl Studio {
         let doc = self.doc.as_ref()?;
         let rig = doc.rig.as_ref()?;
         if self.weight_colors.as_ref().is_none_or(|(b, _)| b != bone) {
-            let index = rig.skeleton.index_of(bone)? as u16;
-            let colors = rig
-                .skin
-                .joints
-                .iter()
-                .zip(&rig.skin.weights)
-                .map(|(j, w)| {
-                    let v: f32 = j
-                        .iter()
-                        .zip(w)
-                        .filter(|(j, _)| **j == index)
-                        .map(|(_, w)| w)
-                        .sum();
-                    view::weight_color(v)
-                })
+            let index = rig.skeleton.index_of(bone)?;
+            let colors = (0..rig.skin.vertex_count())
+                .map(|v| view::weight_color(rig.skin.weight(v, index)))
                 .collect();
             self.weight_colors = Some((bone.to_string(), colors));
         }
@@ -1426,6 +1665,29 @@ fn chain(
             .collect(),
         options: Options::default(),
     }
+}
+
+/// Distance along the ray to where it crosses triangle abc, if it does.
+fn ray_triangle(origin: Vec3, dir: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
+    let (e1, e2) = (b - a, c - a);
+    let p = dir.cross(e2);
+    let det = e1.dot(p);
+    if det.abs() < 1e-12 {
+        return None;
+    }
+    let inv = 1.0 / det;
+    let s = origin - a;
+    let u = s.dot(p) * inv;
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let q = s.cross(e1);
+    let v = dir.dot(q) * inv;
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let t = e2.dot(q) * inv;
+    (t > 0.0).then_some(t)
 }
 
 fn push_undo(undo: &mut Vec<Guides>, g: &Guides) {
@@ -1670,6 +1932,75 @@ mod tests {
             g.component("head").unwrap().parent.as_deref(),
             Some("spine_05")
         );
+    }
+
+    #[test]
+    fn painted_weights_undo_and_survive_a_rebuild() {
+        let mut s = demo_studio();
+        assert!(s.build(), "{}", s.status);
+        s.weights_bone = Some("upperarm_l".into());
+        s.brush = Brush {
+            mode: BrushMode::Subtract,
+            radius: 0.03,
+            strength: 1.0,
+        };
+        s.show_brush();
+        let at = s.brush_at.expect("the brush lands on the arm");
+        fn rig(s: &Studio) -> &Rig {
+            s.doc.as_ref().unwrap().rig.as_ref().unwrap()
+        }
+        let before = rig(&s).skin.clone();
+        let (up_l, up_r) = (
+            rig(&s).skeleton.index_of("upperarm_l").unwrap(),
+            rig(&s).skeleton.index_of("upperarm_r").unwrap(),
+        );
+        let m = rig(&s).mesh.positions.clone();
+        let nearest = |p: Vec3| {
+            (0..m.len())
+                .min_by(|a, b| m[*a].distance(p).total_cmp(&m[*b].distance(p)))
+                .unwrap()
+        };
+        let v = nearest(at);
+        let twin = nearest(hive_rig::landmarks::mirror(
+            at,
+            rig(&s).guides.body.center_x,
+        ));
+        assert!(s.begin_stroke());
+        assert!(s.paint_at(at) > 0);
+        let painted = rig(&s).skin.clone();
+        assert!(painted.weight(v, up_l) < 0.5 * before.weight(v, up_l));
+        // Symmetry paints the right arm too.
+        assert!(painted.weight(twin, up_r) < 0.5 * before.weight(twin, up_r));
+        assert!(s.can_undo());
+        s.undo();
+        assert_eq!(rig(&s).skin, before);
+        s.redo();
+        assert_eq!(rig(&s).skin, painted);
+
+        // A guide edit clears the rig; building again keeps the stroke.
+        s.add_tail();
+        assert!(s.doc.as_ref().unwrap().rig.is_none());
+        assert!(s.build(), "{}", s.status);
+        assert!(
+            s.status.contains("Kept your edited weights"),
+            "{}",
+            s.status
+        );
+        assert!((rig(&s).skin.weight(v, up_l) - painted.weight(v, up_l)).abs() < 1e-4);
+        // ...and so does raising the influence limit, which the new rig follows.
+        let limits = SkinLimits {
+            max_influences: 8,
+            prune: 0.0,
+        };
+        assert!(s.set_skin_limits(limits));
+        assert!(s.build(), "{}", s.status);
+        assert_eq!(rig(&s).guides.skin, limits);
+        assert!(rig(&s).skin.width() > 4);
+        assert!((rig(&s).skin.weight(v, up_l) - painted.weight(v, up_l)).abs() < 1e-4);
+        // With keep off the rebuild starts from the automatic weights again.
+        s.keep_weights = false;
+        assert!(s.build(), "{}", s.status);
+        assert!(rig(&s).skin.weight(v, up_l) > 0.5 * before.weight(v, up_l));
     }
 
     #[test]

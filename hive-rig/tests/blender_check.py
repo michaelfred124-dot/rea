@@ -107,13 +107,27 @@ def shape_mismatch(c):
     return max(min((d - w).length for d in drawn) for w in wanted)
 
 
-RIG_CONTROLS = json.loads(open(script).read().split('r"""', 1)[1].split('"""', 1)[0])["controls"]["controls"]
+DATA = json.loads(open(script).read().split('r"""', 1)[1].split('"""', 1)[0])
+RIG_CONTROLS = DATA["controls"]["controls"]
 worst = [shape_mismatch(c) for c in RIG_CONTROLS]
 check(all(w is not None and w < 1e-3 for w in worst),
       "every control shape sits on its outline (%d controls, %d shapes)"
       % (len(RIG_CONTROLS), len({c["shape"] for c in RIG_CONTROLS})))
 
 rest = [v.co.copy() for v in geo.data.vertices]
+
+_bones = [b["name"] for b in DATA["skeleton"]["bones"]]
+_groups = {vg.index: vg.name for vg in geo.vertex_groups}
+_off = 0
+for v, vert in enumerate(geo.data.vertices):
+    got = {_groups[g.group]: g.weight for g in vert.groups if g.weight > 0.0}
+    want = {}
+    for j, w in zip(DATA["skin"]["joints"][v], DATA["skin"]["weights"][v]):
+        if w > 0.0:
+            want[_bones[j]] = want.get(_bones[j], 0.0) + w
+    if any(abs(got.get(n, 0.0) - want.get(n, 0.0)) > 1e-4 for n in set(got) | set(want)):
+        _off += 1
+check(_off == 0, "the builder script gives every vertex its weights (%d vertices)" % len(rest))
 check(max((a - b).length for a, b in zip(rest, deformed())) < 1e-4, "rig adds no offset in the rest pose")
 
 for side in ("l", "r"):
@@ -267,4 +281,44 @@ armatures = [o for o in bpy.data.objects if o.type == "ARMATURE"]
 meshes = [o for o in bpy.data.objects if o.type == "MESH" and o.parent in armatures]
 check(len(armatures) == 1 and len(meshes) == 1, "glb imports as one armature and one skinned mesh")
 check(len(meshes[0].vertex_groups) == len(armatures[0].data.bones), "glb carries skin weights for every bone")
+
+
+def same_weights(got, want):
+    return all(abs(got.get(n, 0.0) - want.get(n, 0.0)) < 1e-3 for n in set(got) | set(want))
+
+
+# Every vertex's weights, all of its influences (JOINTS_1/WEIGHTS_1 past four),
+# arrive as hive-rig wrote them. The importer may reorder vertices, so they are
+# matched by position (glTF Y-up is Blender Z-up).
+SKIN = DATA["skin"]
+BONE_NAMES = [b["name"] for b in DATA["skeleton"]["bones"]]
+POSITIONS = DATA["mesh"]["positions"]
+
+
+def wanted(v):
+    out = {}
+    for j, w in zip(SKIN["joints"][v], SKIN["weights"][v]):
+        if w > 0.0:
+            out[BONE_NAMES[j]] = out.get(BONE_NAMES[j], 0.0) + w
+    return out
+
+
+glb_mesh = meshes[0]
+names = {vg.index: vg.name for vg in glb_mesh.vertex_groups}
+by_place = {}
+for v, p in enumerate(POSITIONS):
+    by_place.setdefault(tuple(round(c, 4) for c in (p[0], -p[2], p[1])), []).append(v)
+mismatched, most = 0, 0
+for vert in glb_mesh.data.vertices:
+    co = glb_mesh.matrix_world @ vert.co
+    got = {names[g.group]: g.weight for g in vert.groups if g.weight > 0.0}
+    most = max(most, len(got))
+    candidates = by_place.get(tuple(round(c, 4) for c in co), [])
+    if not any(same_weights(got, wanted(v)) for v in candidates):
+        mismatched += 1
+limit = DATA["guides"].get("skin", {}).get("max_influences", 4)
+check(mismatched == 0 and len(glb_mesh.data.vertices) == len(POSITIONS),
+      "glb weights match the rig on all %d vertices (up to %d influences, limit %d)"
+      % (len(POSITIONS), most, limit))
+check(most <= limit, "no vertex has more than %d influences" % limit)
 print("blender check passed")
