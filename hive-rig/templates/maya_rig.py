@@ -49,6 +49,7 @@ def build(RIG, geo=None):
     BONES = RIG["skeleton"]["bones"]
     CONTROLS = RIG["controls"]["controls"]
     CHAINS = RIG["controls"]["ik_chains"]
+    SPLINES = RIG["controls"].get("splines", [])
 
     def copy_rule(bone):
         parent = bone["parent"]
@@ -203,7 +204,7 @@ def build(RIG, geo=None):
         ctrl_of[c["name"]] = ctrl
         offset_of[c["name"]] = offset
 
-        if c["kind"] == "hock" or (c["kind"] == "fk" and c["bone"] and copy_rule(bone_by_name[c["bone"]]) == "orient"):
+        if c["kind"] == "hock" or (c["kind"] == "fk" and (not c["bone"] or copy_rule(bone_by_name[c["bone"]]) == "orient")):
             for attr in ("tx", "ty", "tz"):
                 cmds.setAttr(ctrl + "." + attr, lock=True, keyable=False, channelBox=False)
         for attr in ("sx", "sy", "sz", "v"):
@@ -377,6 +378,100 @@ def build(RIG, geo=None):
         cmds.setAttr(share + ".input2X", twist["factor"])
         cmds.connectAttr(share + ".outputX", joint_of[b["name"]] + ".rotateX")
 
+    # --------------------------------------------------------------------------- spline chains
+    # A curve through the joints' heads is skinned to a driver joint under each
+    # curve control with hive-rig's weights. An ikSplineHandle fits a copy of the
+    # joints to it (advanced twist from the start and end controls), stretched
+    # by the curve's length; the deform joints follow that copy, and the last
+    # one turns with the end control.
+    def axes(node):
+        m = cmds.xform(node, q=True, ws=True, matrix=True)
+        return [m[0:3], m[4:7], m[8:11]]
+
+    def in_frame(v, frame):
+        return [sum(a * b for a, b in zip(v, axis)) for axis in frame]
+
+    for sp in SPLINES:
+        n = sp["name"]
+        bones = sp["bones"]
+        parent = cmds.listRelatives(joint_of[bones[0]], parent=True)[0]
+        ik_chain = []
+        for b in bones:
+            j = cmds.createNode("joint", name=b + "_spl", parent=ik_chain[-1] if ik_chain else parent)
+            cmds.xform(j, worldSpace=True, translation=mpos(bone_by_name[b]["head"]))
+            cmds.setAttr(j + ".visibility", 0)
+            ik_chain.append(j)
+        cmds.joint(ik_chain[0], edit=True, orientJoint="xyz", secondaryAxisOrient="zup", zeroScaleOrient=True, children=True)
+        cmds.setAttr(ik_chain[-1] + ".jointOrient", 0, 0, 0)
+
+        points = [mpos(p) for p in sp["points"]]
+        curve = cmds.curve(degree=min(3, len(points) - 1), point=points, name=n + "_spline_crv")
+        cmds.parent(curve, helper_grp)
+        drivers = []
+        for ctrl in sp["controls"]:
+            d = cmds.createNode("joint", name=ctrl + "_crv_drv", parent=ctrl_of[ctrl])
+            cmds.matchTransform(d, ctrl_of[ctrl], position=True, rotation=True)
+            cmds.setAttr(d + ".visibility", 0)
+            drivers.append(d)
+        crv_skin = cmds.skinCluster(drivers, curve, toSelectedBones=True, maximumInfluences=len(drivers),
+                                    name=n + "_spline_skinCluster")[0]
+        for i, weights in enumerate(sp["weights"]):
+            cmds.skinPercent(crv_skin, "%s.cv[%d]" % (curve, i), transformValue=list(zip(drivers, weights)))
+
+        handle = cmds.ikHandle(startJoint=ik_chain[0], endEffector=ik_chain[-1], solver="ikSplineSolver",
+                               curve=curve, createCurve=False, parentCurve=False, rootOnCurve=True,
+                               name=n + "_spline_ikHandle")[0]
+        cmds.parent(handle, helper_grp)
+        # Advanced twist: the chain's up (+Y) follows the start and end controls.
+        start, end = ctrl_of[sp["controls"][0]], ctrl_of[sp["controls"][-1]]
+        up = axes(ik_chain[0])[1]
+        cmds.setAttr(handle + ".dTwistControlEnable", 1)
+        cmds.setAttr(handle + ".dWorldUpType", 4)  # object rotation up, start and end
+        cmds.setAttr(handle + ".dForwardAxis", 0)  # +X down the chain
+        cmds.setAttr(handle + ".dWorldUpAxis", 0)  # +Y
+        cmds.setAttr(handle + ".dWorldUpVector", *in_frame(up, axes(start)))
+        cmds.setAttr(handle + ".dWorldUpVectorEnd", *in_frame(up, axes(end)))
+        cmds.connectAttr(start + ".worldMatrix[0]", handle + ".dWorldUpMatrix")
+        cmds.connectAttr(end + ".worldMatrix[0]", handle + ".dWorldUpMatrixEnd")
+
+        # Stretch and volume, on the settings control.
+        settings = ctrl_of[sp["settings"]]
+        cmds.addAttr(settings, longName="stretch", attributeType="double", min=0, max=1,
+                     defaultValue=sp["default_stretch"], keyable=True)
+        cmds.addAttr(settings, longName="volume", attributeType="double", min=0, max=1,
+                     defaultValue=sp["default_volume"], keyable=True)
+        info = cmds.createNode("curveInfo", name=n + "_spline_info")
+        shape = cmds.listRelatives(curve, shapes=True)[0]
+        cmds.connectAttr(shape + ".worldSpace[0]", info + ".inputCurve")
+        ratio = cmds.createNode("multiplyDivide", name=n + "_spline_ratio")
+        cmds.setAttr(ratio + ".operation", 2)
+        cmds.connectAttr(info + ".arcLength", ratio + ".input1X")
+        cmds.setAttr(ratio + ".input2X", cmds.getAttr(info + ".arcLength"))
+        amount = cmds.createNode("blendTwoAttr", name=n + "_spline_stretch")
+        cmds.setAttr(amount + ".input[0]", 1)
+        cmds.connectAttr(ratio + ".outputX", amount + ".input[1]")
+        cmds.connectAttr(settings + ".stretch", amount + ".attributesBlender")
+        for j in ik_chain[1:]:
+            length = cmds.createNode("multiplyDivide", name=j + "_len")
+            cmds.connectAttr(amount + ".output", length + ".input1X")
+            cmds.setAttr(length + ".input2X", cmds.getAttr(j + ".translateX"))
+            cmds.connectAttr(length + ".outputX", j + ".translateX")
+        thin = cmds.createNode("multiplyDivide", name=n + "_spline_thin")
+        cmds.setAttr(thin + ".operation", 3)  # power: 1 / sqrt(stretch)
+        cmds.connectAttr(amount + ".output", thin + ".input1X")
+        cmds.setAttr(thin + ".input2X", -0.5)
+        squash = cmds.createNode("blendTwoAttr", name=n + "_spline_volume")
+        cmds.setAttr(squash + ".input[0]", 1)
+        cmds.connectAttr(thin + ".outputX", squash + ".input[1]")
+        cmds.connectAttr(settings + ".volume", squash + ".attributesBlender")
+
+        for b, j in zip(bones[:-1], ik_chain):
+            cmds.parentConstraint(j, joint_of[b], maintainOffset=True)
+            for axis in ("scaleY", "scaleZ"):
+                cmds.connectAttr(squash + ".output", joint_of[b] + "." + axis)
+        cmds.pointConstraint(ik_chain[-1], joint_of[bones[-1]], maintainOffset=True)
+        cmds.orientConstraint(end, joint_of[bones[-1]], maintainOffset=True)
+
     # What the animator tools need: the limbs and left/right twins from hive-rig,
     # with the bind-pose frames they match and mirror against.
     def world_matrix(node):
@@ -406,6 +501,9 @@ def build(RIG, geo=None):
         d.update(ikFk=float(chain["default_blend"]), stretch=float(chain["default_stretch"]))
         if chain.get("foot"):
             d["roll"] = 0.0
+    for sp in SPLINES:
+        defaults.setdefault(ctrl_of[sp["settings"]], {}).update(
+            stretch=float(sp["default_stretch"]), volume=float(sp["default_volume"]))
     spaces = {}
     for c in CONTROLS:
         if c.get("spaces"):
@@ -436,7 +534,7 @@ def build(RIG, geo=None):
 # left/right twins come from hive-rig (ik_chains and mirror_pairs), kept on the rig
 # as `hiveAnim` with the bind frames. Matrices here are 4x4 lists of rows acting on
 # column vectors; Maya's flat worldMatrix is the transpose.
-ANIM_ATTRS = ("ikFk", "stretch", "roll", "space")
+ANIM_ATTRS = ("ikFk", "stretch", "roll", "space", "volume")
 CHANNELS = ("tx", "ty", "tz", "rx", "ry", "rz")
 
 

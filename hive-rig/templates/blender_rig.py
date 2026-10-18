@@ -44,6 +44,7 @@ def build(RIG, geo=None):
     BONES = RIG["skeleton"]["bones"]
     CONTROLS = RIG["controls"]["controls"]
     CHAINS = RIG["controls"]["ik_chains"]
+    SPLINES = RIG["controls"].get("splines", [])
 
     def copy_rule(bone):
         """Bones without a deforming parent, and face joints, follow position too; the rest only rotate."""
@@ -215,6 +216,31 @@ def build(RIG, geo=None):
         hock_target[chain["name"]] = mch("MCH_%s_hock" % chain["name"], like=hock["bone"], parent=hock["control"])
 
 
+    # Spline chains: a point bone per curve point follows the curve controls by
+    # weight (an Armature constraint, like a skinned curve) and carries a hook of
+    # the curve. A copy of the joints but the last rides the curve with Spline
+    # IK and the deform joints copy it; the last joint starts at its end and
+    # turns with the end control.
+    spline_parts = []
+    for sp in SPLINES:
+        n = sp["name"]
+        points = [mch("MCH_%s_point_%02d" % (n, i), head=to_blender(p)) for i, p in enumerate(sp["points"])]
+        first = bone_by_name[sp["bones"][0]]
+        chain = []
+        for b in sp["bones"][:-1]:
+            chain.append(mch("MCH_%s_spline" % b, like=b,
+                             parent=chain[-1] if chain else BONES[first["parent"]]["name"]))
+        tip = mch("MCH_%s_tip" % n, like=sp["bones"][-1], parent=sp["controls"][-1])
+        # The last joint and the bones hanging from the chain keep their own
+        # scale when it stretches or squashes.
+        inside = set(sp["bones"][:-1])
+        edit[sp["bones"][-1]].inherit_scale = "NONE"
+        for b in BONES:
+            if b["parent"] is not None and BONES[b["parent"]]["name"] in inside and b["name"] not in inside:
+                edit[b["name"]].inherit_scale = "NONE"
+        spline_parts.append((sp, points, chain, tip))
+
+
     def signed_angle(u, v, normal):
         a = u.angle(v)
         if u.cross(v).angle(normal) < 1:
@@ -261,7 +287,7 @@ def build(RIG, geo=None):
         pb.use_custom_shape_bone_size = False
         pb.rotation_mode = "XYZ"
         if c["kind"] == "hock" or (
-            c["kind"] == "fk" and c["bone"] and copy_rule(bone_by_name[c["bone"]]) == "COPY_ROTATION"
+            c["kind"] == "fk" and (not c["bone"] or copy_rule(bone_by_name[c["bone"]]) == "COPY_ROTATION")
         ):
             pb.lock_location = (True, True, True)
         if has_collections:
@@ -369,6 +395,64 @@ def build(RIG, geo=None):
             follow.subtarget = chain["_flat"]
             add_blend_driver(follow, chain["ik_control"])
 
+    for sp, points, chain, tip in spline_parts:
+        settings = pose[sp["settings"]]
+        add_property(settings, "stretch", float(sp["default_stretch"]), 0.0, 1.0,
+                     "1 = the joints stretch to the curve, 0 = they keep their length")
+        add_property(settings, "volume", float(sp["default_volume"]), 0.0, 1.0,
+                     "Thin the joints as they stretch and thicken them as they squash")
+        for point, weights in zip(points, sp["weights"]):
+            con = pose[point].constraints.new("ARMATURE")
+            con.name = "Curve Controls"
+            for ctrl, w in zip(sp["controls"], weights):
+                if w > 1e-6:
+                    t = con.targets.new()
+                    t.target = rig
+                    t.subtarget = ctrl
+                    t.weight = w
+        curve = bpy.data.curves.new(NAME + "_" + sp["name"] + "_curve", "CURVE")
+        curve.dimensions = "3D"
+        spline = curve.splines.new("BEZIER")
+        spline.bezier_points.add(len(points) - 1)
+        for bp, p in zip(spline.bezier_points, sp["points"]):
+            bp.co = to_blender(p)
+            bp.handle_left_type = bp.handle_right_type = "AUTO"
+        curve_obj = bpy.data.objects.new(NAME + "_" + sp["name"] + "_curve", curve)
+        widget_coll.objects.link(curve_obj)  # hidden, still evaluated for the Spline IK
+        curve_obj.parent = rig
+        for i, point in enumerate(points):
+            hook = curve_obj.modifiers.new("Hook_%02d" % i, "HOOK")
+            hook.object = rig
+            hook.subtarget = point
+            hook.vertex_indices_set([3 * i, 3 * i + 1, 3 * i + 2])
+            # Rest: the curve sits where the point bones are, so the hook adds nothing.
+            hook.matrix_inverse = arm_data.bones[point].matrix_local.inverted()
+            hook.center = spline.bezier_points[i].co
+        ik = pose[chain[-1]].constraints.new("SPLINE_IK")
+        ik.name = "Spline IK"
+        ik.target = curve_obj
+        ik.chain_count = len(chain)
+        ik.use_curve_radius = False
+        ik.use_even_divisions = False
+        ik.use_chain_offset = False
+        ik.xz_scale_mode = "VOLUME_PRESERVE"
+        add_driver(ik, "y_scale_mode", sp["settings"], "stretch", "floor(min(stretch, 1) + 0.5)")
+        add_driver(ik, "bulge", sp["settings"], "volume", "volume")
+        for bone, src in zip(sp["bones"], chain):
+            con = pose[bone].constraints.new("COPY_TRANSFORMS")
+            con.name = "Spline"
+            con.target = rig
+            con.subtarget = src
+        end = pose[sp["bones"][-1]].constraints.new("COPY_LOCATION")
+        end.name = "Spline End"
+        end.target = rig
+        end.subtarget = chain[-1]
+        end.head_tail = 1.0
+        turn = pose[sp["bones"][-1]].constraints.new("COPY_ROTATION")
+        turn.name = "Spline End Turn"
+        turn.target = rig
+        turn.subtarget = tip
+
     # Twist helpers take a share of their source bone's twist (rotation about its length).
     for b in BONES:
         twist = b.get("twist")
@@ -432,7 +516,7 @@ def build(RIG, geo=None):
 # IK/FK matching, pose mirroring, reset and space switching. Which controls make
 # up each limb and which controls are left/right twins come from hive-rig (the
 # rig's ik_chains and mirror_pairs), kept on the armature as `hive_anim`.
-ANIM_PROPS = ("ik_fk", "stretch", "roll", "space")
+ANIM_PROPS = ("ik_fk", "stretch", "roll", "space", "volume")
 
 
 def animator_data(RIG, goals, hock_targets):
@@ -457,6 +541,9 @@ def animator_data(RIG, goals, hock_targets):
         d.update(ik_fk=float(c["default_blend"]), stretch=float(c["default_stretch"]))
         if c.get("foot"):
             d["roll"] = 0.0
+    for sp in controls.get("splines", []):
+        defaults.setdefault(sp["settings"], {}).update(
+            stretch=float(sp["default_stretch"]), volume=float(sp["default_volume"]))
     spaces = {}
     for c in controls["controls"]:
         if c.get("spaces"):

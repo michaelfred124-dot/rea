@@ -982,6 +982,12 @@ impl Studio {
         self.add(Preset::Tail, opts);
     }
 
+    /// A curve-driven tentacle from the pelvis (8 joints, 4 curve controls);
+    /// its counts change in Properties.
+    pub fn add_tentacle(&mut self) {
+        self.add(Preset::Tentacle, AddOptions::default());
+    }
+
     pub fn add_chain(&mut self) {
         let id = self.chain_id.trim();
         let opts = AddOptions {
@@ -1621,6 +1627,34 @@ mod tests {
         s.redo();
         assert!(s.doc.as_ref().unwrap().guides.component("prop_r").is_some());
         assert!(!s.can_redo());
+    }
+
+    #[test]
+    fn tentacle_and_spline_spine() {
+        let mut s = demo_studio();
+        s.add_tentacle();
+        assert!(!s.error, "{}", s.status);
+        let built = components::build(&s.doc.as_ref().unwrap().guides).unwrap();
+        let spline = built
+            .controls
+            .splines
+            .iter()
+            .find(|c| c.name == "tentacle")
+            .unwrap();
+        assert_eq!((spline.bones.len(), spline.controls.len()), (8, 4));
+        s.edit("change the spine", |g| {
+            components::set_spine_spline(g, "spine", true, Some(4))?;
+            Ok(String::new())
+        });
+        assert!(!s.error, "{}", s.status);
+        let built = components::build(&s.doc.as_ref().unwrap().guides).unwrap();
+        assert!(built.controls.control("hips_ctrl").is_some());
+        assert!(built.controls.control("spine_mid_02_ctrl").is_some());
+        // One undo brings the FK spine back.
+        s.undo();
+        let built = components::build(&s.doc.as_ref().unwrap().guides).unwrap();
+        assert!(built.controls.control("spine_01_ctrl").is_some());
+        assert_eq!(built.controls.splines.len(), 1);
     }
 
     #[test]

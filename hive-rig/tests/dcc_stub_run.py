@@ -137,7 +137,7 @@ def stub_maya():
               "select", "file", "getAttr", "expression", "attributeQuery", "objExists", "delete", "ls",
               "spaceLocator", "listHistory", "polyEvaluate", "warning", "autoKeyframe", "setKeyframe",
               "window", "deleteUI", "columnLayout", "rowLayout", "setParent", "button", "text", "separator",
-              "checkBox", "showWindow", "confirmDialog"]:
+              "checkBox", "showWindow", "confirmDialog", "skinPercent", "pointConstraint"]:
         setattr(cmds, n, generic(n))
 
     om = types.ModuleType("maya.api.OpenMaya")
@@ -253,6 +253,10 @@ if __name__ == "__main__":
         sys.argv = [script, "--save", "/dev/null"]  # batch: no window
         ns = runpy.run_path(script, run_name="__main__")
         assert "setWeights" in calls and "ikHandle" in calls, calls
+        # Spline chains: every curve point gets its weights, the last joint follows the end.
+        splines = json.loads(open(script).read().split('r"""', 1)[1].split('"""', 1)[0])["controls"].get("splines", [])
+        assert calls.count("skinPercent") == sum(len(s["points"]) for s in splines), calls.count("skinPercent")
+        assert calls.count("pointConstraint") == len(splines)
         # Every CV of every control curve lands on hive-rig's outline (in cm).
         rig = json.loads(open(script).read().split('r"""', 1)[1].split('"""', 1)[0])
         for c in rig["controls"]["controls"]:
@@ -294,6 +298,12 @@ if __name__ == "__main__":
         vm = stub_unreal()
         runpy.run_path(script, run_name="__main__")
         assert vm.add_link.call_count > 20
+        # Spline chains: two Fit Chain on Curve units (keep length, then stretch) each.
+        import json
+
+        splines = json.loads(open(script).read().split('r"""', 1)[1].split('"""', 1)[0]).get("splines", [])
+        units = [c.args[0] for c in vm.add_unit_node_from_struct_path.call_args_list]
+        assert units.count("/Script/ControlRig.RigUnit_FitChainToCurvePerItem") == 2 * len(splines), units
     else:
         raise SystemExit("unknown kind " + kind)
     print("%s builder ran against stubs: ok" % kind)

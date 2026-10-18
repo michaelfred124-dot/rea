@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::controls::{
     Control, ControlKind, ControlParent, ControlRig, FootRoll, HockSegment, IkChain, Shape,
-    ctrl_name, fk_name,
+    SplineChain, ctrl_name, fk_name,
 };
 use crate::landmarks::{Landmarks, mirror};
 use crate::naming::Naming;
@@ -122,6 +122,9 @@ pub enum Kind {
     QuadLeg,
     /// FK chain of any length: fingers, tails, ears, hair, props.
     Chain,
+    /// A curve-driven chain (tentacle): a few curve controls bend a smooth
+    /// curve that the joints follow, with stretch, volume and an FK layer.
+    Spline,
     /// Two eyes that look at a movable target.
     Eyes,
     /// A jaw hinging open from below the ears.
@@ -169,7 +172,7 @@ impl Kind {
             Kind::Eyes => &["eye_l", "eye_r", "target"],
             Kind::Jaw => &["jaw", "chin"],
             Kind::Face => &FACE_GUIDES,
-            Kind::Chain => return None,
+            Kind::Chain | Kind::Spline => return None,
         })
     }
 }
@@ -196,16 +199,28 @@ pub struct Guide {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Options {
-    /// Spine joints between the pelvis and the chest guide.
+    /// Spine joints between the pelvis and the chest guide, or a spline chain's
+    /// joints along its guides (one per guide segment when unset).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub joints: Option<usize>,
     /// Twist helper bones on arms and legs.
     #[serde(default = "yes")]
     pub twist: bool,
+    /// Spine: the spine joints follow a curve between the hips and chest
+    /// controls (a spline spine) instead of an FK control each.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub spline: bool,
+    /// Curve controls of a spline chain or spline spine, ends included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controls: Option<usize>,
 }
 
 fn yes() -> bool {
     true
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl Default for Options {
@@ -213,7 +228,25 @@ impl Default for Options {
         Options {
             joints: None,
             twist: true,
+            spline: false,
+            controls: None,
         }
+    }
+}
+
+/// Curve controls on a spline chain (tentacle) unless the options say otherwise.
+pub const SPLINE_CONTROLS: usize = 4;
+/// Curve controls on a spline spine: hips, middle and chest.
+pub const SPINE_SPLINE_CONTROLS: usize = 3;
+
+impl Options {
+    /// Curve controls of a spline chain (`spine` false) or spline spine.
+    pub fn curve_controls(&self, spine: bool) -> usize {
+        self.controls.unwrap_or(if spine {
+            SPINE_SPLINE_CONTROLS
+        } else {
+            SPLINE_CONTROLS
+        })
     }
 }
 
@@ -323,12 +356,22 @@ pub fn twist_name(bone: &str) -> String {
 /// Bone `i` (from 1) of a chain: `index_l` -> `index_01_l`, `tail` -> `tail_01`.
 fn chain_bone_name(id: &str, side: Side, i: usize) -> String {
     let s = side.suffix();
-    let base = if s.is_empty() {
+    format!("{}_{i:02}{s}", id_base(id, side))
+}
+
+/// A sided component's id without its side: `tentacle_l` -> `tentacle`.
+fn id_base(id: &str, side: Side) -> &str {
+    let s = side.suffix();
+    if s.is_empty() {
         id
     } else {
         id.strip_suffix(s).unwrap_or(id)
-    };
-    format!("{base}_{i:02}{s}")
+    }
+}
+
+/// Joints in a spline chain.
+fn spline_joints(c: &Component) -> usize {
+    c.options.joints.unwrap_or(c.guides.len().saturating_sub(1))
 }
 
 /// The bone and control names a component takes from its id, in build order
@@ -343,6 +386,16 @@ pub fn id_names(c: &Component) -> (Vec<String>, Vec<String>) {
             let controls = bones.iter().map(|b| ctrl_name(b)).collect();
             (bones, controls)
         }
+        Kind::Spline => {
+            let bones = (1..=spline_joints(c))
+                .map(|i| chain_bone_name(&c.id, c.side, i))
+                .collect();
+            let (base, s) = (id_base(&c.id, c.side), c.side.suffix());
+            let k = c.options.curve_controls(false);
+            let curve = (1..=k).map(|i| format!("{base}{s}_ik_{i:02}_ctrl"));
+            let fk = (1..k).map(|i| format!("{base}{s}_fk_{i:02}_ctrl"));
+            (bones, curve.chain(fk).collect())
+        }
         Kind::Eyes => (Vec::new(), vec![format!("{}_ctrl", c.id)]),
         _ => (Vec::new(), Vec::new()),
     }
@@ -351,7 +404,10 @@ pub fn id_names(c: &Component) -> (Vec<String>, Vec<String>) {
 /// Kinds that can be added to any rig: the body's own kinds are fixed to the
 /// mannequin's bone names, so a rig has exactly one of each.
 pub fn is_premade_part(kind: Kind) -> bool {
-    matches!(kind, Kind::Chain | Kind::Eyes | Kind::Jaw | Kind::Face)
+    matches!(
+        kind,
+        Kind::Chain | Kind::Spline | Kind::Eyes | Kind::Jaw | Kind::Face
+    )
 }
 
 // --------------------------------------------------------------------------- default layout
@@ -530,6 +586,9 @@ pub enum Preset {
     /// Three-segment hind legs (thigh, calf, hock, paw) on the pelvis, left and right.
     #[value(name = "quad_legs", alias = "quad_leg", alias = "quad-legs")]
     QuadLegs,
+    /// A curve-driven tentacle: curve controls with stretch, volume and an FK
+    /// layer, from the pelvis or any bone (`--parent`).
+    Tentacle,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -542,6 +601,8 @@ pub struct AddOptions {
     pub joints: Option<usize>,
     /// Component id for a tail or chain.
     pub id: Option<String>,
+    /// Curve controls on a tentacle.
+    pub controls: Option<usize>,
 }
 
 /// Add a premade component with guides placed from the current layout. Returns the
@@ -784,6 +845,43 @@ pub fn add_preset(g: &mut Guides, preset: Preset, opts: &AddOptions) -> Result<V
                 .guide("lip_low", mouth + v(0.0, -0.004, 0.0))
                 .guide("lip_corner_l", mouth + v(0.014, 0.0, -0.004))
                 .guide("lip_corner_r", mouth + v(-0.014, 0.0, -0.004));
+            g.components.push(c);
+            added.push(id);
+        }
+        Preset::Tentacle => {
+            let joints = opts.joints.unwrap_or(8);
+            ensure!(
+                (2..=64).contains(&joints),
+                "--joints must be between 2 and 64"
+            );
+            if let Some(k) = opts.controls {
+                ensure!((2..=16).contains(&k), "--controls must be between 2 and 16");
+            }
+            let parent = opts.parent.clone().unwrap_or_else(|| "pelvis".into());
+            let p = sk
+                .bone(&parent)
+                .with_context(|| format!("no bone named {parent}"))?;
+            let side = p.side;
+            let (start, dir, length) = if parent == "pelvis" {
+                // Out behind the body (the character faces +Z), nearly level.
+                let dir = Vec3::new(0.0, -0.2, -1.0).normalize();
+                (p.head - Vec3::Z * 0.07 * h, dir, 0.6 * h)
+            } else {
+                (p.tail, p.direction(), (p.length() * 3.0).max(0.2 * h))
+            };
+            let id = match &opts.id {
+                Some(id) => id.clone(),
+                None => unique_id(g, "tentacle", side),
+            };
+            ensure!(g.component(&id).is_none(), "{id} already exists");
+            let mut c = Component::new(&id, Kind::Spline, side, Some(&parent));
+            c.options.controls = opts.controls;
+            for k in 0..=joints {
+                c = c.guide(
+                    format!("j{}", k + 1),
+                    start + dir * length * (k as f32 / joints as f32),
+                );
+            }
             g.components.push(c);
             added.push(id);
         }
@@ -1082,24 +1180,62 @@ pub fn mirror_side(g: &mut Guides, source: Side) -> usize {
 }
 
 /// Change the spine component's joint count, re-attaching components that hung
-/// from the old top joint to the new one.
+/// from the old top joint to the new one. Nothing changes when the result
+/// wouldn't build.
 pub fn set_spine_joints(g: &mut Guides, spine_id: &str, joints: usize) -> Result<()> {
     ensure!((1..=16).contains(&joints), "spine joints must be 1 to 16");
-    let default_joints = g.rules().spine_joints;
-    let spine = g
-        .components
-        .iter_mut()
-        .find(|c| c.id == spine_id && c.kind == Kind::Spine)
-        .with_context(|| format!("no spine component named {spine_id}"))?;
-    let old_top = spine_name(spine.options.joints.unwrap_or(default_joints) - 1);
-    spine.options.joints = Some(joints);
-    let new_top = spine_name(joints - 1);
-    for c in &mut g.components {
-        if c.parent.as_deref() == Some(old_top.as_str()) {
-            c.parent = Some(new_top.clone());
+    change_spine(g, spine_id, |next, i| {
+        let default_joints = next.rules().spine_joints;
+        let spine = &mut next.components[i];
+        let old_top = spine_name(spine.options.joints.unwrap_or(default_joints) - 1);
+        spine.options.joints = Some(joints);
+        let new_top = spine_name(joints - 1);
+        for c in &mut next.components {
+            if c.parent.as_deref() == Some(old_top.as_str()) {
+                c.parent = Some(new_top.clone());
+            }
         }
+    })
+}
+
+/// Turn the spine's spline (curve) drive on or off, optionally changing its
+/// number of curve controls. The bones keep their names, so everything hung
+/// from the spine stays where it is. Nothing changes when the result wouldn't build.
+pub fn set_spine_spline(
+    g: &mut Guides,
+    spine_id: &str,
+    on: bool,
+    controls: Option<usize>,
+) -> Result<()> {
+    if let Some(k) = controls {
+        ensure!((2..=16).contains(&k), "curve controls must be 2 to 16");
     }
-    build(g).map(|_| ())
+    change_spine(g, spine_id, |next, i| {
+        let options = &mut next.components[i].options;
+        options.spline = on;
+        if controls.is_some() {
+            options.controls = controls;
+        }
+    })
+}
+
+/// Apply `change` to a copy of the layout (with the spine's index) and keep it
+/// only if it builds.
+fn change_spine(
+    g: &mut Guides,
+    spine_id: &str,
+    change: impl FnOnce(&mut Guides, usize),
+) -> Result<()> {
+    let i = g
+        .components
+        .iter()
+        .position(|c| c.id == spine_id && c.kind == Kind::Spine)
+        .with_context(|| format!("no spine component named {spine_id}"))?;
+    let mut next = g.clone();
+    change(&mut next, i);
+    build(&next)?;
+    *g = next;
+    Ok(())
 }
 
 // --------------------------------------------------------------------------- building
@@ -1133,6 +1269,9 @@ struct Builder {
     /// Arm IK chain -> the control of the bone its clavicle hangs from (the chest).
     arm_chest: HashMap<String, String>,
     head_chest: Option<String>,
+    /// Bones without an FK control that a control stands in for as a space: a
+    /// spline spine's top joint -> its chest control.
+    chest_space: HashMap<String, String>,
     component: String,
     /// The body's belly or crotch line: skin below it belongs to a leg.
     crotch_y: f32,
@@ -1224,6 +1363,17 @@ impl Builder {
     fn has_control(&self, name: &str) -> bool {
         self.rig.control(name).is_some()
     }
+
+    /// The control a part hung from `parent` (its parent control) offers as its
+    /// chest space: the parent control itself, or the control standing in for
+    /// a bone that has none (a spline spine's chest).
+    fn chest_of(&self, parent: &ControlParent) -> Option<String> {
+        match parent {
+            ControlParent::Control(c) => Some(c.clone()),
+            ControlParent::Bone(bone) => self.chest_space.get(bone).cloned(),
+            ControlParent::None => None,
+        }
+    }
 }
 
 /// Turn guides into a skeleton and control rig.
@@ -1237,6 +1387,7 @@ pub fn build(g: &Guides) -> Result<Built> {
         blended: HashSet::new(),
         arm_chest: HashMap::new(),
         head_chest: None,
+        chest_space: HashMap::new(),
         component: String::new(),
         crotch_y: g.body.crotch_y,
         rules: g.rules(),
@@ -1253,6 +1404,7 @@ pub fn build(g: &Guides) -> Result<Built> {
             Kind::Leg => build_leg(&mut b, c, parent)?,
             Kind::QuadLeg => build_quad_leg(&mut b, c, parent)?,
             Kind::Chain => build_chain(&mut b, c, parent)?,
+            Kind::Spline => build_spline(&mut b, c, parent)?,
             Kind::Eyes => build_eyes(&mut b, c, parent)?,
             Kind::Jaw => build_jaw(&mut b, p("jaw"), p("chin"), parent)?,
             Kind::Face => build_face(&mut b, c, parent)?,
@@ -1321,6 +1473,27 @@ fn validate(g: &Guides) -> Result<()> {
                 "component {}: a chain needs at least two guides",
                 c.id
             ),
+        }
+        if c.kind == Kind::Spline {
+            ensure!(
+                (2..=64).contains(&spline_joints(c)),
+                "component {}: a spline chain needs 2 to 64 joints",
+                c.id
+            );
+        }
+        if c.kind == Kind::Spine && c.options.spline {
+            ensure!(
+                c.options.joints.unwrap_or(SPINE_JOINTS) >= 2,
+                "component {}: a spline spine needs at least 2 joints",
+                c.id
+            );
+        }
+        if c.kind == Kind::Spline || (c.kind == Kind::Spine && c.options.spline) {
+            ensure!(
+                (2..=16).contains(&c.options.curve_controls(c.kind == Kind::Spine)),
+                "component {}: a spline needs 2 to 16 curve controls",
+                c.id
+            );
         }
         if matches!(c.kind, Kind::Arm | Kind::Leg | Kind::QuadLeg) {
             ensure!(
@@ -1417,6 +1590,49 @@ fn build_spine(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
         0.17 * h,
         CENTER,
     );
+    if c.options.spline {
+        // The hips control drives the pelvis and starts the curve; the chest
+        // control ends it and turns the top joint.
+        b.control(
+            "hips_ctrl".into(),
+            ControlKind::Fk,
+            ControlParent::Control("cog_ctrl".into()),
+            Some("pelvis"),
+            pelvis,
+            Vec3::Y,
+            Shape::Circle,
+            0.14 * h,
+            CENTER,
+        );
+        let k = c.options.curve_controls(true);
+        let mut curve = vec!["hips_ctrl".to_string()];
+        curve.extend((1..k - 1).map(|i| {
+            if k == 3 {
+                "spine_mid_ctrl".to_string()
+            } else {
+                format!("spine_mid_{i:02}_ctrl")
+            }
+        }));
+        curve.push("chest_ctrl".into());
+        let fk: Vec<String> = (1..k).map(|i| format!("spine_fk_{i:02}_ctrl")).collect();
+        let bones: Vec<String> = (0..joints).map(spine_name).collect();
+        spline_controls(
+            b,
+            Spline {
+                name: &c.id,
+                bones: &bones,
+                curve: &curve,
+                fk: &fk,
+                parent: ControlParent::Control("cog_ctrl".into()),
+                curve_size: 0.12 * h,
+                fk_size: 0.15 * h,
+                color: CENTER,
+            },
+        );
+        b.chest_space
+            .insert(spine_name(joints - 1), "chest_ctrl".into());
+        return Ok(());
+    }
     b.control(
         ctrl_name("pelvis"),
         ControlKind::Fk,
@@ -1452,9 +1668,7 @@ fn build_head(b: &mut Builder, parent: &str, neck: Vec3, head: Vec3, top: Vec3) 
     b.bone("neck_01", parent, neck, head, Side::Center, Region::Center)?;
     b.bone("head", "neck_01", head, top, Side::Center, Region::Center)?;
     let mut parent_ctrl = b.parent_control(parent);
-    if let ControlParent::Control(c) = &parent_ctrl {
-        b.head_chest = Some(c.clone());
-    }
+    b.head_chest = b.chest_of(&parent_ctrl);
     for (n, size) in [("neck_01", 0.06), ("head", 0.08)] {
         let bone = b.sk.bone(n).unwrap().clone();
         b.control(
@@ -1512,8 +1726,8 @@ fn build_arm(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
 
     let color = side_color(side);
     let clav_parent = b.parent_control(parent);
-    if let ControlParent::Control(chest) = &clav_parent {
-        b.arm_chest.insert(format!("arm{s}"), chest.clone());
+    if let Some(chest) = b.chest_of(&clav_parent) {
+        b.arm_chest.insert(format!("arm{s}"), chest);
     }
     let cb = b.sk.bone(&clav).unwrap().clone();
     b.control(
@@ -1853,6 +2067,216 @@ fn build_chain(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
         parent_ctrl = ControlParent::Control(ctrl_name(name));
     }
     Ok(())
+}
+
+/// A tentacle: joints spread evenly along the guides (one per guide segment
+/// unless the options set a count), driven by curve controls with an FK layer.
+fn build_spline(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
+    let region =
+        b.sk.bone(parent)
+            .map(|p| p.region)
+            .unwrap_or(Region::Center);
+    let (names, controls) = id_names(c);
+    let guides: Vec<Vec3> = c.guides.iter().map(|g| g.position).collect();
+    let points = if names.len() + 1 == guides.len() {
+        guides
+    } else {
+        resample(&guides, names.len() + 1)
+    };
+    let mut prev = parent.to_string();
+    for (i, name) in names.iter().enumerate() {
+        b.bone(name, &prev, points[i], points[i + 1], c.side, region)?;
+        prev = name.clone();
+    }
+    let k = c.options.curve_controls(false);
+    let (curve, fk) = controls.split_at(k);
+    let length: f32 = points.windows(2).map(|w| w[0].distance(w[1])).sum();
+    let size = (length / k as f32 * 0.3).clamp(0.01 * b.h, 0.07 * b.h);
+    let parent_ctrl = b.parent_control(parent);
+    spline_controls(
+        b,
+        Spline {
+            name: &c.id,
+            bones: &names,
+            curve,
+            fk,
+            parent: parent_ctrl,
+            curve_size: size,
+            fk_size: size * 1.5,
+            color: side_color(c.side),
+        },
+    );
+    Ok(())
+}
+
+/// What `spline_controls` builds on a chain of bones already in the skeleton.
+struct Spline<'a> {
+    name: &'a str,
+    bones: &'a [String],
+    /// Curve control names, start to end. A first name that is already a
+    /// control (the spine's hips) is used as it is.
+    curve: &'a [String],
+    /// FK layer names, one fewer than the curve controls.
+    fk: &'a [String],
+    /// Where the start control and the FK layer hang.
+    parent: ControlParent,
+    curve_size: f32,
+    fk_size: f32,
+    color: [f32; 3],
+}
+
+/// Curve controls spread along a chain (near the peaks of their curve
+/// weights), an FK layer carrying them, and the chain's [`SplineChain`].
+fn spline_controls(b: &mut Builder, s: Spline) {
+    let bones: Vec<_> = s
+        .bones
+        .iter()
+        .map(|n| b.sk.bone(n).unwrap().clone())
+        .collect();
+    // The curve runs through the joints' heads; the last joint hangs off its end.
+    let points: Vec<Vec3> = bones.iter().map(|bone| bone.head).collect();
+    let params = arc_params(&points);
+    let k = s.curve.len();
+    let spots: Vec<(Vec3, Vec3)> = greville(k)
+        .into_iter()
+        .map(|t| {
+            let i = segment_at(&params, t);
+            let span = (params[i + 1] - params[i]).max(1e-9);
+            let f = ((t - params[i]) / span).clamp(0.0, 1.0);
+            let dir = (points[i + 1] - points[i]).try_normalize();
+            (points[i].lerp(points[i + 1], f), dir.unwrap_or(Vec3::Y))
+        })
+        .collect();
+    if !b.has_control(&s.curve[0]) {
+        b.control(
+            s.curve[0].clone(),
+            ControlKind::Spline,
+            s.parent.clone(),
+            None,
+            spots[0].0,
+            spots[0].1,
+            Shape::Square,
+            s.curve_size,
+            s.color,
+        );
+    }
+    let mut parent = s.parent;
+    for i in 0..k - 1 {
+        b.control(
+            s.fk[i].clone(),
+            ControlKind::Fk,
+            parent,
+            None,
+            spots[i].0,
+            spots[i].1,
+            Shape::Circle,
+            s.fk_size,
+            s.color,
+        );
+        parent = ControlParent::Control(s.fk[i].clone());
+        b.control(
+            s.curve[i + 1].clone(),
+            ControlKind::Spline,
+            parent.clone(),
+            None,
+            spots[i + 1].0,
+            spots[i + 1].1,
+            Shape::Square,
+            s.curve_size,
+            s.color,
+        );
+    }
+    let weights = params.iter().map(|&u| spline_basis(k, u)).collect();
+    b.rig.splines.push(SplineChain {
+        name: s.name.to_string(),
+        bones: s.bones.to_vec(),
+        controls: s.curve.to_vec(),
+        fk_controls: s.fk.to_vec(),
+        settings: s.curve[k - 1].clone(),
+        points,
+        params,
+        weights,
+        default_stretch: 1.0,
+        default_volume: 0.0,
+    });
+}
+
+/// Each point's distance along the polyline through them, as a fraction of its length.
+fn arc_params(points: &[Vec3]) -> Vec<f32> {
+    let mut acc = vec![0.0f32];
+    for w in points.windows(2) {
+        acc.push(acc.last().unwrap() + w[0].distance(w[1]));
+    }
+    let total = acc.last().copied().unwrap_or(0.0).max(1e-9);
+    acc.into_iter().map(|d| d / total).collect()
+}
+
+/// The polyline segment holding fraction `t` of its length.
+fn segment_at(params: &[f32], t: f32) -> usize {
+    params
+        .windows(2)
+        .position(|w| t <= w[1])
+        .unwrap_or(params.len() - 2)
+}
+
+/// `count` points evenly spaced along the polyline through `points`.
+fn resample(points: &[Vec3], count: usize) -> Vec<Vec3> {
+    let params = arc_params(points);
+    (0..count)
+        .map(|j| {
+            let t = j as f32 / (count - 1).max(1) as f32;
+            let i = segment_at(&params, t);
+            let span = (params[i + 1] - params[i]).max(1e-9);
+            points[i].lerp(points[i + 1], ((t - params[i]) / span).clamp(0.0, 1.0))
+        })
+        .collect()
+}
+
+/// Knots of a clamped uniform B-spline with `count` control points, and its degree.
+fn spline_knots(count: usize) -> (Vec<f32>, usize) {
+    let degree = (count - 1).min(3);
+    let inner = count - degree - 1;
+    let mut knots = vec![0.0; degree + 1];
+    knots.extend((1..=inner).map(|i| i as f32 / (inner + 1) as f32));
+    knots.extend(std::iter::repeat_n(1.0, degree + 1));
+    (knots, degree)
+}
+
+/// The weight of each of `count` curve controls at `u` (0 to 1 along the
+/// chain): the basis of a clamped uniform B-spline of degree up to 3. The
+/// weights sum to 1, change smoothly, and the end controls own the ends.
+pub fn spline_basis(count: usize, u: f32) -> Vec<f32> {
+    let (knots, degree) = spline_knots(count);
+    let u = u.clamp(0.0, 1.0);
+    let mut n: Vec<f32> = (0..knots.len() - 1)
+        .map(|i| {
+            let inside = if u >= 1.0 {
+                i == count - 1
+            } else {
+                knots[i] <= u && u < knots[i + 1]
+            };
+            if inside { 1.0 } else { 0.0 }
+        })
+        .collect();
+    let ratio = |num: f32, den: f32| if den > 0.0 { num / den } else { 0.0 };
+    for p in 1..=degree {
+        n = (0..n.len() - 1)
+            .map(|i| {
+                ratio(u - knots[i], knots[i + p] - knots[i]) * n[i]
+                    + ratio(knots[i + p + 1] - u, knots[i + p + 1] - knots[i + 1]) * n[i + 1]
+            })
+            .collect();
+    }
+    n
+}
+
+/// Where each curve control sits along the chain (0 to 1): the Greville
+/// abscissae of the B-spline, near the peak of each control's weight.
+fn greville(count: usize) -> Vec<f32> {
+    let (knots, degree) = spline_knots(count);
+    (0..count)
+        .map(|i| knots[i + 1..=i + degree].iter().sum::<f32>() / degree as f32)
+        .collect()
 }
 
 /// One bone per eye, pointing at the target, aimed by a control in front of it;
@@ -2864,5 +3288,276 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn spline_weights_are_a_smooth_partition_of_unity() {
+        for count in 2..=8 {
+            let at = greville(count);
+            assert_eq!((at[0], at[count - 1]), (0.0, 1.0), "{count}");
+            assert!(at.windows(2).all(|w| w[0] < w[1]), "{count}: {at:?}");
+            for i in 0..=40 {
+                let u = i as f32 / 40.0;
+                let w = spline_basis(count, u);
+                assert_eq!(w.len(), count);
+                assert!((w.iter().sum::<f32>() - 1.0).abs() < 1e-5, "{count} {u}");
+                assert!(w.iter().all(|x| *x >= -1e-6), "{count} {u} {w:?}");
+            }
+            // The end controls own the ends of the curve.
+            assert!((spline_basis(count, 0.0)[0] - 1.0).abs() < 1e-6);
+            assert!((spline_basis(count, 1.0)[count - 1] - 1.0).abs() < 1e-6);
+        }
+        // Four controls make one cubic segment: the Bernstein weights.
+        let w = spline_basis(4, 0.5);
+        for (got, want) in w.iter().zip([0.125, 0.375, 0.375, 0.125]) {
+            assert!((got - want).abs() < 1e-6, "{w:?}");
+        }
+    }
+
+    #[test]
+    fn tentacle_preset_builds_a_curve_driven_chain() {
+        let mut g = demo_guides();
+        let added = add_preset(&mut g, Preset::Tentacle, &AddOptions::default()).unwrap();
+        assert_eq!(added, ["tentacle"]);
+        let built = build(&g).unwrap();
+        assert_controls_consistent(&built);
+        let sp = &built.controls.splines[0];
+        assert_eq!(sp.bones.len(), 8);
+        assert_eq!(sp.bones[0], "tentacle_01");
+        assert_eq!(
+            sp.controls,
+            [
+                "tentacle_ik_01_ctrl",
+                "tentacle_ik_02_ctrl",
+                "tentacle_ik_03_ctrl",
+                "tentacle_ik_04_ctrl"
+            ]
+        );
+        assert_eq!(sp.fk_controls.len(), 3);
+        assert_eq!(sp.settings, "tentacle_ik_04_ctrl");
+        let base = built.skeleton.bone("tentacle_01").unwrap().parent.unwrap();
+        assert_eq!(built.skeleton.bones[base].name, "pelvis");
+        // A point per joint head, each weighted by the controls.
+        assert_eq!(
+            (sp.points.len(), sp.params.len(), sp.weights.len()),
+            (8, 8, 8)
+        );
+        for w in &sp.weights {
+            assert!((w.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+        }
+        // The FK layer carries the curve controls: each FK control's child is the next curve control.
+        for (i, fk) in sp.fk_controls.iter().enumerate() {
+            let next = built.controls.control(&sp.controls[i + 1]).unwrap();
+            assert_eq!(next.parent, ControlParent::Control(fk.clone()));
+            assert_eq!(next.kind, ControlKind::Spline);
+        }
+        // The id names list every bone and control the component builds.
+        let (bones, ctrls) = id_names(g.component("tentacle").unwrap());
+        assert_eq!(bones, sp.bones);
+        for c in ctrls {
+            assert!(built.controls.control(&c).is_some(), "{c}");
+        }
+
+        // Joint and control counts are options; the joints are resampled along the guides.
+        let c = g
+            .components
+            .iter_mut()
+            .find(|c| c.id == "tentacle")
+            .unwrap();
+        c.options.joints = Some(12);
+        c.options.controls = Some(5);
+        let first = c.guides[0].position;
+        let last = c.guides.last().unwrap().position;
+        let built = build(&g).unwrap();
+        assert_controls_consistent(&built);
+        let sp = &built.controls.splines[0];
+        assert_eq!(
+            (sp.bones.len(), sp.controls.len(), sp.fk_controls.len()),
+            (12, 5, 4)
+        );
+        let sk = &built.skeleton;
+        assert!((sk.bone("tentacle_01").unwrap().head - first).length() < 1e-5);
+        assert!((sk.bone("tentacle_12").unwrap().tail - last).length() < 1e-4);
+        let lengths: Vec<f32> = sp
+            .bones
+            .iter()
+            .map(|b| sk.bone(b).unwrap().length())
+            .collect();
+        assert!(
+            lengths.iter().all(|l| (l - lengths[0]).abs() < 1e-4),
+            "{lengths:?}"
+        );
+
+        // Bad counts are refused.
+        let c = g
+            .components
+            .iter_mut()
+            .find(|c| c.id == "tentacle")
+            .unwrap();
+        c.options.controls = Some(1);
+        assert!(build(&g).is_err());
+        let c = g
+            .components
+            .iter_mut()
+            .find(|c| c.id == "tentacle")
+            .unwrap();
+        c.options.controls = None;
+        c.options.joints = Some(1);
+        assert!(build(&g).is_err());
+        let mut g = demo_guides();
+        let opts = AddOptions {
+            parent: Some("head".into()),
+            joints: Some(4),
+            controls: Some(3),
+            id: Some("tendril".into()),
+            ..AddOptions::default()
+        };
+        add_preset(&mut g, Preset::Tentacle, &opts).unwrap();
+        let built = build(&g).unwrap();
+        assert_eq!(built.controls.splines[0].controls.len(), 3);
+        assert!(built.skeleton.bone("tendril_04").is_some());
+        assert!(
+            add_preset(
+                &mut g,
+                Preset::Tentacle,
+                &AddOptions {
+                    joints: Some(1),
+                    ..AddOptions::default()
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn spline_spine_uses_hips_and_chest_controls() {
+        let mut g = demo_guides();
+        set_spine_spline(&mut g, "spine", true, None).unwrap();
+        let built = build(&g).unwrap();
+        assert_controls_consistent(&built);
+        let rig = &built.controls;
+        let sp = &rig.splines[0];
+        assert_eq!(sp.bones, ["spine_01", "spine_02", "spine_03"]);
+        assert_eq!(sp.controls, ["hips_ctrl", "spine_mid_ctrl", "chest_ctrl"]);
+        assert_eq!(sp.fk_controls, ["spine_fk_01_ctrl", "spine_fk_02_ctrl"]);
+        // The hips drive the pelvis (and the legs hang from them); no per-joint FK.
+        let hips = rig.control("hips_ctrl").unwrap();
+        assert_eq!(
+            (hips.kind, hips.bone.as_deref()),
+            (ControlKind::Fk, Some("pelvis"))
+        );
+        assert!(rig.control("pelvis_ctrl").is_none() && rig.control("spine_01_ctrl").is_none());
+        assert_eq!(
+            rig.control("thigh_l_fk_ctrl").unwrap().parent,
+            ControlParent::Control("hips_ctrl".into())
+        );
+        // Parts on the top joint follow the bone, with the chest control as their chest space.
+        assert_eq!(
+            rig.control("clavicle_l_ctrl").unwrap().parent,
+            ControlParent::Bone("spine_03".into())
+        );
+        assert!(
+            rig.control("hand_l_ik_ctrl")
+                .unwrap()
+                .spaces
+                .contains(&"chest_ctrl".to_string())
+        );
+        assert!(
+            rig.control("head_ctrl")
+                .unwrap()
+                .spaces
+                .contains(&"chest_ctrl".to_string())
+        );
+        // The bones are the same as the FK spine's, so attachments are untouched.
+        let fk = build(&demo_guides()).unwrap();
+        let names = |b: &Built| {
+            b.skeleton
+                .bones
+                .iter()
+                .map(|x| x.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&built), names(&fk));
+
+        // More curve controls, a joint count change, then back to FK.
+        set_spine_spline(&mut g, "spine", true, Some(5)).unwrap();
+        set_spine_joints(&mut g, "spine", 6).unwrap();
+        let built = build(&g).unwrap();
+        assert_controls_consistent(&built);
+        let sp = &built.controls.splines[0];
+        assert_eq!(sp.controls.len(), 5);
+        assert_eq!(sp.controls[1], "spine_mid_01_ctrl");
+        assert_eq!(sp.bones.len(), 6);
+        assert!(
+            set_spine_joints(&mut g, "spine", 1).is_err(),
+            "a spline spine needs two joints"
+        );
+        assert!(set_spine_spline(&mut g, "spine", true, Some(1)).is_err());
+        set_spine_spline(&mut g, "spine", false, None).unwrap();
+        let built = build(&g).unwrap();
+        assert!(built.controls.splines.is_empty());
+        assert!(built.controls.control("spine_06_ctrl").is_some());
+        // The option is saved only when on.
+        let json = serde_json::to_string(&g).unwrap();
+        assert!(!json.contains("\"spline\""));
+        set_spine_spline(&mut g, "spine", true, None).unwrap();
+        let back: Guides = serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
+        assert!(back.component("spine").unwrap().options.spline);
+    }
+
+    #[test]
+    fn spline_names_follow_the_naming_convention_and_sides() {
+        let mut g = demo_guides();
+        set_spine_spline(&mut g, "spine", true, None).unwrap();
+        let opts = AddOptions {
+            parent: Some("hand_l".into()),
+            joints: Some(3),
+            ..AddOptions::default()
+        };
+        add_preset(&mut g, Preset::Tentacle, &opts).unwrap();
+        let opts = AddOptions {
+            parent: Some("hand_r".into()),
+            joints: Some(3),
+            ..AddOptions::default()
+        };
+        add_preset(&mut g, Preset::Tentacle, &opts).unwrap();
+        let mut built = build(&g).unwrap();
+        let sp = built
+            .controls
+            .splines
+            .iter()
+            .find(|s| s.name == "tentacle_l")
+            .unwrap();
+        assert_eq!(sp.bones[0], "tentacle_01_l");
+        assert_eq!(sp.controls[0], "tentacle_l_ik_01_ctrl");
+        assert!(built.controls.mirror_pairs.contains(&[
+            "tentacle_l_ik_02_ctrl".into(),
+            "tentacle_r_ik_02_ctrl".into()
+        ]));
+        let naming = crate::naming::Preset::Prefix.naming();
+        naming
+            .apply(&mut built.skeleton, &mut built.controls)
+            .unwrap();
+        for sp in &built.controls.splines {
+            for b in &sp.bones {
+                assert!(built.skeleton.bone(b).is_some(), "{b}");
+            }
+            for c in sp
+                .controls
+                .iter()
+                .chain(&sp.fk_controls)
+                .chain([&sp.settings])
+            {
+                assert!(built.controls.control(c).is_some(), "{c}");
+            }
+        }
+        let sp = built
+            .controls
+            .splines
+            .iter()
+            .find(|s| s.name == "tentacle_l")
+            .unwrap();
+        assert_eq!(sp.controls[0], "L_tentacle_ik_01_ctrl");
+        assert_eq!(built.controls.splines[0].controls[0], "C_hips_ctrl");
     }
 }

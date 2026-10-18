@@ -57,6 +57,7 @@ fn kind_label(k: Kind) -> &'static str {
         Kind::Leg => "Leg",
         Kind::QuadLeg => "Hind leg",
         Kind::Chain => "Chain",
+        Kind::Spline => "Tentacle",
         Kind::Eyes => "Eyes",
         Kind::Jaw => "Jaw",
         Kind::Face => "Face",
@@ -153,7 +154,7 @@ struct LibraryPart {
     once: Option<Kind>,
 }
 
-const LIBRARY: [LibraryPart; 11] = [
+const LIBRARY: [LibraryPart; 12] = [
     LibraryPart {
         art: Art::Face,
         title: "Face",
@@ -216,6 +217,14 @@ const LIBRARY: [LibraryPart; 11] = [
         text: "An FK tail from the pelvis.",
         category: Category::Body,
         add: Studio::add_tail,
+        once: None,
+    },
+    LibraryPart {
+        art: Art::Tentacle,
+        title: "Tentacle",
+        text: "Curve controls bend it smoothly, with stretch, volume and FK.",
+        category: Category::Body,
+        add: Studio::add_tentacle,
         once: None,
     },
     LibraryPart {
@@ -1587,6 +1596,54 @@ impl Studio {
                     self.edit("change the spine", |g| {
                         components::set_spine_joints(g, &id, joints)?;
                         Ok(format!("Spine now has {joints} joints."))
+                    });
+                }
+                let mut spline = comp.options.spline;
+                let mut controls = comp.options.curve_controls(true);
+                let before = (spline, controls);
+                ui.horizontal(|ui| {
+                    theme::pill(ui, &mut spline, "Spline (curve)").on_hover_text(
+                        "Drive the spine with a curve between the hips and chest controls",
+                    );
+                    if spline {
+                        ui.label(RichText::new("controls").color(TEXT_DIM));
+                        ui.add(egui::DragValue::new(&mut controls).range(2..=8));
+                    }
+                });
+                if (spline, controls) != before {
+                    let id = comp.id.clone();
+                    self.edit("change the spine", |g| {
+                        components::set_spine_spline(g, &id, spline, Some(controls))?;
+                        Ok(if spline {
+                            format!("The spine follows a curve with {controls} controls.")
+                        } else {
+                            "The spine has FK controls.".to_string()
+                        })
+                    });
+                }
+            }
+            Kind::Spline => {
+                let mut joints = comp
+                    .options
+                    .joints
+                    .unwrap_or(comp.guides.len().saturating_sub(1));
+                let mut controls = comp.options.curve_controls(false);
+                let before = (joints, controls);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Joints").color(TEXT_DIM));
+                    ui.add(egui::DragValue::new(&mut joints).range(2..=64));
+                    ui.label(RichText::new("Curve controls").color(TEXT_DIM));
+                    ui.add(egui::DragValue::new(&mut controls).range(2..=16));
+                });
+                if (joints, controls) != before {
+                    let id = comp.id.clone();
+                    self.edit("change the tentacle", |g| {
+                        let c = g.components.iter_mut().find(|x| x.id == id).unwrap();
+                        c.options.joints = Some(joints);
+                        c.options.controls = Some(controls);
+                        Ok(format!(
+                            "{id} has {joints} joints and {controls} curve controls."
+                        ))
                     });
                 }
             }
@@ -3322,6 +3379,7 @@ enum Art {
     Ears,
     Fingers,
     Tail,
+    Tentacle,
     Ponytail,
     Prop,
     Chain,
@@ -3638,9 +3696,13 @@ fn hot_chain(painter: &egui::Painter, pts: &[Pos2], width: f32, hot: bool) {
 fn illustration(painter: &egui::Painter, r: Rect, art: Art, hot: bool) {
     match art {
         Art::Face | Art::Eyes | Art::Jaw | Art::Ears | Art::Ponytail => bust(painter, r, art, hot),
-        Art::Fingers | Art::Toes | Art::HindLegs | Art::Tail | Art::Prop | Art::Chain => {
-            figure(painter, r, art, hot)
-        }
+        Art::Fingers
+        | Art::Toes
+        | Art::HindLegs
+        | Art::Tail
+        | Art::Tentacle
+        | Art::Prop
+        | Art::Chain => figure(painter, r, art, hot),
     }
 }
 
@@ -3791,6 +3853,31 @@ fn figure(painter: &egui::Painter, r: Rect, art: Art, hot: bool) {
             .map(|(x, y)| pt(x, y))
             .collect();
             hot_chain(painter, &pts, 2.2, hot);
+        }
+        Art::Tentacle => {
+            // A wavy chain from the pelvis with square curve controls along it.
+            let pts: Vec<Pos2> = (0..9)
+                .map(|i| {
+                    let t = i as f32 / 8.0;
+                    let x = 4.0 + 40.0 * t;
+                    let y = 58.0 + 16.0 * t - 7.0 * (t * std::f32::consts::TAU).sin();
+                    pt(x, y)
+                })
+                .collect();
+            hot_chain(painter, &pts, 1.4, hot);
+            let honey = if hot {
+                Color32::from_rgb(255, 205, 100)
+            } else {
+                ACCENT
+            };
+            for i in [0, 3, 5, 8] {
+                painter.rect_stroke(
+                    Rect::from_center_size(pts[i], Vec2::splat(5.5 * k)),
+                    1,
+                    Stroke::new(1.6, honey),
+                    egui::StrokeKind::Middle,
+                );
+            }
         }
         Art::Prop => {
             let hand = pt(-32.0, 46.0);
@@ -4391,6 +4478,7 @@ fn kind_word(kind: ControlKind) -> &'static str {
         ControlKind::IkEffector => "IK",
         ControlKind::Pole => "Pole",
         ControlKind::Hock => "Hock",
+        ControlKind::Spline => "Curve",
         _ => "Animator",
     }
 }

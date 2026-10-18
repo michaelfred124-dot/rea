@@ -740,7 +740,7 @@ fn hierarchy(g: &Guides, built: &Built, out: &mut Vec<Issue>) {
             Kind::Eyes | Kind::Jaw | Kind::Face => {
                 (&[Kind::Head, Kind::Jaw], Some("head".into()), "the head")
             }
-            Kind::Chain | Kind::Root => (&[], None, ""),
+            Kind::Chain | Kind::Spline | Kind::Root => (&[], None, ""),
         };
         let wrong_kind = !expected.is_empty() && !expected.contains(&o.kind);
         let crossed = c.side != Side::Center && o.side != Side::Center && o.side != c.side;

@@ -303,6 +303,12 @@ impl Naming {
                 ctrl(&mut h.control);
             }
         }
+        for s in &mut controls.splines {
+            s.bones.iter_mut().for_each(bone);
+            s.controls.iter_mut().for_each(ctrl);
+            s.fk_controls.iter_mut().for_each(ctrl);
+            ctrl(&mut s.settings);
+        }
         Ok(())
     }
 }

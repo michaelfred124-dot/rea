@@ -36,6 +36,8 @@ patterns) applied to every export, and now:
 - **Versioning**: guides and rig files carry the hive-rig version that wrote
   them; the guides version pins the builder rules the file doesn't spell out,
   and files from a newer hive-rig open with a warning.
+- **Spline chains**: a `tentacle` (spline) component and a spline spine option;
+  see gap 4.
 
 ## Gaps, ranked by how much they'd help a rigger
 
@@ -44,7 +46,7 @@ patterns) applied to every export, and now:
 | 1 | Quadrupeds and creatures | Dog, horse, spider, dinosaur, werewolf templates; quad legs | Done: a `quad_leg` component (thigh, calf, hock and paw; two-bone IK aimed at a hock control, reverse paw roll, FK, stretch) and a dog layout (`demo --quadruped`), checked in real Blender. Next: horse, spider and dinosaur templates, multi-leg sides, an automatic (spring) hock | Medium |
 | 2 | Face, next steps | Joint-based face plus face controls on a panel | Done: face joints. Next: a 2D face control board, lip zippers, sticky lips | Medium |
 | 3 | Bendy limbs | Bendy/ribbon arms and legs, soft IK | Extra mid-limb controls driving the twist bones; soft IK to stop knee pop | Medium |
-| 4 | Spine and tentacles | Spline (IK) spine, tentacles, multi-branch FK | A spline-chain component with stretch and volume | Medium |
+| 4 | Spine and tentacles | Spline (IK) spine, tentacles, multi-branch FK | Done: a `spline` component (`hive-rig add <guides> tentacle`; joint and curve-control counts) whose curve controls bend a smooth curve the joints follow, with an FK layer, `stretch` on/off and `volume`, and `spine --spline true` for a spline spine (hips and chest controls end the curve). Spline IK on a hooked curve in Blender (checked in real Blender), ikSplineHandle with advanced twist in Maya, Fit Chain on Curve in Unreal (both only against stubs). Next: twist along the chain in Blender, volume in Unreal, an exact curve in Unreal past four controls, a sliding (offset) attribute, multi-branch FK | Medium |
 | 5 | IK/FK and space matching | Snap IK to FK and back without a pop | Done in the Blender tab and Maya window. Next: the same in Unreal (a Control Rig function or editor utility), and matching across a frame range | Small |
 | 6 | Animator tools | Mirror poses, select-all-controls, reset pose | Done in Blender and Maya. Next: flip a whole pose (centre controls too), a pose library | Small |
 | 7 | Joints to guides, next steps | Turn an existing skeleton into guides | Done for .glb. Next: unknown chains (ears, tails, hair) read back as chain components, and FBX input | Small |
