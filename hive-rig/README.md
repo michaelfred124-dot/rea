@@ -29,11 +29,12 @@ a joint; with Symmetry on, its twin on the other side follows.
   middle builds the rig.
 * **The outliner** (left) lists the components as a tree. **Properties** (right)
   shows the rig summary, skin weights (with Mirror and Smooth) and naming, or, with a component
-  selected, its attachment, options, exact guide positions and the names its
+  selected, its attachment, options (the spine's joint count and **Spline (curve)**
+  toggle, a tentacle's joint and curve-control counts), exact guide positions and the names its
   bones will export as. Click a panel's title to fold it away.
 * **The rigging window** (Add, or Shift+A) is the library of premade parts, each
   with an illustration: face joints, eyes with a look-at control, a jaw, ears, fingers, toes, a
-  tail, a ponytail, a prop socket in the right hand, three-segment hind legs
+  tail, a curve-driven tentacle, a ponytail, a prop socket in the right hand, three-segment hind legs
   for quadrupeds, and a custom chain. Its **Templates** category lists saved
   setups (see [Rig templates](#rig-templates)).
 * **The export window** (Ctrl+E) picks the programs, the naming convention, the
@@ -77,7 +78,8 @@ that Blender and Unreal import natively.
 ### The control rig
 
 * `root_ctrl` (world placement) and `cog_ctrl` (moves the body, feet stay planted)
-* FK controls for pelvis, three spine joints, neck, head, clavicles and toes
+* FK controls for pelvis, three spine joints, neck, head, clavicles and toes,
+  or a spline spine (see [Spline chains](#spline-chains-tentacles-and-a-spline-spine))
 * Arms and legs have FK controls, an IK control, a pole-vector control and an
   `ik_fk` blend (0 = FK, 1 = IK). Legs start in IK and arms start in FK.
 * `stretch` on every limb's IK control (0 = rigid, 1 = reaches any goal)
@@ -144,6 +146,7 @@ A rig is a list of components, each placed by a few guide points:
 | leg | hip, knee, ankle, ball, toe, heel | IK/FK leg, reverse foot, stretch, spaces, twist bones |
 | quad_leg | hip, knee, hock, ankle, ball, toe, heel | three-segment hind leg (`thigh`, `calf`, `hock`, `foot`, `ball`): IK with a hock control, reverse paw roll, FK, stretch, spaces, twist bones |
 | chain | two or more | an FK chain: fingers, tails, ears, hair, props |
+| spline | two or more (`j1`…) | a curve-driven chain (tentacle): curve controls, an FK layer, `stretch` and `volume` |
 | eyes | eye_l, eye_r, target | `eye_l`, `eye_r` aimed by a look-at control that follows the head or stays in the world |
 | jaw | jaw, chin | `jaw` with a rotate control |
 | face | brows (3 a side), upper and lower lids, cheeks, nose, upper and lower lip, lip corners | 17 face joints on the head, each with a small control that moves and rotates it; lids pivot on the eye, the lower lip rides on the jaw |
@@ -158,11 +161,59 @@ hive-rig add out/hero.guides.json eyes              # look-at eyes on the head
 hive-rig add out/hero.guides.json jaw
 hive-rig add out/hero.guides.json face              # brow, lid, cheek, nose and lip joints
 hive-rig add out/hero.guides.json chain --parent head --joints 2 --id ear_l
+hive-rig add out/hero.guides.json tentacle --joints 10 --controls 5   # curve-driven, from the pelvis
+hive-rig spine out/hero.guides.json --spline true    # the spine follows a curve (hips, mid, chest)
 hive-rig remove out/hero.guides.json tail           # also removes anything attached to it
 hive-rig components out/hero.guides.json            # list the layout
 hive-rig rebuild out/hero.hive.json                 # rebuild from the edited guides
 hive-rig rig other_character.glb --guides out/hero.guides.json   # reuse a layout
 ```
+
+### Spline chains: tentacles and a spline spine
+
+A spline chain's joints follow a smooth curve that a few curve controls bend.
+`hive-rig add <guides> tentacle` adds one from the pelvis (`--parent` for any
+other bone) with 8 joints (`--joints`) and 4 curve controls (`--controls`, ends
+included). The guides `j1`, `j2`… set the rest shape; the joints are spread
+evenly along them, one per guide segment unless the `joints` option says
+otherwise.
+
+* **Curve controls** (`tentacle_ik_01_ctrl`…) sit along the chain. Each joint
+  follows them by a smooth weighting (the end controls own the ends), so moving
+  one bends the chain and the joints stay on the curve. The end control also
+  turns the last joint.
+* **FK layer** (`tentacle_fk_01_ctrl`…): each FK control carries the next curve
+  control and the FK controls after it, so turning one swings the rest of the
+  chain, and the curve controls stay free to tweak on top.
+* **`stretch`** on the end control: 1 (the default) stretches the joints to the
+  curve's length; 0 keeps their length so they slide along it.
+* **`volume`** on the end control: 0 (the default) to 1, thins stretched joints
+  and thickens squashed ones to keep their volume.
+
+`hive-rig spine <guides> --spline true` (or **Spline (curve)** in the spine's
+Properties) gives the spine the same rig: `hips_ctrl` drives the pelvis and
+starts the curve, `spine_mid_ctrl` bends it and `chest_ctrl` ends it and turns
+the top spine joint, with `spine_fk_01_ctrl`… as the FK layer. `--controls`
+sets the number of curve controls (3 by default) and `--joints` the spine
+joints (at least 2 for a spline spine). The bones keep their names, so the head
+and arms stay attached; they follow the top joint, and the IK hands and the
+head can take `chest_ctrl` as their chest space. `--spline false` brings the
+FK spine back.
+
+How each program builds it:
+
+* **Blender:** a Bézier curve hooked to a bone per curve point, which follows
+  the curve controls through an Armature constraint (their weights); a hidden
+  copy of the joints rides the curve with **Spline IK** (stretch switches its Y
+  scale mode, volume drives its bulge) and the deform joints copy it.
+* **Maya:** a curve skinned to a joint under each curve control with the same
+  weights, an **ikSplineHandle** with advanced twist from the start and end
+  controls, and stretch and volume from the curve's length (`curveInfo`).
+* **Unreal:** Control Rig's **Fit Chain on Curve** on the closest four-point
+  Bézier (exact up to four controls), once keeping lengths and again stretched
+  by `<name>_stretch`. Volume isn't built in Unreal yet, and Fit Chain on Curve
+  takes one cubic Bézier, so with more than four controls the curve is an
+  approximation.
 
 ### Quadrupeds: the dog layout and hind legs
 
@@ -420,6 +471,7 @@ python3 tests/dcc_stub_run.py unreal out/hive_demo_unreal.py  # Python-level che
 pip install bpy && python tests/blender_check.py out/hive_demo_blender.py out/hive_demo.glb
 python tests/blender_guides_check.py out/hive_demo_blender.py           # guides and rebuild
 python tests/blender_quad_check.py dog/hive_dog_blender.py dog/hive_dog.glb   # after demo --quadruped -o dog
+python tests/blender_spline_check.py out/hive_demo_blender.py out/hive_demo.glb   # after add tentacle, spine --spline true, rebuild
 python3 tests/dcc_stub_run.py maya out/hive_demo_maya.py --guides       # Maya guide tools
 python tests/blender_anim_check.py out/hive_demo_blender.py             # animator tools
 ```
@@ -450,6 +502,17 @@ and the front elbows fold back, the poles stand straight ahead of the knees,
 the hock control swings the hock while the paw stays planted, FK moves the
 legs, the paw rolls on its heel, pads and toe tip, stretch reaches a far goal,
 lifting a hind paw leaves the front paw's skin alone, and the `.glb` re-imports.
+
+`blender_spline_check.py` builds a rig with a tentacle and a spline spine in
+real Blender. For both chains it checks that the joints sit on the curve at
+rest and stay on it when the middle curve controls bend it, that the chain
+bends smoothly with its base in place, that with `stretch` on the chain reaches
+a far end control and with it off the joints keep their length, that `volume`
+thins stretched joints, that the first FK control swings the chain, and that
+the end control turns the last joint. On the spine it checks that the chest
+control carries the head and arms with the feet planted, that the hips turn the
+pelvis, and that the IK hand can follow the chest. A bent tentacle deforms the
+mesh, reset brings it back to rest, and the `.glb` re-imports with every joint.
 The app's editing operations (add, remove, mirror, symmetric moves, undo, build,
 export, reopening a rig and loading templates) have unit tests in `src/studio/app.rs`;
 templates have their own (`src/template.rs`: JSON round trip, scaling to another
@@ -460,7 +523,8 @@ executables as a downloadable artifact.
 
 The Maya and Unreal builders, and the Maya guide and animator tools, are checked against stub
 APIs. That catches script errors but doesn't prove the application calls behave
-as intended. The Maya stub also checks that every control curve point is placed
+as intended (the spline chains' ikSplineHandle and Fit Chain on Curve setups
+included). The Maya stub also checks that every control curve point is placed
 on the control's outline. The builders haven't been run inside Maya or Unreal yet.
 
 ## Not yet included

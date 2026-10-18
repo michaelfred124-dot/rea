@@ -120,6 +120,7 @@ pub fn script(rig: &Rig, target: Target, glb_path: &Path) -> Result<String> {
                 "bones": bones,
                 "controls": rig.controls.controls,
                 "ik_chains": rig.controls.ik_chains,
+                "splines": rig.controls.splines,
                 "basis": basis,
             });
             fill(UNREAL_TEMPLATE, &serde_json::to_string(&data)?, &glb)

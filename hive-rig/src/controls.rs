@@ -261,6 +261,9 @@ pub enum ControlKind {
     /// Hock control of a three-segment leg: sits at the ankle under the IK goal
     /// and swings the hock about it, which sets where the two-bone IK aims.
     Hock,
+    /// Curve control of a spline chain (tentacle, spline spine): moving and
+    /// turning it bends the curve the chain's joints follow.
+    Spline,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -416,10 +419,49 @@ pub struct FootRoll {
     pub break_angle: f32,
 }
 
+/// A chain of joints that follows a smooth curve (a tentacle, or a spline spine).
+///
+/// The curve runs through `points` (the joints' heads) at rest. Each point
+/// follows the curve controls by `weights`, the way a skinned curve follows its
+/// joints: posed, a point moves by the weighted blend of its controls' moves
+/// from rest. All joints but the last are fitted along the curve, stretching to
+/// its length or keeping their own; the last joint starts where they end and
+/// turns with the last curve control, like a chest or the tip of a tentacle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SplineChain {
+    /// The component id.
+    pub name: String,
+    /// The deform joints from the base to the tip.
+    pub bones: Vec<String>,
+    /// Curve controls from the start of the curve to its end. The first can
+    /// also drive a bone (a spline spine's hips control drives the pelvis).
+    pub controls: Vec<String>,
+    /// The FK layer: `fk_controls[k]` carries curve control `k + 1` (and the
+    /// FK controls after it), so turning one swings the rest of the chain.
+    pub fk_controls: Vec<String>,
+    /// The control that carries the `stretch` and `volume` attributes.
+    pub settings: String,
+    /// Curve points at rest: every joint's head.
+    pub points: Vec<Vec3>,
+    /// Each point's place along the chain, 0 at the base to 1 at the tip.
+    pub params: Vec<f32>,
+    /// Per point, the weight of each curve control (they sum to 1).
+    pub weights: Vec<Vec<f32>>,
+    /// Initial `stretch`: 1 = the joints stretch to the curve's length, 0 = they
+    /// keep their own and slide along it.
+    pub default_stretch: f32,
+    /// Initial `volume`: 0 = no squash, 1 = the joints thin as they stretch and
+    /// thicken as they squash, keeping their volume.
+    pub default_volume: f32,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ControlRig {
     pub controls: Vec<Control>,
     pub ik_chains: Vec<IkChain>,
+    /// Curve-driven chains: tentacles and spline spines.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub splines: Vec<SplineChain>,
     /// Left/right control twins as `[left, right]`, for the animator tools' pose
     /// mirroring. Found from the internal names when the rig is built, so the DCC
     /// scripts never guess sides from the exported naming convention.

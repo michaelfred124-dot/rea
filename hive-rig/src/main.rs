@@ -84,6 +84,23 @@ enum Command {
         /// Component id for a tail or chain.
         #[arg(long)]
         id: Option<String>,
+        /// Curve controls on a tentacle (ends included, default 4).
+        #[arg(long)]
+        controls: Option<usize>,
+    },
+    /// Change the spine: its joint count, and whether a curve between the hips
+    /// and chest controls drives it (a spline spine) instead of FK.
+    Spine {
+        guides: PathBuf,
+        /// Spine joints (1 to 16).
+        #[arg(long)]
+        joints: Option<usize>,
+        /// Drive the spine with a curve.
+        #[arg(long, action = clap::ArgAction::Set)]
+        spline: Option<bool>,
+        /// Curve controls of a spline spine (ends included, default 3).
+        #[arg(long)]
+        controls: Option<usize>,
     },
     /// Hang a component from another bone (its guides stay where they are).
     Attach {
@@ -507,6 +524,7 @@ fn main() -> Result<()> {
             parent,
             joints,
             id,
+            controls,
         } => {
             let mut g = Guides::load(&guides)?;
             let opts = AddOptions {
@@ -517,10 +535,44 @@ fn main() -> Result<()> {
                 parent,
                 joints,
                 id,
+                controls,
             };
             let added = components::add_preset(&mut g, preset, &opts)?;
             save_guides(&guides, &g)?;
             println!("Added {}", added.join(", "));
+            Ok(())
+        }
+        Command::Spine {
+            guides,
+            joints,
+            spline,
+            controls,
+        } => {
+            let mut g = Guides::load(&guides)?;
+            let id = g
+                .components
+                .iter()
+                .find(|c| c.kind == Kind::Spine)
+                .map(|c| c.id.clone())
+                .context("the layout has no spine")?;
+            if let Some(n) = joints {
+                components::set_spine_joints(&mut g, &id, n)?;
+            }
+            if spline.is_some() || controls.is_some() {
+                let on = spline.unwrap_or_else(|| g.component(&id).unwrap().options.spline);
+                components::set_spine_spline(&mut g, &id, on, controls)?;
+            }
+            save_guides(&guides, &g)?;
+            let o = &g.component(&id).unwrap().options;
+            let joints = o.joints.unwrap_or(components::SPINE_JOINTS);
+            if o.spline {
+                println!(
+                    "{id}: {joints} joints on a curve with {} controls",
+                    o.curve_controls(true)
+                );
+            } else {
+                println!("{id}: {joints} joints with FK controls");
+            }
             Ok(())
         }
         Command::Attach { guides, id, bone } => {
@@ -556,6 +608,16 @@ fn main() -> Result<()> {
                 let parent = c.parent.as_deref().unwrap_or("-");
                 let extra = match c.kind {
                     Kind::Chain => format!("{} bones", c.guides.len() - 1),
+                    Kind::Spline => format!(
+                        "{} bones, {} curve controls",
+                        c.options.joints.unwrap_or(c.guides.len() - 1),
+                        c.options.curve_controls(false)
+                    ),
+                    Kind::Spine if c.options.spline => format!(
+                        "{} joints on a curve ({} controls)",
+                        c.options.joints.unwrap_or(components::SPINE_JOINTS),
+                        c.options.curve_controls(true)
+                    ),
                     Kind::Spine => format!(
                         "{} joints",
                         c.options.joints.unwrap_or(components::SPINE_JOINTS)

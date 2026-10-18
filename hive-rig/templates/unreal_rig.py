@@ -21,6 +21,7 @@ NAME = RIG["name"]
 BONES = RIG["bones"]
 CONTROLS = RIG["controls"]
 CHAINS = RIG["ik_chains"]
+SPLINES = RIG.get("splines", [])
 BASIS_BONES = RIG["basis"]  # pelvis, left hand, head, left ball in this rig's naming
 
 # The .glb written next to this script. Edit if you moved it.
@@ -204,6 +205,15 @@ def rotate(vec, axis, angle):
 chain_end_ik = {c["ik_control"]: c["end"] for c in CHAINS}
 chain_of_pole = {c["pole_control"]: c for c in CHAINS}
 chain_of_hock = {c["hock"]["control"]: c for c in CHAINS if c.get("hock")}
+spline_of = {n: sp for sp in SPLINES for n in sp["controls"] + sp["fk_controls"]}
+
+
+def nearest_bone(sp, position):
+    """The spline joint whose head is nearest a point (hive space)."""
+    def dist(b):
+        h = hive_head(b)
+        return sum((h[k] - position[k]) ** 2 for k in range(3))
+    return min(sp["bones"], key=dist)
 
 
 def solve_end(chain):
@@ -221,6 +231,12 @@ def target_transform(c):
         return initial(bone_key(BASIS_BONES[0]))
     if c["kind"] == "aim":
         return unreal.Transform(location=to_ue(c["position"]))
+    if c["name"] in spline_of:
+        # Curve and FK-layer controls turn like the joint they sit on, so the end
+        # control's rotation is the last joint's.
+        sp = spline_of[c["name"]]
+        bone = sp["bones"][-1] if c["name"] == sp["controls"][-1] else nearest_bone(sp, c["position"])
+        return unreal.Transform(location=to_ue(c["position"]), rotation=initial(bone_key(bone)).rotation.rotator())
     if c["kind"] == "hock":
         # At the ankle, turned like the hock bone.
         chain = chain_of_hock[c["name"]]
@@ -287,6 +303,9 @@ for chain in CHAINS:
     add_float(chain["name"] + "_stretch", owner, 0.0, 1.0, chain["default_stretch"])
     if chain.get("foot"):
         add_float(chain["name"] + "_roll", owner, -90.0, 120.0, 0.0)
+for sp in SPLINES:
+    # Volume (squash) is built in Blender and Maya only.
+    add_float(sp["name"] + "_stretch", control_key(sp["settings"]), 0.0, 1.0, sp["default_stretch"])
 
 # Space switching uses Control Rig's own "available spaces" (UE 5.4+), which
 # animators switch from the Sequencer with automatic compensation.
@@ -397,8 +416,104 @@ for chain in CHAINS:
     for ctrl in chain["fk_controls"]:
         limb_ctrls[ctrl] = chain
 
-# FK in hierarchy order: controls are listed parents-first.
+
+def bezier_fit(params):
+    """How each point of the four-point Bezier closest to a curve is made from
+    the curve's points, as coefficients per point. It starts and ends on the
+    curve; its middle points are a least-squares fit, nudged toward thirds of
+    the chord so short chains still have one (UE's Fit Chain on Curve takes a
+    single cubic Bezier, which matches the curve exactly up to four controls)."""
+    m = len(params)
+    bern = [[(1 - u) ** 3, 3 * u * (1 - u) ** 2, 3 * u * u * (1 - u), u ** 3] for u in params]
+    soft = 1e-3
+    a11 = sum(b[1] * b[1] for b in bern) + soft
+    a12 = sum(b[1] * b[2] for b in bern)
+    a22 = sum(b[2] * b[2] for b in bern) + soft
+    det = a11 * a22 - a12 * a12
+    rhs = []
+    for j, third in ((1, 2.0 / 3.0), (2, 1.0 / 3.0)):
+        r = [b[j] for b in bern]
+        r[0] += soft * third - sum(b[j] * b[0] for b in bern)
+        r[-1] += soft * (1.0 - third) - sum(b[j] * b[3] for b in bern)
+        rhs.append(r)
+    first = [1.0 if i == 0 else 0.0 for i in range(m)]
+    last = [1.0 if i == m - 1 else 0.0 for i in range(m)]
+    p1 = [(a22 * x - a12 * y) / det for x, y in zip(*rhs)]
+    p2 = [(a11 * y - a12 * x) / det for x, y in zip(*rhs)]
+    return [first, p1, p2, last]
+
+
+def solve_spline(sp):
+    """Fit the joints on the curve the controls bend: each Bezier point is its
+    rest place plus the weighted moves of the controls. The joints keep their
+    lengths, then stretch along the whole curve by the stretch control; the last
+    joint turns with the end control."""
+    n, bones, weights = sp["name"], sp["bones"], sp["weights"]
+    rest_ctrl = [initial(control_key(c)).translation for c in sp["controls"]]
+    rest_pts = [bone_location(b) for b in bones]
+    gets = [get_control(c) for c in sp["controls"]]
+    points = []
+    for j, coef in enumerate(bezier_fit(sp["params"])):
+        row = [sum(ci * w[c] for ci, w in zip(coef, weights)) for c in range(len(rest_ctrl))]
+        # The rest Bezier point, less where the weighted rest controls put it.
+        offset = unreal.Vector(0, 0, 0)
+        for ci, p in zip(coef, rest_pts):
+            offset = offset + p * ci
+        for wc, p in zip(row, rest_ctrl):
+            offset = offset - p * wc
+        acc = None
+        for c, wc in enumerate(row):
+            if abs(wc) < 1e-6:
+                continue
+            scaled = math("VectorScale", "%s_bez%d_scale%d" % (n, j, c), {"Factor": "%f" % wc})
+            vm.add_link(gets[c] + ".Transform.Translation", scaled + ".Value")
+            add = math("VectorAdd", "%s_bez%d_add%d" % (n, j, c), {} if acc else {"A": vector_text(offset)})
+            if acc:
+                vm.add_link(acc + ".Result", add + ".A")
+            vm.add_link(scaled + ".Result", add + ".B")
+            acc = add
+        points.append(acc)
+    chain = unit("RigUnit_CollectionChainItem", "Chain_" + n,
+                 {"FirstItem": item_pin("Bone", bones[0]), "LastItem": item_pin("Bone", bones[-1])})
+    first = initial(bone_key(bones[0]))
+    primary = first.inverse_transform_direction((rest_pts[1] - rest_pts[0]).normal())
+    stretch = get_float(n + "_stretch")
+    for alignment in ("Front", "Stretched"):
+        fit = unit("RigUnit_FitChainToCurvePerItem", "Spline_%s_%s" % (n, alignment), {
+            "Alignment": alignment,
+            "PrimaryAxis": vector_text(primary),
+            "SecondaryAxis": "(X=0.000000,Y=0.000000,Z=0.000000)",
+            "bPropagateToChildren": "True",
+        })
+        vm.add_link(chain + ".Collection", fit + ".Items")
+        for label, point in zip("ABCD", points):
+            vm.add_link(point + ".Result", fit + ".Bezier." + label)
+        if alignment == "Stretched":
+            vm.add_link(stretch + ".FloatValue", fit + ".Weight")
+        chain_exec(fit)
+    turn = unit("RigUnit_SetRotation", "SplineEnd_" + bones[-1],
+                {"Item": item_pin("Bone", bones[-1]), "Space": "GlobalSpace", "bPropagateToChildren": "True"})
+    vm.add_link(gets[-1] + ".Transform.Rotation", turn + ".Value")
+    chain_exec(turn)
+
+
+# FK in hierarchy order: controls are listed parents-first. Each spline is
+# solved as soon as all its controls have been passed, before the parts that
+# hang from its joints (a spline spine before the neck and arms).
+pending_splines = list(SPLINES)
+passed = set()
+
+
+def solve_ready_splines():
+    for sp in list(pending_splines):
+        if all(c in passed for c in sp["controls"]):
+            pending_splines.remove(sp)
+            solve_spline(sp)
+
+
 for c in CONTROLS:
+    solve_ready_splines()
+    passed.add(c["name"])
     if c["kind"] not in ("fk", "root") or not c["bone"]:
         continue
     get = get_control(c["name"])
@@ -411,6 +526,7 @@ for c in CONTROLS:
                     {"Item": item_pin("Bone", c["bone"]), "Space": "GlobalSpace", "bPropagateToChildren": "True"})
         vm.add_link(get + ".Transform.Rotation", node + ".Value")
     chain_exec(node)
+solve_ready_splines()
 
 # Eyes: aim each eye bone's rest direction at its control.
 for c in CONTROLS:
