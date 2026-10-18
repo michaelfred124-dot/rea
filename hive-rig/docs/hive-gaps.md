@@ -27,6 +27,11 @@ patterns) applied to every export, and now:
   switching without a pop. Checked in real Blender; Maya only against stubs.
 - **Quadruped hind legs and a dog**: the `quad_leg` component and a built-in
   dog layout and test mesh (`hive-rig demo --quadruped`); see gap 1.
+- **Bird, spider and snake**: built-in layouts, demo bodies and templates
+  (`hive-rig demo --creature bird|spider|snake`) made from the existing
+  components: arm wings and `quad_leg` legs with hocks for the bird, eight FK
+  leg chains for the spider, a spline spine and spline tail for the snake.
+  Checked in real Blender (animator tools); Maya and Unreal only against stubs.
 - **Checks before building**: warnings for a guide across the mid-line, an
   elbow, knee or hock bending the wrong way, a straight limb, a joint outside
   the mesh, joints on top of each other, lopsided twins, off-centre spine and
@@ -49,7 +54,7 @@ patterns) applied to every export, and now:
 
 | # | Area | What Hive/Zoo offer publicly | What we'd build | Size |
 |---|------|------------------------------|-----------------|------|
-| 1 | Quadrupeds and creatures | Dog, horse, spider, dinosaur, werewolf templates; quad legs | Done: a `quad_leg` component (thigh, calf, hock and paw; two-bone IK aimed at a hock control, reverse paw roll, FK, stretch) and a dog layout (`demo --quadruped`), checked in real Blender. Next: horse, spider and dinosaur templates, multi-leg sides, an automatic (spring) hock | Medium |
+| 1 | Quadrupeds and creatures | Dog, horse, spider, dinosaur, werewolf templates; quad legs | Done: a `quad_leg` component (thigh, calf, hock and paw; two-bone IK aimed at a hock control, reverse paw roll, FK, stretch) and a dog layout (`demo --quadruped`), checked in real Blender. Also done: bird (arm wings, `quad_leg` legs with hocks, tail), spider (eight four-bone FK leg chains) and snake (spline spine and tail) layouts, demo bodies and built-in templates (`demo --creature`). Next: horse and dinosaur templates, IK legs beyond one arm and one leg a side (the spider's legs are FK only), wing feather chains, an automatic (spring) hock | Medium |
 | 2 | Face, next steps | Joint-based face plus face controls on a panel | Done: face joints. Next: a 2D face control board, lip zippers, sticky lips | Medium |
 | 3 | Bendy limbs | Bendy/ribbon arms and legs, soft IK | Done: `bendy: true` on an arm or leg puts each segment's skin on four bend joints that follow a curve, arced by a bend control per segment, with a pin control at the elbow or knee; `soft` (0 to 1) on every arm and leg IK eases the reach near full extension and works with stretch. Checked in real Blender; Maya only against stubs; Unreal moves the bend joints onto the curve without turning them and has no soft IK. Next: soft IK in Unreal, bendy hind legs (`quad_leg`), a bend control twist, per-segment bend joint counts | Medium |
 | 4 | Spine and tentacles | Spline (IK) spine, tentacles, multi-branch FK | Done: a `spline` component (`hive-rig add <guides> tentacle`; joint and curve-control counts) whose curve controls bend a smooth curve the joints follow, with an FK layer, `stretch` on/off and `volume`, and `spine --spline true` for a spline spine (hips and chest controls end the curve). Spline IK on a hooked curve in Blender (checked in real Blender), ikSplineHandle with advanced twist in Maya, Fit Chain on Curve in Unreal (both only against stubs). Next: twist along the chain in Blender, volume in Unreal, an exact curve in Unreal past four controls, a sliding (offset) attribute, multi-branch FK | Medium |

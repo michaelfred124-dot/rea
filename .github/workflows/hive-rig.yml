@@ -42,6 +42,10 @@ jobs:
           xvfb-run -a -s "-screen 0 1400x900x24" cargo run --locked -q --bin HiveRig -- \
             --demo --build --weights upperarm_l --dab subtract --screenshot "$RUNNER_TEMP/hive-rig-brush.ppm"
           test "$(head -c 2 "$RUNNER_TEMP/hive-rig-brush.ppm")" = P6
+          # A built-in creature opened as the demo and built.
+          xvfb-run -a -s "-screen 0 1400x900x24" cargo run --locked -q --bin HiveRig -- \
+            --demo spider --build --screenshot "$RUNNER_TEMP/hive-rig-spider.ppm"
+          test "$(head -c 2 "$RUNNER_TEMP/hive-rig-spider.ppm")" = P6
       - name: Skin tools - influence limits, prune, copy weights, keep weights on rebuild
         run: |
           s="$RUNNER_TEMP/skin"
@@ -59,12 +63,15 @@ jobs:
           grep -q "Kept the hand-edited weights of" "$s.log"
           python3 -I tests/dcc_stub_run.py maya "$s/dst/hive_demo_maya.py"
           python3 -I tests/dcc_stub_run.py unreal "$s/dst/hive_demo_unreal.py"
-      - name: Pre-build checks on the demo and the dog
+      - name: Pre-build checks on the demo and the creatures
         run: |
           c="$RUNNER_TEMP/checks"
           cargo run --locked -q -- demo -o "$c/demo"
           cargo run --locked -q -- demo --quadruped -o "$c/dog"
-          for rig in demo/hive_demo dog/hive_dog; do
+          for creature in bird spider snake; do
+            cargo run --locked -q -- demo --creature "$creature" -o "$c/$creature"
+          done
+          for rig in demo/hive_demo dog/hive_dog bird/hive_bird spider/hive_spider snake/hive_snake; do
             cargo run --locked -q -- check "$c/$rig.hive.json" | tee "$c/log.txt"
             grep -q "No problems found" "$c/log.txt"
             grep -q "written by hive-rig" "$c/log.txt"
@@ -149,6 +156,21 @@ jobs:
           cargo run --locked -q -- rebuild "$swap/hive_demo.hive.json"
           python3 -I tests/dcc_stub_run.py maya "$swap/hive_demo_maya.py"
           python3 -I tests/dcc_stub_run.py unreal "$swap/hive_demo_unreal.py"
+      - name: Creatures - bird, spider and snake, Maya and Unreal builders
+        run: |
+          for creature in bird spider snake; do
+            cr="$RUNNER_TEMP/creature_$creature"
+            cargo run --locked -q -- demo --creature "$creature" -o "$cr"
+            python3 -I tests/dcc_stub_run.py unreal "$cr/hive_${creature}_unreal.py"
+            python3 -I tests/dcc_stub_run.py maya "$cr/hive_${creature}_maya.py" --guides
+          done
+          # Each creature is a built-in template that loads onto the biped demo.
+          t="$RUNNER_TEMP/creature_templates"
+          cargo run --locked -q -- demo -o "$t"
+          for creature in dog bird spider snake; do
+            cargo run --locked -q -- template apply "$t/hive_demo.guides.json" "$creature"
+            cargo run --locked -q -- rebuild "$t/hive_demo.hive.json"
+          done
       - name: Spline chains - a tentacle and a spline spine, Maya and Unreal builders
         run: |
           sp="$RUNNER_TEMP/spline"
@@ -266,6 +288,11 @@ jobs:
           # The dog's hind legs have a hock segment between calf and foot.
           cargo run -q -- demo --quadruped -o "$RUNNER_TEMP/anim_dog"
           python tests/blender_anim_check.py "$RUNNER_TEMP/anim_dog/hive_dog_blender.py"
+          # Wings and hocked legs (bird), eight FK legs (spider), spline spine and tail (snake).
+          for creature in bird spider snake; do
+            cargo run -q -- demo --creature "$creature" -o "$RUNNER_TEMP/anim_$creature"
+            python tests/blender_anim_check.py "$RUNNER_TEMP/anim_$creature/hive_${creature}_blender.py"
+          done
       - name: Eyes, jaw, face joints and fingers in Blender
         run: |
           rig="$RUNNER_TEMP/face"

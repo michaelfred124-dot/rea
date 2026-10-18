@@ -253,14 +253,16 @@ if __name__ == "__main__":
         calls = stub_maya()
         sys.argv = [script, "--save", "/dev/null"]  # batch: no window
         ns = runpy.run_path(script, run_name="__main__")
-        assert "setWeights" in calls and "ikHandle" in calls, calls
+        # IK handles for the limbs and spline chains; a spider's FK legs have none.
+        rig = json.loads(open(script).read().split('r"""', 1)[1].split('"""', 1)[0])
+        has_ik = bool(rig["controls"]["ik_chains"] or rig["controls"].get("splines"))
+        assert "setWeights" in calls and ("ikHandle" in calls) == has_ik, calls
         # Spline chains: every curve point gets its weights, the last joint follows the end.
         splines = json.loads(open(script).read().split('r"""', 1)[1].split('"""', 1)[0])["controls"].get("splines", [])
         assert calls.count("skinPercent") == sum(len(s["points"]) for s in splines), calls.count("skinPercent")
         ends = [s["bones"][-1] for s in splines]
         assert all(any(c[0] == "pointConstraint" and c[1][-1] == e for c in calls if isinstance(c, tuple)) for e in ends)
         # Every CV of every control curve lands on hive-rig's outline (in cm).
-        rig = json.loads(open(script).read().split('r"""', 1)[1].split('"""', 1)[0])
         for c in rig["controls"]["controls"]:
             for i, line in enumerate(c["outline"]):
                 shape = c["name"] + "Shape" + (str(i) if i else "")
@@ -269,7 +271,10 @@ if __name__ == "__main__":
                     assert got is not None and max(abs(g - 100.0 * w) for g, w in zip(got, p)) < 1e-6, (shape, j)
         # Animator tools: IK/FK matching, mirror, reset, select, space switch, and the window.
         anim = json.loads(ns["cmds"].getAttr(ns["TOP"] + ".hiveAnim"))
-        assert anim["limbs"] and anim["mirror"] and anim["spaces"], sorted(anim)
+        # Limbs and left/right pairs where the rig has them (a snake has neither).
+        assert len(anim["limbs"]) == len(rig["controls"]["ik_chains"]), sorted(anim)
+        assert len(anim["mirror"]) == len(rig["controls"].get("mirror_pairs", [])), sorted(anim)
+        assert anim["spaces"], sorted(anim)
         for limb in anim["limbs"]:
             # Three-segment legs carry their hock joint and FK control in order.
             segments = 4 if limb["hock"] else 3
@@ -284,17 +289,20 @@ if __name__ == "__main__":
                 for joint in chain["bendy"][seg]["joints"]:
                     assert ("parentConstraint", (joint + "_bend_twist", joint)) in calls, joint
         assert ns["mirror_pose"](None, "left") == len(anim["mirror"])
-        assert ns["mirror_pose"]([anim["mirror"][0][1]], "right") == 1
+        if anim["mirror"]:
+            assert ns["mirror_pose"]([anim["mirror"][0][1]], "right") == 1
         assert ns["reset_pose"]() == len(anim["controls"])
         assert ns["select_controls"]() == len(anim["controls"])
         ns["switch_space"](next(iter(anim["spaces"])), 1)
         ns["show_window"]()
-        assert "rowLayout" in calls and "confirmDialog" not in calls
+        # A row of match buttons per limb.
+        assert ("rowLayout" in calls or not anim["limbs"]) and "confirmDialog" not in calls
         print("maya animator tools ran against stubs: ok")
         if os.path.isfile(ns["HIVE_EXE"]) and "--guides" in sys_args:
             # Guide tools: edit, mirror, add a component, rebuild keeping weights.
             ns["show_guides"]()
-            assert len(ns["guide_nodes"]()) > 20
+            guides = sum(len(c["guides"]) for c in rig["guides"]["components"])
+            assert len(ns["guide_nodes"]()) == guides, (len(ns["guide_nodes"]()), guides)
             ns["mirror_guides"]()
             out = ns["change_components"]("add", "chain", "--parent", "head", "--joints", "2", "--id", "stub_ear")
             assert "stub_ear" in out, out

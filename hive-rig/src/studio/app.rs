@@ -4,6 +4,7 @@
 //! The editing operations are methods on `Studio` that don't touch the UI, so
 //! they are tested directly; `ui` only lays out widgets that call them.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use eframe::egui::Color32;
@@ -464,13 +465,17 @@ impl Studio {
     pub fn load_demo(&mut self) {
         let mesh = demo::humanoid(0.0);
         let (guides, _) = detect_guides(&mesh);
-        let out_dir = std::env::current_exe()
-            .ok()
-            .and_then(|e| e.parent().map(Path::to_path_buf))
-            .unwrap_or_default()
-            .join("demo_rig");
-        self.set_doc(Doc::new("hive_demo".into(), mesh, guides, out_dir));
+        self.set_doc(Doc::new("hive_demo".into(), mesh, guides, demo_out_dir()));
         self.info("Demo character loaded. Drag the guides to adjust, then Build Rig.");
+    }
+
+    /// Open a built-in creature (dog, bird, spider or snake) with its layout.
+    pub fn load_creature(&mut self, c: demo::Creature) {
+        self.set_doc(Doc::new(c.rig_name(), c.mesh(), c.guides(), demo_out_dir()));
+        self.info(format!(
+            "Demo {} loaded. Drag the guides to adjust, then Build Rig.",
+            c.name()
+        ));
     }
 
     pub fn save_guides(&mut self, path: &Path) {
@@ -1691,6 +1696,76 @@ fn ray_triangle(origin: Vec3, dir: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f3
     (t > 0.0).then_some(t)
 }
 
+/// Where the demo characters' rigs are exported: `demo_rig` next to the program.
+fn demo_out_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(Path::to_path_buf))
+        .unwrap_or_default()
+        .join("demo_rig")
+}
+
+/// The outliner's rows as (component index, depth): the attachment tree in
+/// depth-first order, each component right under the one owning its parent
+/// bone, siblings in layout order. Bone owners come from `built`; without it
+/// (a layout that doesn't build) every component is a top-level row.
+pub fn outliner_rows(g: &Guides, built: Option<&Built>) -> Vec<(usize, usize)> {
+    let n = g.components.len();
+    let index: HashMap<&str, usize> = g
+        .components
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.id.as_str(), i))
+        .collect();
+    let owner: HashMap<&str, usize> = built
+        .map(|b| {
+            b.skeleton
+                .bones
+                .iter()
+                .filter_map(|b| Some((b.name.as_str(), *index.get(b.component.as_str())?)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let parent: Vec<Option<usize>> = g
+        .components
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            c.parent
+                .as_deref()
+                .and_then(|p| owner.get(p).copied())
+                .filter(|&o| o != i)
+        })
+        .collect();
+    let mut children = vec![Vec::new(); n];
+    let mut tops = Vec::new();
+    for (i, p) in parent.iter().enumerate() {
+        match p {
+            Some(p) => children[*p].push(i),
+            None => tops.push(i),
+        }
+    }
+    let mut rows = Vec::with_capacity(n);
+    let mut seen = vec![false; n];
+    let mut stack: Vec<(usize, usize)> = tops.iter().rev().map(|&i| (i, 0)).collect();
+    loop {
+        while let Some((i, depth)) = stack.pop() {
+            if std::mem::replace(&mut seen[i], true) {
+                continue;
+            }
+            rows.push((i, depth));
+            stack.extend(children[i].iter().rev().map(|&c| (c, depth + 1)));
+        }
+        // Parents that loop back on each other can't come from a built rig;
+        // list any such component at the top rather than lose it.
+        match seen.iter().position(|s| !s) {
+            Some(i) => stack.push((i, 0)),
+            None => break,
+        }
+    }
+    rows
+}
+
 fn push_undo(undo: &mut Vec<Guides>, g: &Guides) {
     undo.push(g.clone());
     if undo.len() > UNDO_LIMIT {
@@ -2282,5 +2357,107 @@ mod tests {
         let back = Guides::load(&path).unwrap();
         assert_eq!(back.written_by.as_deref(), Some(hive_rig::version::CURRENT));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The outliner rows as (id, depth).
+    fn outline(s: &Studio) -> Vec<(String, usize)> {
+        let doc = s.doc.as_ref().unwrap();
+        outliner_rows(&doc.guides, doc.preview.as_ref().ok())
+            .into_iter()
+            .map(|(i, d)| (doc.guides.components[i].id.clone(), d))
+            .collect()
+    }
+
+    #[test]
+    fn outliner_shows_the_attachment_tree() {
+        let mut s = demo_studio();
+        let row = |id: &str, d: usize| (id.to_string(), d);
+        assert_eq!(
+            outline(&s),
+            [
+                row("root", 0),
+                row("spine", 1),
+                row("head", 2),
+                row("arm_l", 2),
+                row("arm_r", 2),
+                row("leg_l", 2),
+                row("leg_r", 2),
+            ]
+        );
+        // A leg hung from the head is listed under the head, not after the
+        // arms (where its indent read as a child of the right arm).
+        s.attach_component(comp(&s, "leg_l"), "head");
+        assert!(!s.error, "{}", s.status);
+        s.add_tail();
+        assert_eq!(
+            outline(&s),
+            [
+                row("root", 0),
+                row("spine", 1),
+                row("head", 2),
+                row("leg_l", 3),
+                row("arm_l", 2),
+                row("arm_r", 2),
+                row("leg_r", 2),
+                row("tail", 2),
+            ]
+        );
+        // And the head hung from the tail, which was listed after it: the head,
+        // with the leg on it, moves under the tail.
+        s.attach_component(comp(&s, "head"), "tail_03");
+        assert!(!s.error, "{}", s.status);
+        assert_eq!(
+            outline(&s),
+            [
+                row("root", 0),
+                row("spine", 1),
+                row("tail", 2),
+                row("head", 3),
+                row("leg_l", 4),
+                row("arm_l", 2),
+                row("arm_r", 2),
+                row("leg_r", 2),
+            ]
+        );
+        // Each row names its component's index, wherever the tree put it, so
+        // clicking a row picks that component.
+        let doc = s.doc.as_ref().unwrap();
+        let rows = outliner_rows(&doc.guides, doc.preview.as_ref().ok());
+        assert_eq!(rows.len(), doc.guides.components.len());
+        assert_eq!(doc.guides.components[rows[4].0].id, "leg_l");
+        assert_ne!(rows[4].0, 4);
+        // A layout that doesn't build still lists every component.
+        let mut broken = doc.guides.clone();
+        broken.components[2].parent = Some("no_such_bone".into());
+        let built = components::build(&broken);
+        assert!(built.is_err());
+        let flat = outliner_rows(&broken, built.ok().as_ref());
+        assert_eq!(flat.len(), broken.components.len());
+        assert!(flat.iter().all(|&(_, d)| d == 0));
+    }
+
+    #[test]
+    fn creatures_open_build_and_are_templates() {
+        let listed: Vec<String> = template::built_in()
+            .iter()
+            .map(|t| t.name.clone())
+            .collect();
+        for c in demo::Creature::ALL {
+            let mut s = Studio::default();
+            s.load_creature(c);
+            assert!(!s.error, "{c:?}: {}", s.status);
+            let doc = s.doc.as_ref().unwrap();
+            assert_eq!(doc.name, c.rig_name());
+            assert!(doc.checks.is_empty(), "{c:?}: {:?}", doc.checks);
+            assert!(s.build(), "{c:?}: {}", s.status);
+            assert!(listed.contains(&c.name().to_string()), "{c:?}");
+            // Its template loads onto the humanoid demo.
+            let t = template::built_in()
+                .iter()
+                .find(|t| t.name == c.name())
+                .unwrap();
+            let mut s = demo_studio();
+            assert!(s.apply_template(t, None), "{c:?}: {}", s.status);
+        }
     }
 }

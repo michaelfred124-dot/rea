@@ -108,6 +108,42 @@ fn fill(template: &str, json: &str, glb_path: &str) -> String {
         .replace(EXE_SLOT, &exe_path())
 }
 
+/// Bones whose imported positions recover the Unreal import's axes; the first
+/// also places the COG. The pelvis, left hand, head and left ball of the foot
+/// where the rig has them, otherwise other deforming bones, each picked only
+/// when it lies off the line or plane through the ones before it. Four bones
+/// pin the axes down; a flat rig (every bone in one plane, like a snake along
+/// its mid-line) gets three, and the builder takes the plane's normal from them.
+fn basis_bones(rig: &Rig) -> Vec<String> {
+    let sk = &rig.skeleton;
+    let min_gain = 0.01 * rig.guides.body.height;
+    let preferred = ["pelvis", "hand_l", "head", "ball_l"].map(|b| rig.guides.naming.bone(b));
+    let candidates = preferred
+        .iter()
+        .filter_map(|n| sk.bone(n))
+        .chain(sk.bones.iter().filter(|b| b.deform));
+    let mut picked: Vec<(&str, glam::Vec3)> = Vec::new();
+    for b in candidates {
+        if picked.len() == 4 {
+            break;
+        }
+        let p = b.head;
+        // How far `p` lies from the line or plane through the bones picked so far.
+        let gain = match picked.as_slice() {
+            [] => f32::INFINITY,
+            [(_, a)] => p.distance(*a),
+            [(_, a), (_, b)] => (p - *a).cross((*b - *a).normalize_or_zero()).length(),
+            [(_, a), (_, b), (_, c), ..] => (p - *a)
+                .dot((*b - *a).cross(*c - *a).normalize_or_zero())
+                .abs(),
+        };
+        if gain > min_gain && !picked.iter().any(|(n, _)| *n == b.name) {
+            picked.push((&b.name, p));
+        }
+    }
+    picked.into_iter().map(|(n, _)| n.to_string()).collect()
+}
+
 /// Generate the builder script for one DCC.
 pub fn script(rig: &Rig, target: Target, glb_path: &Path) -> Result<String> {
     let glb = glb_path.to_string_lossy().replace('"', "");
@@ -123,8 +159,7 @@ pub fn script(rig: &Rig, target: Target, glb_path: &Path) -> Result<String> {
                 .iter()
                 .map(|b| json!({ "name": b.name, "parent": b.parent, "deform": b.deform, "head": b.head, "translate": b.translate }))
                 .collect();
-            // Bones that recover the import's axes; the first also places the COG.
-            let basis = ["pelvis", "hand_l", "head", "ball_l"].map(|b| rig.guides.naming.bone(b));
+            let basis = basis_bones(rig);
             let data = json!({
                 "name": rig.name,
                 "height": rig.guides.body.height,
@@ -192,6 +227,34 @@ mod tests {
         assert_eq!(sanitize_name("my hero-01"), "my_hero_01");
         assert_eq!(sanitize_name("3d"), "rig_3d");
         assert_eq!(sanitize_name(""), "rig_");
+    }
+
+    #[test]
+    fn unreal_basis_uses_bones_the_rig_has() {
+        use crate::demo::Creature;
+        let r = rig::auto_rig(demo_humanoid(), "demo", Default::default()).unwrap();
+        assert_eq!(basis_bones(&r), ["pelvis", "hand_l", "head", "ball_l"]);
+        let built =
+            |c: Creature| rig::build_rig(c.mesh(), "c", c.guides(), Default::default()).unwrap();
+        // The bird has a left hand (wing) and ball (foot); the spider has neither,
+        // so other bones off the plane stand in.
+        assert_eq!(
+            basis_bones(&built(Creature::Bird)),
+            ["pelvis", "hand_l", "head", "ball_l"]
+        );
+        let spider = built(Creature::Spider);
+        let basis = basis_bones(&spider);
+        assert_eq!(
+            (basis.len(), &basis[..2]),
+            (4, &["pelvis".to_string(), "head".into()][..])
+        );
+        // The snake lies in its mid-plane: three bones, and the builder adds the normal.
+        let snake = built(Creature::Snake);
+        let basis = basis_bones(&snake);
+        assert_eq!(basis.len(), 3);
+        assert!(basis.iter().all(|n| snake.skeleton.bone(n).is_some()));
+        let s = script(&snake, Target::Unreal, Path::new("/tmp/snake.glb")).unwrap();
+        assert!(s.contains("\"basis\":[\"pelvis\",\"head\""), "{basis:?}");
     }
 
     #[test]

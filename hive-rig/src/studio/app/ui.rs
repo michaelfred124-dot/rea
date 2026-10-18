@@ -723,37 +723,15 @@ impl Studio {
 
     fn outliner(&mut self, ctx: &egui::Context) {
         let Some(doc) = &self.doc else { return };
-        // Depth of each component in the attachment tree, for indenting.
-        let owner = |bone: &str| -> Option<&str> {
-            doc.preview
-                .as_ref()
-                .ok()?
-                .skeleton
-                .bone(bone)
-                .map(|b| b.component.as_str())
-        };
-        let ids: Vec<&str> = doc
-            .guides
-            .components
-            .iter()
-            .map(|c| c.id.as_str())
-            .collect();
-        let mut depth = vec![0usize; ids.len()];
-        for (i, c) in doc.guides.components.iter().enumerate() {
-            if let Some(p) = c.parent.as_deref().and_then(owner)
-                && let Some(j) = ids.iter().position(|id| *id == p)
-                && j < i
-            {
-                depth[i] = depth[j] + 1;
-            }
-        }
-        let rows: Vec<(String, Kind, Side, usize)> = doc
-            .guides
-            .components
-            .iter()
-            .zip(&depth)
-            .map(|(c, d)| (c.id.clone(), c.kind, c.side, *d))
-            .collect();
+        // The attachment tree, each component under the one owning its parent bone.
+        let rows: Vec<(usize, String, Kind, Side, usize)> =
+            super::outliner_rows(&doc.guides, doc.preview.as_ref().ok())
+                .into_iter()
+                .map(|(i, depth)| {
+                    let c = &doc.guides.components[i];
+                    (i, c.id.clone(), c.kind, c.side, depth)
+                })
+                .collect();
         let max_h = ctx.content_rect().height() - PANEL_TOP - DOCK_CLEARANCE - 70.0;
 
         floating_area("outliner", Align2::LEFT_TOP, Vec2::new(EDGE, PANEL_TOP)).show(ctx, |ui| {
@@ -772,22 +750,15 @@ impl Studio {
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
                         let shift = ui.input(|i| i.modifiers.shift);
-                        for (i, (id, kind, side, depth)) in rows.iter().enumerate() {
+                        for &(i, ref id, kind, side, depth) in &rows {
                             let order = self.picked.iter().position(|(p, _)| p == id);
                             let selected = order.is_some();
                             // Pick order shows once there are several: the last is the parent.
                             let badge = order
                                 .filter(|_| self.picked.len() > 1)
                                 .map(|n| n + 1 == self.picked.len());
-                            let row = component_row(
-                                ui,
-                                id,
-                                *kind,
-                                *side,
-                                (*depth).min(4),
-                                selected,
-                                badge,
-                            );
+                            let row =
+                                component_row(ui, id, kind, side, depth.min(4), selected, badge);
                             if row.clicked() {
                                 if shift {
                                     self.toggle_pick(i, None);
@@ -3842,8 +3813,25 @@ fn template_preview(painter: &egui::Painter, r: Rect, t: &Template, hot: bool) {
         Scope::Parts => &template::built_in()[0].components,
     };
     let shown = |g: &&components::Guide| g.name != "target" && g.name != "heel";
+    // A layout far longer than it is wide or tall (a snake) is seen from its
+    // left side, head to the right; anything else from the front.
+    let (mut lo3, mut hi3) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for p in body.iter().chain(&t.components) {
+        for g in p.component.guides.iter().filter(shown) {
+            lo3 = lo3.min(g.position);
+            hi3 = hi3.max(g.position);
+        }
+    }
+    let size = hi3 - lo3;
+    let side_view = size.z > 2.0 * size.x.max(size.y);
     // Facing the viewer, the character's left (+X) is on screen right.
-    let flat = |p: Vec3| Vec2::new(p.x, -p.y);
+    let flat = |p: Vec3| {
+        if side_view {
+            Vec2::new(p.z, -p.y)
+        } else {
+            Vec2::new(p.x, -p.y)
+        }
+    };
     let mut lo = Vec2::splat(f32::MAX);
     let mut hi = Vec2::splat(f32::MIN);
     for p in body.iter().chain(&t.components) {

@@ -197,6 +197,264 @@ pub fn demo_quadruped() -> Mesh {
     m
 }
 
+/// Height of the demo bird, floor to the top of the head.
+pub const BIRD_HEIGHT: f32 = 0.5;
+/// Height of the demo spider, floor to the top of its knees.
+pub const SPIDER_HEIGHT: f32 = 0.4;
+/// Size unit of the demo snake, which is about four of them long.
+pub const SNAKE_HEIGHT: f32 = 0.5;
+
+/// The built-in creatures: a layout (`components::quadruped`, `bird`, `spider`
+/// or `snake`) and a procedural demo body built around its guides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Creature {
+    /// Spine, neck and head, tail, two front legs and two three-segment hind legs.
+    Dog,
+    /// Wings (arm components), two legs with hocks, a neck, head and tail.
+    Bird,
+    /// A head, an abdomen and eight legs (FK chains).
+    Spider,
+    /// A spline spine with a raised head and a spline tail.
+    Snake,
+}
+
+impl Creature {
+    pub const ALL: [Creature; 4] = [
+        Creature::Dog,
+        Creature::Bird,
+        Creature::Spider,
+        Creature::Snake,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Creature::Dog => "dog",
+            Creature::Bird => "bird",
+            Creature::Spider => "spider",
+            Creature::Snake => "snake",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Creature> {
+        Creature::ALL.into_iter().find(|c| c.name() == name)
+    }
+
+    /// What the creature's layout holds, for template lists.
+    pub fn description(self) -> &'static str {
+        match self {
+            Creature::Dog => "Four legs with three-segment hind legs, a neck, head and tail.",
+            Creature::Bird => {
+                "Wings with IK/FK like arms, two legs with hocks, a neck, head and tail."
+            }
+            Creature::Spider => "Eight four-bone FK legs, a head and an abdomen.",
+            Creature::Snake => "A spline spine and spline tail with a raised neck and head.",
+        }
+    }
+
+    /// The demo creature's size: floor to the top of the head (the spider's
+    /// knees), or the snake's size unit.
+    pub fn height(self) -> f32 {
+        match self {
+            Creature::Dog => DOG_HEIGHT,
+            Creature::Bird => BIRD_HEIGHT,
+            Creature::Spider => SPIDER_HEIGHT,
+            Creature::Snake => SNAKE_HEIGHT,
+        }
+    }
+
+    /// The creature's default layout, at the demo size.
+    pub fn guides(self) -> crate::components::Guides {
+        let h = self.height();
+        match self {
+            Creature::Dog => crate::components::quadruped(h),
+            Creature::Bird => crate::components::bird(h),
+            Creature::Spider => crate::components::spider(h),
+            Creature::Snake => crate::components::snake(h),
+        }
+    }
+
+    /// The demo body, built around [`Creature::guides`].
+    pub fn mesh(self) -> Mesh {
+        match self {
+            Creature::Dog => demo_quadruped(),
+            Creature::Bird => demo_bird(),
+            Creature::Spider => demo_spider(),
+            Creature::Snake => demo_snake(),
+        }
+    }
+
+    /// The name its demo rig is written as: `hive_dog`, `hive_bird`, ...
+    pub fn rig_name(self) -> String {
+        format!("hive_{}", self.name())
+    }
+}
+
+/// Sphere scaled to an ellipsoid with semi-axes `radii`.
+fn ellipsoid(center: Vec3, radii: Vec3) -> Mesh {
+    let mut m = sphere(Vec3::ZERO, 1.0, 16, 10);
+    for p in &mut m.positions {
+        *p = center + *p * radii;
+    }
+    m
+}
+
+/// A round tube through `points`, its radius going from `radii[i]` at each
+/// point, with a ball at every bend so the joints stay filled.
+fn tube(m: &mut Mesh, points: &[Vec3], radii: &[f32], step: f32) {
+    for (i, pair) in points.windows(2).enumerate() {
+        let r = (radii[i] + radii[i + 1]) * 0.5;
+        m.append(&cylinder(pair[0], pair[1], (r, r), 12, step));
+        if i > 0 {
+            m.append(&sphere(pair[0], radii[i], 10, 6));
+        }
+    }
+}
+
+/// The guides of one component of `g`, in order.
+fn points(g: &crate::components::Guides, comp: &str, names: &[&str]) -> Vec<Vec3> {
+    let c = g.component(comp).unwrap();
+    if names.is_empty() {
+        return c.guides.iter().map(|x| x.position).collect();
+    }
+    names.iter().map(|n| c.position(n).unwrap()).collect()
+}
+
+/// A procedural bird standing on two legs, facing +Z, built around
+/// `components::bird(BIRD_HEIGHT)`: an egg-shaped body, a neck and round head
+/// with a beak, flat wings spread to the sides, a fanned tail and thin legs.
+pub fn demo_bird() -> Mesh {
+    let h = BIRD_HEIGHT;
+    let g = crate::components::bird(h);
+    let mut m = Mesh::default();
+    let step = 0.015;
+    let [pelvis, chest] = points(&g, "spine", &[]).try_into().unwrap();
+    let along = (chest - pelvis).normalize();
+    m.append(&cylinder(
+        pelvis - along * 0.1 * h,
+        chest + along * 0.06 * h,
+        (0.1 * h, 0.11 * h),
+        20,
+        step,
+    ));
+    m.append(&ellipsoid(chest, Vec3::new(0.1, 0.1, 0.08) * h));
+    let [neck, head, beak] = points(&g, "head", &[]).try_into().unwrap();
+    tube(
+        &mut m,
+        &[chest, neck, head],
+        &[0.07 * h, 0.05 * h, 0.045 * h],
+        step,
+    );
+    m.append(&sphere(head, 0.07 * h, 16, 10));
+    m.append(&cylinder(head, beak, (0.025 * h, 0.02 * h), 10, step));
+    let tail = points(&g, "tail", &[]);
+    m.append(&cylinder(
+        tail[0],
+        *tail.last().unwrap(),
+        (0.07 * h, 0.015 * h),
+        12,
+        step,
+    ));
+    for s in ["_l", "_r"] {
+        let wing = points(
+            &g,
+            &format!("wing{s}"),
+            &["clavicle", "shoulder", "elbow", "wrist", "hand_tip"],
+        );
+        // (chord, thickness) of each segment: the hand carries the widest feathers.
+        let shapes = [(0.03, 0.03), (0.06, 0.02), (0.07, 0.018), (0.08, 0.012)];
+        for (pair, (chord, thick)) in wing.windows(2).zip(shapes) {
+            m.append(&cylinder(
+                pair[0],
+                pair[1],
+                (chord * h, thick * h),
+                12,
+                step,
+            ));
+        }
+        let leg = format!("leg{s}");
+        tube(
+            &mut m,
+            &points(&g, &leg, &["hip", "knee", "hock", "ankle", "ball", "toe"]),
+            &[
+                0.03 * h,
+                0.028 * h,
+                0.018 * h,
+                0.014 * h,
+                0.012 * h,
+                0.01 * h,
+            ],
+            step,
+        );
+        let [ankle, heel] = points(&g, &leg, &["ankle", "heel"]).try_into().unwrap();
+        m.append(&cylinder(ankle, heel, (0.01 * h, 0.01 * h), 8, step));
+    }
+    m
+}
+
+/// A procedural spider facing +Z, built around `components::spider(SPIDER_HEIGHT)`:
+/// a rounded cephalothorax and head with fangs, a big abdomen and eight
+/// tapering legs.
+pub fn demo_spider() -> Mesh {
+    let h = SPIDER_HEIGHT;
+    let g = crate::components::spider(h);
+    let mut m = Mesh::default();
+    let step = 0.012;
+    let [pelvis, chest] = points(&g, "spine", &[]).try_into().unwrap();
+    m.append(&ellipsoid(
+        (pelvis + chest) * 0.5,
+        Vec3::new(0.15, 0.1, 0.24) * h,
+    ));
+    let [_, head, fangs] = points(&g, "head", &[]).try_into().unwrap();
+    m.append(&sphere(head, 0.08 * h, 14, 8));
+    m.append(&cylinder(head, fangs, (0.035 * h, 0.025 * h), 10, step));
+    let abdomen = points(&g, "abdomen", &[]);
+    m.append(&ellipsoid(abdomen[1], Vec3::new(0.2, 0.18, 0.36) * h));
+    for s in ["_l", "_r"] {
+        for n in 1..=crate::components::SPIDER_LEGS {
+            tube(
+                &mut m,
+                &points(&g, &format!("leg{n}{s}"), &[]),
+                &[0.035 * h, 0.03 * h, 0.022 * h, 0.015 * h, 0.01 * h],
+                step,
+            );
+        }
+    }
+    m
+}
+
+/// A procedural snake lying along the floor facing +Z, built around
+/// `components::snake(SNAKE_HEIGHT)`: a body tapering to the tail tip, a
+/// raised neck and a flat head with a snout.
+pub fn demo_snake() -> Mesh {
+    let h = SNAKE_HEIGHT;
+    let g = crate::components::snake(h);
+    let mut m = Mesh::default();
+    let step = 0.02;
+    let mut tail = points(&g, "tail", &[]);
+    tail.reverse();
+    let [pelvis, chest] = points(&g, "spine", &[]).try_into().unwrap();
+    let [neck, head, snout] = points(&g, "head", &[]).try_into().unwrap();
+    let mut body = tail.clone();
+    let n = tail.len();
+    let mut radii: Vec<f32> = (0..n)
+        .map(|i| (0.015 + 0.075 * i as f32 / (n - 1) as f32) * h)
+        .collect();
+    // The spine guides are far apart: the body is round between them.
+    for t in [0.0, 0.33, 0.67, 1.0] {
+        body.push(pelvis.lerp(chest, t));
+        radii.push(0.09 * h);
+    }
+    body.extend([neck, head]);
+    radii.extend([0.075 * h, 0.06 * h]);
+    tube(&mut m, &body, &radii, step);
+    m.append(&ellipsoid(
+        head + Vec3::Z * 0.06 * h,
+        Vec3::new(0.09, 0.055, 0.14) * h,
+    ));
+    m.append(&cylinder(head, snout, (0.05 * h, 0.035 * h), 12, step));
+    m
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +475,36 @@ mod tests {
         let (min, max) = m.bounds();
         assert!(min.y > -0.05 * DOG_HEIGHT && min.y < 0.02 * DOG_HEIGHT);
         assert!(max.z - min.z > max.y - min.y, "longer than it is tall");
+    }
+
+    /// Every creature's body is valid and on the floor, and its layout builds
+    /// with no check warnings: every joint inside the body, limbs bending the
+    /// way IK folds them, left and right mirror images.
+    #[test]
+    fn creatures_stand_on_the_floor_around_their_guides() {
+        for c in Creature::ALL {
+            assert_eq!(Creature::from_name(c.name()), Some(c));
+            let m = c.mesh();
+            m.validate().unwrap();
+            let (min, _) = m.bounds();
+            let h = c.height();
+            assert!(min.y > -0.05 * h && min.y < 0.02 * h, "{c:?}: {min}");
+            let g = c.guides();
+            let issues = crate::checks::check(&g, Some(&mut crate::checks::Surface::new(&m)));
+            assert!(issues.is_empty(), "{c:?}: {issues:#?}");
+            let rig =
+                crate::rig::build_rig(m, &c.rig_name(), g, crate::RigOptions::default()).unwrap();
+            // Every deforming bone takes some skin.
+            let used: std::collections::HashSet<usize> = (0..rig.skin.vertex_count())
+                .flat_map(|v| rig.skin.influences(v).map(|(b, _)| b).collect::<Vec<_>>())
+                .collect();
+            for (i, b) in rig.skeleton.bones.iter().enumerate() {
+                assert!(
+                    !b.deform || used.contains(&i),
+                    "{c:?}: {} has no skin",
+                    b.name
+                );
+            }
+        }
     }
 }

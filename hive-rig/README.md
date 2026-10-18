@@ -13,6 +13,7 @@ cargo run --release -- rig path/to/character.glb -o out/
 cargo run --release -- demo -o out/            # T-pose test character
 cargo run --release -- demo -o out/ --arm-drop 45   # A-pose
 cargo run --release -- demo -o out/ --quadruped     # a dog: spine, head, tail, four legs
+cargo run --release -- demo -o out/ --creature bird # also dog, spider, snake
 cargo run --release -- demo -o out/ --bendy --soft 0.3   # bendy arms and legs with soft IK
 ```
 
@@ -28,7 +29,9 @@ a joint; with Symmetry on, its twin on the other side follows.
   for right to left), Symmetry, the Guides / Skeleton / Controls views, Mesh,
   X-ray, Weights, Undo, Redo, Frame and Export. The honeycomb button in the
   middle builds the rig.
-* **The outliner** (left) lists the components as a tree. **Properties** (right)
+* **The outliner** (left) lists the components as their attachment tree: each
+  component sits under the one owning the bone it hangs from (a leg hung from
+  the head is listed under the head). **Properties** (right)
   shows the rig summary, the pre-build [checks](#checks-before-building), skin weights (influence limits, the paint brush, Mirror and Smooth) and naming, or, with a component
   selected, its attachment, options (the spine's joint count and **Spline (curve)**
   toggle, a tentacle's joint and curve-control counts), exact guide positions and the names its
@@ -281,6 +284,35 @@ Body detection only knows bipeds. To rig your own four-legged mesh, start from
 the dog's guides and move them onto it (in the app, or Edit Guides in Blender
 or Maya): `hive-rig rig my_dog.glb --guides out/hive_dog.guides.json`.
 
+### More creatures: bird, spider and snake
+
+`hive-rig demo --creature <dog|bird|spider|snake>` rigs a built-in creature
+with its own demo body (written as `hive_<creature>`; `--quadruped` is
+`--creature dog`). In the app, `HiveRig --demo bird` opens one. Each layout is
+also a built-in template (see [Rig templates](#rig-templates)), so it loads onto
+any character, scaled to its height. They use the existing components only:
+
+* **Bird** (`components::bird`, 0.5 m): a tilted spine, a long neck and a head
+  with the beak along the head bone, a three-bone tail chain, two **wings** and
+  two **legs with hocks**. The wings are arm components spread to the sides
+  (clavicle, upper wing, forearm and hand to the wing tip, the elbow folded
+  back), so they get IK/FK, a pole, stretch and the arm's animator tools. The
+  legs are `quad_leg` components, whose forward knee and backward hock are how
+  a bird's legs fold; the thighs sit inside the body, so the leg skin starts
+  below the belly.
+* **Spider** (`components::spider`, 0.4 m to the top of the knees): a spine
+  through the cephalothorax, a head with the fangs along the head bone, an
+  abdomen chain and **eight legs**, each a four-bone FK chain (`leg1_l` to
+  `leg4_r`) hung from the spine bone it grows from; front legs reach forward,
+  back legs back. FK chains have no IK, so a spider is posed leg by leg.
+* **Snake** (`components::snake`, a 0.5 m size unit; about 2 m long): a
+  **spline spine** of ten joints driven by five curve controls, a raised neck
+  and head, and a spline (`tentacle`) tail of eight joints and four curve
+  controls, all in the mid-plane.
+
+The spider and snake have no leg or arm skin regions: every vertex takes the
+bones nearest it. Their pre-build checks are clear, as the dog's are.
+
 Hind legs can also replace a biped's legs:
 
 ```bash
@@ -401,8 +433,10 @@ click one to load it (one undo step). **Load template…** loads a file, and the
 viewport's right-click **Load template here…** hangs a parts template from the
 bone under the pointer.
 
-Templates are listed from two folders, plus two built in (`biped`, and
-`biped_face_fingers` with eyes, a jaw, face joints and fingers):
+Templates are listed from two folders, plus six built in: `biped`,
+`biped_face_fingers` (with eyes, a jaw, face joints and fingers), and the
+creatures `dog`, `bird`, `spider` and `snake`. A card for a layout much longer
+than it is wide or tall (the snake) draws it from the side.
 
 * `templates/` next to the program, for a studio to ship its own;
 * the user folder, where new templates are saved: `%APPDATA%\HiveRig\templates`
@@ -620,6 +654,7 @@ python tests/blender_bendy_check.py bendy/hive_demo_blender.py   # after demo --
 python3 tests/dcc_stub_run.py maya out/hive_demo_maya.py --guides       # Maya guide tools
 python tests/blender_anim_check.py out/hive_demo_blender.py             # animator tools
 python tests/blender_fbx_check.py out/hive_demo.fbx out/hive_demo.hive.json   # after demo --targets fbx -o out
+python tests/blender_anim_check.py bird/hive_bird_blender.py   # after demo --creature bird -o bird (or spider, snake)
 ```
 
 `blender_fbx_check.py` imports the `.fbx` with Blender's own FBX importer and
@@ -653,6 +688,9 @@ the IK pose; then poses each FK limb and checks FK to IK leaves every bone in
 place, including a straight limb. It mirrors a posed left side and checks the
 right side is its mirror image, mirrors one selected control, switches the IK
 hand's space with the chest turned, and resets the rig back to its rest mesh.
+A rig without arms and legs (the spider, the snake) skips the limb checks: it
+mirrors its posed left controls (the spider's FK legs) onto the right, switches
+the space of the first control that has spaces (the head), and resets.
 
 `blender_quad_check.py` builds the dog in real Blender. It checks that the paws
 reach their IK goals with the hock joined to the paw, the knee folds forward
@@ -688,11 +726,13 @@ export, reopening a rig and loading templates) have unit tests in `src/studio/ap
 templates have their own (`src/template.rs`: JSON round trip, scaling to another
 body height, id clashes, inner parent links and the folders). The pre-build
 checks are tested in `src/checks.rs`: the demo biped (T- and A-pose, with every
-premade part) and the dog have no warnings, each broken case gives exactly its
+premade part) and the dog have no warnings (`src/demo.rs` checks the bird, spider
+and snake the same way on their demo bodies, and that every deforming bone of
+each gets skin), each broken case gives exactly its
 own warning, and its fix clears it; the app's tests select and fix them and
 build with them. Versioning has tests for the stamp, files from before it
 building exactly as before, and files from a newer hive-rig warning. CI runs
-`hive-rig check` on the demo and the dog, and opens
+`hive-rig check` on the demo and every creature, and opens
 the app on a virtual screen and screenshots it after building the demo rig, and
 again with the weight brush after one dab (`--dab subtract`). The skin tools
 (prune, influence caps, the brush's add, subtract, smooth and its undo, keeping
@@ -709,11 +749,15 @@ included). The Maya stub also checks that every control curve point is placed
 on the control's outline. The builders haven't been run inside Maya or Unreal yet,
 and the `.fbx` has been imported only by Blender, not yet by Unreal, Unity or
 Autodesk's FBX SDK.
+The Unreal builder recovers the import's axes from four bones (the pelvis,
+left hand, head and left ball where the rig has them, otherwise other bones off
+their plane); for a flat rig like the snake it takes three and assumes the
+glTF-to-Unreal import mirrors, which is untested in Unreal.
 
 ## Not yet included
 
 See [the gap list](docs/hive-gaps.md)
-for what's planned. In short: corrective shapes, creature templates beyond the dog (horse, spider, dinosaur), extra arms or legs on the same
-side, guide editing in Unreal (rebuild with the CLI and rerun the script), the
+for what's planned. In short: corrective shapes, more creature templates (horse, dinosaur), IK legs beyond one
+arm and one leg a side (the spider's legs are FK chains), guide editing in Unreal (rebuild with the CLI and rerun the script), the
 animator tools (IK/FK matching, mirror and reset pose) in Unreal, FBX input, and
 FBX animation, blend shapes or UVs (the mesh has none yet).
