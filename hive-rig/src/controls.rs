@@ -264,6 +264,11 @@ pub enum ControlKind {
     /// Curve control of a spline chain (tentacle, spline spine): moving and
     /// turning it bends the curve the chain's joints follow.
     Spline,
+    /// Bendy limbs: a mid-segment control whose offset arcs that segment's bend
+    /// joints (see [`Bendy`]).
+    Bend,
+    /// Bendy limbs: the elbow or knee control where the two segments' curves meet.
+    Pin,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -379,6 +384,72 @@ pub struct IkChain {
     /// follows the IK goal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hock: Option<HockSegment>,
+    /// Initial value of the `soft` attribute (0 to 1): how much of the reach is
+    /// eased so the middle joint doesn't snap straight. 0 is a plain IK solve.
+    #[serde(default)]
+    pub default_soft: f32,
+    /// The softened zone at `soft` = 1, as a fraction of the solved length
+    /// (upper plus lower). See [`soft_reach`].
+    #[serde(default = "soft_zone")]
+    pub soft_zone: f32,
+    /// Bendy limbs: bend controls and the joints they arc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bendy: Option<Bendy>,
+}
+
+/// The fraction of the chain eased at `soft` = 1.
+pub const SOFT_ZONE: f32 = 0.1;
+
+fn soft_zone() -> f32 {
+    SOFT_ZONE
+}
+
+/// Where a softened two-bone chain of length `length` reaches toward a goal
+/// `distance` away (the ease every builder implements). With `soft` = 0 it is
+/// `min(distance, length)`. Otherwise the last `soft * zone * length` of the reach
+/// approaches full extension along an exponential, so the chain never quite
+/// straightens and the middle joint doesn't pop. Stretch then blends from this
+/// reach to the goal: the builders aim the solve at
+/// `reach + stretch * (distance - reach)` and scale the bones by that over `reach`.
+pub fn soft_reach(distance: f32, length: f32, soft: f32, zone: f32) -> f32 {
+    let ease = soft.clamp(0.0, 1.0) * zone * length;
+    if ease <= 0.0 {
+        return distance.min(length);
+    }
+    let start = length - ease;
+    if distance <= start {
+        distance
+    } else {
+        start + ease * (1.0 - (-(distance - start) / ease).exp())
+    }
+}
+
+/// A bendy limb: each segment's skin rides on evenly spaced bend joints that
+/// follow a curve, so the limb can arc.
+///
+/// The upper curve runs from the upper bone's head to the pin control, the lower
+/// one from the pin to the lower bone's tail. A point a fraction `t` along a
+/// segment sits at `lerp(start, end, t) + 4t(1 - t) * offset`, where `offset` is
+/// how far the segment's bend control has been moved from the curve's midpoint
+/// (where it sits at rest). Bend joint `i` of `n` starts at `t = i / n` and aims
+/// at the point at `(i + 1) / n`, so the ends stay put. The segment bones keep
+/// driving the limb (IK, FK and stretch) but no longer deform.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Bendy {
+    /// The elbow or knee control (`ControlKind::Pin`), following the lower bone.
+    pub pin: String,
+    pub upper: BendSegment,
+    pub lower: BendSegment,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BendSegment {
+    /// The segment bone (upper or lower).
+    pub bone: String,
+    /// Its bend control (`ControlKind::Bend`), at the segment's middle.
+    pub control: String,
+    /// The bend joints from the segment's start to its end.
+    pub joints: Vec<String>,
 }
 
 /// The extra segment of a three-segment leg (thigh, calf, hock, foot).
@@ -674,6 +745,39 @@ mod tests {
         let mut restyled = back;
         restyled.shape = Shape::Sphere;
         assert_eq!(restyled.outline().len(), 3);
+    }
+
+    #[test]
+    fn soft_reach_eases_toward_full_extension() {
+        let length = 0.8;
+        // Off: the plain solve, straight once the goal is out of reach.
+        for d in [0.2, 0.79, 0.8, 1.3] {
+            assert_eq!(soft_reach(d, length, 0.0, SOFT_ZONE), d.min(length));
+        }
+        let soft = 0.5;
+        let start = length * (1.0 - soft * SOFT_ZONE);
+        let mut last = 0.0f32;
+        for i in 0..=400 {
+            let d = 0.5 + i as f32 * 0.0025;
+            let r = soft_reach(d, length, soft, SOFT_ZONE);
+            if d <= start {
+                assert_eq!(r, d, "below the eased zone the goal is reached");
+            } else {
+                assert!(r < d && r <= length, "{d}: eased short of the goal");
+            }
+            assert!(r >= last, "the reach only grows as the goal moves out");
+            last = r;
+        }
+        // Smooth where the ease begins: the slope is 1 on both sides.
+        let slope = (soft_reach(start + 1e-4, length, soft, SOFT_ZONE) - start) / 1e-4;
+        assert!((slope - 1.0).abs() < 0.01, "{slope}");
+        // Far out it settles just short of the full length.
+        assert!(length - soft_reach(10.0, length, soft, SOFT_ZONE) < 1e-4);
+        // Soft is clamped to 0..1.
+        assert_eq!(
+            soft_reach(0.79, length, 3.0, SOFT_ZONE),
+            soft_reach(0.79, length, 1.0, SOFT_ZONE)
+        );
     }
 
     #[test]

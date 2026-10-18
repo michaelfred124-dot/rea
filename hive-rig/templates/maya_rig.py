@@ -53,7 +53,7 @@ def build(RIG, geo=None):
 
     def copy_rule(bone):
         parent = bone["parent"]
-        moves = bone.get("translate") or parent is None or not BONES[parent]["deform"]
+        moves = bone.get("translate") or parent is None
         return "parent" if moves else "orient"
 
     # --------------------------------------------------------------------------- groups
@@ -183,11 +183,15 @@ def build(RIG, geo=None):
         template = c["bone"] if c["kind"] in ("fk", "root") else chain_end_ik.get(c["name"])
         if template:
             cmds.matchTransform(offset, joint_of[template], position=True, rotation=True)
+        elif c["kind"] == "bend":
+            # Turned like its segment, so its translation is in the segment's frame.
+            cmds.matchTransform(offset, joint_of[parent["name"]], rotation=True)
+            cmds.xform(offset, worldSpace=True, translation=mpos(c["position"]))
         else:
             cmds.xform(offset, worldSpace=True, matrix=axis_matrix(c["axis"], c["position"]))
         # The outline sits at the control's position (clavicle shape at the shoulder).
         place_outline(shapes, c["outline"])
-        if parent["type"] == "bone":
+        if parent["type"] == "bone" and c["kind"] != "bend":  # bend offsets follow their curve (below)
             cmds.parentConstraint(joint_of[parent["name"]], offset, maintainOffset=True)
         if c.get("spaces"):
             # Space switching: the offset follows whichever space the enum selects.
@@ -206,6 +210,9 @@ def build(RIG, geo=None):
 
         if c["kind"] == "hock" or (c["kind"] == "fk" and (not c["bone"] or copy_rule(bone_by_name[c["bone"]]) == "orient")):
             for attr in ("tx", "ty", "tz"):
+                cmds.setAttr(ctrl + "." + attr, lock=True, keyable=False, channelBox=False)
+        if c["kind"] in ("bend", "pin"):
+            for attr in ("rx", "ry", "rz"):
                 cmds.setAttr(ctrl + "." + attr, lock=True, keyable=False, channelBox=False)
         for attr in ("sx", "sy", "sz", "v"):
             cmds.setAttr(ctrl + "." + attr, lock=True, keyable=False, channelBox=False)
@@ -255,6 +262,44 @@ def build(RIG, geo=None):
             out.append(j)
         return out
 
+
+    def feed(plug, value):
+        """Connect a plug, or set a number."""
+        if isinstance(value, str):
+            cmds.connectAttr(value, plug)
+        else:
+            cmds.setAttr(plug, value)
+
+    def math_node(kind, name, a, b, operation=None):
+        """a (op) b with a utility node; returns its output plug."""
+        if kind == "multDoubleLinear" or kind == "addDoubleLinear":
+            n = cmds.createNode(kind, name=name)
+            feed(n + ".input1", a)
+            feed(n + ".input2", b)
+            return n + ".output"
+        if kind == "plusMinusAverage":
+            n = cmds.createNode(kind, name=name)
+            cmds.setAttr(n + ".operation", operation)
+            feed(n + ".input1D[0]", a)
+            feed(n + ".input1D[1]", b)
+            return n + ".output1D"
+        n = cmds.createNode("multiplyDivide", name=name)
+        cmds.setAttr(n + ".operation", operation)
+        feed(n + ".input1X", a)
+        feed(n + ".input2X", b)
+        return n + ".outputX"
+
+    def pick(name, first, operation, second, if_true, if_false):
+        """`if_true` when `first (operation) second`, else `if_false` (condition node)."""
+        n = cmds.createNode("condition", name=name)
+        cmds.setAttr(n + ".operation", operation)
+        feed(n + ".firstTerm", first)
+        feed(n + ".secondTerm", second)
+        feed(n + ".colorIfTrueR", if_true)
+        feed(n + ".colorIfFalseR", if_false)
+        return n + ".outColorR"
+
+    GREATER, LESS = 2, 4  # condition operations
 
     limb_nodes = {}  # chain name -> its helper joints and IK goal, for the animator tools
     for chain in CHAINS:
@@ -322,36 +367,69 @@ def build(RIG, geo=None):
             solve_to = cmds.group(empty=True, name=chain["name"] + "_hock_grp", parent=ctrl_of[hock["control"]])
             cmds.matchTransform(solve_to, joint_of[hock["bone"]], position=True, rotation=True)
             cmds.orientConstraint(goal, ik_chain[3], maintainOffset=True)
-        cmds.parent(handle, solve_to)
         limb_nodes[chain["name"]] = {"fk_joints": fk_chain, "goal": goal, "solve_to": solve_to}
         cmds.orientConstraint(solve_to, ik_chain[2], maintainOffset=True)
 
-        # Stretch: scale the IK joints' lengths by how far the goal is beyond reach.
+        # Soft IK and stretch. `d` is the distance from the shoulder or hip to the
+        # goal and `reach` how far the chain reaches toward it (hive-rig's
+        # soft_reach: min(d, length) at soft 0, eased near full extension above).
+        # The handle sits at `aim` = reach + stretch * (d - reach) on the line to
+        # the goal, and the IK joints' lengths scale by aim / reach to land there.
+        # At soft 0 this is the plain stretch: lengths scale by how far the goal is
+        # beyond reach, blended by `stretch`.
+        n = chain["name"]
         cmds.addAttr(ik_ctrl, longName="stretch", attributeType="double", min=0, max=1,
                      defaultValue=chain["default_stretch"], keyable=True)
+        soft = 0.0
+        if not hock:
+            cmds.addAttr(ik_ctrl, longName="soft", attributeType="double", min=0, max=1,
+                         defaultValue=chain["default_soft"], keyable=True)
+            soft = ik_ctrl + ".soft"
         rest = [cmds.getAttr(j + ".translateX") for j in ik_chain[1:3]]
-        dist = cmds.createNode("distanceBetween", name=chain["name"] + "_stretch_dist")
-        cmds.connectAttr(ik_chain[0] + ".worldMatrix[0]", dist + ".inMatrix1")
+        length = sum(abs(r) for r in rest)
+        soft_root = cmds.group(empty=True, name=n + "_soft_root",
+                               parent=cmds.listRelatives(ik_chain[0], parent=True)[0])
+        cmds.matchTransform(soft_root, ik_chain[0], position=True, rotation=True)
+        dist = cmds.createNode("distanceBetween", name=n + "_soft_dist")
+        cmds.connectAttr(soft_root + ".worldMatrix[0]", dist + ".inMatrix1")
         cmds.connectAttr(solve_to + ".worldMatrix[0]", dist + ".inMatrix2")
-        ratio = cmds.createNode("multiplyDivide", name=chain["name"] + "_stretch_ratio")
-        cmds.setAttr(ratio + ".operation", 2)
-        cmds.connectAttr(dist + ".distance", ratio + ".input1X")
-        cmds.setAttr(ratio + ".input2X", sum(abs(r) for r in rest))
-        over = cmds.createNode("condition", name=chain["name"] + "_stretch_cond")
-        cmds.setAttr(over + ".operation", 2)  # greater than
-        cmds.connectAttr(ratio + ".outputX", over + ".firstTerm")
-        cmds.setAttr(over + ".secondTerm", 1)
-        cmds.connectAttr(ratio + ".outputX", over + ".colorIfTrueR")
-        cmds.setAttr(over + ".colorIfFalseR", 1)
-        amount = cmds.createNode("blendTwoAttr", name=chain["name"] + "_stretch_blend")
-        cmds.setAttr(amount + ".input[0]", 1)
-        cmds.connectAttr(over + ".outColorR", amount + ".input[1]")
-        cmds.connectAttr(ik_ctrl + ".stretch", amount + ".attributesBlender")
-        for j, length in zip(ik_chain[1:], rest):
-            scale = cmds.createNode("multiplyDivide", name=j + "_stretch_len")
-            cmds.connectAttr(amount + ".output", scale + ".input1X")
-            cmds.setAttr(scale + ".input2X", length)
-            cmds.connectAttr(scale + ".outputX", j + ".translateX")
+        d = dist + ".distance"
+        tiny = 1e-4 * length
+        reach = pick(n + "_hard_reach", d, LESS, length, d, length)
+        if soft:
+            ease = math_node("multDoubleLinear", n + "_soft_ease", soft, float(chain["soft_zone"]) * length)
+            ease = pick(n + "_soft_ease_min", ease, GREATER, tiny, ease, tiny)
+            start = math_node("plusMinusAverage", n + "_soft_start", length, ease, 2)
+            over = math_node("plusMinusAverage", n + "_soft_over", d, start, 2)
+            over = pick(n + "_soft_over_min", over, GREATER, 0.0, over, 0.0)
+            fall = math_node("multiplyDivide", n + "_soft_fall", over, ease, 2)
+            fall = math_node("multDoubleLinear", n + "_soft_fall_neg", fall, -1.0)
+            decay = math_node("multiplyDivide", n + "_soft_decay", math.e, fall, 3)
+            rise = math_node("plusMinusAverage", n + "_soft_rise", 1.0, decay, 2)
+            eased = math_node("addDoubleLinear", n + "_soft_eased",
+                              pick(n + "_soft_below", d, LESS, start, d, start),
+                              math_node("multDoubleLinear", n + "_soft_rise_len", ease, rise))
+            reach = pick(n + "_reach", soft, GREATER, 0.0, eased, reach)
+        blend = cmds.createNode("blendTwoAttr", name=n + "_stretch_blend")
+        cmds.connectAttr(reach, blend + ".input[0]")
+        cmds.connectAttr(d, blend + ".input[1]")
+        cmds.connectAttr(ik_ctrl + ".stretch", blend + ".attributesBlender")
+        aim = blend + ".output"
+        amount = math_node("multiplyDivide", n + "_stretch_amount", aim, reach, 2)
+        for j, rest_length in zip(ik_chain[1:], rest):
+            cmds.connectAttr(math_node("multiplyDivide", j + "_stretch_len", amount, rest_length, 1), j + ".translateX")
+        # The handle rides on the line from the shoulder or hip to the goal, `aim` along it.
+        along = math_node("multiplyDivide", n + "_soft_along", aim,
+                          pick(n + "_soft_dist_min", d, GREATER, tiny, d, tiny), 2)
+        back = math_node("plusMinusAverage", n + "_soft_back", 1.0, along, 2)
+        soft_grp = cmds.group(empty=True, name=n + "_soft_grp", parent=helper_grp)
+        con = cmds.pointConstraint(soft_root, solve_to, soft_grp, maintainOffset=False)[0]
+        w_root, w_goal = cmds.pointConstraint(con, query=True, weightAliasList=True)
+        cmds.connectAttr(back, con + "." + w_root)
+        cmds.connectAttr(along, con + "." + w_goal)
+        cmds.parent(handle, soft_grp)
+        limb_nodes[n]["soft_root"] = soft_root
+        limb_nodes[n]["length"] = length
 
         for k, (bone, ik_j, fk_j) in enumerate(zip(chain_bones(chain), ik_chain, fk_chain)):
             # Lower joints also take position so stretching reaches the skin.
@@ -368,6 +446,53 @@ def build(RIG, geo=None):
         if hock:
             cmds.connectAttr(ik_ctrl + ".ikFk", offset_of[hock["control"]] + ".visibility")
 
+    # --------------------------------------------------------------------------- bendy limbs
+    # Each segment's curve runs from its start to its end point (the upper one from
+    # the shoulder or hip to the pin, the lower one from the pin to the wrist or
+    # ankle). Groups under the segment joint sit at points along it, each moved by
+    # its share, 4t(1 - t), of the bend control's offset; each bend joint sits on
+    # its point, aims at the next and takes its twist share there.
+    twist_driven = {}  # bend joint -> the group its twist share turns
+    for chain in CHAINS:
+        bendy = chain.get("bendy")
+        if not bendy:
+            continue
+        pin = ctrl_of[bendy["pin"]]
+        ends = (joint_of[chain["upper"]], pin), (pin, joint_of[chain["end"]])
+        for seg, (start, end) in zip((bendy["upper"], bendy["lower"]), ends):
+            seg_joint = joint_of[seg["bone"]]
+            ctrl, offset = ctrl_of[seg["control"]], offset_of[seg["control"]]
+            # The bend control stays at the curve's middle, turned like the segment.
+            cmds.pointConstraint(start, end, offset, maintainOffset=False)
+            cmds.orientConstraint(seg_joint, offset, maintainOffset=True)
+            k = len(seg["joints"])
+            points = []
+            for i in range(k + 1):
+                t = i / float(k)
+                base = cmds.group(empty=True, name="%s_curve%d_base" % (seg["bone"], i), parent=seg_joint)
+                for attr in ("rx", "ry", "rz"):
+                    cmds.setAttr(base + "." + attr, 0)
+                con = cmds.pointConstraint(start, end, base, maintainOffset=False)[0]
+                w_start, w_end = cmds.pointConstraint(con, query=True, weightAliasList=True)
+                cmds.setAttr(con + "." + w_start, 1.0 - t)
+                cmds.setAttr(con + "." + w_end, t)
+                point = cmds.group(empty=True, name="%s_curve%d" % (seg["bone"], i), parent=base)
+                share = cmds.createNode("multiplyDivide", name="%s_curve%d_bend" % (seg["bone"], i))
+                cmds.connectAttr(ctrl + ".translate", share + ".input1")
+                for axis in "XYZ":
+                    cmds.setAttr(share + ".input2" + axis, 4.0 * t * (1.0 - t))
+                cmds.connectAttr(share + ".output", point + ".translate")
+                points.append(point)
+            for i, joint in enumerate(seg["joints"]):
+                aim = cmds.group(empty=True, name=joint + "_bend_aim", parent=helper_grp)
+                cmds.pointConstraint(points[i], aim, maintainOffset=False)
+                cmds.aimConstraint(points[i + 1], aim, maintainOffset=False, aimVector=(1, 0, 0),
+                                   upVector=(0, 1, 0), worldUpType="objectrotation",
+                                   worldUpVector=(0, 1, 0), worldUpObject=seg_joint)
+                turn = cmds.group(empty=True, name=joint + "_bend_twist", parent=aim)
+                cmds.parentConstraint(turn, joint_of[joint], maintainOffset=False)
+                twist_driven[joint] = turn
+
     # --------------------------------------------------------------------------- twist helpers
     for b in BONES:
         twist = b.get("twist")
@@ -376,7 +501,7 @@ def build(RIG, geo=None):
         share = cmds.createNode("multiplyDivide", name=b["name"] + "_twist_share")
         cmds.connectAttr(joint_of[twist["source"]] + ".rotateX", share + ".input1X")
         cmds.setAttr(share + ".input2X", twist["factor"])
-        cmds.connectAttr(share + ".outputX", joint_of[b["name"]] + ".rotateX")
+        cmds.connectAttr(share + ".outputX", twist_driven.get(b["name"], joint_of[b["name"]]) + ".rotateX")
 
     # --------------------------------------------------------------------------- spline chains
     # A curve through the joints' heads is skinned to a driver joint under each
@@ -496,9 +621,14 @@ def build(RIG, geo=None):
             "rest": [world_matrix(joint_of[b]) for b in chain_bones(chain)],
             "rest_pole": world_matrix(ctrl_of[chain["pole_control"]]),
             "hock": {"control": ctrl_of[hock["control"]], "target": nodes["solve_to"]} if hock else None,
+            # Soft IK: where the reach is measured from, the chain length and the eased zone.
+            "soft": None if hock else {"root": nodes["soft_root"], "length": nodes["length"],
+                                       "zone": float(chain["soft_zone"])},
         })
         d = defaults.setdefault(ik_ctrl, {})
         d.update(ikFk=float(chain["default_blend"]), stretch=float(chain["default_stretch"]))
+        if not hock:
+            d["soft"] = float(chain["default_soft"])
         if chain.get("foot"):
             d["roll"] = 0.0
     for sp in SPLINES:
@@ -534,7 +664,7 @@ def build(RIG, geo=None):
 # left/right twins come from hive-rig (ik_chains and mirror_pairs), kept on the rig
 # as `hiveAnim` with the bind frames. Matrices here are 4x4 lists of rows acting on
 # column vectors; Maya's flat worldMatrix is the transpose.
-ANIM_ATTRS = ("ikFk", "stretch", "roll", "space", "volume")
+ANIM_ATTRS = ("ikFk", "stretch", "soft", "roll", "space", "volume")
 CHANNELS = ("tx", "ty", "tz", "rx", "ry", "rz")
 
 
@@ -697,6 +827,16 @@ def rotate_about(p, origin, axis, angle):
     return add(origin, r)
 
 
+def unsoft_reach(reach, length, soft, zone):
+    """The goal distance at which a softened chain reaches `reach` (the inverse of
+    hive-rig's soft_reach), so matching to IK lands on the FK pose."""
+    ease = soft * zone * length
+    start = length - ease
+    if ease <= 0.0 or reach <= start:
+        return reach
+    return start - ease * math.log(max(1.0 - (reach - start) / ease, 1e-9))
+
+
 def fk_to_ik(name):
     """Move the IK control and pole onto the FK pose, then switch the limb to IK."""
     limb = limb_of(name)
@@ -704,6 +844,17 @@ def fk_to_ik(name):
     # The IK goal can sit below the control (a rolled foot); keep that offset.
     offset = mat_mul(mat_inv(world(limb["ik"])), world(limb["goal"]))
     set_world(limb["ik"], mat_mul(fk[-1], mat_inv(offset)))
+    soft = limb.get("soft")
+    if soft and cmds.getAttr(limb["ik"] + ".soft") > 0.0:
+        # Soft IK falls short near full reach: push the control out until the eased
+        # reach lands on the FK end.
+        root = translation(world(soft["root"]))
+        have = sub(translation(world(limb["goal"])), root)
+        distance = math.sqrt(dot(have, have))
+        want = unsoft_reach(distance, soft["length"], cmds.getAttr(limb["ik"] + ".soft"), soft["zone"])
+        if want > distance:
+            m = world(limb["ik"])
+            set_world(limb["ik"], with_translation(m, add(translation(m), scale(norm(have), want - distance))))
     hock = limb.get("hock")
     if hock:
         # Turn the hock control (it pivots on the ankle) until the group it carries

@@ -302,6 +302,14 @@ impl Naming {
                 ctrl(&mut h.fk_control);
                 ctrl(&mut h.control);
             }
+            if let Some(bendy) = &mut k.bendy {
+                ctrl(&mut bendy.pin);
+                for seg in [&mut bendy.upper, &mut bendy.lower] {
+                    bone(&mut seg.bone);
+                    ctrl(&mut seg.control);
+                    seg.joints.iter_mut().for_each(bone);
+                }
+            }
         }
         for s in &mut controls.splines {
             s.bones.iter_mut().for_each(bone);
@@ -348,6 +356,7 @@ mod tests {
         ] {
             components::add_preset(&mut guides, preset, &Default::default()).unwrap();
         }
+        components::set_limb_options(&mut guides, true, 0.2);
         let built = components::build(&guides).unwrap();
         let game = Preset::Game.naming();
         for b in &built.skeleton.bones {
@@ -379,6 +388,12 @@ mod tests {
             for k in &ct.ik_chains {
                 assert!(bones.contains(&k.end) && ctrls.contains(&k.ik_control));
                 assert!(k.fk_controls.iter().all(|f| ctrls.contains(f)));
+                let bendy = k.bendy.as_ref().unwrap();
+                assert!(ctrls.contains(&bendy.pin));
+                for seg in [&bendy.upper, &bendy.lower] {
+                    assert!(bones.contains(&seg.bone) && ctrls.contains(&seg.control));
+                    assert!(seg.joints.iter().all(|j| bones.contains(j)), "{preset:?}");
+                }
             }
             assert!(!ct.mirror_pairs.is_empty());
             for [l, r] in &ct.mirror_pairs {

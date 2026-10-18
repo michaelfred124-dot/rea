@@ -66,8 +66,11 @@ pub struct Bone {
     /// Twist helper: rotates about its own length by `factor` times the twist of `source`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub twist: Option<Twist>,
-    /// The bone's control moves it as well as rotating it (face joints), even
-    /// though its parent deforms.
+    /// The bone's control moves it as well as rotating it: face joints, and bones
+    /// built under a non-deforming helper (the root). Without it the control only
+    /// turns the bone. Decided when the rig is built, so the builders never guess
+    /// it from other flags (a bendy limb's segment bones stop deforming but still
+    /// carry their children by rotation).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub translate: bool,
     /// Only vertices within this distance of the bone take its weight (face

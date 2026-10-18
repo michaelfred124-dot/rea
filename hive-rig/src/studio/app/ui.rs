@@ -1787,6 +1787,9 @@ impl Studio {
                         });
                     }
                 });
+                if comp.kind != Kind::QuadLeg {
+                    self.limb_options(ui, &comp);
+                }
             }
             _ => {}
         }
@@ -1870,6 +1873,47 @@ impl Studio {
     }
 
     /// Record an undo step for a guide move unless one is already in progress.
+    /// Arm and leg options: bendy segments and the IK's soft reach.
+    fn limb_options(&mut self, ui: &mut Ui, comp: &components::Component) {
+        let id = comp.id.clone();
+        let mut bendy = comp.options.bendy;
+        let mut soft = comp.options.soft;
+        let mut toggled = false;
+        let mut softened = false;
+        ui.horizontal(|ui| {
+            toggled = theme::pill(ui, &mut bendy, "Bendy")
+                .on_hover_text("Bend controls arc each segment, and a pin moves the elbow or knee")
+                .clicked();
+            ui.label(RichText::new("Soft IK").color(TEXT_DIM));
+            softened = ui
+                .add(
+                    egui::DragValue::new(&mut soft)
+                        .range(0.0..=1.0)
+                        .speed(0.01)
+                        .max_decimals(2),
+                )
+                .on_hover_text(
+                    "Eases the IK near full reach so the knee or elbow doesn't pop (0 = off)",
+                )
+                .changed();
+        });
+        if toggled {
+            self.edit("change bendy", |g| {
+                component_mut(g, &id).options.bendy = bendy;
+                Ok(format!(
+                    "Bendy {} on {id}.",
+                    if bendy { "on" } else { "off" }
+                ))
+            });
+        }
+        if softened {
+            self.edit("change soft IK", |g| {
+                component_mut(g, &id).options.soft = soft;
+                Ok(format!("Soft IK on {id} is now {soft:.2}."))
+            });
+        }
+    }
+
     fn begin_change(&mut self) {
         if self.drag.is_none()
             && let Some(doc) = &mut self.doc
@@ -4691,6 +4735,11 @@ fn shape_preview(painter: &egui::Painter, rect: Rect, shape: Shape, stroke: Stro
     }
 }
 
+/// The component `id` of `g`, which the inspector has just shown.
+fn component_mut<'a>(g: &'a mut components::Guides, id: &str) -> &'a mut components::Component {
+    g.components.iter_mut().find(|x| x.id == id).unwrap()
+}
+
 fn kind_word(kind: ControlKind) -> &'static str {
     match kind {
         ControlKind::Root => "Root",
@@ -4700,6 +4749,8 @@ fn kind_word(kind: ControlKind) -> &'static str {
         ControlKind::Pole => "Pole",
         ControlKind::Hock => "Hock",
         ControlKind::Spline => "Curve",
+        ControlKind::Bend => "Bend",
+        ControlKind::Pin => "Pin",
         _ => "Animator",
     }
 }

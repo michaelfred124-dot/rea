@@ -70,7 +70,8 @@ def stub_maya():
                 if kwargs.get("allDescendents"):
                     return sorted(nodes)
                 return ["parent_or_shape"]
-            if name in ("skinCluster", "ikHandle", "orientConstraint", "aimConstraint", "parentConstraint", "poleVectorConstraint"):
+            if name in ("skinCluster", "ikHandle", "orientConstraint", "aimConstraint", "parentConstraint",
+                        "pointConstraint", "poleVectorConstraint"):
                 if kwargs.get("query") and kwargs.get("weightAliasList"):
                     targets = [a for a in args if isinstance(a, str)]
                     return ["t%d_W%d" % (i, i) for i in range(max(2, len(targets)))]
@@ -96,7 +97,7 @@ def stub_maya():
                     attrs[args[0]] = args[1]
                 return None
             if name == "addAttr":
-                attrs.setdefault("%s.%s" % (args[0], kwargs["longName"]), None)
+                attrs.setdefault("%s.%s" % (args[0], kwargs["longName"]), kwargs.get("defaultValue"))
                 return None
             if name == "attributeQuery":
                 return "%s.%s" % (kwargs["node"], args[0]) in attrs
@@ -133,7 +134,7 @@ def stub_maya():
 
     for n in ["about", "group", "rename", "parent", "listRelatives", "sets", "polySoftEdge", "createNode", "xform",
               "joint", "setAttr", "skinCluster", "curve", "matchTransform", "move", "parentConstraint",
-              "orientConstraint", "aimConstraint", "addAttr", "makeIdentity", "ikHandle", "poleVectorConstraint", "connectAttr",
+              "orientConstraint", "aimConstraint", "pointConstraint", "addAttr", "makeIdentity", "ikHandle", "poleVectorConstraint", "connectAttr",
               "select", "file", "getAttr", "expression", "attributeQuery", "objExists", "delete", "ls",
               "spaceLocator", "listHistory", "polyEvaluate", "warning", "autoKeyframe", "setKeyframe",
               "window", "deleteUI", "columnLayout", "rowLayout", "setParent", "button", "text", "separator",
@@ -256,7 +257,8 @@ if __name__ == "__main__":
         # Spline chains: every curve point gets its weights, the last joint follows the end.
         splines = json.loads(open(script).read().split('r"""', 1)[1].split('"""', 1)[0])["controls"].get("splines", [])
         assert calls.count("skinPercent") == sum(len(s["points"]) for s in splines), calls.count("skinPercent")
-        assert calls.count("pointConstraint") == len(splines)
+        ends = [s["bones"][-1] for s in splines]
+        assert all(any(c[0] == "pointConstraint" and c[1][-1] == e for c in calls if isinstance(c, tuple)) for e in ends)
         # Every CV of every control curve lands on hive-rig's outline (in cm).
         rig = json.loads(open(script).read().split('r"""', 1)[1].split('"""', 1)[0])
         for c in rig["controls"]["controls"]:
@@ -274,6 +276,13 @@ if __name__ == "__main__":
             assert len(limb["joints"]) == len(limb["fk"]) == len(limb["fk_joints"]) == segments, limb["name"]
             ns["ik_to_fk"](limb["name"])
             ns["fk_to_ik"](limb["name"])
+        # Soft IK on every two-bone limb; bendy limbs constrain each bend joint to its curve.
+        for chain in rig["controls"]["ik_chains"]:
+            ik = chain["ik_control"]
+            assert ns["cmds"].attributeQuery("soft", node=ik) != bool(chain.get("hock")), chain["name"]
+            for seg in ("upper", "lower") if chain.get("bendy") else ():
+                for joint in chain["bendy"][seg]["joints"]:
+                    assert ("parentConstraint", (joint + "_bend_twist", joint)) in calls, joint
         assert ns["mirror_pose"](None, "left") == len(anim["mirror"])
         assert ns["mirror_pose"]([anim["mirror"][0][1]], "right") == 1
         assert ns["reset_pose"]() == len(anim["controls"])
@@ -295,15 +304,22 @@ if __name__ == "__main__":
             assert not ns["guide_nodes"]()
             print("maya guide tools ran against stubs: ok")
     elif kind == "unreal":
+        import json
+
         vm = stub_unreal()
         runpy.run_path(script, run_name="__main__")
         assert vm.add_link.call_count > 20
         # Spline chains: two Fit Chain on Curve units (keep length, then stretch) each.
-        import json
-
         splines = json.loads(open(script).read().split('r"""', 1)[1].split('"""', 1)[0]).get("splines", [])
         units = [c.args[0] for c in vm.add_unit_node_from_struct_path.call_args_list]
         assert units.count("/Script/ControlRig.RigUnit_FitChainToCurvePerItem") == 2 * len(splines), units
+        # Bendy limbs: every bend joint is placed on its curve after the solve.
+        rig = json.loads(open(script).read().split('r"""', 1)[1].split('"""', 1)[0])
+        made = {c.args[3] for c in vm.add_unit_node_from_struct_path.call_args_list}
+        for chain in rig["ik_chains"]:
+            for seg in ("upper", "lower") if chain.get("bendy") else ():
+                for joint in chain["bendy"][seg]["joints"]:
+                    assert "Bend_" + joint in made, joint
     else:
         raise SystemExit("unknown kind " + kind)
     print("%s builder ran against stubs: ok" % kind)
