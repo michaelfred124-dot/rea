@@ -216,6 +216,18 @@ jobs:
             cargo run -q -- demo -o "$RUNNER_TEMP/rig$drop" --arm-drop "$drop"
             python tests/blender_check.py "$RUNNER_TEMP/rig$drop/hive_demo_blender.py" "$RUNNER_TEMP/rig$drop/hive_demo.glb"
           done
+      - name: FBX through Blender's FBX importer - demo, dog, bendy, 8 influences, side-first names
+        run: |
+          f="$RUNNER_TEMP/fbx"
+          cargo run -q -- demo -o "$f/plain" --targets fbx
+          cargo run -q -- demo -o "$f/dog" --quadruped --targets fbx
+          cargo run -q -- demo -o "$f/bendy" --bendy --targets fbx
+          cargo run -q -- demo -o "$f/m8" --engine unreal --targets fbx
+          cargo run -q -- naming "$f/m8/hive_demo.guides.json" prefix
+          cargo run -q -- rebuild "$f/m8/hive_demo.hive.json" -o "$f/named" --targets fbx
+          for rig in plain/hive_demo dog/hive_dog bendy/hive_demo m8/hive_demo named/hive_demo; do
+            python tests/blender_fbx_check.py "$f/$rig.fbx" "$f/$rig.hive.json"
+          done
       - name: Control shapes set in guides.json, in Blender
         run: |
           rig="$RUNNER_TEMP/shapes"

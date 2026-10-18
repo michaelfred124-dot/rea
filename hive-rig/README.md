@@ -38,8 +38,8 @@ a joint; with Symmetry on, its twin on the other side follows.
   tail, a curve-driven tentacle, a ponytail, a prop socket in the right hand, three-segment hind legs
   for quadrupeds, and a custom chain. Its **Templates** category lists saved
   setups (see [Rig templates](#rig-templates)).
-* **The export window** (Ctrl+E) picks the programs, the naming convention, the
-  file name and the folder.
+* **The export window** (Ctrl+E) picks the programs (and **Export FBX** for
+  game engines), the naming convention, the file name and the folder.
 
 Every change rebuilds the bone and control preview at once; Ctrl+Z and Ctrl+Y
 undo and redo, Ctrl+B builds, 1/2/3 switch views and F frames the character.
@@ -65,6 +65,7 @@ output folder.
 | File | Use it in | What it contains |
 | --- | --- | --- |
 | `<name>.glb` | Blender, Unreal, any glTF tool | Mesh, skeleton and skin weights |
+| `<name>.fbx` (with `--targets fbx`) | Unreal, Unity, any FBX tool | Mesh, skeleton, skin weights and bind pose |
 | `<name>_blender.py` | Blender 3.6+ | Mesh, armature, weights **and controls** |
 | `<name>_maya.py` | Maya 2022+ | Mesh, oriented joints, skinCluster **and controls** |
 | `<name>_unreal.py` | Unreal Engine 5.2+ | Imports the .glb and builds a **Control Rig Blueprint** |
@@ -75,6 +76,29 @@ Controls don't survive generic formats like FBX or glTF, so each application
 gets a generated Python script that rebuilds the control rig with native
 tools. The skin and skeleton are written as glTF because it's an open format
 that Blender and Unreal import natively.
+
+### FBX for game engines
+
+`--targets fbx` (on `rig`, `demo` and `rebuild`, alone or with the scripts:
+`--targets blender,maya,unreal,fbx`), or **Export FBX** in the app's export
+window, also writes `<name>.fbx`: a binary FBX 7.4 that Unreal and Unity import
+directly as a skeletal mesh, with no script. It holds the mesh (triangles,
+smooth normals, one material), one joint per bone named with the rig's
+[naming convention](#naming-conventions) and parented as in the skeleton, the
+skin weights with every influence the skin keeps (8 for `--engine unreal`, up to
+12; FBX has no limit of four), and a bind pose for the mesh and every bone. It
+is Y-up, facing +Z, in centimetres; Unity and Blender scale it to metres. Joints
+carry translation only, like the `.glb`. FBX has no controls: use the Unreal
+script for a Control Rig.
+
+```bash
+hive-rig demo -o out --targets fbx --engine unreal   # out/hive_demo.fbx with 8 influences
+hive-rig rebuild out/hive_demo.hive.json --targets unreal,fbx
+```
+
+The writer is a small hand-written one in `src/export/fbx.rs` (no FBX SDK, no new
+crates), from the publicly described binary layout. Arrays are written
+uncompressed, so files are larger than ones written with compression.
 
 ### The control rig
 
@@ -579,13 +603,13 @@ back to average human proportions and prints a warning.
    and influences below the prune threshold (if any) are dropped.
 4. **Controls** (`src/controls.rs`): the DCC-neutral description of every control
    (its parent, shape, colour and driven bone) and the IK chains, as built by the components.
-5. **Export** (`src/export/`): the glTF writer and the three builder templates
+5. **Export** (`src/export/`): the glTF and FBX writers and the three builder templates
    in `templates/`, with the rig data embedded so each script is self-contained.
 
 ## Testing
 
 ```bash
-cargo test                       # landmarks, skeleton, skin, controls, glTF round trip
+cargo test                       # landmarks, skeleton, skin, controls, glTF and FBX read back
 python3 tests/dcc_stub_run.py maya out/hive_demo_maya.py      # Python-level check
 python3 tests/dcc_stub_run.py unreal out/hive_demo_unreal.py  # Python-level check
 pip install bpy && python tests/blender_check.py out/hive_demo_blender.py out/hive_demo.glb
@@ -595,7 +619,16 @@ python tests/blender_spline_check.py out/hive_demo_blender.py out/hive_demo.glb 
 python tests/blender_bendy_check.py bendy/hive_demo_blender.py   # after demo --bendy --soft 0.5 -o bendy
 python3 tests/dcc_stub_run.py maya out/hive_demo_maya.py --guides       # Maya guide tools
 python tests/blender_anim_check.py out/hive_demo_blender.py             # animator tools
+python tests/blender_fbx_check.py out/hive_demo.fbx out/hive_demo.hive.json   # after demo --targets fbx -o out
 ```
+
+`blender_fbx_check.py` imports the `.fbx` with Blender's own FBX importer and
+compares it with the `.hive.json`: the bone count, names, parents and rest
+positions, the mesh's vertices, every vertex's weights (all influences), that
+the skin doesn't move at rest, and that posing a bone moves only the skin it
+(or a bone below it) weighs on. CI runs it on the demo, the dog, bendy limbs,
+an 8-influence rig and side-first names. `src/export/fbx.rs` reads the file
+back with a strict parser in its unit tests.
 
 `blender_check.py` builds the rig in real Blender and checks that it works as
 a rig: the rest pose is unchanged, feet and hands reach their IK goals, knees
@@ -673,11 +706,14 @@ The Maya and Unreal builders, and the Maya guide and animator tools, are checked
 APIs. That catches script errors but doesn't prove the application calls behave
 as intended (the spline chains' ikSplineHandle and Fit Chain on Curve setups
 included). The Maya stub also checks that every control curve point is placed
-on the control's outline. The builders haven't been run inside Maya or Unreal yet.
+on the control's outline. The builders haven't been run inside Maya or Unreal yet,
+and the `.fbx` has been imported only by Blender, not yet by Unreal, Unity or
+Autodesk's FBX SDK.
 
 ## Not yet included
 
 See [the gap list](docs/hive-gaps.md)
 for what's planned. In short: corrective shapes, creature templates beyond the dog (horse, spider, dinosaur), extra arms or legs on the same
 side, guide editing in Unreal (rebuild with the CLI and rerun the script), the
-animator tools (IK/FK matching, mirror and reset pose) in Unreal, and FBX output.
+animator tools (IK/FK matching, mirror and reset pose) in Unreal, FBX input, and
+FBX animation, blend shapes or UVs (the mesh has none yet).

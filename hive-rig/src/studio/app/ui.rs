@@ -2383,17 +2383,22 @@ impl Studio {
                 close |= dialog_header(
                     ui,
                     "Export rig",
-                    "Writes the skinned .glb and a builder script per program, with every control.",
+                    "Writes the skinned .glb and a builder script per program, with every control. \
+                     Export FBX adds an .fbx (mesh, skeleton, skin) for game engines.",
                 );
                 let doc = self.doc.as_mut().unwrap();
 
                 theme::label_caps(ui, "Programs");
-                let w = (ui.available_width() - 16.0) / 3.0;
+                let w = (ui.available_width() - 24.0) / 4.0;
                 ui.horizontal(|ui| {
-                    for (i, (name, note)) in
-                        [("Blender", "3.6+"), ("Maya", "2022+"), ("Unreal", "5.2+")]
-                            .into_iter()
-                            .enumerate()
+                    for (i, (name, note)) in [
+                        ("Blender", "3.6+"),
+                        ("Maya", "2022+"),
+                        ("Unreal", "5.2+"),
+                        ("Export FBX", "Unreal, Unity"),
+                    ]
+                    .into_iter()
+                    .enumerate()
                     {
                         if target_tile(ui, w, name, note, self.targets[i]).clicked() {
                             self.targets[i] = !self.targets[i];

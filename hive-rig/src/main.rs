@@ -255,7 +255,9 @@ enum SideArg {
 
 #[derive(clap::Args)]
 struct Outputs {
-    /// Which DCC builder scripts to write.
+    /// What to write besides the .glb: builder scripts for blender, maya and
+    /// unreal, and fbx for a binary .fbx (mesh, skeleton, skin, bind pose) for
+    /// game engines such as Unreal and Unity.
     #[arg(
         short,
         long,

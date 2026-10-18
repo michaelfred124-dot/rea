@@ -221,7 +221,8 @@ pub struct Studio {
     pub brush_at: Option<Vec3>,
     /// Keep hand-edited weights when the rig is built again.
     pub keep_weights: bool,
-    pub targets: [bool; 3],
+    /// Blender, Maya, Unreal scripts and the FBX file, in `Target::ALL` order.
+    pub targets: [bool; 4],
     pub status: String,
     pub error: bool,
     /// The status is a warning: the operation worked, with something to look at.
@@ -278,7 +279,7 @@ impl Default for Studio {
             brush: Brush::default(),
             brush_at: None,
             keep_weights: true,
-            targets: [true; 3],
+            targets: [true, true, true, false],
             status: "Open a character to start, or try the demo.".into(),
             error: false,
             warn: false,
@@ -1799,7 +1800,7 @@ mod tests {
                 .any(|c| c.r() > 200)
         );
         let dir = std::env::temp_dir().join(format!("hive_studio_test_{}", std::process::id()));
-        s.targets = [true, false, true];
+        s.targets = [true, false, true, true];
         let files = s.export(&dir).unwrap();
         let names: Vec<String> = files
             .iter()
@@ -1807,6 +1808,7 @@ mod tests {
             .collect();
         assert!(names.contains(&"hive_demo_blender.py".to_string()));
         assert!(names.contains(&"hive_demo.guides.json".to_string()));
+        assert!(names.contains(&"hive_demo.fbx".to_string()));
         assert!(!names.iter().any(|n| n.ends_with("_maya.py")));
 
         // Editing invalidates the built rig; export builds it again.

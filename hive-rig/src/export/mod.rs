@@ -1,9 +1,11 @@
 //! Writers for the interchange mesh and the per-DCC control-rig builders.
 //!
 //! Skeleton and skin travel as glTF (open, imported natively by Blender and
-//! Unreal). Controls do not survive any generic format, so each DCC also gets a
+//! Unreal), and on request as a binary FBX for game engines (Unreal, Unity).
+//! Controls do not survive any generic format, so each DCC also gets a
 //! generated Python script that rebuilds the control rig with native tools.
 
+pub mod fbx;
 pub mod glb;
 
 use std::path::{Path, PathBuf};
@@ -27,16 +29,22 @@ pub enum Target {
     Blender,
     Maya,
     Unreal,
+    /// A binary `<name>.fbx` with mesh, skeleton, skin and bind pose, for game
+    /// engines. Not a builder script: FBX carries no controls.
+    Fbx,
 }
 
 impl Target {
-    pub const ALL: [Target; 3] = [Target::Blender, Target::Maya, Target::Unreal];
+    pub const ALL: [Target; 4] = [Target::Blender, Target::Maya, Target::Unreal, Target::Fbx];
+    /// The targets that get a builder script.
+    pub const SCRIPTS: [Target; 3] = [Target::Blender, Target::Maya, Target::Unreal];
 
     pub fn key(self) -> &'static str {
         match self {
             Target::Blender => "blender",
             Target::Maya => "maya",
             Target::Unreal => "unreal",
+            Target::Fbx => "fbx",
         }
     }
 }
@@ -48,7 +56,10 @@ impl FromStr for Target {
             "blender" => Ok(Target::Blender),
             "maya" => Ok(Target::Maya),
             "unreal" | "ue" | "ue5" => Ok(Target::Unreal),
-            other => anyhow::bail!("unknown target '{other}' (expected blender, maya or unreal)"),
+            "fbx" => Ok(Target::Fbx),
+            other => {
+                anyhow::bail!("unknown target '{other}' (expected blender, maya, unreal or fbx)")
+            }
         }
     }
 }
@@ -125,11 +136,12 @@ pub fn script(rig: &Rig, target: Target, glb_path: &Path) -> Result<String> {
             });
             fill(UNREAL_TEMPLATE, &serde_json::to_string(&data)?, &glb)
         }
+        Target::Fbx => anyhow::bail!("FBX is written as a file, not a builder script"),
     })
 }
 
-/// Write `<name>.glb`, `<name>.hive.json`, `<name>.guides.json` and one builder
-/// script per target.
+/// Write `<name>.glb`, `<name>.hive.json`, `<name>.guides.json`, one builder
+/// script per DCC target and `<name>.fbx` for the FBX target.
 pub fn write_all(rig: &Rig, out_dir: &Path, targets: &[Target]) -> Result<Vec<PathBuf>> {
     // A bare file name's parent is the empty path: that's the current folder.
     let out_dir = if out_dir.as_os_str().is_empty() {
@@ -156,8 +168,15 @@ pub fn write_all(rig: &Rig, out_dir: &Path, targets: &[Target]) -> Result<Vec<Pa
     written.push(guides_path);
 
     for &t in targets {
-        let path = out_dir.join(format!("{}_{}.py", rig.name, t.key()));
-        std::fs::write(&path, script(rig, t, &glb_path)?)?;
+        let path = if t == Target::Fbx {
+            let path = out_dir.join(format!("{}.fbx", rig.name));
+            std::fs::write(&path, fbx::write(rig))?;
+            path
+        } else {
+            let path = out_dir.join(format!("{}_{}.py", rig.name, t.key()));
+            std::fs::write(&path, script(rig, t, &glb_path)?)?;
+            path
+        };
         written.push(path);
     }
     Ok(written)
@@ -178,13 +197,15 @@ mod tests {
     #[test]
     fn parses_targets() {
         assert_eq!("UE5".parse::<Target>().unwrap(), Target::Unreal);
+        assert_eq!("FBX".parse::<Target>().unwrap(), Target::Fbx);
         assert!("houdini".parse::<Target>().is_err());
     }
 
     #[test]
     fn scripts_embed_valid_json_and_no_placeholders() {
         let r = rig::auto_rig(demo_humanoid(), "demo", Default::default()).unwrap();
-        for t in Target::ALL {
+        assert!(script(&r, Target::Fbx, Path::new("/tmp/demo.glb")).is_err());
+        for t in Target::SCRIPTS {
             let s = script(&r, t, Path::new("/tmp/demo.glb")).unwrap();
             assert!(
                 !s.contains(JSON_SLOT) && !s.contains(GLB_SLOT) && !s.contains(EXE_SLOT),

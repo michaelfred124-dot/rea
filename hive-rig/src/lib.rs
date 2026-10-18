@@ -6,6 +6,7 @@
 //! an animator control rig, and exports it for Blender, Maya and Unreal Engine:
 //!
 //! * `<name>.glb` – skinned mesh + skeleton (imports natively in Blender and Unreal)
+//! * `<name>.fbx` – skinned mesh, skeleton and bind pose for game engines (on request)
 //! * `<name>_blender.py` – rebuilds mesh, armature, weights and controls in Blender
 //! * `<name>_maya.py` – rebuilds mesh, joints, skinCluster and controls in Maya
 //! * `<name>_unreal.py` – imports the .glb and builds a Control Rig Blueprint
