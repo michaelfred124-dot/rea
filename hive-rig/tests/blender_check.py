@@ -193,9 +193,12 @@ reset()
 pb["hand_l_ik_ctrl"]["ik_fk"] = 0.0
 pb["hand_l_fk_ctrl"].rotation_euler = (0.0, 1.0, 0.0)  # 1 rad about the hand's length
 update()
-rel = pb["lowerarm_l"].matrix.inverted() @ pb["lowerarm_twist_01_l"].matrix
-twist_angle = rel.to_euler().y
+# A bendy forearm grades the twist over several joints; the far one takes the usual half.
+_twists = [n for n in ("lowerarm_twist_%02d_l" % i for i in range(1, 13)) if n in pb]
+_angles = [(pb["lowerarm_l"].matrix.inverted() @ pb[n].matrix).to_euler().y for n in _twists]
+twist_angle = _angles[-1]
 check(abs(twist_angle - 0.5) < 0.05, "forearm twist bone takes half the hand twist (%.2f rad)" % twist_angle)
+check(all(a < b + 1e-4 for a, b in zip(_angles, _angles[1:])), "forearm twist grows towards the hand")
 
 # Space switching.
 reset()
