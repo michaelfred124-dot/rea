@@ -13,6 +13,7 @@ Running it again in a file that already has this rig only brings the Hive tab ba
 """
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -47,9 +48,10 @@ def build(RIG, geo=None):
     SPLINES = RIG["controls"].get("splines", [])
 
     def copy_rule(bone):
-        """Bones without a deforming parent, and face joints, follow position too; the rest only rotate."""
+        """Bones marked `translate` by hive-rig (under the root, face joints) and the root follow
+        position too; the rest only rotate."""
         parent = bone["parent"]
-        moves = bone.get("translate") or parent is None or not BONES[parent]["deform"]
+        moves = bone.get("translate") or parent is None
         return "COPY_TRANSFORMS" if moves else "COPY_ROTATION"
 
     # --------------------------------------------------------------------------- scene
@@ -215,6 +217,60 @@ def build(RIG, geo=None):
         edit[hock["bone"]].inherit_scale = "NONE"
         hock_target[chain["name"]] = mch("MCH_%s_hock" % chain["name"], like=hock["bone"], parent=hock["control"])
 
+    # Soft IK (two-bone limbs): the IK aims at a helper on the line from the
+    # shoulder or hip to the goal, pulled in as the goal nears full reach.
+    soft_rig = {}
+    for chain in CHAINS:
+        if chain.get("hock"):
+            continue
+        n = chain["name"]
+        parent = edit[chain["upper"]].parent
+        goal = foot_ik_target.get(n, chain["ik_control"])
+        soft_rig[n] = {
+            "root": mch("MCH_%s_soft_root" % n, like=chain["upper"], parent=parent.name if parent else None),
+            "target": mch("MCH_%s_soft" % n, like=goal),
+            "goal": goal,
+            "length": edit[chain["upper"]].length + edit[chain["lower"]].length,
+        }
+        # The lower and end bones take a stretched upper bone's scale along their
+        # own length, so a soft stretch doesn't shear them.
+        edit[chain["lower"]].inherit_scale = "ALIGNED"
+        edit[chain["end"]].inherit_scale = "ALIGNED"
+
+    # Bendy limbs: each segment's curve runs from its start to its end point (the
+    # upper one from the shoulder or hip to the pin, the lower one from the pin to
+    # the wrist or ankle). Helpers on the segment sit at points along it; the bend
+    # control's offset arcs them and the bend joints run from point to point.
+    def aligned(name, head, segment, parent):
+        """A helper (or control) at `head`, turned like `segment`."""
+        eb = edit.get(name) or edit.new(name)
+        eb.use_deform = False
+        seg = edit[segment]
+        eb.head = head
+        eb.tail = head + (seg.tail - seg.head).normalized() * max(0.02, 0.1 * seg.length)
+        eb.roll = seg.roll
+        eb.parent = edit[parent]
+        if name not in MCH and name not in {c["name"] for c in CONTROLS}:
+            MCH.append(name)
+        return name
+
+    bend_rig = []
+    for chain in CHAINS:
+        bendy = chain.get("bendy")
+        if not bendy:
+            continue
+        pin = bendy["pin"]
+        ends = ((chain["upper"], 0.0), (pin, 0.0)), ((pin, 0.0), (chain["lower"], 1.0))
+        for seg, (start, end) in zip((bendy["upper"], bendy["lower"]), ends):
+            sb = edit[seg["bone"]]
+            k = len(seg["joints"])
+            mid = sb.head.lerp(sb.tail, 0.5)
+            space = aligned("MCH_%s_bend_space" % seg["bone"], mid, seg["bone"], seg["bone"])
+            aligned(seg["control"], mid, seg["bone"], space)
+            points = [aligned("MCH_%s_curve_%d" % (seg["bone"], i), sb.head.lerp(sb.tail, i / k), seg["bone"],
+                              seg["bone"]) for i in range(k + 1)]
+            bend_rig.append(dict(seg, start=start, end=end, space=space, points=points))
+
 
     # Spline chains: a point bone per curve point follows the curve controls by
     # weight (an Armature constraint, like a skinned curve) and carries a hook of
@@ -290,6 +346,9 @@ def build(RIG, geo=None):
             c["kind"] == "fk" and (not c["bone"] or copy_rule(bone_by_name[c["bone"]]) == "COPY_ROTATION")
         ):
             pb.lock_location = (True, True, True)
+        if c["kind"] in ("bend", "pin"):
+            pb.lock_rotation = (True, True, True)
+            pb.lock_rotation_w = True
         if has_collections:
             ctrl_coll.assign(arm_data.bones[c["name"]])
         if hasattr(pb, "color"):
@@ -300,17 +359,34 @@ def build(RIG, geo=None):
             pb.color.custom.active = (1.0, 1.0, 1.0)
 
     # --------------------------------------------------------------------------- constraints
-    def add_driver(owner, path, control, prop, expression, index=-1):
+    def add_driver(owner, path, control, prop, expression, index=-1, more=(), distance=None):
         """Drive owner.path from a custom property on a control (simple expressions only,
-        so it works without enabling Python auto-run)."""
+        so it works without enabling Python auto-run). `more` adds other properties of
+        the same control; `distance` (two bone names) adds `d`, the distance between them."""
         fcurve = owner.driver_add(path, index) if index >= 0 else owner.driver_add(path)
         drv = fcurve.driver
         drv.type = "SCRIPTED"
-        var = drv.variables.new()
-        var.name = prop
-        var.type = "SINGLE_PROP"
-        var.targets[0].id = rig
-        var.targets[0].data_path = 'pose.bones["%s"]["%s"]' % (control, prop)
+        for name in (prop,) + tuple(more):
+            # A name reads that property of `control`; (variable, bone, property) another bone's.
+            var_name, bone, bone_prop = (name, control, name) if isinstance(name, str) else name
+            var = drv.variables.new()
+            var.name = var_name
+            var.type = "SINGLE_PROP"
+            var.targets[0].id = rig
+            var.targets[0].data_path = 'pose.bones["%s"]["%s"]' % (bone, bone_prop)
+        if distance:
+            var = drv.variables.new()
+            var.name = "d"
+            var.type = "LOC_DIFF"
+            for t, bone in zip(var.targets, distance):
+                t.id = rig
+                t.bone_target = bone
+            # The distance is in world space; `w` (the rig's scale) brings lengths there.
+            var = drv.variables.new()
+            var.name = "w"
+            var.type = "TRANSFORMS"
+            var.targets[0].id = rig
+            var.targets[0].transform_type = "SCALE_AVG"
         drv.expression = expression
         return fcurve
 
@@ -356,8 +432,45 @@ def build(RIG, geo=None):
         ik.target = rig
         ik.subtarget = hock_target[chain["name"]] if hock else goal
         ik.use_stretch = True
-        for bone in (chain["upper"], chain["lower"]):
-            add_driver(pose[bone], "ik_stretch", chain["ik_control"], "stretch", "stretch * 0.1")
+        soft = soft_rig.get(chain["name"])
+        if soft is None:
+            for bone in (chain["upper"], chain["lower"]):
+                add_driver(pose[bone], "ik_stretch", chain["ik_control"], "stretch", "stretch * 0.1")
+        else:
+            # Soft IK: the solve aims at the soft helper, at `reach` (hive-rig's
+            # soft_reach) blended toward the goal by stretch, and the chain scales
+            # along its length to land there. At soft = 0 the helper sits on the goal
+            # and Blender's own IK stretch works as before.
+            add_property(ik_pb, "soft", float(chain["default_soft"]), 0.0, 1.0,
+                         "Ease the reach near full extension so the joint doesn't pop")
+            ik.subtarget = soft["target"]
+            # Blender caps an expression at 256 characters, so the eased reach is worked
+            # out once, into the helper's `reach` property, and read from there.
+            length, zone = soft["length"], float(chain["soft_zone"])
+            pair = (soft["root"], soft["goal"])
+            helper = pose[soft["target"]]
+            helper["reach"] = length
+            ease = "max(soft * %.9g * w, 1e-9)" % (zone * length)
+            start = "(%.9g * w - %s)" % (length, ease)
+            add_driver(helper, '["reach"]', chain["ik_control"], "soft",
+                       "min(d, %s) + %s * (1 - exp(-max(d - %s, 0) / %s))" % (start, ease, start, ease),
+                       distance=pair)
+            reach = ("r", soft["target"], "reach")
+            aim = "(r + stretch * (d - r))"
+            for bone in (chain["upper"], chain["lower"]):
+                add_driver(pose[bone], "ik_stretch", chain["ik_control"], "stretch",
+                           "stretch * 0.1 if soft <= 0 else 0", more=("soft",))
+            add_driver(pose[chain["upper"]], "scale", chain["ik_control"], "soft",
+                       "1 if soft <= 0 else 1 + (%s / r - 1) * ik_fk" % aim, index=1,
+                       more=("stretch", "ik_fk", reach), distance=pair)
+            follow = helper.constraints.new("COPY_LOCATION")
+            follow.name = "Goal"
+            follow.target, follow.subtarget = rig, soft["goal"]
+            pull = helper.constraints.new("COPY_LOCATION")
+            pull.name = "Soft"
+            pull.target, pull.subtarget = rig, soft["root"]
+            add_driver(pull, "influence", chain["ik_control"], "soft",
+                       "0 if soft <= 0 else 1 - %s / max(d, 1e-9)" % aim, more=("stretch", reach), distance=pair)
         ik.pole_target = rig
         ik.pole_subtarget = chain["pole_control"]
         ik.pole_angle = pole_angles[chain["name"]]
@@ -453,6 +566,34 @@ def build(RIG, geo=None):
         turn.target = rig
         turn.subtarget = tip
 
+    # Bendy limbs: each curve point follows the segment's start and end, plus its
+    # share of the bend control's offset; each bend joint sits on its point, takes
+    # its twist (below) and then stretches to the next point.
+    def copy_location(pb, target, head_tail=0.0, influence=1.0, offset=False):
+        con = pb.constraints.new("COPY_LOCATION")
+        con.target, con.subtarget = rig, target
+        con.head_tail = head_tail
+        con.influence = influence
+        if offset:
+            con.use_offset = True
+            con.owner_space = con.target_space = "LOCAL"
+        return con
+
+    for seg in bend_rig:
+        (start, start_at), (end, end_at) = seg["start"], seg["end"]
+        k = len(seg["joints"])
+        for name, t, bend in [(seg["space"], 0.5, 0.0)] + [
+            (point, i / k, 4.0 * (i / k) * (1.0 - i / k)) for i, point in enumerate(seg["points"])
+        ]:
+            pb = pose[name]
+            copy_location(pb, start, start_at)
+            if t > 0:
+                copy_location(pb, end, end_at, t)
+            if bend > 0:
+                copy_location(pb, seg["control"], influence=bend, offset=True)
+        for i, joint in enumerate(seg["joints"]):
+            copy_location(pose[joint], seg["points"][i])
+
     # Twist helpers take a share of their source bone's twist (rotation about its length).
     for b in BONES:
         twist = b.get("twist")
@@ -468,6 +609,16 @@ def build(RIG, geo=None):
         con.owner_space = con.target_space = "LOCAL"
         con.mix_mode = "ADD"
         con.influence = abs(twist["factor"])
+
+    # Then each bend joint stretches to the next curve point, keeping its twist.
+    for seg in bend_rig:
+        for i, joint in enumerate(seg["joints"]):
+            pb = pose[joint]
+            reach = pb.constraints.new("STRETCH_TO")
+            reach.name = "Bend"
+            reach.target, reach.subtarget = rig, seg["points"][i + 1]
+            reach.rest_length = pb.bone.length
+            reach.volume = "NO_VOLUME"
 
     # Space switching.
     for c in CONTROLS:
@@ -506,7 +657,7 @@ def build(RIG, geo=None):
     rig["hive_name"] = NAME
     rig["hive_guides"] = json.dumps(RIG["guides"])
     rig["hive_dir"] = OUT_DIR
-    rig["hive_anim"] = json.dumps(animator_data(RIG, foot_ik_target, hock_target))
+    rig["hive_anim"] = json.dumps(animator_data(RIG, foot_ik_target, hock_target, soft_rig))
     bpy.context.view_layer.objects.active = rig
     print("hive-rig: built %s with %d bones and %d controls" % (NAME, len(BONES), len(CONTROLS)))
     return rig, geo
@@ -516,10 +667,10 @@ def build(RIG, geo=None):
 # IK/FK matching, pose mirroring, reset and space switching. Which controls make
 # up each limb and which controls are left/right twins come from hive-rig (the
 # rig's ik_chains and mirror_pairs), kept on the armature as `hive_anim`.
-ANIM_PROPS = ("ik_fk", "stretch", "roll", "space", "volume")
+ANIM_PROPS = ("ik_fk", "stretch", "soft", "roll", "space", "volume")
 
 
-def animator_data(RIG, goals, hock_targets):
+def animator_data(RIG, goals, hock_targets, soft_rig):
     controls = RIG["controls"]
     limbs, defaults = [], {}
     for c in controls["ik_chains"]:
@@ -536,9 +687,14 @@ def animator_data(RIG, goals, hock_targets):
             # The two-bone IK reaches the hock joint on those legs.
             "reach": hock["bone"] if hock else c["end"],
             "hock": {"control": hock["control"], "target": hock_targets[c["name"]]} if hock else None,
+            # Soft IK: where the reach is measured from, the chain length and the eased zone.
+            "soft": {"root": soft_rig[c["name"]]["root"], "length": soft_rig[c["name"]]["length"],
+                     "zone": float(c["soft_zone"])} if c["name"] in soft_rig else None,
         })
         d = defaults.setdefault(c["ik_control"], {})
         d.update(ik_fk=float(c["default_blend"]), stretch=float(c["default_stretch"]))
+        if c["name"] in soft_rig:
+            d["soft"] = float(c["default_soft"])
         if c.get("foot"):
             d["roll"] = 0.0
     for sp in controls.get("splines", []):
@@ -635,6 +791,16 @@ def ik_to_fk(rig, name):
     key_controls(rig, limb["fk"] + [limb["ik"]])
 
 
+def unsoft_reach(reach, length, soft, zone):
+    """The goal distance at which a softened chain reaches `reach` (the inverse of
+    hive-rig's soft_reach), so matching to IK lands on the FK pose."""
+    ease = soft * zone * length
+    start = length - ease
+    if ease <= 0.0 or reach <= start:
+        return reach
+    return start - ease * math.log(max(1.0 - (reach - start) / ease, 1e-9))
+
+
 def fk_to_ik(rig, name):
     """Move the IK control and pole onto the FK pose, then switch the limb to IK."""
     limb = limb_of(rig, name)
@@ -646,6 +812,18 @@ def fk_to_ik(rig, name):
     offset = ik.matrix.inverted() @ goal.matrix
     ik.matrix = fk[-1] @ offset.inverted()
     refresh(rig)
+    soft = limb.get("soft")
+    if soft and ik.get("soft", 0.0) > 0.0:
+        # Soft IK falls short near full reach: push the control out until the eased
+        # reach lands on the FK end.
+        root = pose[soft["root"]].head
+        have = goal.head - root
+        want = unsoft_reach(have.length, soft["length"], ik["soft"], soft["zone"])
+        if want > have.length:
+            m = ik.matrix.copy()
+            m.translation += have.normalized() * (want - have.length)
+            ik.matrix = m
+            refresh(rig)
     hock = limb.get("hock")
     if hock:
         # Turn the hock control (it pivots on the ankle) until its copy of the hock

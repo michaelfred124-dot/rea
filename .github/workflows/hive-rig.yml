@@ -139,6 +139,16 @@ jobs:
           cargo run --locked -q -- rebuild "$sp/hive_demo.hive.json"
           python3 -I tests/dcc_stub_run.py maya "$sp/hive_demo_maya.py" --guides
           python3 -I tests/dcc_stub_run.py unreal "$sp/hive_demo_unreal.py"
+      - name: Bendy limbs and soft IK, Maya and Unreal builders
+        run: |
+          b="$RUNNER_TEMP/bendy"
+          cargo run --locked -q -- demo -o "$b" --bendy --soft 0.5
+          python3 -I tests/dcc_stub_run.py maya "$b/hive_demo_maya.py"
+          python3 -I tests/dcc_stub_run.py unreal "$b/hive_demo_unreal.py"
+          cargo run --locked -q -- naming "$b/hive_demo.guides.json" suffix
+          cargo run --locked -q -- rebuild "$b/hive_demo.hive.json"
+          python3 -I tests/dcc_stub_run.py maya "$b/hive_demo_maya.py"
+          python3 -I tests/dcc_stub_run.py unreal "$b/hive_demo_unreal.py"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: hive-demo-rigs
@@ -238,6 +248,13 @@ jobs:
           cargo run -q -- rebuild "$sp/hive_demo.hive.json"
           python tests/blender_spline_check.py "$sp/hive_demo_blender.py" "$sp/hive_demo.glb"
           python tests/blender_guides_check.py "$sp/hive_demo_blender.py"
+      - name: Bendy limbs and soft IK in Blender
+        run: |
+          b="$RUNNER_TEMP/bendy"
+          cargo run -q -- demo -o "$b" --bendy --soft 0.5
+          python tests/blender_bendy_check.py "$b/hive_demo_blender.py"
+          cargo run -q -- demo -o "$b/plain" --bendy
+          python tests/blender_anim_check.py "$b/plain/hive_demo_blender.py"
       - name: Side-first naming in Blender
         run: |
           rig="$RUNNER_TEMP/face"

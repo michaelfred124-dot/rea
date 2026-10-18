@@ -13,8 +13,8 @@ use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
 use crate::controls::{
-    Control, ControlKind, ControlParent, ControlRig, FootRoll, HockSegment, IkChain, Shape,
-    SplineChain, ctrl_name, fk_name,
+    BendSegment, Bendy, Control, ControlKind, ControlParent, ControlRig, FootRoll, HockSegment,
+    IkChain, SOFT_ZONE, Shape, SplineChain, ctrl_name, fk_name,
 };
 use crate::landmarks::{Landmarks, mirror};
 use crate::naming::Naming;
@@ -61,6 +61,9 @@ pub const RULES_V1: Rules = Rules {
 pub fn rules(_version: u32) -> Rules {
     RULES_V1
 }
+
+/// Bend joints on each segment of a bendy limb.
+pub const BEND_JOINTS: usize = 4;
 
 /// The editable rig layout: components and their guide positions (model space,
 /// Y-up, metres, facing +Z).
@@ -213,6 +216,20 @@ pub struct Options {
     /// Curve controls of a spline chain or spline spine, ends included.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub controls: Option<usize>,
+    /// Bendy arms and legs: bend controls arc each segment's joints, and a pin
+    /// control moves the elbow or knee. Replaces the twist helpers with
+    /// [`BEND_JOINTS`] bend joints per segment (which still take the twist shares
+    /// when `twist` is on).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bendy: bool,
+    /// Default of the IK limb's `soft` attribute (0 to 1), which eases the reach
+    /// near full extension so the knee or elbow doesn't pop.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub soft: f32,
+}
+
+fn is_zero(v: &f32) -> bool {
+    *v == 0.0
 }
 
 fn yes() -> bool {
@@ -230,6 +247,8 @@ impl Default for Options {
             twist: true,
             spline: false,
             controls: None,
+            bendy: false,
+            soft: 0.0,
         }
     }
 }
@@ -347,9 +366,15 @@ pub fn spine_name(i: usize) -> String {
 
 /// `upperarm_l` -> `upperarm_twist_01_l`.
 pub fn twist_name(bone: &str) -> String {
+    twist_joint_name(bone, 1)
+}
+
+/// Twist (or bend) joint `n` (from 1) of a limb segment: `upperarm_l`, 2 ->
+/// `upperarm_twist_02_l`.
+pub fn twist_joint_name(bone: &str, n: usize) -> String {
     match bone.rsplit_once('_') {
-        Some((base, side)) => format!("{base}_twist_01_{side}"),
-        None => format!("{bone}_twist_01"),
+        Some((base, side)) => format!("{base}_twist_{n:02}_{side}"),
+        None => format!("{bone}_twist_{n:02}"),
     }
 }
 
@@ -1179,6 +1204,16 @@ pub fn mirror_side(g: &mut Guides, source: Side) -> usize {
     updates.len() + paired
 }
 
+/// Set `bendy` and the default `soft` on every arm and leg.
+pub fn set_limb_options(g: &mut Guides, bendy: bool, soft: f32) {
+    for c in &mut g.components {
+        if matches!(c.kind, Kind::Arm | Kind::Leg) {
+            c.options.bendy = bendy;
+            c.options.soft = soft;
+        }
+    }
+}
+
 /// Change the spine component's joint count, re-attaching components that hung
 /// from the old top joint to the new one. Nothing changes when the result
 /// wouldn't build.
@@ -1294,8 +1329,10 @@ impl Builder {
             "component {}: parent bone '{parent}' doesn't exist (components must come after the component that owns their parent)",
             self.component
         );
+        let parent_deforms = self.sk.bone(parent).is_some_and(|p| p.deform);
         let i = self.sk.add(name, Some(parent), head, tail, side, region);
         self.sk.bones[i].component = self.component.clone();
+        self.sk.bones[i].translate = !parent_deforms;
         Ok(i)
     }
 
@@ -1502,6 +1539,22 @@ fn validate(g: &Guides) -> Result<()> {
                 c.id
             );
         }
+        ensure!(
+            !c.options.bendy || matches!(c.kind, Kind::Arm | Kind::Leg),
+            "component {}: only arms and legs can be bendy",
+            c.id
+        );
+        ensure!(
+            c.options.soft == 0.0 || matches!(c.kind, Kind::Arm | Kind::Leg),
+            "component {}: only arms and legs have soft IK",
+            c.id
+        );
+        ensure!(
+            (0.0..=1.0).contains(&c.options.soft),
+            "component {}: soft must be 0 to 1 (got {})",
+            c.id,
+            c.options.soft
+        );
         if c.kind == Kind::Spine {
             let n = g.spine_joints(c);
             ensure!(
@@ -1722,7 +1775,7 @@ fn build_arm(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
         format!("hand{s}"),
     ];
     let points = [p("shoulder"), p("elbow"), p("wrist"), p("hand_tip")];
-    limb_bones(b, &names, &clav, &points, side, region, c.options.twist)?;
+    let bend = limb_bones(b, &names, &clav, &points, side, region, &c.options)?;
 
     let color = side_color(side);
     let clav_parent = b.parent_control(parent);
@@ -1750,6 +1803,8 @@ fn build_arm(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
         Limb {
             blend: if planted { 1.0 } else { 0.0 },
             upright_ik: planted,
+            soft: c.options.soft,
+            bend,
             ..Limb::default()
         },
     );
@@ -1764,7 +1819,7 @@ fn build_leg(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
     b.link(parent, region);
     let names = [format!("thigh{s}"), format!("calf{s}"), format!("foot{s}")];
     let points = [p("hip"), p("knee"), p("ankle"), p("ball")];
-    limb_bones(b, &names, parent, &points, side, region, c.options.twist)?;
+    let bend = limb_bones(b, &names, parent, &points, side, region, &c.options)?;
     let ball = format!("ball{s}");
     b.bone(&ball, &names[2], p("ball"), p("toe"), side, region)?;
 
@@ -1788,6 +1843,8 @@ fn build_leg(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
             upright_ik: true,
             foot: Some(foot),
             hock: None,
+            soft: c.options.soft,
+            bend,
         },
     );
     toe_control(b, side, &names[2], ball);
@@ -1823,7 +1880,7 @@ fn build_quad_leg(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
     b.link(parent, region);
     let segments = [format!("thigh{s}"), format!("calf{s}"), format!("hock{s}")];
     let points = [p("hip"), p("knee"), p("hock"), p("ankle")];
-    limb_bones(b, &segments, parent, &points, side, region, c.options.twist)?;
+    limb_bones(b, &segments, parent, &points, side, region, &c.options)?;
     let foot = format!("foot{s}");
     b.bone(&foot, &segments[2], p("ankle"), p("ball"), side, region)?;
     let ball = format!("ball{s}");
@@ -1850,6 +1907,7 @@ fn build_quad_leg(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
             upright_ik: true,
             foot: Some(roll),
             hock: Some(segments[2].clone()),
+            ..Limb::default()
         },
     );
     toe_control(b, side, &foot, ball);
@@ -1860,6 +1918,11 @@ fn build_quad_leg(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
 /// of the upper and lower segments (mannequin names). Upper twists counter half of
 /// their own twist so the shoulder and hip don't candy-wrap; lower twists carry
 /// half of the hand or foot twist.
+///
+/// A bendy limb instead gets [`BEND_JOINTS`] joints along the whole of each
+/// segment, which take its skin (the segment bone stops deforming). Their twist
+/// shares grow toward the far end, up to the share the single helper has.
+/// Returns the bend joints of the upper and lower segments.
 fn limb_bones(
     b: &mut Builder,
     names: &[String; 3],
@@ -1867,8 +1930,8 @@ fn limb_bones(
     points: &[Vec3; 4],
     side: Side,
     region: Region,
-    twist: bool,
-) -> Result<()> {
+    options: &Options,
+) -> Result<Option<[Vec<String>; 2]>> {
     let mut prev = parent.to_string();
     for (i, name) in names.iter().enumerate() {
         b.bone(name, &prev, points[i], points[i + 1], side, region)?;
@@ -1877,7 +1940,43 @@ fn limb_bones(
     // The upper bone also blends into the torso.
     let upper = b.sk.index_of(&names[0]).unwrap();
     b.sk.bones[upper].links.push(Region::Center);
-    if twist {
+    if options.bendy {
+        let t = |i: usize| i as f32 / BEND_JOINTS as f32;
+        let mut out: [Vec<String>; 2] = Default::default();
+        for (k, (seg, factor, source)) in
+            [(&names[0], -0.5, &names[0]), (&names[1], 0.5, &names[2])]
+                .into_iter()
+                .enumerate()
+        {
+            let si = b.sk.index_of(seg).unwrap();
+            let bone = b.sk.bones[si].clone();
+            for n in 0..BEND_JOINTS {
+                let name = twist_joint_name(seg, n + 1);
+                let i = b.bone(
+                    &name,
+                    seg,
+                    bone.head.lerp(bone.tail, t(n)),
+                    bone.head.lerp(bone.tail, t(n + 1)),
+                    side,
+                    region,
+                )?;
+                // Each joint blends across the same regions as its segment (the
+                // upper one into the torso).
+                b.sk.bones[i].links = bone.links.clone();
+                if options.twist {
+                    b.sk.bones[i].twist = Some(Twist {
+                        source: source.clone(),
+                        factor: factor * t(n + 1),
+                    });
+                }
+                out[k].push(name);
+            }
+            // After its joints, so they aren't built as hanging from a helper.
+            b.sk.bones[si].deform = false;
+        }
+        return Ok(Some(out));
+    }
+    if options.twist {
         for (seg, factor, source) in [(&names[0], -0.5, &names[0]), (&names[1], 0.5, &names[2])] {
             let bone = b.sk.bone(seg).unwrap().clone();
             let i = b.bone(
@@ -1894,7 +1993,7 @@ fn limb_bones(
             });
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// How a limb's IK is set up.
@@ -1907,6 +2006,10 @@ struct Limb {
     foot: Option<FootRoll>,
     /// The hock bone of a three-segment leg, between the lower and end bones.
     hock: Option<String>,
+    /// Default of the `soft` attribute.
+    soft: f32,
+    /// Bend joints of the upper and lower segments, for a bendy limb.
+    bend: Option<[Vec<String>; 2]>,
 }
 
 fn limb_controls(
@@ -2016,6 +2119,47 @@ fn limb_controls(
         }
     });
 
+    // Bendy: a pin at the elbow or knee, following the lower bone, and a bend
+    // control at the middle of each segment, following its segment.
+    let bendy = limb.bend.map(|[upper_joints, lower_joints]| {
+        let pin = format!("{}_pin_ctrl", lo.name);
+        b.control(
+            pin.clone(),
+            ControlKind::Pin,
+            ControlParent::Bone(lo.name.clone()),
+            None,
+            lo.head,
+            lo.direction(),
+            Shape::Sphere,
+            0.025 * h,
+            color,
+        );
+        let mut segment = |bone: &crate::skeleton::Bone, joints: Vec<String>| {
+            let control = format!("{}_bend_ctrl", bone.name);
+            b.control(
+                control.clone(),
+                ControlKind::Bend,
+                ControlParent::Bone(bone.name.clone()),
+                None,
+                bone.head.lerp(bone.tail, 0.5),
+                bone.direction(),
+                Shape::Octagon,
+                0.8 * size,
+                color,
+            );
+            BendSegment {
+                bone: bone.name.clone(),
+                control,
+                joints,
+            }
+        };
+        Bendy {
+            pin,
+            upper: segment(&up, upper_joints),
+            lower: segment(&lo, lower_joints),
+        }
+    });
+
     b.rig.ik_chains.push(IkChain {
         name: format!("{kind}{s}"),
         upper: up.name.clone(),
@@ -2028,6 +2172,9 @@ fn limb_controls(
         default_stretch: 0.0,
         foot: limb.foot,
         hock: hock_segment,
+        default_soft: limb.soft,
+        soft_zone: SOFT_ZONE,
+        bendy,
     });
 }
 
@@ -2839,6 +2986,133 @@ mod tests {
         let back: Guides = serde_json::from_str(&text).unwrap();
         assert_eq!(back.components.len(), g.components.len());
         assert!(back.components.iter().all(|c| c.options.twist));
+        // Options left at their defaults stay out of the file.
+        assert!(!text.contains("bendy") && !text.contains("soft"));
+        let mut g = demo_guides();
+        set_limb_options(&mut g, true, 0.3);
+        let back: Guides = serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
+        let arm = back.component("arm_l").unwrap();
+        assert!(arm.options.bendy && arm.options.soft == 0.3);
+        assert!(!back.component("spine").unwrap().options.bendy);
+    }
+
+    #[test]
+    fn bendy_limbs_arc_their_joints_from_bend_and_pin_controls() {
+        let mut g = demo_guides();
+        set_limb_options(&mut g, true, 0.4);
+        let built = build(&g).unwrap();
+        assert_controls_consistent(&built);
+        let (sk, rig) = (&built.skeleton, &built.controls);
+        // Each limb trades its two twist helpers for BEND_JOINTS per segment.
+        let plain = build(&demo_guides()).unwrap().skeleton.bones.len();
+        assert_eq!(sk.bones.len(), plain + 4 * 2 * (BEND_JOINTS - 1));
+        assert_eq!(rig.ik_chains.len(), 4);
+        for chain in &rig.ik_chains {
+            assert_eq!(chain.default_soft, 0.4);
+            let bendy = chain.bendy.as_ref().expect(&chain.name);
+            let pin = rig.control(&bendy.pin).unwrap();
+            assert_eq!(pin.kind, ControlKind::Pin);
+            assert_eq!(pin.parent, ControlParent::Bone(chain.lower.clone()));
+            assert_eq!(pin.position, sk.bone(&chain.lower).unwrap().head);
+            for (seg, bone) in [(&bendy.upper, &chain.upper), (&bendy.lower, &chain.lower)] {
+                assert_eq!(&seg.bone, bone);
+                let segment = sk.bone(bone).unwrap();
+                assert!(!segment.deform, "{bone} hands its skin to the bend joints");
+                let ctrl = rig.control(&seg.control).unwrap();
+                assert_eq!(ctrl.kind, ControlKind::Bend);
+                assert_eq!(ctrl.parent, ControlParent::Bone(bone.clone()));
+                assert!((ctrl.position - segment.head.lerp(segment.tail, 0.5)).length() < 1e-5);
+                // Evenly spaced joints from the segment's start to its end, in order.
+                assert_eq!(seg.joints.len(), BEND_JOINTS);
+                let mut at = segment.head;
+                let mut share = 0.0f32;
+                for (n, name) in seg.joints.iter().enumerate() {
+                    let j = sk.bone(name).unwrap();
+                    assert_eq!(name, &twist_joint_name(bone, n + 1));
+                    assert!(j.deform && !j.translate, "{name}");
+                    assert_eq!(sk.bones[j.parent.unwrap()].name, *bone);
+                    assert!(
+                        (j.head - at).length() < 1e-5,
+                        "{name} starts where the last ended"
+                    );
+                    at = j.tail;
+                    assert_eq!(j.links, segment.links, "{name} blends like its segment");
+                    let t = j.twist.as_ref().unwrap();
+                    assert!(
+                        t.factor.abs() > share,
+                        "{name}: twist shares grow along the segment"
+                    );
+                    share = t.factor.abs();
+                }
+                assert!((at - segment.tail).length() < 1e-5);
+                assert!(
+                    (share - 0.5).abs() < 1e-6,
+                    "the far joint takes the usual share"
+                );
+            }
+            // The bendy controls are mirrored with the rest of the limb.
+            if chain.name.ends_with("_l") {
+                for c in [&bendy.pin, &bendy.upper.control, &bendy.lower.control] {
+                    assert!(rig.mirror_pairs.iter().any(|[l, _]| l == c), "{c}");
+                }
+            }
+        }
+        // Segment bones stop deforming but still turn their children (no position copy).
+        assert!(!sk.bone("lowerarm_l").unwrap().translate);
+        assert!(!sk.bone("hand_l").unwrap().translate);
+        assert!(
+            sk.bone("pelvis").unwrap().translate,
+            "hangs from the root helper"
+        );
+        // Without twist the bend joints still arc, just without twist shares.
+        g.components
+            .iter_mut()
+            .for_each(|c| c.options.twist = false);
+        let sk = build(&g).unwrap().skeleton;
+        assert!(
+            sk.bone("calf_twist_04_l")
+                .is_some_and(|b| b.twist.is_none())
+        );
+    }
+
+    #[test]
+    fn bendy_and_soft_are_checked() {
+        let mut g = quadruped(1.0);
+        let hind = g
+            .components
+            .iter_mut()
+            .find(|c| c.kind == Kind::QuadLeg)
+            .unwrap();
+        hind.options.bendy = true;
+        let e = build(&g).err().unwrap().to_string();
+        assert!(e.contains("only arms and legs can be bendy"), "{e}");
+        let mut g = quadruped(1.0);
+        g.components
+            .iter_mut()
+            .find(|c| c.kind == Kind::QuadLeg)
+            .unwrap()
+            .options
+            .soft = 0.2;
+        assert!(build(&g).is_err());
+        let mut g = demo_guides();
+        set_limb_options(&mut g, false, 1.5);
+        let e = build(&g).err().unwrap().to_string();
+        assert!(e.contains("soft must be 0 to 1"), "{e}");
+        // Soft alone keeps the plain skeleton; every IK limb carries its default.
+        let mut g = demo_guides();
+        set_limb_options(&mut g, false, 0.25);
+        let built = build(&g).unwrap();
+        assert_eq!(
+            built.skeleton.bones.len(),
+            build(&demo_guides()).unwrap().skeleton.bones.len()
+        );
+        assert!(
+            built
+                .controls
+                .ik_chains
+                .iter()
+                .all(|c| c.default_soft == 0.25 && c.bendy.is_none())
+        );
     }
 
     /// Bones and controls as comparable values.

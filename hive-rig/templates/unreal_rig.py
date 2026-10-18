@@ -4,6 +4,10 @@ Imports the skinned glTF, creates a Control Rig Blueprint for it and fills it
 with the hive controls: FK controls for every bone, Two Bone IK with pole
 vectors on each limb, and an `<limb>_ik_fk` float control blending IK and FK.
 
+Bendy limbs are an approximation here: the bend joints slide onto the curve the
+bend and pin controls describe but don't turn along it. Soft IK isn't built in
+Unreal; the limbs solve as plain (stretchy) two-bone IK.
+
 Requirements: Unreal Engine 5.2+ with the "Python Editor Script Plugin" and
 "Control Rig" plugins enabled. Run from Tools > Execute Python Script, or
 from the Output Log in Python mode: py "<path to this file>"
@@ -137,7 +141,7 @@ def vector_text(v):
 def copy_rule(bone_name):
     bone = next(b for b in BONES if b["name"] == bone_name)
     parent = bone["parent"]
-    moves = bone.get("translate") or parent is None or not BONES[parent]["deform"]
+    moves = bone.get("translate") or parent is None
     return "transform" if moves else "rotation"
 
 
@@ -242,6 +246,13 @@ def target_transform(c):
         chain = chain_of_hock[c["name"]]
         return unreal.Transform(location=bone_location(chain["end"]),
                                 rotation=initial(bone_key(chain["hock"]["bone"])).rotation.rotator())
+    if c["kind"] == "pin":
+        # At the elbow or knee, turned like the lower bone it follows.
+        return initial(bone_key(c["parent"]["name"]))
+    if c["kind"] == "bend":
+        # At the segment's middle, turned like the segment it follows.
+        return unreal.Transform(location=to_ue(c["position"]),
+                                rotation=initial(bone_key(c["parent"]["name"])).rotation.rotator())
     if c["kind"] == "pole":
         chain = chain_of_pole[c["name"]]
         a, m, e = (bone_location(b) for b in (chain["upper"], chain["lower"], solve_end(chain)))
@@ -266,14 +277,20 @@ def add_control(name, parent, settings, value):
 
 def make_control(c, parent):
     settings = unreal.RigControlSettings()
-    settings.control_type = unreal.RigControlType.EULER_TRANSFORM
+    # Bend and pin controls only move: their value is an offset in the frame of
+    # the bone they follow.
+    moves_only = c["kind"] in ("bend", "pin")
+    settings.control_type = unreal.RigControlType.POSITION if moves_only else unreal.RigControlType.EULER_TRANSFORM
     try:
         settings.animation_type = unreal.RigControlAnimationType.ANIMATION_CONTROL
     except AttributeError:
         pass
     settings.shape_name = shape_for(c["shape"])
     settings.shape_color = unreal.LinearColor(c["color"][0], c["color"][1], c["color"][2], 1.0)
-    value = unreal.RigHierarchy.make_control_value_from_euler_transform(unreal.EulerTransform())
+    if moves_only:
+        value = unreal.RigHierarchy.make_control_value_from_vector(unreal.Vector(0.0, 0.0, 0.0))
+    else:
+        value = unreal.RigHierarchy.make_control_value_from_euler_transform(unreal.EulerTransform())
     k = add_control(c["name"], parent, settings, value)
     world = target_transform(c)
     parent_world = initial(parent) if parent.name != "None" else unreal.Transform()
@@ -630,6 +647,53 @@ for chain in CHAINS:
         vm.add_link(combined + ".Result", toe + ".Value")
         vm.add_link(blend + ".FloatValue", toe + ".Weight")
         chain_exec(toe)
+
+# Bendy limbs (an approximation): after the limb is solved, each bend joint moves
+# by its share of the pin's and bend control's offsets. A point t along a segment
+# takes 4t(1 - t) of the bend offset and, toward the pin end, t of the pin offset.
+def bone_rotation(bone):
+    return unit("RigUnit_GetTransform", "Get_%s_rot" % bone,
+                {"Item": item_pin("Bone", bone), "Space": "GlobalSpace"}) + ".Transform.Rotation"
+
+
+def control_offset(name, bone):
+    """The control's offset from rest, in global space (its value is in the frame of `bone`)."""
+    value = unit("RigUnit_GetControlVector", "Get_" + name, {"Control": name})
+    turned = math("QuaternionRotateVector", name + "_offset", {})
+    vm.add_link(bone_rotation(bone), turned + ".Transform")
+    vm.add_link(value + ".Vector", turned + ".Vector")
+    return turned + ".Result"
+
+
+def scaled(vector, factor, name):
+    node = math("VectorScale", name, {"Factor": str(factor)})
+    vm.add_link(vector, node + ".Value")
+    return node + ".Result"
+
+
+for chain in CHAINS:
+    bendy = chain.get("bendy")
+    if not bendy:
+        continue
+    pin = control_offset(bendy["pin"], chain["lower"])
+    for seg, pin_at_end in ((bendy["upper"], True), (bendy["lower"], False)):
+        bend = control_offset(seg["control"], seg["bone"])
+        k = len(seg["joints"])
+        for i, joint in enumerate(seg["joints"]):
+            t = i / float(k)
+            pin_share = t if pin_at_end else 1.0 - t
+            total = math("VectorAdd", joint + "_bend_offset", {})
+            vm.add_link(scaled(pin, pin_share, joint + "_pin_share"), total + ".A")
+            vm.add_link(scaled(bend, 4.0 * t * (1.0 - t), joint + "_bend_share"), total + ".B")
+            here = unit("RigUnit_GetTransform", "Get_" + joint,
+                        {"Item": item_pin("Bone", joint), "Space": "GlobalSpace"})
+            moved = math("VectorAdd", joint + "_bent", {})
+            vm.add_link(here + ".Transform.Translation", moved + ".A")
+            vm.add_link(total + ".Result", moved + ".B")
+            place = unit("RigUnit_SetTranslation", "Bend_" + joint,
+                         {"Item": item_pin("Bone", joint), "Space": "GlobalSpace", "bPropagateToChildren": "False"})
+            vm.add_link(moved + ".Result", place + ".Value")
+            chain_exec(place)
 
 unreal.ControlRigBlueprintLibrary.recompile_vm(blueprint)
 unreal.EditorAssetLibrary.save_loaded_asset(blueprint)

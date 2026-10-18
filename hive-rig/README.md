@@ -13,6 +13,7 @@ cargo run --release -- rig path/to/character.glb -o out/
 cargo run --release -- demo -o out/            # T-pose test character
 cargo run --release -- demo -o out/ --arm-drop 45   # A-pose
 cargo run --release -- demo -o out/ --quadruped     # a dog: spine, head, tail, four legs
+cargo run --release -- demo -o out/ --bendy --soft 0.3   # bendy arms and legs with soft IK
 ```
 
 ## The Hive Rig app
@@ -83,6 +84,24 @@ that Blender and Unreal import natively.
 * Arms and legs have FK controls, an IK control, a pole-vector control and an
   `ik_fk` blend (0 = FK, 1 = IK). Legs start in IK and arms start in FK.
 * `stretch` on every limb's IK control (0 = rigid, 1 = reaches any goal)
+* `soft` on every arm and leg IK control (0 to 1, default 0 = a plain solve).
+  As the goal nears full reach, the last `soft` × 10% of the reach is eased
+  along an exponential, so the knee or elbow opens smoothly instead of popping
+  straight; the hand or foot then trails the control slightly. With `stretch`
+  the softened chain scales along its length to land on the goal, keeping the
+  eased bend. Set the starting value with the component's `soft` option. A limb
+  that is nearly straight in the bind pose is eased there too when `soft` > 0.
+  Blender (drivers and constraints) and Maya (a node network) build it; Unreal
+  doesn't yet and solves plain stretchy IK.
+* Bendy limbs (`bendy: true` on an arm or leg, off by default): each segment's
+  skin moves from the segment bone onto four bend joints
+  (`upperarm_twist_01_l`…`_04_l`), which follow a curve from the shoulder or hip
+  through the elbow or knee to the wrist or ankle. `upperarm_l_bend_ctrl` and
+  `lowerarm_l_bend_ctrl` at each segment's middle arc it (cartoony bends) with
+  the joints at the ends staying put, and `lowerarm_l_pin_ctrl` moves the elbow
+  (or knee) where the two curves meet. The bend joints still take the twist
+  shares. Blender and Maya aim each joint along the curve; Unreal is a simpler
+  approximation that moves the joints onto the curve without turning them.
 * Reverse foot: `roll` on each foot's IK control. Negative values rock back on
   the heel. Positive values lift the heel around the ball, then around the toe
   tip once the roll passes 30°. The toe control stays usable in both modes.
@@ -142,8 +161,8 @@ A rig is a list of components, each placed by a few guide points:
 | root | root | `root` bone, `root_ctrl` |
 | spine | pelvis, chest | `pelvis`, `spine_01`… (3 joints by default), COG, pelvis and spine controls |
 | head | neck, head, head_top | `neck_01`, `head`, controls with space switching |
-| arm | clavicle, shoulder, elbow, wrist, hand_tip | clavicle, IK/FK arm, stretch, spaces, twist bones |
-| leg | hip, knee, ankle, ball, toe, heel | IK/FK leg, reverse foot, stretch, spaces, twist bones |
+| arm | clavicle, shoulder, elbow, wrist, hand_tip | clavicle, IK/FK arm, stretch, soft IK, spaces, twist bones; bend and pin controls with `bendy` |
+| leg | hip, knee, ankle, ball, toe, heel | IK/FK leg, reverse foot, stretch, soft IK, spaces, twist bones; bend and pin controls with `bendy` |
 | quad_leg | hip, knee, hock, ankle, ball, toe, heel | three-segment hind leg (`thigh`, `calf`, `hock`, `foot`, `ball`): IK with a hock control, reverse paw roll, FK, stretch, spaces, twist bones |
 | chain | two or more | an FK chain: fingers, tails, ears, hair, props |
 | spline | two or more (`j1`…) | a curve-driven chain (tentacle): curve controls, an FK layer, `stretch` and `volume` |
@@ -440,7 +459,8 @@ mirrored vertex position, and **Smooth**, which blurs the shown bone's weights
 (or every bone's) with their neighbours.
 
 `guides.json` is plain JSON, so you can also edit guide positions, the spine's
-`joints` option, or `twist: false` on a limb by hand.
+`joints` option, or `twist: false`, `bendy: true` or `soft` on a limb by hand.
+In the app, a selected arm or leg has **Bendy** and **Soft IK** in its options.
 
 ### Editing guides in Blender and Maya
 
@@ -473,11 +493,12 @@ have an **Animation** section:
   move. A rolled foot keeps its roll. On a three-segment hind leg the hock
   is matched too: IK to FK sets the hock's FK control, and FK to IK turns the
   IK hock control to the FK hock. FK has no stretch, so a stretched IK limb
-  can't be matched exactly in FK.
+  can't be matched exactly in FK. With `soft` on, FK to IK sets the IK control
+  out past the FK hand or foot by as much as the ease pulls it back.
 * **Mirror Pose** copies the selected controls' pose onto their twins on the
   other side, or every left (right) control's pose when nothing is selected.
   Poses are mirrored relative to each control's parent, along with `ik_fk`,
-  `stretch`, `roll` and `space`. Centre controls are left alone.
+  `stretch`, `soft`, `roll` and `space`. Centre controls are left alone.
 * **Reset** puts every control, or only the selected ones, back to the bind
   pose and default settings. **Select All Controls** selects the controls only.
 * **Switch space without a pop**: Blender shows a button per space for the
@@ -530,6 +551,7 @@ pip install bpy && python tests/blender_check.py out/hive_demo_blender.py out/hi
 python tests/blender_guides_check.py out/hive_demo_blender.py           # guides and rebuild
 python tests/blender_quad_check.py dog/hive_dog_blender.py dog/hive_dog.glb   # after demo --quadruped -o dog
 python tests/blender_spline_check.py out/hive_demo_blender.py out/hive_demo.glb   # after add tentacle, spine --spline true, rebuild
+python tests/blender_bendy_check.py bendy/hive_demo_blender.py   # after demo --bendy --soft 0.5 -o bendy
 python3 tests/dcc_stub_run.py maya out/hive_demo_maya.py --guides       # Maya guide tools
 python tests/blender_anim_check.py out/hive_demo_blender.py             # animator tools
 ```
@@ -571,6 +593,18 @@ the end control turns the last joint. On the spine it checks that the chest
 control carries the head and arms with the feet planted, that the hips turn the
 pelvis, and that the IK hand can follow the chest. A bent tentacle deforms the
 mesh, reset brings it back to rest, and the `.glb` re-imports with every joint.
+
+`blender_bendy_check.py` builds a biped with bendy limbs and soft IK in real
+Blender. On every arm and leg it moves the upper bend control and checks that
+the bend joints bow out along the curve (the middle point by the full offset,
+the others by 4t(1-t) of it) while the shoulder or hip, elbow or knee, wrist or
+ankle and the lower segment stay put, and that the skin follows; the pin moves
+where the two curves meet. For soft IK it sweeps the IK foot out through full
+reach and checks that the knee opens monotonically and smoothly and never snaps
+straight (its fastest opening rate drops several-fold against `soft` 0), that
+the foot follows hive-rig's `soft_reach` curve, that with stretch the foot
+reaches the goal with the knee still bent, and that FK to IK on a nearly
+straight leg doesn't pop. Drivers stay simple expressions.
 The app's editing operations (add, remove, mirror, symmetric moves, undo, build,
 export, reopening a rig and loading templates) have unit tests in `src/studio/app.rs`;
 templates have their own (`src/template.rs`: JSON round trip, scaling to another

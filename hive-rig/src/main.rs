@@ -54,6 +54,12 @@ enum Command {
         /// legs and two three-segment hind legs (written as `hive_dog`).
         #[arg(long)]
         quadruped: bool,
+        /// Make the arms and legs bendy (bend controls and an elbow/knee pin).
+        #[arg(long, conflicts_with = "quadruped")]
+        bendy: bool,
+        /// Default soft IK (0 to 1) on the arms and legs.
+        #[arg(long, default_value_t = 0.0, conflicts_with = "quadruped")]
+        soft: f32,
         #[command(flatten)]
         common: Common,
     },
@@ -584,6 +590,7 @@ fn main() -> Result<()> {
             arm_drop: _,
             quadruped: true,
             common,
+            ..
         } => {
             let guides = components::quadruped(demo::DOG_HEIGHT);
             run(demo::demo_quadruped(), "hive_dog", guides, &out, &common)
@@ -592,10 +599,13 @@ fn main() -> Result<()> {
             out,
             arm_drop,
             quadruped: false,
+            bendy,
+            soft,
             common,
         } => {
             let mesh = demo::humanoid(arm_drop);
-            let guides = detect(&mesh);
+            let mut guides = detect(&mesh);
+            components::set_limb_options(&mut guides, bendy, soft);
             run(mesh, "hive_demo", guides, &out, &common)
         }
         Command::Rebuild {
