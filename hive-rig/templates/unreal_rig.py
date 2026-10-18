@@ -26,7 +26,7 @@ BONES = RIG["bones"]
 CONTROLS = RIG["controls"]
 CHAINS = RIG["ik_chains"]
 SPLINES = RIG.get("splines", [])
-BASIS_BONES = RIG["basis"]  # pelvis, left hand, head, left ball in this rig's naming
+BASIS_BONES = RIG["basis"]  # pelvis, left hand, head, left ball where the rig has them (see solve_basis)
 
 # The .glb written next to this script. Edit if you moved it.
 GLB_PATH = r"""__HIVE_GLB_PATH__"""
@@ -163,16 +163,31 @@ def bone_location(name):
 # ----------------------------------------------------------------------- hive -> Unreal space
 # The importer converts axes and units; recover that mapping from four imported
 # bones instead of assuming it, so pivot placement holds for any import settings.
+# A flat rig (every bone in one plane) sends three: the plane's normal maps to
+# the normal of the imported plane, scaled like the rest and flipped, because
+# importing from glTF's right-handed axes into Unreal's left-handed ones mirrors.
 def hive_head(name):
     return next(b["head"] for b in BONES if b["name"] == name)
+
+
+def _cross(a, b):
+    return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+
+
+def _length(a):
+    return sum(x * x for x in a) ** 0.5
 
 
 def solve_basis():
     names = BASIS_BONES
     hp = [hive_head(n) for n in names]
     up = [bone_location(n) for n in names]
-    u = [[hp[i][k] - hp[0][k] for k in range(3)] for i in (1, 2, 3)]  # hive columns
-    v = [[up[i].x - up[0].x, up[i].y - up[0].y, up[i].z - up[0].z] for i in (1, 2, 3)]
+    u = [[hp[i][k] - hp[0][k] for k in range(3)] for i in range(1, len(names))]  # hive columns
+    v = [[up[i].x - up[0].x, up[i].y - up[0].y, up[i].z - up[0].z] for i in range(1, len(names))]
+    if len(u) == 2:
+        scale = _length(v[0]) / max(_length(u[0]), 1e-9)
+        u.append(_cross(u[0], u[1]))
+        v.append([-x / max(scale, 1e-9) for x in _cross(v[0], v[1])])
     # M = V * U^-1, with U's columns u[0..2].
     a, b, c = u
     det = (a[0] * (b[1] * c[2] - b[2] * c[1]) - b[0] * (a[1] * c[2] - a[2] * c[1])

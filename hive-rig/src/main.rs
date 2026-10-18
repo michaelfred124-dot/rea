@@ -49,17 +49,22 @@ enum Command {
         #[arg(short, long, default_value = "hive_demo")]
         out: PathBuf,
         /// Lower the demo character's arms by this many degrees (45 = A-pose).
-        #[arg(long, default_value_t = 0.0, conflicts_with = "quadruped")]
+        #[arg(long, default_value_t = 0.0, conflicts_with_all = ["quadruped", "creature"])]
         arm_drop: f32,
-        /// Rig the built-in dog instead: spine, neck and head, tail, two front
-        /// legs and two three-segment hind legs (written as `hive_dog`).
-        #[arg(long)]
+        /// Rig the built-in dog instead (the same as `--creature dog`).
+        #[arg(long, conflicts_with = "creature")]
         quadruped: bool,
+        /// Rig a built-in creature instead, written as `hive_<creature>`: a dog
+        /// (four legs with three-segment hind legs), a bird (wings, two legs
+        /// with hocks, tail), a spider (eight FK legs) or a snake (spline spine
+        /// and tail with a head).
+        #[arg(long, value_enum)]
+        creature: Option<demo::Creature>,
         /// Make the arms and legs bendy (bend controls and an elbow/knee pin).
-        #[arg(long, conflicts_with = "quadruped")]
+        #[arg(long, conflicts_with_all = ["quadruped", "creature"])]
         bendy: bool,
         /// Default soft IK (0 to 1) on the arms and legs.
-        #[arg(long, default_value_t = 0.0, conflicts_with = "quadruped")]
+        #[arg(long, default_value_t = 0.0, conflicts_with_all = ["quadruped", "creature"])]
         soft: f32,
         #[command(flatten)]
         common: Common,
@@ -747,21 +752,21 @@ fn main() -> Result<()> {
         }
         Command::Demo {
             out,
-            arm_drop: _,
-            quadruped: true,
+            quadruped,
+            creature,
             common,
             ..
-        } => {
-            let guides = components::quadruped(demo::DOG_HEIGHT);
-            run(demo::demo_quadruped(), "hive_dog", guides, &out, &common)
+        } if quadruped || creature.is_some() => {
+            let c = creature.unwrap_or(demo::Creature::Dog);
+            run(c.mesh(), &c.rig_name(), c.guides(), &out, &common)
         }
         Command::Demo {
             out,
             arm_drop,
-            quadruped: false,
             bendy,
             soft,
             common,
+            ..
         } => {
             let mesh = demo::humanoid(arm_drop);
             let mut guides = detect(&mesh);

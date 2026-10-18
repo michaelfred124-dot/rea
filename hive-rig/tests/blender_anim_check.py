@@ -95,9 +95,16 @@ rest = [v.co.copy() for v in geo.data.vertices]
 ns["reset_pose"](rig)
 check(max((a - b).length for a, b in zip(rest, deformed())) < 1e-4, "reset leaves the rest pose unchanged")
 
+# Creatures without arms or legs (a spider's FK legs, a snake's splines) skip
+# the limb checks and get the mirror and space checks on the controls they have.
+has_limbs = all(n in limbs for n in ("arm_l", "arm_r", "leg_l", "leg_r"))
+print("limbs:", ", ".join(sorted(limbs)) or "none")
+
 for side in ("l", "r"):
     for kind in ("arm", "leg"):
         name = "%s_%s" % (kind, side)
+        if name not in limbs:
+            continue
         limb = limbs[name]
 
         # IK to FK: pose the IK limb, match, and the FK controls hold the IK pose.
@@ -159,56 +166,86 @@ for side in ("l", "r"):
         bend = (pose[limb["pole"]].head - pose[limb["lower"]].head).normalized()
         check(bend.dot(rest_bend) > 0.99, "%s: FK to IK keeps the pole in front of the joint" % name)
 
-# Mirror: pose the left side, copy it to the right, and the right is its mirror image.
-ns["reset_pose"](rig)
-arm, leg = limbs["arm_l"], limbs["leg_l"]
-pose[arm["fk"][0]].rotation_euler = (0.3, -0.2, 0.5)
-pose[arm["fk"][1]].rotation_euler = (0.0, 0.3, -0.6)
-pose[arm["fk"][2]].rotation_euler = (0.2, 0.4, 0.1)
-pose[leg["ik"]].location = (0.04, 0.1, -0.05)
-pose[leg["ik"]].rotation_euler = (0.2, 0.3, -0.1)
-pose[leg["ik"]]["roll"] = 25.0
-pose[leg["pole"]].location = (0.05, 0.0, 0.02)
-if leg.get("hock"):
-    pose[leg["hock"]["control"]].rotation_euler = (0.2, 0.0, 0.1)
-update()
-n = ns["mirror_pose"](rig, None, "left")
-check(n == len(data["mirror"]), "mirror with nothing selected copies all %d left controls" % n)
-
-
 def mirrored(p):
     return Vector((2 * center_x - p.x, p.y, p.z))
 
 
-for kl, kr in (("arm_l", "arm_r"), ("leg_l", "leg_r")):
-    for bl, br in zip(chain_bones(limbs[kl]), chain_bones(limbs[kr])):
-        update()
-        head_err = (pose[br].head - mirrored(pose[bl].head)).length
-        tail_err = (pose[br].tail - mirrored(pose[bl].tail)).length
-        check(head_err < POS_TOL and tail_err < POS_TOL,
-              "mirror: %s is the mirror image of %s (%.5f, %.5f m)" % (br, bl, head_err, tail_err))
-        # The roll mirrors too: each side axis maps onto the twin's (up to its sign).
-        def flip(v):
-            return Vector((-v.x, v.y, v.z))
+def flip(v):
+    return Vector((-v.x, v.y, v.z))
 
-        sign = 1.0 if flip(bones[bl].x_axis).dot(bones[br].x_axis) > 0 else -1.0
-        err = 1.0 - sign * flip(pose[bl].x_axis).dot(pose[br].x_axis)
-        check(err < 1e-4, "mirror: %s turns like %s mirrored (%.6f)" % (br, bl, err))
-check(pose[limbs["leg_r"]["ik"]]["roll"] == 25.0, "mirror copies the foot roll")
-moved = max((pose[bl].head - bones[bl].head_local).length for bl in chain_bones(arm))
-check(moved > 0.05, "the posed left arm moved (%.3f m)" % moved)
+
+def check_mirrored(bl, br):
+    """Posed bone `br` is the mirror image of posed bone `bl`, roll included."""
+    update()
+    head_err = (pose[br].head - mirrored(pose[bl].head)).length
+    tail_err = (pose[br].tail - mirrored(pose[bl].tail)).length
+    check(head_err < POS_TOL and tail_err < POS_TOL,
+          "mirror: %s is the mirror image of %s (%.5f, %.5f m)" % (br, bl, head_err, tail_err))
+    # The roll mirrors too: each side axis maps onto the twin's (up to its sign).
+    sign = 1.0 if flip(bones[bl].x_axis).dot(bones[br].x_axis) > 0 else -1.0
+    err = 1.0 - sign * flip(pose[bl].x_axis).dot(pose[br].x_axis)
+    check(err < 1e-4, "mirror: %s turns like %s mirrored (%.6f)" % (br, bl, err))
+
+
+# Mirror: pose the left side, copy it to the right, and the right is its mirror image.
+ns["reset_pose"](rig)
+twin = {l: r for l, r in data["mirror"]}
+if has_limbs:
+    arm, leg = limbs["arm_l"], limbs["leg_l"]
+    pose[arm["fk"][0]].rotation_euler = (0.3, -0.2, 0.5)
+    pose[arm["fk"][1]].rotation_euler = (0.0, 0.3, -0.6)
+    pose[arm["fk"][2]].rotation_euler = (0.2, 0.4, 0.1)
+    pose[leg["ik"]].location = (0.04, 0.1, -0.05)
+    pose[leg["ik"]].rotation_euler = (0.2, 0.3, -0.1)
+    pose[leg["ik"]]["roll"] = 25.0
+    pose[leg["pole"]].location = (0.05, 0.0, 0.02)
+    if leg.get("hock"):
+        pose[leg["hock"]["control"]].rotation_euler = (0.2, 0.0, 0.1)
+else:
+    # Every left control turned (an FK leg bends at each joint).
+    for k, left in enumerate(twin):
+        pose[left].rotation_euler = (0.2 + 0.05 * k, -0.3, 0.4)
+update()
+n = ns["mirror_pose"](rig, None, "left")
+check(n == len(data["mirror"]), "mirror with nothing selected copies all %d left controls" % n)
+
+if has_limbs:
+    for kl, kr in (("arm_l", "arm_r"), ("leg_l", "leg_r")):
+        for bl, br in zip(chain_bones(limbs[kl]), chain_bones(limbs[kr])):
+            check_mirrored(bl, br)
+    check(pose[limbs["leg_r"]["ik"]]["roll"] == 25.0, "mirror copies the foot roll")
+    moved = max((pose[bl].head - bones[bl].head_local).length for bl in chain_bones(arm))
+    check(moved > 0.05, "the posed left arm moved (%.3f m)" % moved)
+else:
+    # Each pair of controls ends up mirror images.
+    for left, right in data["mirror"]:
+        check_mirrored(left, right)
+    if data["mirror"]:
+        moved = max((pose[l].tail - bones[l].tail_local).length for l in twin)
+        check(moved > 0.01, "the posed left controls moved (%.3f m)" % moved)
+    else:
+        print("no left/right controls to mirror")
 
 # Mirror selected only: just the picked control's twin changes.
 ns["reset_pose"](rig)
-pose[arm["fk"][0]].rotation_euler = (0.0, 0.0, 0.5)
-pose[leg["ik"]].location = (0.0, 0.1, 0.0)
-for p in pose:
-    ns["set_bone_selected"](p, p.name == arm["fk"][0])
-check(ns["selected_controls"](rig) == [arm["fk"][0]], "one control picked")
-ns["mirror_pose"](rig, ns["selected_controls"](rig), "right")
-right_arm, right_leg = limbs["arm_r"], limbs["leg_r"]
-check(pose[right_arm["fk"][0]].matrix_basis != Matrix.Identity(4), "mirror selected copies the picked control")
-check(pose[right_leg["ik"]].matrix_basis == Matrix.Identity(4), "mirror selected leaves other controls alone")
+if has_limbs:
+    picked, other, other_twin = arm["fk"][0], leg["ik"], limbs["leg_r"]["ik"]
+    pose[picked].rotation_euler = (0.0, 0.0, 0.5)
+    pose[other].location = (0.0, 0.1, 0.0)
+elif len(twin) > 1:
+    picked, other = list(twin)[:2]
+    other_twin = twin[other]
+    pose[picked].rotation_euler = (0.0, 0.0, 0.5)
+    pose[other].rotation_euler = (0.0, 0.0, 0.5)
+else:
+    picked = None
+if picked:
+    for p in pose:
+        ns["set_bone_selected"](p, p.name == picked)
+    check(ns["selected_controls"](rig) == [picked], "one control picked")
+    ns["mirror_pose"](rig, ns["selected_controls"](rig), "right")
+    check(pose[twin[picked]].matrix_basis != Matrix.Identity(4), "mirror selected copies the picked control")
+    check(pose[other_twin].matrix_basis == Matrix.Identity(4), "mirror selected leaves other controls alone")
 
 # Select all controls.
 count = ns["select_controls"](rig)
@@ -216,19 +253,25 @@ check(sorted(ns["selected_controls"](rig)) == sorted(data["controls"]) and count
       "select all picks every control (%d)" % count)
 check(not any(ns["bone_selected"](p) for p in pose if p.name not in data["controls"]), "select all picks only controls")
 
-# Space switch without a pop: twist the chest, move the IK hand into chest space.
+# Space switch without a pop: twist the chest, move the IK hand into chest space
+# (without arms, the first control that has spaces, into its last space).
 ns["reset_pose"](rig)
-hand_ik = arm["ik"]
+if has_limbs:
+    hand_ik = arm["ik"]
+    pose[hand_ik]["ik_fk"] = 1.0
+    target = 2
+else:
+    hand_ik = next(c for c in data["controls"] if c in data["spaces"])
+    target = len(data["spaces"][hand_ik]) - 1
 spaces = data["spaces"][hand_ik]
-pose[hand_ik]["ik_fk"] = 1.0
-chest = spaces[2]
+chest = spaces[target]
 pose[chest].rotation_euler = (0.0, 0.4, 0.2)
 pose[hand_ik].location = (0.02, -0.05, 0.03)
 update()
 before = world(hand_ik)
-ns["switch_space"](rig, hand_ik, 2)
+ns["switch_space"](rig, hand_ik, target)
 ok, how = same(world(hand_ik), before)
-check(pose[hand_ik]["space"] == 2 and ok, "switching the IK hand to %s does not move it (%s)" % (chest, how))
+check(pose[hand_ik]["space"] == target and ok, "switching %s to %s does not move it (%s)" % (hand_ik, chest, how))
 ns["switch_space"](rig, hand_ik, 0)
 ok, how = same(world(hand_ik), before)
 check(pose[hand_ik]["space"] == 0 and ok, "switching back to %s does not move it (%s)" % (spaces[0], how))
@@ -245,9 +288,13 @@ check(drawn.count("hive.match_limb") == 2 * len(limbs) and "hive.switch_space" i
       "the Hive tab shows match buttons for %d limbs, mirror, reset and the space buttons" % len(limbs))
 
 # Reset everything through the panel's operator.
-pose[arm["fk"][0]].rotation_euler = (0.4, 0.0, 0.0)
-pose[leg["ik"]]["roll"] = 30.0
-pose[hand_ik]["space"] = 2
+if has_limbs:
+    pose[arm["fk"][0]].rotation_euler = (0.4, 0.0, 0.0)
+    pose[leg["ik"]]["roll"] = 30.0
+else:
+    for name in data["controls"][1::3]:
+        pose[name].rotation_euler = (0.4, 0.0, 0.0)
+pose[hand_ik]["space"] = target
 check(bpy.ops.hive.reset_pose(selected=False) == {"FINISHED"}, "Reset All runs from the Hive tab")
 update()
 check(all(pose[n].matrix_basis == Matrix.Identity(4) for n in data["controls"]), "reset puts every control at bind")

@@ -1,7 +1,7 @@
 //! Hive Rig: the desktop rigging app. Double-click it, open a character, adjust
 //! the guides, build and export.
 //!
-//! `HiveRig [character, rig or guides file] [--demo] [--build] [--weights BONE] [--paint] [--dab add|subtract|smooth] [--library] [--templates] [--export]
+//! `HiveRig [character, rig or guides file] [--demo [dog|bird|spider|snake]] [--build] [--weights BONE] [--paint] [--dab add|subtract|smooth] [--library] [--templates] [--export]
 //! [--select COMPONENT[,COMPONENT...]] [--pick NAME] [--pose BONE] [--screenshot OUT.ppm]`
 //! (the flags exist so the window can be checked automatically).
 
@@ -22,6 +22,8 @@ use eframe::egui;
 struct Launch {
     file: Option<PathBuf>,
     demo: bool,
+    /// `--demo dog|bird|spider|snake`: open that creature as the demo.
+    creature: Option<hive_rig::demo::Creature>,
     build: bool,
     weights: Option<String>,
     /// Turn the weight brush on and show it over the `--weights` bone.
@@ -39,10 +41,19 @@ struct Launch {
 
 fn parse_args() -> Launch {
     let mut launch = Launch::default();
-    let mut args = std::env::args_os().skip(1);
+    let mut args = std::env::args_os().skip(1).peekable();
     while let Some(a) = args.next() {
         match a.to_str() {
-            Some("--demo") => launch.demo = true,
+            Some("--demo") => {
+                launch.demo = true;
+                // `--demo bird`: a built-in creature instead of the humanoid.
+                launch.creature = args
+                    .peek()
+                    .and_then(|n| hive_rig::demo::Creature::from_name(n.to_str()?));
+                if launch.creature.is_some() {
+                    args.next();
+                }
+            }
             Some("--build") => launch.build = true,
             Some("--weights") => {
                 launch.weights = args.next().map(|s| s.to_string_lossy().into_owned())
@@ -117,8 +128,10 @@ fn main() -> eframe::Result {
     let launch = parse_args();
     let mut studio = app::Studio::default();
     // `--demo layout.guides.json` opens the demo, then the guides onto it.
-    if launch.demo {
-        studio.load_demo();
+    match launch.creature {
+        Some(c) => studio.load_creature(c),
+        None if launch.demo => studio.load_demo(),
+        None => {}
     }
     if let Some(file) = &launch.file {
         studio.open(file);

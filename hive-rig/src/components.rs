@@ -569,15 +569,24 @@ pub fn quadruped(height: f32) -> Guides {
         }
         components.push(leg);
     }
-    let mut tail = Component::new("tail", Kind::Chain, Side::Center, Some("pelvis"));
-    for k in 0..=5 {
-        let t = k as f32 / 5.0;
-        tail = tail.guide(
-            format!("j{}", k + 1),
-            v(0.0, 0.62 + 0.1 * t, -0.48 - 0.4 * t),
-        );
-    }
-    components.push(tail);
+    components.push(chain(
+        "tail".into(),
+        Side::Center,
+        "pelvis",
+        (0..=5).map(|k| {
+            let t = k as f32 / 5.0;
+            v(0.0, 0.62 + 0.1 * t, -0.48 - 0.4 * t)
+        }),
+    ));
+    // Below the belly line the skin belongs to a leg; everything above it is
+    // body, however wide.
+    creature(h, components, 0.45 * h, 0.5 * h)
+}
+
+/// A creature layout standing on the floor at the origin, facing +Z. Skin
+/// below `crotch_y` belongs to a leg, and skin further than `torso_half_width`
+/// from the mid-line above it to an arm.
+fn creature(h: f32, components: Vec<Component>, crotch_y: f32, torso_half_width: f32) -> Guides {
     Guides {
         format: GUIDES_FORMAT.into(),
         version: GUIDES_VERSION,
@@ -586,16 +595,203 @@ pub fn quadruped(height: f32) -> Guides {
             floor: 0.0,
             height: h,
             center_x: 0.0,
-            // The belly line: below it the skin belongs to a leg.
-            crotch_y: 0.45 * h,
-            // Everything above the belly is body, however wide.
-            torso_half_width: 0.5 * h,
+            crotch_y,
+            torso_half_width,
         },
         components,
         naming: Naming::default(),
         skin: SkinLimits::default(),
         control_styles: BTreeMap::new(),
     }
+}
+
+/// A chain component through `points`, with guides `j1`, `j2`, ...
+fn chain(
+    id: String,
+    side: Side,
+    parent: &str,
+    points: impl IntoIterator<Item = Vec3>,
+) -> Component {
+    let mut c = Component::new(id, Kind::Chain, side, Some(parent));
+    for (k, p) in points.into_iter().enumerate() {
+        c = c.guide(format!("j{}", k + 1), p);
+    }
+    c
+}
+
+/// The built-in bird layout for a bird `height` metres tall (floor to the top
+/// of the head), facing +Z: a tilted spine, a long neck and head with the beak
+/// along the head bone, two wings, two legs with hocks and a tail. The wings
+/// are arm components spread to the sides (shoulder, elbow folded back, wrist
+/// and the hand to the wing tip), so they get IK/FK and a pole like an arm;
+/// the legs are [`Kind::QuadLeg`], whose knee and hock fold the way a bird's do.
+pub fn bird(height: f32) -> Guides {
+    let h = height;
+    let v = |x: f32, y: f32, z: f32| Vec3::new(x, y, z) * h;
+    let chest_bone = spine_name(SPINE_JOINTS - 1);
+    let mut components = vec![
+        Component::new("root", Kind::Root, Side::Center, None).guide("root", Vec3::ZERO),
+        Component::new("spine", Kind::Spine, Side::Center, Some("root"))
+            .guide("pelvis", v(0.0, 0.46, -0.12))
+            .guide("chest", v(0.0, 0.56, 0.12)),
+        Component::new("head", Kind::Head, Side::Center, Some(&chest_bone))
+            .guide("neck", v(0.0, 0.6, 0.14))
+            .guide("head", v(0.0, 0.84, 0.2))
+            .guide("head_top", v(0.0, 0.86, 0.36)),
+    ];
+    for side in [Side::Left, Side::Right] {
+        let sx = side.sign();
+        components.push(
+            Component::new(
+                format!("wing{}", side.suffix()),
+                Kind::Arm,
+                side,
+                Some(&chest_bone),
+            )
+            .guide("clavicle", v(0.03 * sx, 0.58, 0.1))
+            .guide("shoulder", v(0.1 * sx, 0.6, 0.06))
+            .guide("elbow", v(0.32 * sx, 0.62, -0.02))
+            .guide("wrist", v(0.55 * sx, 0.62, 0.03))
+            .guide("hand_tip", v(0.85 * sx, 0.6, -0.05)),
+        );
+    }
+    for side in [Side::Left, Side::Right] {
+        let mut leg = Component::new(
+            format!("leg{}", side.suffix()),
+            Kind::QuadLeg,
+            side,
+            Some("pelvis"),
+        );
+        let points = quad_leg_points(v(0.07 * side.sign(), 0.42, -0.04), 0.0);
+        for (name, p) in QUAD_LEG_GUIDES.iter().zip(points) {
+            leg = leg.guide(*name, p);
+        }
+        components.push(leg);
+    }
+    components.push(chain(
+        "tail".into(),
+        Side::Center,
+        "pelvis",
+        (0..4).map(|k| {
+            let t = k as f32 / 3.0;
+            v(0.0, 0.47 - 0.08 * t, -0.22 - 0.4 * t)
+        }),
+    ));
+    // The thighs sit inside the body, as a bird's do, so the leg skin starts
+    // below its belly; the wings reach out past the body.
+    creature(h, components, 0.3 * h, 0.12 * h)
+}
+
+/// Legs of the built-in spider on each side, front to back.
+pub const SPIDER_LEGS: usize = 4;
+
+/// The built-in spider layout for a spider `height` metres tall (floor to the
+/// top of its knees), facing +Z: a spine through the cephalothorax, a head with
+/// the fangs along the head bone, an abdomen chain behind and four legs a side.
+/// Each leg is a four-bone FK chain (coxa and femur up to the knee, then patella
+/// and tibia, metatarsus and tarsus down to the floor) hung from the spine bone
+/// it grows from, with the front legs reaching forward and the back legs back.
+pub fn spider(height: f32) -> Guides {
+    let h = height;
+    let v = |x: f32, y: f32, z: f32| Vec3::new(x, y, z) * h;
+    let mut components = vec![
+        Component::new("root", Kind::Root, Side::Center, None).guide("root", Vec3::ZERO),
+        Component::new("spine", Kind::Spine, Side::Center, Some("root"))
+            .guide("pelvis", v(0.0, 0.42, -0.02))
+            .guide("chest", v(0.0, 0.44, 0.3)),
+        Component::new(
+            "head",
+            Kind::Head,
+            Side::Center,
+            Some(&spine_name(SPINE_JOINTS - 1)),
+        )
+        .guide("neck", v(0.0, 0.44, 0.33))
+        .guide("head", v(0.0, 0.45, 0.4))
+        .guide("head_top", v(0.0, 0.4, 0.54)),
+        chain(
+            "abdomen".into(),
+            Side::Center,
+            "pelvis",
+            [
+                v(0.0, 0.46, -0.08),
+                v(0.0, 0.56, -0.42),
+                v(0.0, 0.48, -0.78),
+            ],
+        ),
+    ];
+    // (where along the body it grows, the spine bone there, its sweep forward in degrees)
+    let legs: [(f32, usize, f32); SPIDER_LEGS] = [
+        (0.27, 2, 45.0),
+        (0.17, 1, 15.0),
+        (0.08, 0, -15.0),
+        (0.0, 0, -45.0),
+    ];
+    for side in [Side::Left, Side::Right] {
+        let sx = side.sign();
+        for (n, (z, bone, sweep)) in legs.into_iter().enumerate() {
+            let (sin, cos) = sweep.to_radians().sin_cos();
+            // (distance out from the body's mid-line, height above the floor)
+            let at = |out: f32, up: f32| v(sx * out * cos, up, z + out * sin);
+            components.push(chain(
+                format!("leg{}{}", n + 1, side.suffix()),
+                side,
+                &spine_name(bone),
+                [
+                    at(0.07, 0.44),
+                    at(0.34, 0.95),
+                    at(0.62, 0.48),
+                    at(0.8, 0.12),
+                    at(0.88, 0.0),
+                ],
+            ));
+        }
+    }
+    // A low body with legs spread wide: no skin is cut off as a leg or an
+    // arm region, so each leg's skin follows its nearest bones.
+    creature(h, components, -h, 10.0 * h)
+}
+
+/// Joints of the built-in snake's spline spine (its top joint carries the head).
+pub const SNAKE_SPINE_JOINTS: usize = 10;
+
+/// The built-in snake layout, `height` metres being its size unit (the snake is
+/// about four of them long), facing +Z along the floor: a spline spine with ten
+/// joints driven by five curve controls, a raised neck and head with the jaw
+/// along the head bone, and a spline tail tapering behind.
+pub fn snake(height: f32) -> Guides {
+    let h = height;
+    let v = |x: f32, y: f32, z: f32| Vec3::new(x, y, z) * h;
+    let mut spine = Component::new("spine", Kind::Spine, Side::Center, Some("root"))
+        .guide("pelvis", v(0.0, 0.1, -1.2))
+        .guide("chest", v(0.0, 0.14, 1.0));
+    spine.options.joints = Some(SNAKE_SPINE_JOINTS);
+    spine.options.spline = true;
+    spine.options.controls = Some(5);
+    let mut tail = Component::new("tail", Kind::Spline, Side::Center, Some("pelvis"));
+    for k in 0..=8 {
+        let t = k as f32 / 8.0;
+        tail = tail.guide(
+            format!("j{}", k + 1),
+            v(0.0, 0.12 - 0.05 * t, -1.26 - 1.5 * t),
+        );
+    }
+    tail.options.controls = Some(4);
+    let components = vec![
+        Component::new("root", Kind::Root, Side::Center, None).guide("root", Vec3::ZERO),
+        spine,
+        Component::new(
+            "head",
+            Kind::Head,
+            Side::Center,
+            Some(&spine_name(SNAKE_SPINE_JOINTS - 1)),
+        )
+        .guide("neck", v(0.0, 0.15, 1.05))
+        .guide("head", v(0.0, 0.32, 1.3))
+        .guide("head_top", v(0.0, 0.32, 1.55)),
+        tail,
+    ];
+    // Lying on the floor: no leg or arm regions, the skin follows the bones.
+    creature(h, components, -h, 10.0 * h)
 }
 
 /// Premade components that can be added to an existing layout.

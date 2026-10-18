@@ -547,7 +547,7 @@ pub fn find(spec: &str) -> Result<Template> {
 }
 
 /// The templates every copy ships with, made in code from the demo character's
-/// default layout.
+/// default layout and the built-in creatures' layouts.
 pub fn built_in() -> &'static [Template] {
     static BUILT_IN: OnceLock<Vec<Template>> = OnceLock::new();
     BUILT_IN.get_or_init(|| {
@@ -562,7 +562,7 @@ pub fn built_in() -> &'static [Template] {
             t.description = text.into();
             t
         };
-        vec![
+        let mut all = vec![
             make(
                 &biped,
                 "biped",
@@ -573,12 +573,12 @@ pub fn built_in() -> &'static [Template] {
                 "biped_face_fingers",
                 "The biped with eyes, a jaw, face joints and five fingers a hand.",
             ),
-            make(
-                &components::quadruped(crate::demo::DOG_HEIGHT),
-                "dog",
-                "Four legs with three-segment hind legs, a neck, head and tail.",
-            ),
-        ]
+        ];
+        // The creatures: dog, bird, spider and snake.
+        for c in crate::demo::Creature::ALL {
+            all.push(make(&c.guides(), c.name(), c.description()));
+        }
+        all
     })
 }
 
