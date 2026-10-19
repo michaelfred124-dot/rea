@@ -179,6 +179,8 @@ pub struct Brush {
     pub radius: f32,
     /// 0..1 per dab at the brush centre.
     pub strength: f32,
+    /// The weight Replace sets, or the factor Scale multiplies by.
+    pub value: f32,
 }
 
 impl Default for Brush {
@@ -187,6 +189,7 @@ impl Default for Brush {
             mode: BrushMode::Add,
             radius: 0.04,
             strength: 0.3,
+            value: 0.5,
         }
     }
 }
@@ -246,6 +249,8 @@ pub struct Studio {
     /// Templates found by the last scan of the template folders, and the files
     /// that couldn't be read. `None` until the first scan.
     pub templates: Option<(Vec<Listed>, Vec<String>)>,
+    /// Vertex selection, locks, copied weights and the other weight tools.
+    pub skin_tools: SkinTools,
     drag: Option<Drag>,
     /// Where the brush last dabbed in the stroke being painted.
     stroke: Option<Vec3>,
@@ -303,6 +308,7 @@ impl Default for Studio {
             chain_parent: String::new(),
             chain_joints: 3,
             chain_id: String::new(),
+            skin_tools: SkinTools::default(),
             drag: None,
             stroke: None,
             weight_colors: None,
@@ -361,6 +367,7 @@ impl Studio {
         self.weight_colors = None;
         self.painting = false;
         self.brush_at = None;
+        self.skin_tools = SkinTools::default();
         self.drag = None;
         self.shape_undo.clear();
         self.shape_pick = None;
@@ -1187,6 +1194,10 @@ impl Studio {
             .weights_bone
             .as_deref()
             .and_then(|b| rig.skeleton.index_of(b));
+        let locks = skin::edit::lock_mask(
+            &rig.skeleton,
+            self.skin_tools.locked.iter().map(String::as_str),
+        );
         rig.skin = hive_rig::skin::smooth(
             &rig.skin,
             &rig.mesh,
@@ -1194,6 +1205,7 @@ impl Studio {
             bone,
             2,
             rig.guides.skin,
+            &locks,
         );
         doc.exported = false;
         self.weight_colors = None;
@@ -1301,8 +1313,14 @@ impl Studio {
 
     /// Start a brush stroke: one undo step for the whole stroke.
     pub fn begin_stroke(&mut self) -> bool {
-        if self.paint_bone().is_none() {
+        let Some(bone) = self.paint_bone() else {
             self.fail("Build the rig and pick a bone under Weights, then paint it.");
+            return false;
+        };
+        let evens_out = matches!(self.brush.mode, BrushMode::Smooth | BrushMode::Mend);
+        if !evens_out && self.lock_mask().get(bone).copied().unwrap_or(false) {
+            let name = self.weights_bone.clone().unwrap_or_default();
+            self.fail(format!("{name} is locked; unlock it to paint it."));
             return false;
         }
         if let Some(doc) = &mut self.doc {
@@ -1319,10 +1337,10 @@ impl Studio {
         };
         let positions = self.shown_positions().unwrap_or_default();
         let (symmetry, brush) = (self.symmetry, self.brush);
+        let (locks, adjacency) = (self.lock_mask(), self.neighbours());
         let Some(doc) = &mut self.doc else { return 0 };
         let Some(rig) = &mut doc.rig else { return 0 };
         let body = rig.guides.body;
-        let adjacency = doc.mesh.adjacency();
         let mut dabs = vec![(bone, at)];
         if symmetry {
             let twins = skin::bone_twins(&rig.skeleton, body.center_x, 0.05 * body.height);
@@ -1344,8 +1362,10 @@ impl Studio {
                     radius: brush.radius * body.height,
                     strength: brush.strength,
                     mode: brush.mode,
+                    value: brush.value,
                 },
                 rig.guides.skin,
+                &locks,
             );
         }
         if changed > 0 {
@@ -1845,7 +1865,10 @@ fn push_undo(undo: &mut Vec<Guides>, g: &Guides) {
 }
 
 mod shapes;
+mod skin_edit;
 mod ui;
+
+pub use skin_edit::{SelectOp, SkinTools};
 
 #[cfg(test)]
 mod tests {
@@ -2092,6 +2115,7 @@ mod tests {
             mode: BrushMode::Subtract,
             radius: 0.03,
             strength: 1.0,
+            value: 0.5,
         };
         s.show_brush();
         let at = s.brush_at.expect("the brush lands on the arm");

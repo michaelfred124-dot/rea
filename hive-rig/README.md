@@ -32,7 +32,7 @@ a joint; with Symmetry on, its twin on the other side follows.
 * **The outliner** (left) lists the components as their attachment tree: each
   component sits under the one owning the bone it hangs from (a leg hung from
   the head is listed under the head). **Properties** (right)
-  shows the rig summary, the pre-build [checks](#checks-before-building), [blendshapes](#blendshapes-and-corrective-shapes) (a weight slider per shape, correctives, the sculpt brush), skin weights (influence limits, the paint brush, Mirror and Smooth) and naming, or, with a component
+  shows the rig summary, the pre-build [checks](#checks-before-building), [blendshapes](#blendshapes-and-corrective-shapes) (a weight slider per shape, correctives, the sculpt brush), skin weights (influence limits, the paint brush, Mirror and Smooth, locks, fixes and the vertex selection) and naming, or, with a component
   selected, its attachment, options (the spine's joint count and **Spline (curve)**
   toggle, a tentacle's joint and curve-control counts), exact guide positions and the names its
   bones will export as. Click a panel's title to fold it away.
@@ -617,10 +617,45 @@ mirrored vertex position, and **Smooth**, which blurs the shown bone's weights
 * **Paint**: pick a bone in the weights list, turn on **Paint** and drag on the
   mesh. **Add** raises the bone's weight (the vertex's other bones give way),
   **Subtract** lowers it (the other bones take it up; a vertex held by that bone
-  alone passes to its parent), **Smooth** blends towards the neighbours. The
-  brush fades to nothing at its rim; set its radius (or press `[` and `]`) and
-  strength. With Symmetry on, the twin bone is painted on the other side. Each
-  stroke, mirror and smooth is one Undo step. Dragging off the mesh still orbits.
+  alone passes to its parent), **Replace** moves it towards the brush's
+  **Value**, **Scale** multiplies it by the **Factor** (0.5 halves it at full
+  strength), **Smooth** blends every bone towards the neighbours, and **Mend**
+  fixes spikes: only a vertex whose weights stand out from its neighbours' (by
+  more than 0.5, see [docs/skinning.md](docs/skinning.md#editing-weights-by-hand))
+  takes their average, so smooth skin around it is left as it is. The brush fades
+  to nothing at its rim; set its radius (or press `[` and `]`) and strength. With
+  Symmetry on, the twin bone is painted on the other side. Each stroke, mirror
+  and smooth is one Undo step. Dragging off the mesh still orbits.
+* **Bend** (under the brush): turns the painted bone at its joint, 0 to 90
+  degrees about X, Y or Z (the axis across the bone by default), through the
+  test pose, so you watch the skin deform while you paint. Painting lands on the
+  bent skin. Nothing is saved; 0 straightens it.
+* **Lock** the shown bone (the weights list marks locked bones): no brush mode,
+  smooth, flood, paste, fix or automatic-weights rerun changes its weights on
+  any vertex; the vertex's unlocked bones share whatever the locked ones leave.
+  A locked bone can't be painted itself. Mirror and weight copy still copy every
+  bone.
+* **Normalize** makes every vertex add up to 1 within the influence limits
+  (locked weights stay); **Fix spikes** gives every vertex standing out from
+  its neighbours by more than **Spike above** their average weights;
+  **Auto weights** re-runs the automatic weights (the voxel method above) on the
+  shown bone's skin, wherever it has weight now or would get it, and keeps your
+  edits everywhere else.
+* **Select** vertices: with **Select** on, click a vertex on the mesh or drag a
+  box (Shift adds, Ctrl removes, Alt-drag orbits). A box takes only the vertices
+  in front, or everything under it with X-ray on. Copies of a vertex split at a
+  UV seam are selected together, so edits never tear a seam. **Grow** and
+  **Shrink** add or take off a ring of neighbours, **Its skin** selects
+  everything the shown bone moves. For the selection: **Copy** (one vertex's
+  weights, or the average of several) and **Paste** (Ctrl+C, Ctrl+V), **Flood**
+  (set the shown bone to a value on all of them) and **Auto** (the automatic
+  weights again on just those vertices).
+* **Weight table**: with vertices selected, a panel at the bottom left lists
+  each one's influences (the first 12 vertices). Drag or type a weight; the
+  vertex's other unlocked bones share the rest. A whole drag or a typed value is
+  one Undo step.
+* **Hover** over the mesh with a bone shown (or Select on) to see the vertex
+  under the pointer and each influence on it.
 * **Max influences and prune**: the most bones per vertex, 1 to 12, with the
   engines named: Unreal 8 (12 with its extra-influences setting), Unity and
   glTF 4. Past four, the `.glb` writes a second `JOINTS_1`/`WEIGHTS_1` set (a
@@ -641,8 +676,14 @@ hive-rig demo -o out --engine unreal               # 8 influences (unreal12, uni
 hive-rig rig hero.glb -o out --max-influences 6 --prune 0.01
 hive-rig weights limit out/hero.hive.json --engine unity --prune 0.02
 hive-rig weights copy base/base.hive.json hero/hero.hive.json   # copy weights onto another rig
+hive-rig weights normalize out/hero.hive.json      # every vertex adds up to 1
+hive-rig weights fix-spikes out/hero.hive.json --threshold 0.6 --lock head
+hive-rig weights auto out/hero.hive.json --bone upperarm_l --bone lowerarm_l   # automatic weights again there
 hive-rig rebuild out/hero.hive.json --keep-weights  # keep hand-edited weights
 ```
+
+`normalize`, `fix-spikes` and `auto` take `--lock BONE` (repeatable) for bones
+whose weights stay, and `-o` and `--targets` like the other commands.
 
 `weights copy` moves one character's weights onto another with the same or a
 similar skeleton, in any pose or size (an A-pose character from a T-pose one,
@@ -847,7 +888,15 @@ the app on a virtual screen and screenshots it after building the demo rig, and
 again with the weight brush after one dab (`--dab subtract`). The skin tools
 (prune, influence caps, the brush's add, subtract, smooth and its undo, keeping
 edits across a rebuild, and copying weights between the T-pose and A-pose demo)
-have unit tests in `src/skin.rs`, `src/rig.rs` and `src/studio/app.rs`; the
+have unit tests in `src/skin.rs`, `src/rig.rs` and `src/studio/app.rs`. The hand
+edits have their own in `src/skin/edit.rs` (locks under every brush mode and the
+influence cap, Replace, Scale, Mend on a planted spike, fixing spikes, flood,
+paste, re-running the automatic weights on a bone's skin, normalize, grow and
+shrink) and the app's in `src/studio/app/skin_edit.rs` (a locked bone through a
+whole stroke, copy, paste, flood, weight table drags and the automatic-weights
+rerun, each one Undo step; click and box selection seeing only the front; the
+paint bend). The app screenshots them with `--weights BONE --lock BONE --bend 70
+--bend-axis z --dab replace --vertices --hover --tools`; the
 `.glb`'s second joints/weights set is read back in `src/export/glb.rs`.
 CI runs all of this (`.github/workflows/hive-rig.yml`), and builds both Windows
 executables as a downloadable artifact.

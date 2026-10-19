@@ -86,6 +86,50 @@ so smoothing crosses seams and both copies of a seam vertex keep the same
 weights (otherwise the mesh would tear open along the seam when posed). The
 Properties panel's **Smooth** and the brush's Smooth mode use the same pass.
 
+## Editing weights by hand
+
+Automatic weights get a character most of the way; riggers then fix what they
+see while bending the joints. hive-rig's tools, in `src/skin.rs` (the brush) and
+`src/skin/edit.rs` (everything else), all keep every vertex adding up to 1 and
+within the influence limits after each edit.
+
+* **Setting one bone's weight.** Add, Subtract, Replace and Scale only decide
+  the painted bone's new weight `t` on a vertex. The vertex's other bones are
+  then scaled together so they add up to `1 - t` (their proportions stay). When
+  no other bone holds the vertex, taking weight off the bone hands it to the
+  nearest deforming parent. Flood and the weight table set the weight the same
+  way.
+* **Locks.** A locked bone keeps its weight `l` on every vertex. The painted
+  bone can then reach at most `1 - (sum of locked weights)`, and only the
+  unlocked bones are rescaled, pruned or dropped by the influence cap (the cap
+  drops the weakest unlocked bone first). Edits that blend whole vertices
+  (smooth, paste, the automatic weights again) put the locked weights back
+  afterwards and rescale the rest into the room left; if nothing unlocked would
+  be left to fill it, the vertex isn't changed.
+* **Spikes.** A vertex's *spike* is half the summed difference, bone by bone,
+  between its weights and the average of its neighbours' (the same measure as
+  the "spikes" column below): 0 where it agrees with them, about 0.5 on a hard
+  edge between two bones, near 1 for a vertex given to a bone nothing around it
+  has. Mend (a brush mode) and Fix spikes (the whole mesh) give a vertex above
+  the threshold (0.5 by default) its neighbours' average, computed from the
+  weights before the pass so one fix doesn't spread into the next. Unlike
+  Smooth, vertices below the threshold aren't touched, so a deliberate soft
+  falloff survives. Neighbours are taken over the surface with seam copies
+  welded, as for smoothing.
+* **Normalize** scales each vertex that doesn't add up to 1 as a whole, then
+  applies the limits. Edits in hive-rig never leave such vertices; they come
+  from rigs edited elsewhere or by hand.
+* **Re-running the automatic weights** on a selection or on one bone's skin
+  (every vertex the bone weighs now or would weigh automatically) copies the
+  rig's automatic weights (geodesic voxel binding, above) onto just those
+  vertices; the hand edits elsewhere stay.
+* **Selections** grow and shrink by one ring of surface neighbours. Selecting a
+  vertex selects its seam copies too, so an edit never gives two copies of one
+  point different weights (which tears the mesh open when posed).
+* **Seeing it bend.** The app's Bend slider turns the painted bone at its joint
+  through the test pose (linear blend skinning of the rest mesh with that bone
+  and its children turned), so painting happens on the deformed skin.
+
 ## Influence limits and pruning
 
 Engines cap how many bones may move one vertex: 4 for Unity's usual setting and

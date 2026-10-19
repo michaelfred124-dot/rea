@@ -9,7 +9,9 @@
 //!
 //! The tools: mirror, smooth, prune small influences, cap the influences per
 //! vertex for a game engine, paint with a brush, keep hand edits across a
-//! rebuild, and copy weights from another character.
+//! rebuild, and copy weights from another character. The hand edits beyond
+//! the brush (locks, normalise, spikes, flood, paste, re-running the automatic
+//! weights on part of the mesh, vertex selections) are in [`edit`].
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -21,6 +23,8 @@ use crate::landmarks::mirror;
 use crate::mesh::Mesh;
 use crate::skeleton::{Side, Skeleton, turn_about};
 use crate::voxel::{self, Volume};
+
+pub mod edit;
 
 /// Most influences per vertex any engine preset asks for.
 pub const INFLUENCE_CAP: usize = 12;
@@ -380,6 +384,29 @@ impl SkinWeights {
         self.influences(v).map(|(j, w)| (j as u16, w)).collect()
     }
 
+    /// The mean of some vertices' influences, strongest first (empty for none).
+    pub fn average(&self, vertices: impl IntoIterator<Item = usize>) -> Vec<(u16, f32)> {
+        let mut sum: Vec<(u16, f32)> = Vec::new();
+        let mut n = 0usize;
+        for v in vertices {
+            if v >= self.vertex_count() {
+                continue;
+            }
+            n += 1;
+            for (j, w) in self.influences(v) {
+                match sum.iter_mut().find(|p| p.0 as usize == j) {
+                    Some(p) => p.1 += w,
+                    None => sum.push((j as u16, w)),
+                }
+            }
+        }
+        for p in sum.iter_mut() {
+            p.1 /= n.max(1) as f32;
+        }
+        sum.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        sum
+    }
+
     fn to_dense(&self, n_bones: usize) -> Vec<Vec<f32>> {
         (0..self.vertex_count())
             .map(|v| {
@@ -416,7 +443,15 @@ impl SkinWeights {
 /// Merge repeated bones, sort strongest first, drop influences below the prune
 /// threshold, keep at most `max_influences` and renormalise. `keep` is a bone
 /// that stays even when it is among the smallest (the bone being painted).
-fn limit_pairs(pairs: &mut Vec<(u16, f32)>, limits: SkinLimits, keep: Option<u16>) {
+///
+/// Bones marked in `locked` keep their weight: only the unlocked bones are
+/// pruned, dropped and rescaled to fill what the locked ones leave.
+fn limit_pairs(
+    pairs: &mut Vec<(u16, f32)>,
+    limits: SkinLimits,
+    keep: Option<u16>,
+    locked: &[bool],
+) {
     let mut merged: Vec<(u16, f32)> = Vec::with_capacity(pairs.len());
     for &(j, w) in pairs.iter() {
         if !(w > 0.0 && w.is_finite()) {
@@ -428,6 +463,14 @@ fn limit_pairs(pairs: &mut Vec<(u16, f32)>, limits: SkinLimits, keep: Option<u16
         }
     }
     merged.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let is_locked = |j: u16| locked.get(j as usize).copied().unwrap_or(false);
+    let held: f32 = merged.iter().filter(|p| is_locked(p.0)).map(|p| p.1).sum();
+    let free: f32 = merged.iter().filter(|p| !is_locked(p.0)).map(|p| p.1).sum();
+    if held > 0.0 && free > 0.0 {
+        limit_locked(&mut merged, limits, keep, &is_locked, held);
+        *pairs = merged;
+        return;
+    }
     normalise(&mut merged);
     if limits.prune > 0.0 && merged.len() > 1 {
         let strongest = merged[0].0;
@@ -447,6 +490,51 @@ fn limit_pairs(pairs: &mut Vec<(u16, f32)>, limits: SkinLimits, keep: Option<u16
     *pairs = merged;
 }
 
+/// [`limit_pairs`] for a vertex with locked and unlocked bones (merged, sorted
+/// and adding up to 1): the locked weights stay, the unlocked ones are pruned,
+/// capped and rescaled to the `1 - held` left over.
+fn limit_locked(
+    merged: &mut Vec<(u16, f32)>,
+    limits: SkinLimits,
+    keep: Option<u16>,
+    is_locked: &dyn Fn(u16) -> bool,
+    held: f32,
+) {
+    if held >= 1.0 {
+        merged.retain(|p| is_locked(p.0));
+        normalise(merged);
+        return;
+    }
+    let rescale = |m: &mut Vec<(u16, f32)>| {
+        let held: f32 = m.iter().filter(|p| is_locked(p.0)).map(|p| p.1).sum();
+        let free: f32 = m.iter().filter(|p| !is_locked(p.0)).map(|p| p.1).sum();
+        let room = 1.0 - held;
+        if free > 0.0 && room > 0.0 {
+            for p in m.iter_mut().filter(|p| !is_locked(p.0)) {
+                p.1 *= room / free;
+            }
+        } else {
+            normalise(m);
+        }
+    };
+    rescale(merged);
+    if limits.prune > 0.0 {
+        let strongest = merged.iter().find(|p| !is_locked(p.0)).map(|p| p.0);
+        merged.retain(|p| {
+            p.1 >= limits.prune || is_locked(p.0) || Some(p.0) == strongest || Some(p.0) == keep
+        });
+    }
+    let max = limits.max_influences.clamp(1, INFLUENCE_CAP);
+    if merged.len() > max {
+        // Locked bones first, then the painted bone, then the strongest.
+        let rank = |p: &(u16, f32)| (!is_locked(p.0), Some(p.0) != keep);
+        merged.sort_by(|a, b| rank(a).cmp(&rank(b)).then(b.1.total_cmp(&a.1)));
+        merged.truncate(max);
+    }
+    rescale(merged);
+    merged.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+}
+
 fn normalise(pairs: &mut [(u16, f32)]) {
     let sum: f32 = pairs.iter().map(|p| p.1).sum();
     if sum > 0.0 {
@@ -462,14 +550,15 @@ pub fn limit(skin: &SkinWeights, limits: SkinLimits) -> SkinWeights {
     let mut out = skin.clone();
     for v in 0..out.vertex_count() {
         let mut pairs = skin.pairs(v);
-        limit_pairs(&mut pairs, limits, None);
+        limit_pairs(&mut pairs, limits, None, &[]);
         out.set(v, pairs);
     }
     out
 }
 
 /// Smooth painted or computed weights over the surface: everywhere, or only
-/// around the vertices `bone` influences.
+/// around the vertices `bone` influences. Bones marked in `locked` keep their
+/// weights.
 pub fn smooth(
     skin: &SkinWeights,
     mesh: &Mesh,
@@ -477,6 +566,7 @@ pub fn smooth(
     bone: Option<usize>,
     iterations: usize,
     limits: SkinLimits,
+    locked: &[bool],
 ) -> SkinWeights {
     let mut dense = skin.to_dense(sk.bones.len());
     let opts = SkinOptions {
@@ -490,7 +580,33 @@ pub fn smooth(
         bone,
         limits.max_influences,
     );
-    limit(&SkinWeights::from_dense(&dense), limits)
+    let smoothed = SkinWeights::from_dense(&dense);
+    let mut out = skin.clone();
+    for v in 0..out.vertex_count() {
+        let mut pairs = smoothed.pairs(v);
+        relock(&skin.pairs(v), &mut pairs, locked);
+        limit_pairs(&mut pairs, limits, None, locked);
+        out.set(v, pairs);
+    }
+    out
+}
+
+/// Put the locked bones' weights back as they were in `old` after an edit that
+/// moved every bone (a blend with the neighbours, a paste). When the edit left
+/// nothing for the unlocked bones to share, the vertex stays as it was.
+fn relock(old: &[(u16, f32)], new: &mut Vec<(u16, f32)>, locked: &[bool]) {
+    let is_locked = |j: u16| locked.get(j as usize).copied().unwrap_or(false);
+    if !old.iter().chain(new.iter()).any(|p| is_locked(p.0)) {
+        return;
+    }
+    new.retain(|p| !is_locked(p.0));
+    let held: f32 = old.iter().filter(|p| is_locked(p.0)).map(|p| p.1).sum();
+    let free: f32 = new.iter().map(|p| p.1).sum();
+    if free <= 0.0 && held < 1.0 - 1e-6 {
+        *new = old.to_vec();
+        return;
+    }
+    new.extend(old.iter().filter(|p| is_locked(p.0)));
 }
 
 /// For each bone, the bone on the other side of the body (its own index on the
@@ -564,9 +680,23 @@ pub enum BrushMode {
     Add,
     /// Lower the bone's weight; the vertex's other bones take it up.
     Subtract,
+    /// Move the bone's weight towards the dab's `value`.
+    Replace,
+    /// Multiply the bone's weight by the dab's `value` (below 1 thins it out).
+    Scale,
     /// Blend every bone's weight towards the neighbours' average.
     Smooth,
+    /// Only where a vertex's weights stand out from its neighbours' (by more
+    /// than [`SPIKE`]), replace them with the neighbours' average.
+    Mend,
 }
+
+/// How far a vertex's weights may stand out from the average of its
+/// neighbours' before Mend and "fix spikes" treat it as a spike: half the
+/// summed difference per bone, from 0 (the same) to 1 (no bone in common). A
+/// vertex on a hard edge between two bones scores about 0.5; a vertex given to
+/// another bone than everything around it scores near 1.
+pub const SPIKE: f32 = 0.5;
 
 /// One touch of the weight brush.
 #[derive(Debug, Clone, Copy)]
@@ -577,11 +707,16 @@ pub struct Dab {
     /// 0..1: how far one dab moves a vertex at the brush centre.
     pub strength: f32,
     pub mode: BrushMode,
+    /// The weight Replace moves towards, or the factor Scale multiplies by (0..1).
+    pub value: f32,
 }
 
 /// Paint one dab of `bone`'s weight onto the vertices within the brush, fading
 /// to nothing at its rim. `positions` are where the vertices are drawn (posed or
-/// at rest). Returns how many vertices changed.
+/// at rest). Bones marked in `locked` keep their weights; a locked `bone` can't
+/// be painted (Smooth and Mend still even out the unlocked bones). Returns how
+/// many vertices changed.
+#[allow(clippy::too_many_arguments)]
 pub fn paint(
     skin: &mut SkinWeights,
     positions: &[Vec3],
@@ -590,12 +725,20 @@ pub fn paint(
     bone: usize,
     dab: Dab,
     limits: SkinLimits,
+    locked: &[bool],
 ) -> usize {
-    if bone >= sk.bones.len() || dab.radius <= 0.0 || dab.strength <= 0.0 {
+    let blends = matches!(dab.mode, BrushMode::Smooth | BrushMode::Mend);
+    let bone_locked = locked.get(bone).copied().unwrap_or(false);
+    if bone >= sk.bones.len()
+        || dab.radius <= 0.0
+        || dab.strength <= 0.0
+        || (bone_locked && !blends)
+    {
         return 0;
     }
     let b = bone as u16;
     let strength = dab.strength.clamp(0.0, 1.0);
+    let value = dab.value.clamp(0.0, 1.0);
     let inside: Vec<(usize, f32)> = positions
         .iter()
         .enumerate()
@@ -604,56 +747,40 @@ pub fn paint(
             (d < 1.0).then(|| (v, strength * (1.0 - d * d).powi(2)))
         })
         .collect();
-    let before = (dab.mode == BrushMode::Smooth).then(|| skin.clone());
+    let before = blends.then(|| skin.clone());
     let fallback = fallback_bone(sk, bone);
     let mut changed = 0;
     for (v, t) in inside {
         if v >= skin.vertex_count() {
             continue;
         }
-        let mut pairs = skin.pairs(v);
-        let own: f32 = pairs.iter().filter(|p| p.0 == b).map(|p| p.1).sum();
-        let others: f32 = pairs.iter().filter(|p| p.0 != b).map(|p| p.1).sum();
-        let keep = match dab.mode {
-            BrushMode::Add => {
-                let target = own + t * (1.0 - own);
-                scale_others(&mut pairs, b, target, others);
-                Some(b)
-            }
-            BrushMode::Subtract => {
-                let target = own * (1.0 - t);
-                if others > 0.0 {
-                    scale_others(&mut pairs, b, target, others);
-                } else if let Some(f) = fallback {
-                    pairs.retain(|p| p.0 != b);
-                    pairs.push((b, target));
-                    pairs.push((f as u16, own - target));
-                }
-                None
-            }
-            BrushMode::Smooth => {
+        let old = skin.pairs(v);
+        let own: f32 = old.iter().filter(|p| p.0 == b).map(|p| p.1).sum();
+        let set = |target: f32| with_weight(&old, b, target, locked, fallback);
+        let (mut pairs, keep) = match dab.mode {
+            BrushMode::Add => (set(own + t * (1.0 - own)), Some(b)),
+            BrushMode::Subtract => (set(own * (1.0 - t)), None),
+            BrushMode::Replace => (set(own + t * (value - own)), (value > 0.0).then_some(b)),
+            BrushMode::Scale => (set(own * (1.0 - t * (1.0 - value))), None),
+            BrushMode::Smooth | BrushMode::Mend => {
                 let before = before.as_ref().unwrap();
                 let nbrs = adjacency.get(v).map_or(&[][..], Vec::as_slice);
                 if nbrs.is_empty() {
                     continue;
                 }
-                let k = t / nbrs.len() as f32;
-                let mut blended: Vec<(u16, f32)> =
-                    pairs.iter().map(|&(j, w)| (j, w * (1.0 - t))).collect();
-                for &n in nbrs {
-                    blended.extend(
-                        before
-                            .pairs(n as usize)
-                            .into_iter()
-                            .map(|(j, w)| (j, w * k)),
-                    );
+                let avg = before.average(nbrs.iter().map(|&n| n as usize));
+                if dab.mode == BrushMode::Mend && spike(&old, &avg) <= SPIKE {
+                    continue;
                 }
-                pairs = blended;
-                None
+                let mut blended: Vec<(u16, f32)> =
+                    old.iter().map(|&(j, w)| (j, w * (1.0 - t))).collect();
+                blended.extend(avg.iter().map(|&(j, w)| (j, w * t)));
+                relock(&old, &mut blended, locked);
+                (blended, None)
             }
         };
-        limit_pairs(&mut pairs, limits, keep);
-        if pairs != skin.pairs(v) {
+        limit_pairs(&mut pairs, limits, keep, locked);
+        if pairs != old {
             skin.set(v, pairs);
             changed += 1;
         }
@@ -661,19 +788,63 @@ pub fn paint(
     changed
 }
 
-/// Set bone `b`'s weight to `target` and scale the other bones so the vertex
-/// still adds up to 1.
-fn scale_others(pairs: &mut Vec<(u16, f32)>, b: u16, target: f32, others: f32) {
-    let k = if others > 0.0 {
-        (1.0 - target) / others
-    } else {
-        0.0
+/// How far a vertex's influences stand out from `avg`: half the summed weight
+/// difference per bone, 0 (the same) to 1 (no bone in common).
+fn spike(pairs: &[(u16, f32)], avg: &[(u16, f32)]) -> f32 {
+    let weight = |list: &[(u16, f32)], j: u16| -> f32 {
+        list.iter().filter(|p| p.0 == j).map(|p| p.1).sum()
     };
-    pairs.retain(|p| p.0 != b);
-    for p in pairs.iter_mut() {
-        p.1 *= k;
+    let mut bones: Vec<u16> = pairs.iter().chain(avg).map(|p| p.0).collect();
+    bones.sort_unstable();
+    bones.dedup();
+    0.5 * bones
+        .iter()
+        .map(|&j| (weight(pairs, j) - weight(avg, j)).abs())
+        .sum::<f32>()
+}
+
+/// A vertex's influences with bone `b` set to `target`, the other unlocked
+/// bones scaled so the vertex still adds up to 1. Locked bones keep their
+/// weight, so `target` is capped at what they leave. When no unlocked bone
+/// can take up weight taken off `b`, it goes to `fallback` (if unlocked).
+fn with_weight(
+    pairs: &[(u16, f32)],
+    b: u16,
+    target: f32,
+    locked: &[bool],
+    fallback: Option<usize>,
+) -> Vec<(u16, f32)> {
+    let is_locked = |j: u16| locked.get(j as usize).copied().unwrap_or(false);
+    let held: f32 = pairs
+        .iter()
+        .filter(|p| p.0 != b && is_locked(p.0))
+        .map(|p| p.1)
+        .sum();
+    let others: f32 = pairs
+        .iter()
+        .filter(|p| p.0 != b && !is_locked(p.0))
+        .map(|p| p.1)
+        .sum();
+    let room = (1.0 - held).max(0.0);
+    let target = target.clamp(0.0, room);
+    let mut out: Vec<(u16, f32)> = pairs.iter().filter(|p| p.0 != b).copied().collect();
+    let fallback = fallback
+        .map(|f| f as u16)
+        .filter(|&f| f != b && !is_locked(f));
+    if others > 0.0 {
+        let k = (room - target) / others;
+        for p in out.iter_mut().filter(|p| !is_locked(p.0)) {
+            p.1 *= k;
+        }
+        out.push((b, target));
+    } else if let Some(f) = fallback.filter(|_| target < room) {
+        out.push((b, target));
+        out.push((f, room - target));
+    } else {
+        // Nothing else can take or give weight: the bone keeps what is left.
+        out.push((b, room));
     }
-    pairs.push((b, if others > 0.0 { target } else { 1.0 }));
+    out
 }
 
 /// Where weight taken off a bone goes when nothing else holds the vertex: its
@@ -872,6 +1043,7 @@ pub fn transfer(src: &Skinned, dst: &Skinned, dst_to_src: &[Option<usize>]) -> S
                 prune: 0.0,
             },
             None,
+            &[],
         );
         if pairs.is_empty() {
             // Nothing on the source maps here: keep the target's own weights.
@@ -1235,6 +1407,7 @@ mod tests {
             Some(hand_l as usize),
             2,
             SkinLimits::default(),
+            &[],
         );
         assert_normalised(&smoothed);
         // Smoothing around the left hand leaves the right leg alone.
@@ -1565,9 +1738,10 @@ mod tests {
             radius: 0.08,
             strength: 0.5,
             mode,
+            value: 1.0,
         };
         let stroke = |s: &mut SkinWeights, bone: usize, d: Dab| {
-            paint(s, &mesh.positions, &adj, sk, bone, d, limits)
+            paint(s, &mesh.positions, &adj, sk, bone, d, limits, &[])
         };
         let mut painted = skin.clone();
         let changed = stroke(&mut painted, spine, dab(BrushMode::Add));
@@ -1592,6 +1766,7 @@ mod tests {
             radius: 0.01,
             strength: 0.05,
             mode: BrushMode::Add,
+            value: 1.0,
         };
         stroke(&mut faint, spine, tiny);
         assert!(faint.weight(full, spine) > 0.0);
@@ -1616,6 +1791,7 @@ mod tests {
             radius: 0.01,
             strength: 1.0,
             mode: BrushMode::Subtract,
+            value: 1.0,
         };
         stroke(&mut alone, hand, wipe);
         assert_normalised(&alone);

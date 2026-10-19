@@ -19,7 +19,7 @@ use hive_rig::components::{self, ControlStyle, Guides, Kind};
 use hive_rig::controls::{ControlKind, Shape};
 use hive_rig::naming::{Naming, Preset};
 use hive_rig::skeleton::Side;
-use hive_rig::skin::{BrushMode, Engine, INFLUENCE_CAP};
+use hive_rig::skin::{Engine, INFLUENCE_CAP};
 use hive_rig::template::{self, Listed, Scope, Source, Template};
 
 use super::{Category, Doc, Drag, FingerSides, Mode, Pose, RigPick, Studio, count, push_undo};
@@ -27,6 +27,8 @@ use crate::theme::{
     self, ACCENT, BORDER, CARD, CARD_HI, ERR, OK, TEXT, TEXT_DIM, TEXT_FAINT, WARN,
 };
 use crate::view::{self, Projector};
+
+mod skin_panel;
 
 const PICK_RADIUS: f32 = 10.0;
 /// Component handles are corner brackets around the first guide: their half
@@ -287,6 +289,7 @@ impl Studio {
             self.camera_pill(&ctx);
             self.outliner(&ctx);
             self.properties(&ctx);
+            self.weight_table(&ctx);
             self.dock(&ctx);
             self.library_window(&ctx);
             self.export_window(&ctx);
@@ -1309,7 +1312,12 @@ impl Studio {
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.weights_bone, None, "Off");
                     for b in &deform {
-                        ui.selectable_value(&mut self.weights_bone, Some(b.clone()), b);
+                        let label = if self.skin_tools.locked.contains(b) {
+                            format!("{b}  (locked)")
+                        } else {
+                            b.clone()
+                        };
+                        ui.selectable_value(&mut self.weights_bone, Some(b.clone()), label);
                     }
                 });
             weight_legend(ui);
@@ -1336,6 +1344,7 @@ impl Studio {
                     self.smooth_weights();
                 }
             });
+            self.weight_tools(ui);
             ui.checkbox(
                 &mut self.keep_weights,
                 RichText::new("Keep edited weights on rebuild").size(12.5),
@@ -1435,20 +1444,13 @@ impl Studio {
                 self.painting = on;
                 if on {
                     self.sculpting = false;
+                    self.skin_tools.selecting = false;
                 } else {
                     self.brush_at = None;
                 }
             }
-            theme::segmented(
-                ui,
-                &mut self.brush.mode,
-                &[
-                    (BrushMode::Add, "Add"),
-                    (BrushMode::Subtract, "Subtract"),
-                    (BrushMode::Smooth, "Smooth"),
-                ],
-            );
         });
+        self.brush_modes(ui);
         let height = self
             .doc
             .as_ref()
@@ -1473,6 +1475,7 @@ impl Studio {
             ui.label(RichText::new("Strength").size(12.0).color(TEXT_DIM));
             ui.add(egui::Slider::new(&mut self.brush.strength, 0.01..=1.0).max_decimals(2));
         });
+        self.brush_extras(ui);
     }
 
     /// The pre-build checks: every warning, a click to select its guide, and a
@@ -2692,7 +2695,9 @@ impl Studio {
         } else {
             self.stroke = None;
         }
-        let stroking = self.stroke.is_some();
+        let select_on = self.select_tool_on();
+        let boxing = self.skin_input(ui, &response, &pr, pointer, press, blocked);
+        let stroking = self.stroke.is_some() || boxing;
         if response.drag_stopped() {
             self.stroke = None;
         }
@@ -2746,6 +2751,7 @@ impl Studio {
         }
         if response.clicked()
             && !brush_on
+            && !select_on
             && let Some(p) = pointer
         {
             if self.mode == Mode::Guides {
@@ -2790,6 +2796,7 @@ impl Studio {
         if brush_on || sculpt_on {
             self.paint_brush(&painter, &pr);
         }
+        self.paint_skin_tools(&painter, &pr);
         paint_axes(
             &painter,
             &pr,
@@ -2900,11 +2907,10 @@ impl Studio {
             return;
         };
         let r = c.distance(edge).max(2.0);
-        let (glyph, color) = match self.brush.mode {
-            _ if sculpt => ("\u{2194}", Color32::from_rgb(255, 190, 110)),
-            BrushMode::Add => ("+", ACCENT),
-            BrushMode::Subtract => ("\u{2212}", Color32::from_rgb(110, 200, 255)),
-            BrushMode::Smooth => ("~", Color32::from_rgb(190, 160, 255)),
+        let (glyph, color) = if sculpt {
+            ("\u{2194}", Color32::from_rgb(255, 190, 110))
+        } else {
+            skin_panel::brush_glyph(self.brush.mode)
         };
         painter.circle_filled(c, r, color.gamma_multiply(0.10));
         // The inner ring shows where the brush is at full strength.

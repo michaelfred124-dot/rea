@@ -357,6 +357,76 @@ enum WeightsCommand {
         #[command(flatten)]
         output: Outputs,
     },
+    /// Make every vertex's weights add up to 1 within the rig's influence
+    /// limits.
+    Normalize {
+        /// The `<name>.hive.json` of the rig.
+        rig: PathBuf,
+        #[command(flatten)]
+        edit: WeightEdit,
+    },
+    /// Replace every vertex whose weights stand out from its neighbours'
+    /// (a spike) with their average.
+    FixSpikes {
+        /// The `<name>.hive.json` of the rig.
+        rig: PathBuf,
+        /// How far a vertex must differ from its neighbours' average, from 0 to
+        /// 1: 0.5 is a hard edge between two bones, 1 a vertex sharing no bone
+        /// with them.
+        #[arg(long, default_value_t = hive_rig::skin::SPIKE)]
+        threshold: f32,
+        #[command(flatten)]
+        edit: WeightEdit,
+    },
+    /// Re-run the automatic weights on the skin of some bones (wherever they
+    /// have weight now or would get it), keeping the hand edits elsewhere.
+    Auto {
+        /// The `<name>.hive.json` of the rig.
+        rig: PathBuf,
+        /// A bone whose skin gets the automatic weights again (repeatable).
+        #[arg(long, required = true)]
+        bone: Vec<String>,
+        #[command(flatten)]
+        edit: WeightEdit,
+    },
+}
+
+/// What every hand edit of a rig's weights takes.
+#[derive(clap::Args)]
+struct WeightEdit {
+    /// A bone whose weights stay as they are (repeatable).
+    #[arg(long)]
+    lock: Vec<String>,
+    /// Output directory (default: the rig's directory).
+    #[arg(short, long)]
+    out: Option<PathBuf>,
+    #[command(flatten)]
+    output: Outputs,
+}
+
+impl WeightEdit {
+    /// The lock mask for `rig`, refusing names that aren't its bones.
+    fn locks(&self, rig: &Rig) -> Result<Vec<bool>> {
+        for name in &self.lock {
+            anyhow::ensure!(
+                rig.skeleton.index_of(name).is_some(),
+                "'{name}' is not a bone of '{}'",
+                rig.name
+            );
+        }
+        Ok(hive_rig::skin::edit::lock_mask(
+            &rig.skeleton,
+            self.lock.iter().map(String::as_str),
+        ))
+    }
+
+    fn write(&self, rig: &Rig, path: &Path) -> Result<()> {
+        let dir = self
+            .out
+            .clone()
+            .unwrap_or_else(|| path.parent().unwrap_or(Path::new(".")).to_path_buf());
+        write(rig, &dir, &self.output)
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -1001,6 +1071,71 @@ fn weights_command(action: WeightsCommand) -> Result<()> {
             }
             let dir = out.unwrap_or_else(|| path.parent().unwrap_or(Path::new(".")).to_path_buf());
             write(&r, &dir, &output)
+        }
+        WeightsCommand::Normalize { rig: path, edit } => {
+            let mut r = load_rig(&path)?;
+            let locks = edit.locks(&r)?;
+            let (skin, n) = hive_rig::skin::edit::normalize(&r.skin, r.guides.skin, &locks);
+            r.skin = skin;
+            println!(
+                "Normalized the weights of '{}': {n} vertices changed.",
+                r.name
+            );
+            edit.write(&r, &path)
+        }
+        WeightsCommand::FixSpikes {
+            rig: path,
+            threshold,
+            edit,
+        } => {
+            anyhow::ensure!(
+                (0.0..=1.0).contains(&threshold),
+                "the spike threshold must be between 0 and 1, not {threshold}"
+            );
+            let mut r = load_rig(&path)?;
+            let locks = edit.locks(&r)?;
+            let adjacency = hive_rig::skin::edit::surface_neighbours(&r.mesh);
+            let (skin, n) = hive_rig::skin::edit::fix_spikes(
+                &r.skin,
+                &adjacency,
+                threshold,
+                r.guides.skin,
+                &locks,
+            );
+            r.skin = skin;
+            println!(
+                "Fixed {n} spiky vertices of '{}' (standing out by more than {threshold}).",
+                r.name
+            );
+            edit.write(&r, &path)
+        }
+        WeightsCommand::Auto {
+            rig: path,
+            bone,
+            edit,
+        } => {
+            let mut r = load_rig(&path)?;
+            let locks = edit.locks(&r)?;
+            let auto = r.auto_weights(SkinOptions::default());
+            let mut region = Vec::new();
+            for name in &bone {
+                let b = r
+                    .skeleton
+                    .index_of(name)
+                    .ok_or_else(|| anyhow::anyhow!("'{name}' is not a bone of '{}'", r.name))?;
+                region.extend(hive_rig::skin::edit::bone_region(&r.skin, &auto, b));
+            }
+            region.sort_unstable();
+            region.dedup();
+            let n =
+                hive_rig::skin::edit::restore(&mut r.skin, &auto, &region, r.guides.skin, &locks);
+            println!(
+                "Re-ran the automatic weights on the skin of {} in '{}': {n} of {} vertices changed.",
+                bone.join(", "),
+                r.name,
+                region.len()
+            );
+            edit.write(&r, &path)
         }
     }
 }

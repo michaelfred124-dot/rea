@@ -1,7 +1,8 @@
 //! Hive Rig: the desktop rigging app. Double-click it, open a character, adjust
 //! the guides, build and export.
 //!
-//! `HiveRig [character, rig or guides file] [--demo [dog|bird|spider|snake]] [--build] [--weights BONE] [--paint] [--dab add|subtract|smooth] [--library] [--templates] [--export]
+//! `HiveRig [character, rig or guides file] [--demo [dog|bird|spider|snake]] [--build] [--weights BONE] [--paint] [--dab add|subtract|replace|scale|smooth|mend]
+//! [--lock BONE] [--bend DEGREES] [--bend-axis x|y|z] [--tools] [--vertices] [--hover] [--library] [--templates] [--export]
 //! [--select COMPONENT[,COMPONENT...]] [--pick NAME] [--pose BONE[=DEGREES[@x|y|z]]] [--shape NAME=WEIGHT]...
 //! [--screenshot OUT.ppm]`
 //! (the flags exist so the window can be checked automatically).
@@ -29,8 +30,20 @@ struct Launch {
     weights: Option<String>,
     /// Turn the weight brush on and show it over the `--weights` bone.
     paint: bool,
-    /// Paint one dab there: add, subtract or smooth.
+    /// Paint one dab there: add, subtract, replace, scale, smooth or mend.
     dab: Option<String>,
+    /// Lock these bones' weights.
+    lock: Vec<String>,
+    /// Bend the `--weights` bone this many degrees (the paint preview).
+    bend: Option<f32>,
+    /// About this world axis (0..2) instead of the one across the bone.
+    bend_axis: Option<usize>,
+    /// Scroll Properties down to the weight tools.
+    tools: bool,
+    /// Turn the select tool on and select the vertices around the brush spot.
+    vertices: bool,
+    /// Show the influences of the vertex at the brush spot, as on hover.
+    hover: bool,
     library: bool,
     templates: bool,
     export: bool,
@@ -66,6 +79,20 @@ fn parse_args() -> Launch {
                 launch.paint = true;
                 launch.dab = args.next().map(|s| s.to_string_lossy().into_owned());
             }
+            Some("--lock") => {
+                if let Some(b) = args.next() {
+                    launch.lock.push(b.to_string_lossy().into_owned());
+                }
+            }
+            Some("--bend") => launch.bend = args.next().and_then(|s| s.to_str()?.parse().ok()),
+            Some("--bend-axis") => {
+                launch.bend_axis = args
+                    .next()
+                    .and_then(|s| ["x", "y", "z"].iter().position(|a| s.to_str() == Some(a)))
+            }
+            Some("--tools") => launch.tools = true,
+            Some("--vertices") => launch.vertices = true,
+            Some("--hover") => launch.hover = true,
             Some("--library") => launch.library = true,
             Some("--templates") => {
                 launch.library = true;
@@ -146,14 +173,24 @@ fn main() -> eframe::Result {
         studio.build();
     }
     studio.weights_bone = launch.weights;
-    if launch.paint {
+    for bone in &launch.lock {
+        studio.toggle_lock(bone);
+    }
+    if let Some(degrees) = launch.bend {
+        studio.bend_paint_bone(degrees, launch.bend_axis);
+    }
+    if launch.paint || launch.vertices || launch.hover {
         studio.show_brush();
     }
     if let Some(mode) = &launch.dab {
+        use hive_rig::skin::BrushMode;
         studio.brush.mode = match mode.as_str() {
-            "subtract" => hive_rig::skin::BrushMode::Subtract,
-            "smooth" => hive_rig::skin::BrushMode::Smooth,
-            _ => hive_rig::skin::BrushMode::Add,
+            "subtract" => BrushMode::Subtract,
+            "replace" => BrushMode::Replace,
+            "scale" => BrushMode::Scale,
+            "smooth" => BrushMode::Smooth,
+            "mend" => BrushMode::Mend,
+            _ => BrushMode::Add,
         };
         studio.brush.strength = 0.8;
         if let Some(at) = studio.brush_at
@@ -161,6 +198,26 @@ fn main() -> eframe::Result {
         {
             studio.paint_at(at);
         }
+    }
+    // The vertex nearest the brush spot: selected with its neighbours, or hovered.
+    let spot = studio.brush_at.and_then(|at| {
+        let m = &studio.doc.as_ref()?.mesh.positions;
+        (0..m.len()).min_by(|a, b| m[*a].distance(at).total_cmp(&m[*b].distance(at)))
+    });
+    if launch.vertices
+        && let Some(v) = spot
+    {
+        studio.painting = false;
+        studio.skin_tools.selecting = true;
+        studio.select_vertices(&[v], app::SelectOp::Replace);
+        studio.grow_selection();
+    }
+    if launch.hover {
+        studio.painting = launch.paint;
+        studio.skin_tools.hover = spot;
+    }
+    if launch.tools {
+        studio.skin_tools.scroll_to_tools = 4;
     }
     studio.library_open = launch.library;
     if launch.templates {
