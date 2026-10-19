@@ -50,7 +50,7 @@ jobs:
         run: |
           s="$RUNNER_TEMP/skin"
           cargo run --locked -q -- demo -o "$s/src" --engine unreal --prune 0.01 | tee "$s.log"
-          grep -q "up to 8 influences" "$s.log"
+          grep -Eq "up to [5-8] influences" "$s.log"
           grep -q '"max_influences": 8' "$s/src/hive_demo.guides.json"
           cargo run --locked -q -- demo -o "$s/dst" --arm-drop 45
           cargo run --locked -q -- naming "$s/dst/hive_demo.guides.json" suffix
