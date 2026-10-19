@@ -105,15 +105,15 @@ pub struct ControlStyle {
     pub color: Option<[f32; 3]>,
 }
 
-/// Whole-body measurements used to split the mesh into skin regions.
+/// Whole-body measurements from the landmarks (the skin weights don't use them).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Body {
     pub floor: f32,
     pub height: f32,
     pub center_x: f32,
-    /// Below this height, vertices belong to a leg.
+    /// Height of the crotch: an arm reaching below it is a planted front leg.
     pub crotch_y: f32,
-    /// Further than this from the centre line, vertices above the crotch belong to an arm.
+    /// Half the torso's width at the chest.
     pub torso_half_width: f32,
 }
 
@@ -583,9 +583,8 @@ pub fn quadruped(height: f32) -> Guides {
     creature(h, components, 0.45 * h, 0.5 * h)
 }
 
-/// A creature layout standing on the floor at the origin, facing +Z. Skin
-/// below `crotch_y` belongs to a leg, and skin further than `torso_half_width`
-/// from the mid-line above it to an arm.
+/// A creature layout standing on the floor at the origin, facing +Z, with its
+/// belly line at `crotch_y` and half its body's width `torso_half_width`.
 fn creature(h: f32, components: Vec<Component>, crotch_y: f32, torso_half_width: f32) -> Guides {
     Guides {
         format: GUIDES_FORMAT.into(),

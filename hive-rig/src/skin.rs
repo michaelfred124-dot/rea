@@ -1,10 +1,11 @@
 //! Skin weights: the automatic weights and the tools that edit them.
 //!
-//! Each vertex is first assigned a body region (left arm, right leg, torso...) from
-//! the landmarks, which limits the bones that may influence it. Within that set,
-//! weights fall off with the inverse fourth power of the distance to each bone
-//! segment, are trimmed to the strongest influences the rig allows, and then
-//! smoothed over the mesh surface so joints bend without hard creases.
+//! The automatic weights measure each bone's distance to each vertex through the
+//! solid volume of the mesh (geodesic voxel binding, see [`crate::voxel`]), so
+//! weight never jumps across an air gap, whatever the creature. Weights fall off
+//! with the inverse eighth power of that distance, are trimmed to the strongest
+//! influences the rig allows, and are then smoothed over the mesh surface so
+//! joints bend without hard creases. See `docs/skinning.md`.
 //!
 //! The tools: mirror, smooth, prune small influences, cap the influences per
 //! vertex for a game engine, paint with a brush, keep hand edits across a
@@ -16,10 +17,10 @@ use std::str::FromStr;
 use glam::{Quat, Vec3};
 use serde::{Deserialize, Serialize};
 
-use crate::components::Body;
 use crate::landmarks::mirror;
 use crate::mesh::Mesh;
-use crate::skeleton::{Bone, Region, Side, Skeleton, turn_about};
+use crate::skeleton::{Side, Skeleton, turn_about};
+use crate::voxel::{self, Volume};
 
 /// Most influences per vertex any engine preset asks for.
 pub const INFLUENCE_CAP: usize = 12;
@@ -154,84 +155,59 @@ impl Default for SkinOptions {
     }
 }
 
-fn vertex_region(body: &Body, x: f32, y: f32) -> Region {
-    let dx = x - body.center_x;
-    if y < body.crotch_y {
-        return if dx >= 0.0 {
-            Region::LegL
-        } else {
-            Region::LegR
-        };
-    }
-    if dx.abs() > body.torso_half_width * 1.05 {
-        return if dx > 0.0 { Region::ArmL } else { Region::ArmR };
-    }
-    Region::Center
-}
+/// Voxels along the longest side of the mesh for the automatic weights: about
+/// 7 mm on a 1.8 m character. Gaps narrower than a voxel or two (fingers held
+/// together, thighs pressed together) are bridged.
+pub const VOXEL_RESOLUTION: usize = 256;
 
-/// Bones allowed to influence vertices of `region`.
-fn allowed_bones(sk: &Skeleton, region: Region) -> Vec<usize> {
-    sk.bones
-        .iter()
-        .enumerate()
-        .filter(|(_, b)| b.deform && (b.region == region || b.links.contains(&region)))
-        .map(|(i, _)| i)
-        .collect()
-}
+/// Weights fall off with this power of the distance through the body. Measured
+/// on real characters against their artists' weights (see docs/skinning.md),
+/// 8 tracks them more closely than 4 or 6 and keeps elbows and knees fuller;
+/// the smoothing passes then soften the joints.
+const FALLOFF: i32 = 8;
 
-pub fn compute(
-    mesh: &Mesh,
-    sk: &Skeleton,
-    body: &Body,
-    opts: SkinOptions,
-    limits: SkinLimits,
-) -> SkinWeights {
-    let regions = [
-        Region::Center,
-        Region::ArmL,
-        Region::ArmR,
-        Region::LegL,
-        Region::LegR,
-    ];
+/// Automatic weights for any mesh and any skeleton.
+///
+/// Each deforming bone's distance to each vertex is measured through the solid
+/// volume of the mesh (see [`crate::voxel`]), so weight can't jump across the
+/// air between legs, between an arm and the ribs, or between fingers further
+/// apart than a voxel. Weights fall off with the inverse eighth power of that
+/// distance (only within `reach` for bones that have one, such as face joints),
+/// are trimmed to the strongest influences the rig allows, and smoothed over
+/// the surface.
+pub fn compute(mesh: &Mesh, sk: &Skeleton, opts: SkinOptions, limits: SkinLimits) -> SkinWeights {
     let max = limits.max_influences.clamp(1, INFLUENCE_CAP);
-    let allowed: Vec<Vec<usize>> = regions.iter().map(|r| allowed_bones(sk, *r)).collect();
     let n_bones = sk.bones.len();
-    let eps = (body.height * 0.005).powi(2);
-    // Distance is measured to each bone's skinned segment (see Skeleton::skin_segment).
-    let segments: Vec<Bone> = (0..n_bones)
-        .map(|i| {
-            let (head, tail) = sk.skin_segment(i);
-            Bone {
-                head,
-                tail,
-                ..sk.bones[i].clone()
-            }
-        })
-        .collect();
+    let deform: Vec<usize> = (0..n_bones).filter(|&b| sk.bones[b].deform).collect();
+    let (lo, hi) = mesh.bounds();
+    // Distances are taken as a fraction of the mesh size, so the weights are
+    // the same at any scale and stay well inside f32 range.
+    let size = (hi - lo).max_element().max(1e-6);
+    const EPS: f32 = 0.005 * 0.005;
+    let dist = bone_distances(mesh, sk, &deform, VOXEL_RESOLUTION);
 
-    // Dense per-vertex weights keep smoothing simple; skeletons are small.
-    let mut dense: Vec<Vec<f32>> = mesh
-        .positions
-        .iter()
-        .map(|p| {
-            let r = vertex_region(body, p.x, p.y);
-            let ri = regions.iter().position(|x| *x == r).unwrap();
+    let mut dense: Vec<Vec<f32>> = (0..mesh.vertex_count())
+        .map(|v| {
             let mut w = vec![0.0f32; n_bones];
-            for &b in &allowed[ri] {
-                let d = segments[b].distance_to(*p);
-                let falloff = match segments[b].reach {
+            for (k, &b) in deform.iter().enumerate() {
+                let d = dist[k][v];
+                if !d.is_finite() {
+                    continue;
+                }
+                let falloff = match sk.bones[b].reach {
                     Some(r) if d >= r => continue,
                     Some(r) => (1.0 - d / r).powi(2),
                     None => 1.0,
                 };
-                w[b] = falloff / (d * d + eps).powi(2);
+                let x = d / size;
+                w[b] = falloff / (x * x + EPS).powi(FALLOFF / 2);
             }
             keep_top(&mut w, max);
             w
         })
         .collect();
 
-    smooth_dense(&mut dense, &mesh.adjacency(), opts, None, max);
+    smooth_dense(&mut dense, &surface_adjacency(mesh), opts, None, max);
     let mut out = SkinWeights::from_dense(&dense);
     for v in 0..out.vertex_count() {
         if out.joints[v].is_empty() {
@@ -242,6 +218,79 @@ pub fn compute(
         }
     }
     limit(&out, limits)
+}
+
+/// For each bone in `bones`, its distance to every vertex through the mesh's
+/// solid volume, never less than the straight-line distance. Measured on each
+/// bone's skinned segment (see [`Skeleton::skin_segment`]), several bones at a
+/// time.
+fn bone_distances(mesh: &Mesh, sk: &Skeleton, bones: &[usize], resolution: usize) -> Vec<Vec<f32>> {
+    let vol = Volume::new(mesh, resolution);
+    let cells: Vec<Option<u32>> = mesh.positions.iter().map(|p| vol.cell_near(*p)).collect();
+    let segments: Vec<(Vec3, Vec3)> = bones.iter().map(|&b| sk.skin_segment(b)).collect();
+    let seeds: Vec<Vec<(u32, f32)>> = segments.iter().map(|&(a, b)| vol.seeds(a, b)).collect();
+    // Pieces no bone passes through.
+    let mut orphan = vec![true; vol.piece_count()];
+    for &(c, _) in seeds.iter().flatten() {
+        orphan[vol.piece_of(c)] = false;
+    }
+    let one = |k: usize, scratch: &mut Vec<f32>| -> Vec<f32> {
+        let (head, tail) = segments[k];
+        vol.distances(head, tail, &seeds[k], &orphan, scratch);
+        mesh.positions
+            .iter()
+            .zip(&cells)
+            .map(|(p, c)| {
+                let straight = voxel::segment_distance(*p, head, tail);
+                c.map_or(straight, |c| scratch[c as usize].max(straight))
+            })
+            .collect()
+    };
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .clamp(1, bones.len().max(1));
+    let mut out: Vec<Vec<f32>> = vec![Vec::new(); bones.len()];
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let one = &one;
+                scope.spawn(move || {
+                    let mut scratch = Vec::new();
+                    (t..bones.len())
+                        .step_by(threads)
+                        .map(|k| (k, one(k, &mut scratch)))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for h in handles {
+            for (k, d) in h.join().expect("a skin weight thread panicked") {
+                out[k] = d;
+            }
+        }
+    });
+    out
+}
+
+/// Neighbours over the surface with vertices at the same position (split at
+/// UV or normal seams) counted as one, so smoothing crosses seams and the two
+/// copies of a seam vertex keep the same weights.
+fn surface_adjacency(mesh: &Mesh) -> Vec<Vec<u32>> {
+    let weld = voxel::weld_positions(&mesh.positions);
+    let adj = mesh.adjacency();
+    let mut merged: Vec<Vec<u32>> = vec![Vec::new(); adj.len()];
+    for (v, nbrs) in adj.iter().enumerate() {
+        let rep = weld[v] as usize;
+        merged[rep].extend(nbrs.iter().map(|&n| weld[n as usize]));
+    }
+    for (rep, list) in merged.iter_mut().enumerate() {
+        list.sort_unstable();
+        list.dedup();
+        list.retain(|&n| n as usize != rep);
+    }
+    (0..adj.len())
+        .map(|v| merged[weld[v] as usize].clone())
+        .collect()
 }
 
 /// Average each vertex's weights with its neighbours'. With `only`, just the
@@ -425,7 +474,7 @@ pub fn smooth(
     };
     smooth_dense(
         &mut dense,
-        &mesh.adjacency(),
+        &surface_adjacency(mesh),
         opts,
         bone,
         limits.max_influences,
@@ -1080,6 +1129,7 @@ pub fn deform_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::Body;
     use crate::{components, demo, landmarks::detect};
 
     struct Built {
@@ -1100,7 +1150,7 @@ mod tests {
     }
 
     fn auto(b: &Built, limits: SkinLimits) -> SkinWeights {
-        compute(&b.mesh, &b.sk, &b.body, SkinOptions::default(), limits)
+        compute(&b.mesh, &b.sk, SkinOptions::default(), limits)
     }
 
     fn skinned<'a>(b: &'a Built, skin: &'a SkinWeights) -> Skinned<'a> {
@@ -1187,7 +1237,7 @@ mod tests {
     }
 
     #[test]
-    fn weights_are_normalised_and_regional() {
+    fn weights_are_normalised_and_limbs_stay_apart() {
         let b = demo_rig(0.0);
         let (mesh, sk) = (&b.mesh, &b.sk);
         let skin = auto(&b, SkinLimits::default());
@@ -1209,8 +1259,134 @@ mod tests {
         for (i, p) in mesh.positions.iter().enumerate() {
             if p.y < 0.5 && p.x > 0.0 {
                 for (j, _) in skin.influences(i) {
-                    assert!(!sk.bones[j].name.ends_with("_r"));
+                    assert!(
+                        !sk.bones[j].name.ends_with("_r"),
+                        "{} at {p}",
+                        sk.bones[j].name
+                    );
                 }
+            }
+        }
+    }
+
+    /// The summed weight of the bones whose names start with any of `prefixes`.
+    fn weight_of(skin: &SkinWeights, sk: &Skeleton, v: usize, prefixes: &[&str]) -> f32 {
+        skin.influences(v)
+            .filter(|(j, _)| prefixes.iter().any(|p| sk.bones[*j].name.starts_with(p)))
+            .map(|(_, w)| w)
+            .sum()
+    }
+
+    #[test]
+    fn arms_hanging_by_the_body_keep_their_own_weights() {
+        // Arms dropped 80 degrees hang a few centimetres from the ribs. Body
+        // detection doesn't read arms that low, so the arm guides are put on
+        // the demo's arms by hand.
+        let drop = 80f32.to_radians();
+        let mesh = demo::humanoid(80.0);
+        let mut guides = components::biped(&detect(&demo::humanoid(45.0)));
+        for c in &mut guides.components {
+            if c.kind != components::Kind::Arm {
+                continue;
+            }
+            let sx = c.side.sign();
+            let shoulder = Vec3::new(0.12 * sx, 1.40, 0.0);
+            let dir = Vec3::new(sx * drop.cos(), -drop.sin(), 0.0);
+            for g in &mut c.guides {
+                g.position = match g.name.as_str() {
+                    "shoulder" => shoulder,
+                    "elbow" => shoulder + dir * 0.32 - Vec3::Z * 0.01,
+                    "wrist" => shoulder + dir * 0.64,
+                    "hand_tip" => shoulder + dir * 0.74,
+                    _ => g.position,
+                };
+            }
+        }
+        let b = Built {
+            sk: components::build(&guides).unwrap().skeleton,
+            body: guides.body,
+            mesh,
+        };
+        let (mesh, sk) = (&b.mesh, &b.sk);
+        let skin = auto(&b, SkinLimits::default());
+        assert_normalised(&skin);
+        let arm = ["upperarm", "lowerarm", "hand"];
+        let mut checked = 0;
+        for (v, p) in mesh.positions.iter().enumerate() {
+            // The flanks of the torso, from the elbows down (the arm fuses
+            // with the ribs above, where the armpit blends).
+            if p.x.abs() > 0.08 && p.x.abs() < 0.1 && (0.9..1.09).contains(&p.y) {
+                let w = weight_of(&skin, sk, v, &arm);
+                assert!(w < 0.05, "torso vertex {p} takes {w} from the arm");
+                checked += 1;
+            }
+        }
+        assert!(checked > 10, "{checked}");
+        // The forearm's far half goes to its twist bone, the near half to the
+        // forearm, as the twist distribution expects.
+        let lower = sk.index_of("lowerarm_l").unwrap();
+        let twist = sk.index_of("lowerarm_twist_01_l").unwrap();
+        let (elbow, wrist) = (sk.bones[lower].head, sk.bones[lower].tail);
+        let near = |t: f32| {
+            let at = elbow.lerp(wrist, t);
+            (0..mesh.vertex_count())
+                .min_by(|a, c| {
+                    mesh.positions[*a]
+                        .distance(at)
+                        .total_cmp(&mesh.positions[*c].distance(at))
+                })
+                .unwrap()
+        };
+        assert_eq!(dominant(&skin, near(0.2)), lower);
+        assert_eq!(dominant(&skin, near(0.85)), twist);
+    }
+
+    #[test]
+    fn an_eyeball_piece_follows_its_eye_bone() {
+        let mut mesh = demo::humanoid(0.0);
+        let mut guides = components::biped(&detect(&mesh));
+        components::add_preset(
+            &mut guides,
+            components::Preset::Eyes,
+            &components::AddOptions::default(),
+        )
+        .unwrap();
+        let sk = components::build(&guides).unwrap().skeleton;
+        let eye = sk.index_of("eye_l").unwrap();
+        let ball = demo::sphere(sk.bones[eye].head, 0.012, 12, 8);
+        let first = mesh.vertex_count();
+        mesh.append(&ball);
+        let skin = compute(&mesh, &sk, SkinOptions::default(), SkinLimits::default());
+        for v in first..mesh.vertex_count() {
+            assert_eq!(dominant(&skin, v), eye, "eyeball vertex {v}");
+            assert!(skin.weight(v, eye) > 0.8, "{}", skin.weight(v, eye));
+        }
+    }
+
+    #[test]
+    fn seam_copies_share_their_weights() {
+        // Split the whole demo mesh as if along UV seams: every vertex gets a
+        // twin at the same place, used by every other triangle.
+        let b = demo_rig(0.0);
+        let mut mesh = b.mesh.clone();
+        let n = mesh.vertex_count() as u32;
+        mesh.positions.extend(b.mesh.positions.clone());
+        mesh.normals.extend(b.mesh.normals.clone());
+        for (t, tri) in mesh.indices.chunks_mut(3).enumerate() {
+            if t % 2 == 0 {
+                for i in tri {
+                    *i += n;
+                }
+            }
+        }
+        let skin = compute(&mesh, &b.sk, SkinOptions::default(), SkinLimits::default());
+        for (v, nbrs) in b.mesh.adjacency().iter().enumerate() {
+            if nbrs.is_empty() {
+                continue;
+            }
+            for bone in 0..b.sk.bones.len() {
+                let (x, y) = (skin.weight(v, bone), skin.weight(v + n as usize, bone));
+                assert!((x - y).abs() < 1e-4, "vertex {v} bone {bone}: {x} vs {y}");
             }
         }
     }

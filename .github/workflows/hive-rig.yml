@@ -280,6 +280,29 @@ jobs:
           cargo run -q -- rebuild "$s/dst/hive_demo.hive.json"
           cargo run -q -- weights copy "$s/src/hive_demo.hive.json" "$s/dst/hive_demo.hive.json" --engine unreal12
           python tests/blender_check.py "$s/dst/hive_demo_blender.py" "$s/dst/hive_demo.glb"
+      - name: Automatic skin weights on public characters, posed in Blender
+        run: |
+          w="$RUNNER_TEMP/weights"
+          # Downloaded at pinned commits, never committed; read with python -I.
+          sh tests/fetch_skin_models.sh "$w/models" CesiumMan RobotExpressive
+          cargo run -q --release -- rig "$w/models/CesiumMan/CesiumMan.glb" -o "$w/cesium" -t blender
+          python -I tests/blender_skin_eval.py "$w/cesium/CesiumMan.hive.json" \
+            --source "$w/models/CesiumMan/CesiumMan.glb" \
+            --max-leg-leak 0.02 --min-thickness 0.85 --max-spikes 0.4
+          cargo run -q --release -- rig "$w/models/RobotExpressive/RobotExpressive.glb" -o "$w/robot" -t blender
+          python -I tests/blender_skin_eval.py "$w/robot/RobotExpressive.hive.json" \
+            --source "$w/models/RobotExpressive/RobotExpressive.glb" \
+            --max-arm-leak 0.02 --max-piece-wrong 0.05 --min-thickness 0.85 --max-spikes 0.6 --max-artist-diff 0.2
+          for drop in 0 45; do
+            cargo run -q --release -- demo -o "$w/demo$drop" --arm-drop "$drop"
+            python -I tests/blender_skin_eval.py "$w/demo$drop/hive_demo.hive.json" \
+              --max-leg-leak 0.02 --max-arm-leak 0.02 --min-thickness 0.85 --max-spikes 0.4
+          done
+          for creature in dog bird spider snake; do
+            cargo run -q --release -- demo --creature "$creature" -o "$w/$creature"
+            python -I tests/blender_skin_eval.py "$w/$creature/hive_$creature.hive.json" \
+              --max-leg-leak 0.02 --min-thickness 0.75 --max-spikes 0.4 --max-piece-wrong 0.1
+          done
       - name: Animator tools - IK/FK matching, mirror, reset and space switching in Blender
         run: |
           for drop in 0 45; do

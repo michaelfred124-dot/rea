@@ -310,8 +310,10 @@ any character, scaled to its height. They use the existing components only:
   and head, and a spline (`tentacle`) tail of eight joints and four curve
   controls, all in the mid-plane.
 
-The spider and snake have no leg or arm skin regions: every vertex takes the
-bones nearest it. Their pre-build checks are clear, as the dog's are.
+Every creature is skinned the same way, by distance through its body (see
+[Skin](#how-it-works)), so a spider's legs or a bird's wings never share
+weights across the air between them. Their pre-build checks are clear, as the
+dog's are.
 
 Hind legs can also replace a biped's legs:
 
@@ -630,11 +632,17 @@ back to average human proportions and prints a warning.
 2. **Guides** (`src/components.rs`): the landmarks place the default biped
    layout, mirrored for the right side. Each component builds its bones and
    controls from its guides: 31 bones for the biped, including 8 twist helpers.
-3. **Skin** (`src/skin.rs`): every vertex is assigned to a body region (torso,
-   left/right arm or leg), so weights can't bleed between limbs that are close
-   together. Weights fall off with inverse distance to each bone, are limited
-   to the rig's max influences (4 unless set), are smoothed over the surface,
-   and influences below the prune threshold (if any) are dropped.
+3. **Skin** (`src/skin.rs`, `src/voxel.rs`): the mesh is voxelized into a
+   solid (holes capped, the inside flood-filled), and each bone's distance to
+   each vertex is measured through that solid (geodesic voxel binding), so
+   weights can't jump across the air between legs, an arm and the ribs, or a
+   spider's legs, and loose pieces (eyes, teeth, clothes) follow the bones
+   inside or nearest them. Weights fall off with that distance, are limited to
+   the rig's max influences (4 unless set), are smoothed over the surface
+   (across UV seams), and influences below the prune threshold (if any) are
+   dropped. [docs/skinning.md](docs/skinning.md) explains automatic weights,
+   smoothing, influence limits, twist and corrective shapes, and measurements
+   on real characters. About a second for a 30,000-vertex character.
 4. **Controls** (`src/controls.rs`): the DCC-neutral description of every control
    (its parent, shape, colour and driven bone) and the IK chains, as built by the components.
 5. **Export** (`src/export/`): the glTF and FBX writers and the three builder templates
@@ -647,6 +655,10 @@ cargo test                       # landmarks, skeleton, skin, controls, glTF and
 python3 tests/dcc_stub_run.py maya out/hive_demo_maya.py      # Python-level check
 python3 tests/dcc_stub_run.py unreal out/hive_demo_unreal.py  # Python-level check
 pip install bpy && python tests/blender_check.py out/hive_demo_blender.py out/hive_demo.glb
+python -I tests/blender_skin_eval.py out/hive_demo.hive.json            # skin weight quality
+sh tests/fetch_skin_models.sh /tmp/models CesiumMan    # real models (pinned), then:
+hive-rig rig /tmp/models/CesiumMan/CesiumMan.glb -o /tmp/cm
+python -I tests/blender_skin_eval.py /tmp/cm/CesiumMan.hive.json --source /tmp/models/CesiumMan/CesiumMan.glb
 python tests/blender_guides_check.py out/hive_demo_blender.py           # guides and rebuild
 python tests/blender_quad_check.py dog/hive_dog_blender.py dog/hive_dog.glb   # after demo --quadruped -o dog
 python tests/blender_spline_check.py out/hive_demo_blender.py out/hive_demo.glb   # after add tentacle, spine --spline true, rebuild

@@ -80,7 +80,7 @@ pub fn build_rig(mesh: Mesh, name: &str, guides: Guides, opts: RigOptions) -> an
         .naming
         .apply(&mut built.skeleton, &mut built.controls)?;
     guides.skin.validate()?;
-    let skin = skin::compute(&mesh, &built.skeleton, &guides.body, opts.skin, guides.skin);
+    let skin = skin::compute(&mesh, &built.skeleton, opts.skin, guides.skin);
     Ok(Rig {
         format: FORMAT.into(),
         version: FORMAT_VERSION,
@@ -146,13 +146,7 @@ impl Rig {
 
     /// The automatic weights this rig's guides give, before any hand edits.
     pub fn auto_weights(&self, opts: SkinOptions) -> SkinWeights {
-        skin::compute(
-            &self.mesh,
-            &self.skeleton,
-            &self.guides.body,
-            opts,
-            self.guides.skin,
-        )
+        skin::compute(&self.mesh, &self.skeleton, opts, self.guides.skin)
     }
 }
 

@@ -28,6 +28,7 @@ pub mod skeleton;
 pub mod skin;
 pub mod template;
 pub mod version;
+pub mod voxel;
 
 pub use export::Target;
 pub use rig::{Rig, RigOptions, auto_rig, build_rig};

@@ -6,8 +6,9 @@
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
-/// Which body region a bone belongs to. Used to keep skin weights from bleeding
-/// between limbs that happen to be close together (inner thighs, arms at the hips).
+/// Which body region a bone belongs to (a label written to the rig file). The
+/// automatic skin weights no longer read it: they keep limbs apart by measuring
+/// through the body (see `crate::voxel`), which works for any creature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Region {
@@ -56,8 +57,8 @@ pub struct Bone {
     pub deform: bool,
     pub side: Side,
     pub region: Region,
-    /// Other regions whose vertices this bone may also weight, so skin blends
-    /// across a joint between regions (e.g. the upper arm into the torso).
+    /// Other regions this bone borders (the upper arm the torso). A label kept
+    /// in rig files; the automatic skin weights don't read it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<Region>,
     /// Id of the component that built this bone.
