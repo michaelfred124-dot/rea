@@ -335,6 +335,17 @@ fn head_chain(
         return Vec::new();
     };
     let mut chain = t.down(chest, end).unwrap_or_default();
+    // Face joints (brows, lids, eyes, a jaw) fan out from the head. Past a
+    // fan only a leaf on the mid-line can be the head's end, never a brow.
+    if let Some(f) = chain.iter().position(|&j| t.children[j].len() >= 3)
+        && f + 1 < chain.len()
+    {
+        let next = chain[f + 1];
+        let ends_head = f + 2 == chain.len()
+            && t.children[next].is_empty()
+            && (pos(next).x - body.center_x).abs() < 0.002 * body.height;
+        chain.truncate(if ends_head { f + 2 } else { f + 1 });
+    }
     while chain
         .last()
         .is_some_and(|&j| (pos(j).x - body.center_x).abs() > 0.03 * body.height)
@@ -542,6 +553,32 @@ mod tests {
         assert_eq!(name(map.arms[1][arm.wrist.unwrap()]), "hand_r");
         assert_eq!(name(*map.head.first().unwrap()), "neck_01");
         assert!(map.chest.is_some());
+    }
+
+    #[test]
+    fn the_head_ends_at_its_face_joints() {
+        // Brows, eyes and a jaw fan out from the head, a brow higher than
+        // the head joint; none of them is the head's end.
+        let mesh = demo::humanoid(0.0);
+        let (mut joints, built, body) = nameless(&mesh);
+        let head = built.skeleton.index_of("head").unwrap();
+        let at = built.skeleton.bones[head].head;
+        let h = body.height;
+        for (dx, dy) in [
+            (0.008, 0.05),
+            (-0.008, 0.05),
+            (0.02, 0.03),
+            (-0.02, 0.03),
+            (0.0, -0.03),
+        ] {
+            joints.push(Joint {
+                name: "face".into(),
+                position: at + Vec3::new(dx * h, dy * h, 0.04 * h),
+                parent: Some(head),
+            });
+        }
+        let map = map(&joints, &body, BodyKind::Biped).unwrap();
+        assert_eq!(*map.head.last().unwrap(), head);
     }
 
     #[test]
