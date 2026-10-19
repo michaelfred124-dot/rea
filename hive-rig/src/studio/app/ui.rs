@@ -1290,6 +1290,9 @@ impl Studio {
         self.checks_card(ui);
 
         ui.add_space(8.0);
+        self.shapes_card(ui);
+
+        ui.add_space(8.0);
         theme::label_caps(ui, "Skin weights");
         self.skin_limits(ui);
         if deform.is_empty() {
@@ -1430,7 +1433,9 @@ impl Studio {
             );
             if on != self.painting {
                 self.painting = on;
-                if !on {
+                if on {
+                    self.sculpting = false;
+                } else {
                     self.brush_at = None;
                 }
             }
@@ -2600,6 +2605,8 @@ impl Studio {
         // The weight brush (after Build, with a bone shown): dragging on the mesh
         // paints, dragging off it still orbits.
         let brush_on = self.painting && self.mode != Mode::Guides && self.paint_bone().is_some();
+        let sculpt_on =
+            !brush_on && self.sculpting && self.mode != Mode::Guides && self.shape_pick.is_some();
         let hit_at = |s: &Studio, p: Pos2| {
             let (o, d) = pr.ray(p);
             s.hit_mesh(o, d)
@@ -2650,6 +2657,37 @@ impl Studio {
                 && self.begin_stroke()
             {
                 self.paint_at(hit);
+            }
+        } else if sculpt_on {
+            // The sculpt brush: the vertices under it follow the pointer across
+            // the screen (in the plane facing the camera through the grab point).
+            if self.stroke.is_none()
+                && response.hovered()
+                && let Some(p) = pointer
+            {
+                self.brush_at = hit_at(self, p);
+            }
+            if response.drag_started_by(PointerButton::Primary)
+                && let Some(p) = press.or(pointer)
+                && let Some(hit) = hit_at(self, p)
+                && self.begin_sculpt()
+            {
+                self.stroke = Some(hit);
+            }
+            if let Some(last) = self.stroke
+                && response.dragged_by(PointerButton::Primary)
+                && let Some(p) = pointer
+            {
+                let (o, d) = pr.ray(p);
+                let across = d.dot(pr.forward);
+                if across.abs() > 1e-6 {
+                    let to = o + d * ((last - o).dot(pr.forward) / across);
+                    if to.distance(last) > 1e-5 {
+                        self.sculpt_at(last, to - last);
+                        self.stroke = Some(to);
+                        self.brush_at = Some(to);
+                    }
+                }
             }
         } else {
             self.stroke = None;
@@ -2749,7 +2787,7 @@ impl Studio {
             paint_grid(&painter, &pr, min.y, (max - min).max_element().max(0.5));
         }
         self.paint(&painter, &pr, pointer);
-        if brush_on {
+        if brush_on || sculpt_on {
             self.paint_brush(&painter, &pr);
         }
         paint_axes(
@@ -2850,13 +2888,20 @@ impl Studio {
         let (Some(at), Some(doc)) = (self.brush_at, &self.doc) else {
             return;
         };
-        let radius = self.brush.radius * doc.guides.body.height;
+        let sculpt = !self.painting && self.sculpting;
+        let reach = if sculpt {
+            self.sculpt_radius
+        } else {
+            self.brush.radius
+        };
+        let radius = reach * doc.guides.body.height;
         let right = pr.forward.cross(Vec3::Y).normalize_or(Vec3::X);
         let (Some(c), Some(edge)) = (pr.pos(at), pr.pos(at + right * radius)) else {
             return;
         };
         let r = c.distance(edge).max(2.0);
         let (glyph, color) = match self.brush.mode {
+            _ if sculpt => ("\u{2194}", Color32::from_rgb(255, 190, 110)),
             BrushMode::Add => ("+", ACCENT),
             BrushMode::Subtract => ("\u{2212}", Color32::from_rgb(110, 200, 255)),
             BrushMode::Smooth => ("~", Color32::from_rgb(190, 160, 255)),
@@ -2873,8 +2918,13 @@ impl Studio {
             FontId::proportional(18.0),
             color,
         );
-        if let Some(bone) = &self.weights_bone {
-            label_chip(painter, c + Vec2::new(r + 10.0, 12.0), bone);
+        let chip = if sculpt {
+            self.shape_pick.as_ref()
+        } else {
+            self.weights_bone.as_ref()
+        };
+        if let Some(name) = chip {
+            label_chip(painter, c + Vec2::new(r + 10.0, 12.0), name);
         }
     }
 
@@ -2916,6 +2966,11 @@ impl Studio {
             Some(b) if self.show_mesh => self.weights_for(b).map(<[Color32]>::to_vec),
             _ => None,
         };
+        let textures = if self.show_mesh && colors.is_none() {
+            self.mesh_textures(painter.ctx())
+        } else {
+            Vec::new()
+        };
         let Some(doc) = &self.doc else { return };
         let frame = self.frame();
         if self.show_mesh {
@@ -2930,6 +2985,7 @@ impl Studio {
                 positions,
                 base,
                 colors.as_deref(),
+                Some(&textures),
                 alpha,
             );
         }

@@ -32,7 +32,7 @@ a joint; with Symmetry on, its twin on the other side follows.
 * **The outliner** (left) lists the components as their attachment tree: each
   component sits under the one owning the bone it hangs from (a leg hung from
   the head is listed under the head). **Properties** (right)
-  shows the rig summary, the pre-build [checks](#checks-before-building), skin weights (influence limits, the paint brush, Mirror and Smooth) and naming, or, with a component
+  shows the rig summary, the pre-build [checks](#checks-before-building), [blendshapes](#blendshapes-and-corrective-shapes) (a weight slider per shape, correctives, the sculpt brush), skin weights (influence limits, the paint brush, Mirror and Smooth) and naming, or, with a component
   selected, its attachment, options (the spine's joint count and **Spline (curve)**
   toggle, a tentacle's joint and curve-control counts), exact guide positions and the names its
   bones will export as. Click a panel's title to fold it away.
@@ -67,8 +67,9 @@ output folder.
 
 | File | Use it in | What it contains |
 | --- | --- | --- |
-| `<name>.glb` | Blender, Unreal, any glTF tool | Mesh, skeleton and skin weights |
-| `<name>.fbx` (with `--targets fbx`) | Unreal, Unity, any FBX tool | Mesh, skeleton, skin weights and bind pose |
+| `<name>.glb` | Blender, Unreal, any glTF tool | Mesh (with its objects, UVs, materials, textures and blendshapes), skeleton and skin weights |
+| `<name>.fbx` (with `--targets fbx`) | Unreal, Unity, any FBX tool | The same mesh, skeleton, skin weights, blend shapes and bind pose |
+| `<name>_textures/` | Everything above | The character's texture images, when it has any |
 | `<name>_blender.py` | Blender 3.6+ | Mesh, armature, weights **and controls** |
 | `<name>_maya.py` | Maya 2022+ | Mesh, oriented joints, skinCluster **and controls** |
 | `<name>_unreal.py` | Unreal Engine 5.2+ | Imports the .glb and builds a **Control Rig Blueprint** |
@@ -85,8 +86,9 @@ that Blender and Unreal import natively.
 `--targets fbx` (on `rig`, `demo` and `rebuild`, alone or with the scripts:
 `--targets blender,maya,unreal,fbx`), or **Export FBX** in the app's export
 window, also writes `<name>.fbx`: a binary FBX 7.4 that Unreal and Unity import
-directly as a skeletal mesh, with no script. It holds the mesh (triangles,
-smooth normals, one material), one joint per bone named with the rig's
+directly as a skeletal mesh, with no script. It holds the mesh (a mesh object
+per source object, with its normals, UV sets, vertex colours, materials with
+their texture files, and blend shapes; see [Mesh fidelity](#mesh-fidelity)), one joint per bone named with the rig's
 [naming convention](#naming-conventions) and parented as in the skeleton, the
 skin weights with every influence the skin keeps (8 for `--engine unreal`, up to
 12; FBX has no limit of four), and a bind pose for the mesh and every bone. It
@@ -102,6 +104,100 @@ hive-rig rebuild out/hive_demo.hive.json --targets unreal,fbx
 The writer is a small hand-written one in `src/export/fbx.rs` (no FBX SDK, no new
 crates), from the publicly described binary layout. Arrays are written
 uncompressed, so files are larger than ones written with compression.
+
+### Mesh fidelity
+
+A character comes out looking as it went in, only rigged. hive-rig keeps:
+
+* **Objects and pieces**: each mesh node of a glTF (each `o`/`g` of an OBJ)
+  stays its own object, and each primitive (each run of faces with one
+  `usemtl`) its own piece with its material. Skinning treats the whole
+  character as one surface (copies of a vertex along a UV seam or hard edge
+  count as joined), but every output keeps the pieces: a `.glb` mesh node per
+  object sharing one skin, an FBX mesh per object, and a Blender object or Maya
+  mesh per object.
+* **Vertex data**: normals (as given, including hard edges), every UV set,
+  tangents, and vertex colours (OBJ `v x y z r g b` too). An OBJ vertex used
+  with different UVs or normals is split into copies, as glTF stores it.
+* **Materials**: glTF metal-roughness materials (base colour, metallic,
+  roughness, emissive, alpha mode and cutoff, double-sided) with their base
+  colour, metallic-roughness, normal, occlusion and emissive textures and the
+  UV set each one uses; OBJ `.mtl` files (`Kd`, `d`/`Tr`, `Ke`, `Pr`, `Pm`,
+  `map_Kd`, `bump`/`norm`, `map_Ke`).
+* **Textures**: images embedded in a `.glb` or referenced by a `.gltf` or
+  `.mtl` are written once into `<name>_textures/` next to the rig, and the
+  `.hive.json` names them there (no image data in the JSON). The `.glb`
+  embeds them again; the FBX, Blender and Maya scripts read them from the
+  folder.
+* **Blendshapes**: glTF morph targets (merged by name across meshes, with
+  their normal offsets and default weights) become hive-rig shapes, written
+  back as `.glb` morph targets (named in `extras.targetNames`), FBX blend shape
+  channels, Blender shape keys, a Maya blendShape and Unreal morph targets.
+
+Not kept yet: texture transforms (`KHR_texture_transform`) and sampler
+wrap/filter settings, other material extensions (clearcoat, transmission and
+so on), tangent offsets of morph targets, and the source file's own skin and
+animations (the character is rigged anew). Blender doesn't wire the occlusion
+texture into its material (it has no input for it); the image is kept on the
+material.
+
+### Blendshapes and corrective shapes
+
+Shapes live on the rig's mesh (`"shapes"` in the `.hive.json`): each moves
+some vertices by an offset, has a weight, and may be **driven** by a pose
+reader: the turn of one bone about an axis, from `start` degrees (off) to
+`end` degrees (fully on). A **corrective** is a shape sculpted in a pose and
+driven by it, such as an elbow that keeps its volume as it bends.
+
+In the app, after Build, the Properties panel's **Blendshapes** card lists the
+shapes with a weight slider each (a driven shape shows the weight its bone
+gives it in the test pose). **Corrective from pose** makes a shape for the
+test-posed bone, driven by it, off at rest and on at the pose's angle; **New
+shape** makes one to sculpt at rest. With a shape picked, turn on **Sculpt** and
+drag on the mesh: the vertices under the brush follow the pointer in the
+current pose, and the change is worked back through the skin so that, in that
+pose, the shape puts them where you dragged them. Each shape's `...` menu
+mirrors it onto the other side (its driver moves to the twin bone), splits it
+into left and right halves, or removes it; **Combine shown** adds the shapes
+with a weight above zero into a new one. Shape edits have their own **Undo shape**.
+
+On the command line (each command writes the rig and its outputs again):
+
+```bash
+hive-rig shape out/hero.hive.json list
+# Sculpt in a pose and drive the shape from it: the forearm bent 90 degrees
+hive-rig shape out/hero.hive.json sculpt elbow_fix_l --pose lowerarm_l=90 \
+  --at 0.33,1.43,-0.01 --radius 0.08 --offset 0,0.03,0 --drive
+hive-rig shape out/hero.hive.json sculpt smile --from sculpted_smile.glb   # from a sculpted copy
+hive-rig shape out/hero.hive.json mirror elbow_fix_l                       # elbow_fix_r, driven by lowerarm_r
+hive-rig shape out/hero.hive.json split smile --width 0.02                 # smile_l and smile_r
+hive-rig shape out/hero.hive.json combine smile_l,brow_up_l --as happy_l
+hive-rig shape out/hero.hive.json weight smile 0.5
+hive-rig shape out/hero.hive.json drive shoulder_fix --bone upperarm_l --toward up --start 10 --end 80
+hive-rig shape out/hero.hive.json undrive shoulder_fix
+hive-rig shape out/hero.hive.json rename smile grin
+hive-rig shape out/hero.hive.json remove grin
+```
+
+`--pose BONE=DEGREES@DIRECTION` turns a bone so its tip swings toward
+`up`, `down`, `forward`, `back`, `left`, `right` or `x,y,z`; a limb's middle
+bone (forearm, shin) bends the way its IK bends without one. `--from` takes a
+mesh with the same vertices, sculpted in that pose (or at rest). A rebuild keeps
+the shapes and moves their drivers onto the renamed bones.
+
+How each target drives a corrective:
+
+| Target | Shapes | Driver |
+| --- | --- | --- |
+| `.glb` | Morph targets with names and default weights | None (glTF has no drivers) |
+| `.fbx` | Blend shape channels with default weights | None (FBX has no drivers) |
+| Blender | Shape keys | A driver on the key's value: the bone's local rotation (quaternion) read with a simple expression, so it works without Python auto-run. Checked in real Blender |
+| Maya | A blendShape in front of the skinCluster | A node network (multMatrix, decomposeMatrix, vectorProduct) and an expression on the target weight. Only against stubs |
+| Unreal | Morph targets from the `.glb` import | A curve per corrective, set by a pose reader in the Control Rig. The curve drives the morph target only when the Control Rig runs in the mesh's Anim Blueprint; shapes without a driver stay at zero (their weight isn't applied). Only against stubs |
+
+Pose readers measure a bone's turn about one axis since rest (the twist part of
+its rotation about that axis, so turns about other axes change it little). Cone and RBF readers, and helper joints driven
+by readers, are not built yet.
 
 ### The control rig
 
@@ -647,6 +743,8 @@ cargo test                       # landmarks, skeleton, skin, controls, glTF and
 python3 tests/dcc_stub_run.py maya out/hive_demo_maya.py      # Python-level check
 python3 tests/dcc_stub_run.py unreal out/hive_demo_unreal.py  # Python-level check
 pip install bpy && python tests/blender_check.py out/hive_demo_blender.py out/hive_demo.glb
+python -I tests/blender_mesh_check.py out/hero_blender.py --source hero.glb --fbx out/hero.fbx   # after rig hero.glb -o out --targets blender,fbx
+python -I tests/blender_mesh_check.py out/hive_demo_blender.py --corrective elbow_fix_l lowerarm_l_fk_ctrl
 python tests/blender_guides_check.py out/hive_demo_blender.py           # guides and rebuild
 python tests/blender_quad_check.py dog/hive_dog_blender.py dog/hive_dog.glb   # after demo --quadruped -o dog
 python tests/blender_spline_check.py out/hive_demo_blender.py out/hive_demo.glb   # after add tentacle, spine --spline true, rebuild
@@ -742,11 +840,34 @@ have unit tests in `src/skin.rs`, `src/rig.rs` and `src/studio/app.rs`; the
 CI runs all of this (`.github/workflows/hive-rig.yml`), and builds both Windows
 executables as a downloadable artifact.
 
+`blender_mesh_check.py` checks that a rigged character still looks like its
+source, in real Blender. It reads the source `.glb` with a small reader of its
+own (not hive-rig's importer or Blender's) and, after building the rig with the
+script, compares: the object count and each object's material pieces, every UV
+set (matched by vertex position, so vertex order doesn't matter), the
+materials and that every texture is loaded, and every morph target as a shape
+key with the same offsets. With `--fbx` it repeats the UV, material, texture and
+shape checks on the `.fbx` through Blender's FBX importer. With `--corrective`
+it checks the shape's driver: off at rest, on when the control bends the joint
+90 degrees, half on at half the bend, the mesh moves, and bending the other way
+leaves it off. CI downloads two public models from the Khronos glTF sample
+assets at a pinned commit (CesiumMan, textured and skinned; MorphPrimitivesTest,
+two materials and a morph target), rigs them and runs it; the downloads are
+never committed. Locally it also passed on Fox, AnimatedMorphCube, MultiUVTest
+and VertexColorTest. Unit tests read the `.glb` back through the `gltf` crate
+and hive-rig's loader (objects, UV sets, colours, materials, the embedded image,
+morph targets), the FBX with the strict reader (objects, UV layers by polygon
+vertex, materials, textures, blend shapes, skins and the bind pose), OBJ and MTL
+import, the textures folder, and the corrective sculpt (in its pose the
+vertices land where they were put; at rest it's off).
+
 The Maya and Unreal builders, and the Maya guide and animator tools, are checked against stub
 APIs. That catches script errors but doesn't prove the application calls behave
 as intended (the spline chains' ikSplineHandle and Fit Chain on Curve setups
 included). The Maya stub also checks that every control curve point is placed
-on the control's outline. The builders haven't been run inside Maya or Unreal yet,
+on the control's outline, that every shape reaches a blendShape target and every
+corrective an expression, and that every object gets a skinCluster; the Unreal
+stub checks a curve and a reader per corrective. The builders haven't been run inside Maya or Unreal yet,
 and the `.fbx` has been imported only by Blender, not yet by Unreal, Unity or
 Autodesk's FBX SDK.
 The Unreal builder recovers the import's axes from four bones (the pelvis,
@@ -757,7 +878,7 @@ glTF-to-Unreal import mirrors, which is untested in Unreal.
 ## Not yet included
 
 See [the gap list](docs/hive-gaps.md)
-for what's planned. In short: corrective shapes, more creature templates (horse, dinosaur), IK legs beyond one
+for what's planned. In short: cone and RBF pose readers, more creature templates (horse, dinosaur), IK legs beyond one
 arm and one leg a side (the spider's legs are FK chains), guide editing in Unreal (rebuild with the CLI and rerun the script), the
-animator tools (IK/FK matching, mirror and reset pose) in Unreal, FBX input, and
-FBX animation, blend shapes or UVs (the mesh has none yet).
+animator tools (IK/FK matching, mirror and reset pose) in Unreal, FBX input,
+FBX animation, and the mesh details listed under [Mesh fidelity](#mesh-fidelity).

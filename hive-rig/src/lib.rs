@@ -5,8 +5,10 @@
 //! game-ready skeleton from them, computes skin weights, designs
 //! an animator control rig, and exports it for Blender, Maya and Unreal Engine:
 //!
-//! * `<name>.glb` – skinned mesh + skeleton (imports natively in Blender and Unreal)
-//! * `<name>.fbx` – skinned mesh, skeleton and bind pose for game engines (on request)
+//! * `<name>.glb` – skinned mesh + skeleton, with the source's objects, UVs,
+//!   normals, vertex colours, materials, textures and blendshapes
+//! * `<name>.fbx` – the same skinned mesh, skeleton and bind pose for game engines (on request)
+//! * `<name>_textures/` – the texture images, named from the other files
 //! * `<name>_blender.py` – rebuilds mesh, armature, weights and controls in Blender
 //! * `<name>_maya.py` – rebuilds mesh, joints, skinCluster and controls in Maya
 //! * `<name>_unreal.py` – imports the .glb and builds a Control Rig Blueprint
@@ -24,6 +26,7 @@ pub mod landmarks;
 pub mod mesh;
 pub mod naming;
 pub mod rig;
+pub mod shapes;
 pub mod skeleton;
 pub mod skin;
 pub mod template;

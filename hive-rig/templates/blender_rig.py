@@ -3,6 +3,11 @@
 Builds the skinned mesh, a deform armature and an animator control rig with FK
 and IK controls, pole targets and an IK/FK blend slider on every limb.
 
+The mesh keeps the source's objects, UV sets, normals, vertex colours and
+materials (textures are read from the folder next to the rig), and its
+blendshapes become shape keys. A corrective shape's key is driven by the turn
+of the bone it reads, with a simple expression.
+
 It also adds a "Hive" tab to the 3D view sidebar (press N) for editing the rig's
 guides, adding or removing components (fingers, tails) and rebuilding the rig.
 Rebuilding keeps your skin weights except where new bones were added.
@@ -38,9 +43,283 @@ def from_blender(v):
     return [v[0], v[2], -v[1]]
 
 
-def build(RIG, geo=None):
-    """Build the armature, controls and skin for RIG. With `geo`, re-skin that
-    existing mesh object instead of creating a new one."""
+def mesh_pieces(M, name):
+    """hive-rig's pieces grouped by object: [(object name, first vertex, vertex
+    count, pieces)]. A mesh without pieces is one object named `name`."""
+    parts = M.get("parts") or [{
+        "object": 0, "material": None, "first_vertex": 0, "vertex_count": len(M["positions"]),
+        "first_index": 0, "index_count": len(M["indices"]),
+    }]
+    names = M.get("objects") or [name]
+    out = []
+    for p in parts:
+        if out and out[-1][4] == p["object"]:
+            out[-1][3].append(p)
+            out[-1][2] += p["vertex_count"]
+        else:
+            out.append([names[p["object"]] if p["object"] < len(names) else name,
+                        p["first_vertex"], p["vertex_count"], [p], p["object"]])
+    return [(o[0], o[1], o[2], o[3]) for o in out]
+
+
+def principled(mat):
+    return next(n for n in mat.node_tree.nodes if n.type == "BSDF_PRINCIPLED")
+
+
+def socket(node, *names):
+    """The first input with one of `names` (they change between Blender versions)."""
+    for n in names:
+        if n in node.inputs:
+            return node.inputs[n]
+    return None
+
+
+def build_materials(RIG):
+    """A Principled BSDF material per hive-rig material, with its images loaded
+    from the textures folder next to the rig. The last entry is a plain grey
+    for pieces without a material."""
+    M = RIG["mesh"]
+    images = []
+    for img in M.get("images", []):
+        path = img["uri"] if os.path.isabs(img["uri"]) else os.path.join(OUT_DIR, img["uri"])
+        try:
+            images.append(bpy.data.images.load(path, check_existing=True))
+        except RuntimeError:
+            print("hive-rig: can't load texture %s" % path)
+            images.append(None)
+    mats = []
+    for m in M.get("materials", []):
+        mat = bpy.data.materials.new(m.get("name") or "material")
+        mat.use_nodes = True
+        tree = mat.node_tree
+        bsdf = principled(mat)
+        base = m.get("base_color", [0.8, 0.8, 0.8, 1.0])
+        bsdf.inputs["Base Color"].default_value = base
+        bsdf.inputs["Metallic"].default_value = m.get("metallic", 0.0)
+        bsdf.inputs["Roughness"].default_value = m.get("roughness", 0.6)
+        bsdf.inputs["Alpha"].default_value = base[3]
+        emission = socket(bsdf, "Emission Color", "Emission")
+        if emission is not None and any(m.get("emissive", [0, 0, 0])):
+            emission.default_value = list(m["emissive"]) + [1.0]
+            strength = socket(bsdf, "Emission Strength")
+            if strength is not None:
+                strength.default_value = 1.0
+
+        def texture(ref, color=True, y=0):
+            image = images[ref["image"]] if ref["image"] < len(images) else None
+            if image is None:
+                return None
+            node = tree.nodes.new("ShaderNodeTexImage")
+            node.image = image
+            node.location = (-600, y)
+            if not color:
+                image.colorspace_settings.name = "Non-Color"
+            uv_set = ref.get("uv_set", 0)
+            if uv_set:
+                uv = tree.nodes.new("ShaderNodeUVMap")
+                uv.uv_map = "UVMap_%d" % uv_set
+                uv.location = (-800, y)
+                tree.links.new(uv.outputs["UV"], node.inputs["Vector"])
+            return node
+
+        ref = m.get("base_color_texture")
+        if ref:
+            node = texture(ref, y=300)
+            if node is not None:
+                color = node.outputs["Color"]
+                if list(base[:3]) != [1.0, 1.0, 1.0]:
+                    # The colour factor multiplies the texture, as in glTF.
+                    try:
+                        mix = tree.nodes.new("ShaderNodeMix")
+                        mix.data_type = "RGBA"
+                        mix.blend_type = "MULTIPLY"
+                        mix.inputs[0].default_value = 1.0
+                        a, b, out = mix.inputs[6], mix.inputs[7], mix.outputs[2]
+                    except RuntimeError:
+                        mix = tree.nodes.new("ShaderNodeMixRGB")
+                        mix.blend_type = "MULTIPLY"
+                        mix.inputs[0].default_value = 1.0
+                        a, b, out = mix.inputs[1], mix.inputs[2], mix.outputs[0]
+                    mix.location = (-300, 300)
+                    tree.links.new(color, a)
+                    b.default_value = base
+                    color = out
+                tree.links.new(color, bsdf.inputs["Base Color"])
+                if m.get("alpha_mode", "opaque") != "opaque":
+                    tree.links.new(node.outputs["Alpha"], bsdf.inputs["Alpha"])
+        ref = m.get("metallic_roughness_texture")
+        if ref:
+            node = texture(ref, color=False, y=0)
+            if node is not None:
+                sep = tree.nodes.new("ShaderNodeSeparateColor")
+                sep.location = (-300, 0)
+                tree.links.new(node.outputs["Color"], sep.inputs[0])
+                tree.links.new(sep.outputs[1], bsdf.inputs["Roughness"])
+                tree.links.new(sep.outputs[2], bsdf.inputs["Metallic"])
+        ref = m.get("normal_texture")
+        if ref:
+            node = texture(ref, color=False, y=-300)
+            if node is not None:
+                nm = tree.nodes.new("ShaderNodeNormalMap")
+                nm.location = (-300, -300)
+                nm.inputs["Strength"].default_value = ref.get("scale", 1.0)
+                if ref.get("uv_set", 0):
+                    nm.uv_map = "UVMap_%d" % ref["uv_set"]
+                tree.links.new(node.outputs["Color"], nm.inputs["Color"])
+                tree.links.new(nm.outputs["Normal"], bsdf.inputs["Normal"])
+        ref = m.get("emissive_texture")
+        if ref and emission is not None:
+            node = texture(ref, y=-600)
+            if node is not None:
+                tree.links.new(node.outputs["Color"], emission)
+                strength = socket(bsdf, "Emission Strength")
+                if strength is not None:
+                    strength.default_value = 1.0
+        mode = m.get("alpha_mode", "opaque")
+        if mode != "opaque":
+            if hasattr(mat, "surface_render_method"):
+                mat.surface_render_method = "BLENDED" if mode == "blend" else "DITHERED"
+            if hasattr(mat, "blend_method"):
+                try:
+                    mat.blend_method = "BLEND" if mode == "blend" else "CLIP"
+                except TypeError:
+                    pass
+        mat.use_backface_culling = not m.get("double_sided", False)
+        # Unlike Blender, glTF has an occlusion map; keep its image on the material.
+        ref = m.get("occlusion_texture")
+        if ref:
+            node = texture(ref, color=False, y=-900)
+            if node is not None:
+                node.label = "occlusion"
+        mats.append(mat)
+    grey = bpy.data.materials.new(RIG["name"] + "_mat")
+    grey.diffuse_color = (0.8, 0.8, 0.8, 1.0)
+    mats.append(grey)
+    return mats
+
+
+def build_meshes(RIG, coll):
+    """One mesh object per object of hive-rig's mesh, with its pieces' materials,
+    normals, UV sets and vertex colours. Each object remembers where its
+    vertices start in hive-rig's list (`hive_first_vertex`), for the skin and
+    the shapes."""
+    M = RIG["mesh"]
+    NAME = RIG["name"]
+    positions, normals, indices = M["positions"], M["normals"], M["indices"]
+    uv_sets = M.get("uvs", [])
+    colors = M.get("colors", [])
+    groups = mesh_pieces(M, NAME)
+    mats = build_materials(RIG) if (M.get("materials") or len(groups) > 1 or uv_sets) else None
+    geos = []
+    for obj_name, start, count, pieces in groups:
+        faces, slot_of_face, slots = [], [], []
+        for p in pieces:
+            key = p.get("material")
+            key = -1 if key is None else key
+            if key not in slots:
+                slots.append(key)
+            slot = slots.index(key)
+            tri = indices[p["first_index"] : p["first_index"] + p["index_count"]]
+            for i in range(0, len(tri), 3):
+                faces.append((tri[i] - start, tri[i + 1] - start, tri[i + 2] - start))
+                slot_of_face.append(slot)
+        label = NAME if len(groups) == 1 else obj_name
+        mesh = bpy.data.meshes.new(label + "_mesh")
+        mesh.from_pydata([to_blender(p) for p in positions[start : start + count]], [], faces)
+        if mats is not None:
+            for key in slots:
+                mesh.materials.append(mats[key])
+            mesh.polygons.foreach_set("material_index", slot_of_face)
+        loop_vertex = [0] * len(mesh.loops)
+        mesh.loops.foreach_get("vertex_index", loop_vertex)
+        for k, uvs in enumerate(uv_sets):
+            layer = mesh.uv_layers.new(name="UVMap" if k == 0 else "UVMap_%d" % k)
+            flat = []
+            for v in loop_vertex:
+                u, t = uvs[start + v]
+                flat += (u, 1.0 - t)  # glTF's V runs down the image, Blender's up
+            layer.data.foreach_set("uv", flat)
+        if colors:
+            attr = mesh.color_attributes.new("Color", "FLOAT_COLOR", "POINT")
+            flat = [c for col in colors[start : start + count] for c in col]
+            attr.data.foreach_set("color", flat)
+        mesh.polygons.foreach_set("use_smooth", [True] * len(mesh.polygons))
+        mesh.update()
+        # The source's normals, hard edges included.
+        if hasattr(mesh, "use_auto_smooth"):
+            mesh.use_auto_smooth = True
+        mesh.normals_split_custom_set_from_vertices([to_blender(n) for n in normals[start : start + count]])
+        geo = bpy.data.objects.new(label + "_geo" if len(groups) == 1 else label, mesh)
+        geo["hive_first_vertex"] = start
+        coll.objects.link(geo)
+        geos.append(geo)
+    return geos
+
+
+def turn_expression(axis, start, end):
+    """A driver expression for a pose reader: the bone's local rotation (the
+    quaternion w, x, y, z) turned about `axis` (in the bone's own frame), in
+    degrees, mapped from start..end onto 0..1. Simple enough for Blender to
+    run without Python."""
+    s = "(%.6f*x+%.6f*y+%.6f*z)" % tuple(axis)
+    turn = "degrees(atan2(2*w*%s, w*w-%s*%s))" % (s, s, s)
+    span = (end - start) or 1e-6
+    return "clamp((%s-(%.6f))/(%.6f), 0, 1)" % (turn, start, span)
+
+
+def build_shapes(RIG, geos, rig):
+    """Shape keys for hive-rig's blendshapes on the objects they move, at their
+    weights; corrective shapes get a driver reading their bone's rotation."""
+    shapes = RIG["mesh"].get("shapes", [])
+    if not shapes:
+        return
+    for k, geo in enumerate(geos):
+        start = geo.get("hive_first_vertex", 0)
+        n = len(geo.data.vertices)
+        mine = [s for s in shapes
+                if any(start <= v < start + n for v in s["vertices"]) or (k == 0 and not s["vertices"])]
+        if not mine:
+            continue
+        if geo.data.shape_keys is None:
+            geo.shape_key_add(name="Basis", from_mix=False)
+        for s in mine:
+            kb = geo.data.shape_keys.key_blocks.get(s["name"]) or geo.shape_key_add(name=s["name"], from_mix=False)
+            co = [0.0] * (3 * n)
+            geo.data.shape_keys.key_blocks["Basis"].data.foreach_get("co", co)
+            for v, d in zip(s["vertices"], s["offsets"]):
+                i = v - start
+                if 0 <= i < n:
+                    bd = to_blender(d)
+                    co[3 * i] += bd[0]
+                    co[3 * i + 1] += bd[1]
+                    co[3 * i + 2] += bd[2]
+            kb.data.foreach_set("co", co)
+            kb.value = s.get("weight", 0.0)
+            reader = s.get("driver")
+            if reader and reader["bone"] in rig.data.bones:
+                bone = rig.data.bones[reader["bone"]]
+                axis = (bone.matrix_local.to_3x3().inverted() @ to_blender(reader["axis"])).normalized()
+                kb.driver_remove("value")
+                drv = kb.driver_add("value").driver
+                drv.type = "SCRIPTED"
+                for var_name, channel in (("w", "ROT_W"), ("x", "ROT_X"), ("y", "ROT_Y"), ("z", "ROT_Z")):
+                    var = drv.variables.new()
+                    var.name = var_name
+                    var.type = "TRANSFORMS"
+                    t = var.targets[0]
+                    t.id = rig
+                    t.bone_target = reader["bone"]
+                    t.transform_type = channel
+                    t.rotation_mode = "QUATERNION"
+                    t.transform_space = "LOCAL_SPACE"
+                drv.expression = turn_expression(axis, reader["start"], reader["end"])
+            elif reader:
+                print("hive-rig: shape %s reads bone %s, which the rig doesn't have" % (s["name"], reader["bone"]))
+
+
+def build(RIG, geos=None):
+    """Build the armature, controls and skin for RIG. With `geos`, re-skin those
+    existing mesh objects instead of creating new ones."""
     NAME = RIG["name"]
     BONES = RIG["skeleton"]["bones"]
     CONTROLS = RIG["controls"]["controls"]
@@ -67,29 +346,18 @@ def build(RIG, geo=None):
     widget_coll.hide_render = True
 
     # --------------------------------------------------------------------------- mesh
-    if geo is None:
-        positions = RIG["mesh"]["positions"]
-        indices = RIG["mesh"]["indices"]
-        mesh = bpy.data.meshes.new(NAME + "_mesh")
-        mesh.from_pydata(
-            [to_blender(p) for p in positions],
-            [],
-            [indices[i : i + 3] for i in range(0, len(indices), 3)],
-        )
-        mesh.update()
-        for poly in mesh.polygons:
-            poly.use_smooth = True
-        geo = bpy.data.objects.new(NAME + "_geo", mesh)
-        root_coll.objects.link(geo)
+    if geos is None:
+        geos = build_meshes(RIG, root_coll)
     else:
-        # Rebuilding: keep the user's mesh object (materials, modifiers, edits) and
-        # replace only its skin.
-        geo.vertex_groups.clear()
-        for m in [m for m in geo.modifiers if m.type == "ARMATURE"]:
-            geo.modifiers.remove(m)
-        world = geo.matrix_world.copy()
-        geo.parent = None
-        geo.matrix_world = world
+        # Rebuilding: keep the user's mesh objects (materials, modifiers, edits) and
+        # replace only their skin.
+        for geo in geos:
+            geo.vertex_groups.clear()
+            for m in [m for m in geo.modifiers if m.type == "ARMATURE"]:
+                geo.modifiers.remove(m)
+            world = geo.matrix_world.copy()
+            geo.parent = None
+            geo.matrix_world = world
 
     # --------------------------------------------------------------------------- widgets
     def outline_widget(c, bone_matrix):
@@ -639,18 +907,22 @@ def build(RIG, geo=None):
     bpy.ops.object.mode_set(mode="OBJECT")
 
     # --------------------------------------------------------------------------- skin
-    for b in BONES:
-        if b["deform"]:
-            geo.vertex_groups.new(name=b["name"])
-    groups = {vg.name: vg for vg in geo.vertex_groups}
-    for v, (joints, weights) in enumerate(zip(RIG["skin"]["joints"], RIG["skin"]["weights"])):
-        for j, w in zip(joints, weights):
-            if w > 0.0:
-                groups[BONES[j]["name"]].add([v], w, "REPLACE")
-
-    mod = geo.modifiers.new("Armature", "ARMATURE")
-    mod.object = rig
-    geo.parent = rig
+    # Each object takes the weights of its own run of hive-rig's vertices.
+    all_joints, all_weights = RIG["skin"]["joints"], RIG["skin"]["weights"]
+    for geo in geos:
+        start = geo.get("hive_first_vertex", 0)
+        for b in BONES:
+            if b["deform"]:
+                geo.vertex_groups.new(name=b["name"])
+        groups = {vg.name: vg for vg in geo.vertex_groups}
+        for v in range(len(geo.data.vertices)):
+            for j, w in zip(all_joints[start + v], all_weights[start + v]):
+                if w > 0.0:
+                    groups[BONES[j]["name"]].add([v], w, "REPLACE")
+        mod = geo.modifiers.new("Armature", "ARMATURE")
+        mod.object = rig
+        geo.parent = rig
+    build_shapes(RIG, geos, rig)
 
     # What the Hive panel needs to edit guides and rebuild, kept with the rig so it
     # survives saving and reopening the file.
@@ -660,7 +932,7 @@ def build(RIG, geo=None):
     rig["hive_anim"] = json.dumps(animator_data(RIG, foot_ik_target, hock_target, soft_rig))
     bpy.context.view_layer.objects.active = rig
     print("hive-rig: built %s with %d bones and %d controls" % (NAME, len(BONES), len(CONTROLS)))
-    return rig, geo
+    return rig, geos
 
 
 # --------------------------------------------------------------------------- animator tools
@@ -969,8 +1241,14 @@ def guide_objects(rig):
     return [o for o in bpy.data.objects if o.get("hive_rig") == rig.name]
 
 
+def rig_meshes(rig):
+    """The rig's mesh objects, in hive-rig's vertex order."""
+    meshes = [o for o in rig.children if o.type == "MESH"]
+    return sorted(meshes, key=lambda o: o.get("hive_first_vertex", 0))
+
+
 def rig_mesh(rig):
-    return next((o for o in rig.children if o.type == "MESH"), None)
+    return next(iter(rig_meshes(rig)), None)
 
 
 def guides_of(rig):
@@ -1084,8 +1362,8 @@ def rebuild(rig, keep_weights=True):
     with open(hive_path) as f:
         data = json.load(f)
 
-    geo = rig_mesh(rig)
-    old = read_weights(geo) if geo is not None and keep_weights else None
+    geos = rig_meshes(rig)
+    old = [w for geo in geos for w in read_weights(geo)] if geos and keep_weights else None
     old_bones = {b.name for b in rig.data.bones}
     name = rig["hive_name"]
     remove_guides(rig)
@@ -1099,20 +1377,23 @@ def rebuild(rig, keep_weights=True):
         bpy.data.collections.remove(widgets)
 
     bpy.context.view_layer.update()
-    rig, geo = build(data, geo)
+    rig, geos = build(data, geos or None)
     kept = 0
-    if old is not None and len(old) == len(geo.data.vertices):
-        groups = {vg.name: vg for vg in geo.vertex_groups}
-        new = read_weights(geo)
-        for v, (before, after) in enumerate(zip(old, new)):
-            if not before or not set(after) <= old_bones:
-                continue
-            for g in after:
-                groups[g].remove([v])
-            for g, w in before.items():
-                if g in groups:
-                    groups[g].add([v], w, "REPLACE")
-            kept += 1
+    if old is not None and len(old) == sum(len(g.data.vertices) for g in geos):
+        for geo in geos:
+            start = geo.get("hive_first_vertex", 0)
+            groups = {vg.name: vg for vg in geo.vertex_groups}
+            new = read_weights(geo)
+            for v, after in enumerate(new):
+                before = old[start + v]
+                if not before or not set(after) <= old_bones:
+                    continue
+                for g in after:
+                    groups[g].remove([v])
+                for g, w in before.items():
+                    if g in groups:
+                        groups[g].add([v], w, "REPLACE")
+                kept += 1
     print("hive-rig: rebuilt %s; kept the weights of %d vertices" % (name, kept))
     return rig
 

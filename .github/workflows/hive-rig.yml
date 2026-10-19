@@ -192,6 +192,36 @@ jobs:
           cargo run --locked -q -- rebuild "$b/hive_demo.hive.json"
           python3 -I tests/dcc_stub_run.py maya "$b/hive_demo_maya.py"
           python3 -I tests/dcc_stub_run.py unreal "$b/hive_demo_unreal.py"
+      - name: Blendshapes - sculpt, mirror, split, combine, drive; Maya and Unreal builders
+        run: |
+          s="$RUNNER_TEMP/blendshapes"
+          cargo run --locked -q -- demo -o "$s" --targets blender,maya,unreal,fbx
+          r="$s/hive_demo.hive.json"
+          elbow=$(python3 -I - "$r" <<'EOF'
+          import json, sys
+          rig = json.load(open(sys.argv[1]))
+          bone = next(b for b in rig["skeleton"]["bones"] if b["name"] == "lowerarm_l")
+          print(",".join(str(x) for x in bone["head"]))
+          EOF
+          )
+          cargo run --locked -q -- shape "$r" sculpt elbow_fix_l --pose lowerarm_l=90 --at "$elbow" --radius 0.08 --offset 0,0.03,0 --drive
+          cargo run --locked -q -- shape "$r" mirror elbow_fix_l
+          cargo run --locked -q -- shape "$r" sculpt brow_up --at 0.03,1.72,0.1 --radius 0.06 --offset 0,0.02,0
+          cargo run --locked -q -- shape "$r" split brow_up
+          cargo run --locked -q -- shape "$r" combine brow_up_l,elbow_fix_l --as combo
+          cargo run --locked -q -- shape "$r" weight brow_up 0.25
+          cargo run --locked -q -- shape "$r" drive combo --bone upperarm_l --toward up --start 10 --end 80
+          cargo run --locked -q -- shape "$r" remove combo
+          cargo run --locked -q -- shape "$r" list | tee "$s/log.txt"
+          grep -q "elbow_fix_r .*driven by lowerarm_r" "$s/log.txt"
+          python3 -I tests/dcc_stub_run.py maya "$s/hive_demo_maya.py"
+          python3 -I tests/dcc_stub_run.py unreal "$s/hive_demo_unreal.py"
+          cargo run --locked -q -- rebuild "$r"
+          python3 -I tests/dcc_stub_run.py maya "$s/hive_demo_maya.py" --guides
+          # The studio shows a shape at a weight and a driven corrective in a pose.
+          xvfb-run -a -s "-screen 0 1400x900x24" cargo run --locked -q --bin HiveRig -- \
+            "$r" --pose lowerarm_l=-90@y --shape brow_up=1 --screenshot "$RUNNER_TEMP/hive-rig-shapes.ppm"
+          test "$(head -c 2 "$RUNNER_TEMP/hive-rig-shapes.ppm")" = P6
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: hive-demo-rigs
@@ -362,6 +392,35 @@ jobs:
           print("joints read back as guides")
           PY
           python tests/blender_check.py "$rig/out/mixamo_blender.py" "$rig/out/mixamo.glb"
+      - name: Real models keep their look - UVs, materials, textures, pieces, morph targets
+        run: |
+          # Public Khronos samples at a pinned commit, downloaded as data into
+          # their own folders (never committed), and read with python -I.
+          base="https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/edc7c9e67c639d230715049ee31f9a96a6babbbe/Models"
+          a="$RUNNER_TEMP/samples"
+          o="$RUNNER_TEMP/samples_rigged"
+          for m in CesiumMan MorphPrimitivesTest; do
+            mkdir -p "$a/$m"
+            curl -sSfL --retry 3 -o "$a/$m/$m.glb" "$base/$m/glTF-Binary/$m.glb"
+            cargo run -q -- rig "$a/$m/$m.glb" -o "$o/$m" --targets blender,fbx
+            python -I tests/blender_mesh_check.py "$o/$m/${m}_blender.py" --source "$a/$m/$m.glb" --fbx "$o/$m/$m.fbx"
+          done
+      - name: A corrective shape driven by the elbow, in Blender and through FBX
+        run: |
+          s="$RUNNER_TEMP/corrective"
+          cargo run -q -- demo -o "$s" --targets blender,fbx
+          r="$s/hive_demo.hive.json"
+          elbow=$(python -I - "$r" <<'EOF'
+          import json, sys
+          rig = json.load(open(sys.argv[1]))
+          bone = next(b for b in rig["skeleton"]["bones"] if b["name"] == "lowerarm_l")
+          print(",".join(str(x) for x in bone["head"]))
+          EOF
+          )
+          cargo run -q -- shape "$r" sculpt elbow_fix_l --pose lowerarm_l=90 --at "$elbow" --radius 0.08 --offset 0,0.03,0 --drive
+          cargo run -q -- shape "$r" mirror elbow_fix_l
+          python -I tests/blender_mesh_check.py "$s/hive_demo_blender.py" --corrective elbow_fix_l lowerarm_l_fk_ctrl --fbx "$s/hive_demo.fbx"
+          python -I tests/blender_mesh_check.py "$s/hive_demo_blender.py" --corrective elbow_fix_r lowerarm_r_fk_ctrl
       - name: Edit guides, add fingers and a tail, and rebuild in Blender
         run: |
           cargo run -q -- demo -o "$RUNNER_TEMP/guides"

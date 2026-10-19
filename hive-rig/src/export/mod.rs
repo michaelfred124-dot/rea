@@ -157,9 +157,17 @@ pub fn script(rig: &Rig, target: Target, glb_path: &Path) -> Result<String> {
                 .skeleton
                 .bones
                 .iter()
-                .map(|b| json!({ "name": b.name, "parent": b.parent, "deform": b.deform, "head": b.head, "translate": b.translate }))
+                .map(|b| json!({ "name": b.name, "parent": b.parent, "deform": b.deform, "head": b.head, "tail": b.tail, "translate": b.translate }))
                 .collect();
             let basis = basis_bones(rig);
+            // The morph targets come in with the .glb; the script only needs
+            // their names, weights and pose readers.
+            let shapes: Vec<_> = rig
+                .mesh
+                .shapes
+                .iter()
+                .map(|s| json!({ "name": s.name, "weight": s.weight, "driver": s.driver }))
+                .collect();
             let data = json!({
                 "name": rig.name,
                 "height": rig.guides.body.height,
@@ -168,6 +176,7 @@ pub fn script(rig: &Rig, target: Target, glb_path: &Path) -> Result<String> {
                 "ik_chains": rig.controls.ik_chains,
                 "splines": rig.controls.splines,
                 "basis": basis,
+                "shapes": shapes,
             });
             fill(UNREAL_TEMPLATE, &serde_json::to_string(&data)?, &glb)
         }
@@ -189,6 +198,19 @@ pub fn write_all(rig: &Rig, out_dir: &Path, targets: &[Target]) -> Result<Vec<Pa
     // that DCC importers such as Unreal's may not accept in the embedded .glb path.
     let out_dir = std::path::absolute(out_dir)?;
     let mut written = Vec::new();
+
+    // Texture images go next to the rig, and the rig file names them there.
+    let (images, copied) = place_images(rig, &out_dir)?;
+    written.extend(copied);
+    let placed;
+    let rig = if images.is_empty() {
+        rig
+    } else {
+        let mut r = rig.clone();
+        r.mesh.images = images;
+        placed = r;
+        &placed
+    };
 
     let glb_path = out_dir.join(format!("{}.glb", rig.name));
     std::fs::write(&glb_path, glb::write(rig))?;
@@ -217,10 +239,119 @@ pub fn write_all(rig: &Rig, out_dir: &Path, targets: &[Target]) -> Result<Vec<Pa
     Ok(written)
 }
 
+/// The folder the rig's texture images are written to, next to the rig.
+pub fn textures_folder(rig: &Rig) -> String {
+    format!("{}_textures", rig.name)
+}
+
+/// Write every texture image of the rig into `<out>/<name>_textures/` (from the
+/// bytes held for embedded images, or by copying the source file), and return
+/// the images named relative to `out` together with the files written. An
+/// image already there is left alone; one whose file can't be found keeps its
+/// name and a warning is printed.
+pub fn place_images(rig: &Rig, out_dir: &Path) -> Result<(Vec<crate::mesh::Image>, Vec<PathBuf>)> {
+    let images = &rig.mesh.images;
+    if images.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let folder = textures_folder(rig);
+    let dir = out_dir.join(&folder);
+    let mut used = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(images.len());
+    let mut written = Vec::new();
+    for (i, image) in images.iter().enumerate() {
+        let stem = sanitize_name(if image.name.is_empty() {
+            "image"
+        } else {
+            &image.name
+        });
+        let mut file = format!("{stem}.{}", image.extension());
+        let mut k = 2;
+        while !used.insert(file.to_ascii_lowercase()) {
+            file = format!("{stem}_{k}.{}", image.extension());
+            k += 1;
+        }
+        let target = dir.join(&file);
+        let mut placed = image.clone();
+        placed.uri = format!("{folder}/{file}");
+        let already_there = image
+            .path
+            .as_ref()
+            .is_some_and(|p| std::path::absolute(p).ok().as_deref() == Some(target.as_path()))
+            && target.is_file();
+        if !already_there {
+            match image.bytes() {
+                Some(bytes) => {
+                    std::fs::create_dir_all(&dir)
+                        .with_context(|| format!("creating {}", dir.display()))?;
+                    std::fs::write(&target, &bytes)
+                        .with_context(|| format!("writing {}", target.display()))?;
+                    written.push(target.clone());
+                }
+                None => {
+                    eprintln!(
+                        "warning: texture image {i} ('{}') can't be read from {}; the rig still names it",
+                        image.name,
+                        image
+                            .path
+                            .as_ref()
+                            .map_or_else(|| image.uri.clone(), |p| p.display().to_string())
+                    );
+                    placed.uri = image.uri.clone();
+                    out.push(placed);
+                    continue;
+                }
+            }
+        }
+        placed.data = None;
+        placed.path = Some(target);
+        out.push(placed);
+    }
+    Ok((out, written))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{demo::demo_humanoid, rig};
+
+    #[test]
+    fn images_go_next_to_the_rig_and_load_back() {
+        let r = rig::auto_rig(
+            crate::demo::dressed_humanoid(),
+            "dressed",
+            Default::default(),
+        )
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("hive-rig-images-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let written = write_all(&r, &dir, &[Target::Fbx]).unwrap();
+        let png = dir.join("dressed_textures").join("skin.png");
+        assert!(written.contains(&std::path::absolute(&png).unwrap()));
+        assert_eq!(
+            std::fs::read(&png).unwrap(),
+            &*r.mesh.images[0].bytes().unwrap()
+        );
+        // The rig file names the image by its place, with no image data in it.
+        let json = std::fs::read_to_string(dir.join("dressed.hive.json")).unwrap();
+        assert!(json.contains("\"uri\": \"dressed_textures/skin.png\""));
+        assert!(!json.contains("hive-rig test image") && !json.contains("base64"));
+        let back = Rig::load(&dir.join("dressed.hive.json")).unwrap();
+        assert_eq!(
+            back.mesh.images[0].bytes().as_deref(),
+            r.mesh.images[0].bytes().as_deref()
+        );
+        assert_eq!(back.mesh.objects, r.mesh.objects);
+        assert_eq!(back.mesh.shapes[0].vertices, r.mesh.shapes[0].vertices);
+        // Writing again from the loaded rig leaves the placed image alone.
+        write_all(&back, &dir, &[]).unwrap();
+        assert_eq!(
+            std::fs::read(&png).unwrap(),
+            &*r.mesh.images[0].bytes().unwrap()
+        );
+        assert!(!dir.join("dressed_textures").join("skin_2.png").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn sanitizes_names() {

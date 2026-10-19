@@ -8,18 +8,20 @@ default-run = "hive-rig"
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
 glam = { version = "0.34.1", features = ["serde"] }
-gltf = "1.4.1"
+gltf = { version = "1.4.1", features = ["extras"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 eframe = { version = "0.37.0", optional = true, default-features = false, features = ["glow", "default_fonts", "x11", "wayland", "accesskit", "clipboard", "links"] }
 rfd = { version = "0.17.2", optional = true }
+# Decodes texture images for the app's viewport (already built for gltf).
+image = { version = "0.25.10", optional = true, default-features = false, features = ["jpeg", "png"] }
 # Only to bundle the monochrome emoji/icon fonts the app uses for icons.
 egui = { version = "0.37.0", optional = true, default-features = false, features = ["monochrome_emoji_fonts"] }
 
 [features]
 default = ["studio"]
 # The Hive Rig desktop app (`HiveRig`). The command-line `hive-rig` doesn't need it.
-studio = ["dep:eframe", "dep:rfd", "dep:egui"]
+studio = ["dep:eframe", "dep:rfd", "dep:egui", "dep:image"]
 
 [[bin]]
 name = "hive-rig"

@@ -93,6 +93,8 @@ def stub_maya():
             if name == "getAttr":
                 return attrs.get(args[0], 10.0)
             if name == "setAttr":
+                if kwargs.get("type") in ("pointArray", "componentList"):
+                    calls.append(("setAttr_" + kwargs["type"], args[0]))
                 if kwargs.get("type") == "string":
                     attrs[args[0]] = args[1]
                 return None
@@ -126,8 +128,19 @@ def stub_maya():
                 return N_VERTS[0]
             if name == "about":
                 return True
-            if name in ("group", "curve", "createNode", "rename"):
-                return node(*args, **kwargs) if name != "rename" else args[1]
+            if name == "rename":
+                nodes.add(args[1])
+                return args[1]
+            if name in ("group", "curve", "createNode", "shadingNode"):
+                return node(*args, **kwargs)
+            if name == "sets" and kwargs.get("empty"):
+                return node(*args, **kwargs)
+            if name == "blendShape":
+                calls.append((name, args))
+                return [node(*args, **kwargs)]
+            if name == "expression":
+                calls.append(("expression", kwargs.get("name", "")))
+                return None
             return None
 
         return fn
@@ -138,13 +151,15 @@ def stub_maya():
               "select", "file", "getAttr", "expression", "attributeQuery", "objExists", "delete", "ls",
               "spaceLocator", "listHistory", "polyEvaluate", "warning", "autoKeyframe", "setKeyframe",
               "window", "deleteUI", "columnLayout", "rowLayout", "setParent", "button", "text", "separator",
-              "checkBox", "showWindow", "confirmDialog", "skinPercent", "pointConstraint"]:
+              "checkBox", "showWindow", "confirmDialog", "skinPercent", "pointConstraint",
+              "shadingNode", "uvLink", "blendShape", "aliasAttr", "loadPlugin"]:
         setattr(cmds, n, generic(n))
 
     om = types.ModuleType("maya.api.OpenMaya")
     om.MPoint = lambda *a: a
     om.MPointArray = list
     om.MVector = Vec
+    om.MColor = lambda c: tuple(c)
     om.MIntArray = list
     om.MDoubleArray = lambda n, v: [v] * n
     om.MFn = mock.MagicMock()
@@ -237,7 +252,7 @@ def stub_unreal():
     vm = blueprint.get_controller_by_name.return_value
     vm.get_graph.return_value.get_nodes.return_value = []
     sys.modules["unreal"] = unreal
-    return vm
+    return vm, blueprint.get_hierarchy_controller.return_value.add_curve
 
 
 if __name__ == "__main__":
@@ -298,6 +313,19 @@ if __name__ == "__main__":
         # A row of match buttons per limb.
         assert ("rowLayout" in calls or not anim["limbs"]) and "confirmDialog" not in calls
         print("maya animator tools ran against stubs: ok")
+        # Blend shapes: every shape lands on a blendShape target with its
+        # offsets and vertices; every corrective gets a reader network.
+        shapes = rig["mesh"].get("shapes", [])
+        targets = [c for c in calls if isinstance(c, tuple) and c[0] == "setAttr_pointArray"]
+        comps = [c for c in calls if isinstance(c, tuple) and c[0] == "setAttr_componentList"]
+        assert len(targets) == len(comps) >= len(shapes), (len(targets), len(shapes))
+        readers = [s for s in shapes if s.get("driver")]
+        exprs = [c for c in calls if isinstance(c, tuple) and c[0] == "expression" and c[1].endswith("_reader_expr")]
+        assert len(exprs) >= len(readers), (len(exprs), len(readers))
+        objects = len({p["object"] for p in rig["mesh"].get("parts", [])}) or 1
+        assert calls.count("setWeights") == objects, (calls.count("setWeights"), objects)
+        if shapes:
+            print("maya blend shapes ran against stubs: %d shapes, %d readers: ok" % (len(shapes), len(readers)))
         if os.path.isfile(ns["HIVE_EXE"]) and "--guides" in sys_args:
             # Guide tools: edit, mirror, add a component, rebuild keeping weights.
             ns["show_guides"]()
@@ -308,13 +336,14 @@ if __name__ == "__main__":
             assert "stub_ear" in out, out
             calls.clear()
             ns["rebuild"](True)
-            assert calls.count("setWeights") == 2, calls.count("setWeights")
+            objects = len({p["object"] for p in rig["mesh"].get("parts", [])}) or 1
+            assert calls.count("setWeights") == 2 * objects, calls.count("setWeights")
             assert not ns["guide_nodes"]()
             print("maya guide tools ran against stubs: ok")
     elif kind == "unreal":
         import json
 
-        vm = stub_unreal()
+        vm, vm_curves = stub_unreal()
         runpy.run_path(script, run_name="__main__")
         assert vm.add_link.call_count > 20
         # Spline chains: two Fit Chain on Curve units (keep length, then stretch) each.
@@ -328,6 +357,14 @@ if __name__ == "__main__":
             for seg in ("upper", "lower") if chain.get("bendy") else ():
                 for joint in chain["bendy"][seg]["joints"]:
                     assert "Bend_" + joint in made, joint
+        # Corrective shapes: a curve per driven shape, set from its pose reader.
+        driven = [s["name"] for s in rig.get("shapes", []) if s.get("driver")]
+        for name in driven:
+            assert "Curve_" + name in made and "Reader_%s_weight" % name in made, name
+        curves = [c.args[0] for c in vm_curves.call_args_list]
+        assert sorted(curves) == sorted(driven), (curves, driven)
+        if driven:
+            print("unreal corrective curves ran against stubs: %d: ok" % len(driven))
     else:
         raise SystemExit("unknown kind " + kind)
     print("%s builder ran against stubs: ok" % kind)

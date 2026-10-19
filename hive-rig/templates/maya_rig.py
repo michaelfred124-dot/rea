@@ -4,6 +4,11 @@ Builds the mesh, an oriented joint skeleton with a skinCluster, and an animator
 control rig: NURBS controls with offset groups, FK chains, IK handles with pole
 vectors, and an `ikFk` blend attribute on every limb's IK control.
 
+The mesh keeps the source's objects, UV sets, normals, vertex colours and
+materials (standardSurface with file textures from the folder next to the rig).
+Blendshapes go on a blendShape node in front of the skin; a corrective shape's
+weight is driven by a small node network that reads its bone's turn.
+
 Run in Maya 2022+: Script Editor > Python tab > File > Load Script > Execute,
 or `mayapy <this file>` with --save <path.ma> to build headless.
 
@@ -43,9 +48,271 @@ def mpos(p):
     return [p[0] * SCALE, p[1] * SCALE, p[2] * SCALE]
 
 
-def build(RIG, geo=None):
-    """Build the skeleton, skin and controls for RIG. With `geo`, re-skin that
-    existing mesh instead of creating a new one."""
+GEO_RUNS = {}  # mesh -> (first hive-rig vertex, vertex count), for meshes built this session
+
+
+def mesh_pieces(M, name):
+    """hive-rig's pieces grouped by object: [(object name, first vertex, vertex
+    count, pieces)]. A mesh without pieces is one object named `name`."""
+    parts = M.get("parts") or [{
+        "object": 0, "material": None, "first_vertex": 0, "vertex_count": len(M["positions"]),
+        "first_index": 0, "index_count": len(M["indices"]),
+    }]
+    names = M.get("objects") or [name]
+    out = []
+    for p in parts:
+        if out and out[-1][4] == p["object"]:
+            out[-1][3].append(p)
+            out[-1][2] += p["vertex_count"]
+        else:
+            out.append([names[p["object"]] if p["object"] < len(names) else name,
+                        p["first_vertex"], p["vertex_count"], [p], p["object"]])
+    return [(o[0], o[1], o[2], o[3]) for o in out]
+
+
+def vertex_run(geo, fallback_count=None):
+    """Where a mesh's vertices start in hive-rig's list, and how many it has."""
+    if geo in GEO_RUNS:
+        return GEO_RUNS[geo]
+    start = 0
+    if cmds.attributeQuery("hiveFirstVertex", node=geo, exists=True):
+        start = int(cmds.getAttr(geo + ".hiveFirstVertex") or 0)
+    count = fallback_count if fallback_count is not None else cmds.polyEvaluate(geo, vertex=True)
+    return start, count
+
+
+def safe_node_name(name):
+    out = "".join(c if c.isalnum() or c == "_" else "_" for c in name) or "node"
+    return out if not out[0].isdigit() else "n_" + out
+
+
+def build_materials(RIG):
+    """A standardSurface and shading group per hive-rig material, with file
+    textures from the textures folder next to the rig. Returns the shading
+    groups (the last is the default one) and the textures that use a UV set
+    other than the first, to link once the meshes exist."""
+    M = RIG["mesh"]
+    groups, uv_links = [], []
+    images = M.get("images", [])
+    for m in M.get("materials", []):
+        name = safe_node_name(m.get("name") or "material")
+        shader = cmds.shadingNode("standardSurface", asShader=True, name=name)
+        sg = cmds.sets(renderable=True, noSurfaceShader=True, empty=True, name=name + "SG")
+        cmds.connectAttr(shader + ".outColor", sg + ".surfaceShader", force=True)
+        base = m.get("base_color", [0.8, 0.8, 0.8, 1.0])
+        cmds.setAttr(shader + ".base", 1.0)
+        cmds.setAttr(shader + ".baseColor", base[0], base[1], base[2], type="double3")
+        cmds.setAttr(shader + ".metalness", m.get("metallic", 0.0))
+        cmds.setAttr(shader + ".specularRoughness", m.get("roughness", 0.6))
+        cmds.setAttr(shader + ".opacity", base[3], base[3], base[3], type="double3")
+        emissive = m.get("emissive", [0.0, 0.0, 0.0])
+        if any(emissive):
+            cmds.setAttr(shader + ".emission", 1.0)
+            cmds.setAttr(shader + ".emissionColor", emissive[0], emissive[1], emissive[2], type="double3")
+
+        def texture(ref, label, raw=False):
+            if ref["image"] >= len(images):
+                return None
+            uri = images[ref["image"]]["uri"]
+            path = uri if os.path.isabs(uri) else os.path.join(OUT_DIR, uri)
+            tex = cmds.shadingNode("file", asTexture=True, isColorManaged=True, name="%s_%s_tex" % (name, label))
+            place = cmds.shadingNode("place2dTexture", asUtility=True, name="%s_%s_place" % (name, label))
+            for a in ("coverage", "translateFrame", "rotateFrame", "mirrorU", "mirrorV", "stagger", "wrapU",
+                      "wrapV", "repeatUV", "offset", "rotateUV", "noiseUV", "vertexUvOne", "vertexUvTwo",
+                      "vertexUvThree", "vertexCameraOne"):
+                cmds.connectAttr(place + "." + a, tex + "." + a, force=True)
+            cmds.connectAttr(place + ".outUV", tex + ".uvCoord", force=True)
+            cmds.connectAttr(place + ".outUvFilterSize", tex + ".uvFilterSize", force=True)
+            cmds.setAttr(tex + ".fileTextureName", path, type="string")
+            if raw:
+                cmds.setAttr(tex + ".colorSpace", "Raw", type="string")
+            if ref.get("uv_set", 0):
+                uv_links.append((tex, ref["uv_set"]))
+            return tex
+
+        ref = m.get("base_color_texture")
+        if ref:
+            tex = texture(ref, "base")
+            if tex:
+                if list(base[:3]) != [1.0, 1.0, 1.0]:
+                    cmds.setAttr(tex + ".colorGain", base[0], base[1], base[2], type="double3")
+                cmds.connectAttr(tex + ".outColor", shader + ".baseColor", force=True)
+                if m.get("alpha_mode", "opaque") != "opaque":
+                    cmds.connectAttr(tex + ".outAlpha", shader + ".opacityR", force=True)
+                    cmds.connectAttr(tex + ".outAlpha", shader + ".opacityG", force=True)
+                    cmds.connectAttr(tex + ".outAlpha", shader + ".opacityB", force=True)
+        ref = m.get("metallic_roughness_texture")
+        if ref:
+            tex = texture(ref, "metal_rough", raw=True)
+            if tex:
+                cmds.connectAttr(tex + ".outColorG", shader + ".specularRoughness", force=True)
+                cmds.connectAttr(tex + ".outColorB", shader + ".metalness", force=True)
+        ref = m.get("normal_texture")
+        if ref:
+            tex = texture(ref, "normal", raw=True)
+            if tex:
+                bump = cmds.shadingNode("bump2d", asUtility=True, name=name + "_normal_bump")
+                cmds.setAttr(bump + ".bumpInterp", 1)  # tangent-space normals
+                cmds.setAttr(bump + ".bumpDepth", ref.get("scale", 1.0))
+                cmds.connectAttr(tex + ".outAlpha", bump + ".bumpValue", force=True)
+                cmds.connectAttr(tex + ".outColor", bump + ".normalMap", force=True)  # read by some renderers
+                cmds.connectAttr(bump + ".outNormal", shader + ".normalCamera", force=True)
+        ref = m.get("emissive_texture")
+        if ref:
+            tex = texture(ref, "emissive")
+            if tex:
+                cmds.setAttr(shader + ".emission", 1.0)
+                cmds.connectAttr(tex + ".outColor", shader + ".emissionColor", force=True)
+        groups.append(sg)
+    groups.append("initialShadingGroup")
+    return groups, uv_links
+
+
+def build_meshes(RIG, parent):
+    """One mesh per object of hive-rig's mesh, with its UV sets, normals,
+    vertex colours and a material per piece."""
+    M = RIG["mesh"]
+    positions, normals, indices = M["positions"], M["normals"], M["indices"]
+    uv_sets, colors = M.get("uvs", []), M.get("colors", [])
+    pieces_by_object = mesh_pieces(M, NAME)
+    groups, uv_links = build_materials(RIG)
+    geos = []
+    for obj_name, start, count, pieces in pieces_by_object:
+        connects = []
+        for p in pieces:
+            connects += [i - start for i in indices[p["first_index"] : p["first_index"] + p["index_count"]]]
+        points = om.MPointArray([om.MPoint(*mpos(p)) for p in positions[start : start + count]])
+        counts = [3] * (len(connects) // 3)
+        fn_mesh = om.MFnMesh()
+        mesh_obj = fn_mesh.create(points, counts, connects)
+        label = NAME + "_geo" if len(pieces_by_object) == 1 else safe_node_name(obj_name)
+        geo = cmds.rename(om.MFnDagNode(mesh_obj).fullPathName(), label)
+        for k, uvs in enumerate(uv_sets):
+            set_name = "map1" if k == 0 else "uvSet%d" % k
+            if k > 0:
+                fn_mesh.createUVSet(set_name)
+            us = [uv[0] for uv in uvs[start : start + count]]
+            vs = [1.0 - uv[1] for uv in uvs[start : start + count]]  # glTF's V runs down
+            fn_mesh.setUVs(us, vs, set_name)
+            fn_mesh.assignUVs(counts, connects, set_name)
+        # The source's normals, hard edges included.
+        fn_mesh.setVertexNormals([om.MVector(*n) for n in normals[start : start + count]], list(range(count)))
+        if colors:
+            fn_mesh.setVertexColors([om.MColor(c) for c in colors[start : start + count]], list(range(count)))
+        cmds.parent(geo, parent)
+        geo_shape = cmds.listRelatives(geo, shapes=True, fullPath=True)[0]
+        face = 0
+        for p in pieces:
+            faces = p["index_count"] // 3
+            m = p.get("material")
+            sg = groups[m] if m is not None and m < len(groups) - 1 else groups[-1]
+            cmds.sets("%s.f[%d:%d]" % (geo, face, face + faces - 1), edit=True, forceElement=sg)
+            face += faces
+        if not normals:
+            cmds.polySoftEdge(geo, angle=180, constructionHistory=False)
+        cmds.addAttr(geo, longName="hiveFirstVertex", attributeType="long", defaultValue=start)
+        cmds.setAttr(geo + ".hiveFirstVertex", start)
+        GEO_RUNS[geo] = (start, count)
+        geos.append(geo)
+        for tex, k in uv_links:
+            cmds.uvLink(make=True, uvSet="%s.uvSet[%d].uvSetName" % (geo_shape, k), texture=tex)
+    return geos
+
+
+def build_shapes(RIG, geos):
+    """A blendShape node per mesh that hive-rig's shapes move, with a target
+    per shape at its weight. Returns {shape name: [(blendShape, index)]}."""
+    shapes = RIG["mesh"].get("shapes", [])
+    out = {}
+    if not shapes:
+        return out
+    for k, geo in enumerate(geos):
+        start, count = vertex_run(geo, len(RIG["mesh"]["positions"]) if len(geos) == 1 else None)
+        mine = [s for s in shapes
+                if any(start <= v < start + count for v in s["vertices"]) or (k == 0 and not s["vertices"])]
+        if not mine:
+            continue
+        existing = cmds.ls(cmds.listHistory(geo) or [], type="blendShape") or []
+        if existing:
+            # Rebuilding: the blend shapes (and any edits to them) stay.
+            for i, s in enumerate(mine):
+                out.setdefault(s["name"], []).append((existing[0], i))
+            continue
+        bs = cmds.blendShape(geo, name=geo.split("|")[-1] + "_shapes", frontOfChain=True)[0]
+        for i, s in enumerate(mine):
+            points, comps = [], []
+            for v, d in zip(s["vertices"], s["offsets"]):
+                if start <= v < start + count:
+                    points.append((d[0] * SCALE, d[1] * SCALE, d[2] * SCALE, 1.0))
+                    comps.append("vtx[%d]" % (v - start))
+            item = "%s.inputTarget[0].inputTargetGroup[%d].inputTargetItem[6000]" % (bs, i)
+            cmds.setAttr(item + ".inputPointsTarget", len(points), *points, type="pointArray")
+            cmds.setAttr(item + ".inputComponentsTarget", len(comps), *comps, type="componentList")
+            cmds.setAttr("%s.weight[%d]" % (bs, i), s.get("weight", 0.0))
+            cmds.aliasAttr(safe_node_name(s["name"]), "%s.weight[%d]" % (bs, i))
+            out.setdefault(s["name"], []).append((bs, i))
+    return out
+
+
+def build_shape_drivers(RIG, shape_nodes, joint_of):
+    """Corrective shapes: each pose reader is a small node network on its joint.
+    multMatrix takes the joint's rotation from its rest (matrix times the
+    inverse rest matrix), decomposeMatrix gives it as a quaternion, a
+    vectorProduct dots its axis part with the reader's axis (in the joint's
+    own frame), and an expression turns that into the turn angle and the
+    shape weight (0 at `start` degrees, 1 at `end`)."""
+    readers = [s for s in RIG["mesh"].get("shapes", []) if s.get("driver") and s["name"] in shape_nodes]
+    if not readers:
+        return
+    try:
+        cmds.loadPlugin("matrixNodes", quiet=True)
+    except RuntimeError:
+        pass
+    for s in readers:
+        d = s["driver"]
+        joint = joint_of.get(d["bone"])
+        if joint is None:
+            cmds.warning("hive-rig: shape %s reads joint %s, which the rig doesn't have" % (s["name"], d["bone"]))
+            continue
+        n = safe_node_name(s["name"])
+        rest = cmds.getAttr(joint + ".matrix")
+        rest = rest if isinstance(rest, (list, tuple)) and len(rest) == 16 else [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+        rows = [list(rest[i * 4 : i * 4 + 4]) for i in range(4)]
+        # Maya's flat matrices are rows acting on row vectors: transpose to the
+        # column form mat_inv takes, and back.
+        cols = [[rows[j][i] for j in range(4)] for i in range(4)]
+        inv = mat_inv(cols)
+        inv_flat = [inv[j][i] for i in range(4) for j in range(4)]
+        rel = cmds.createNode("multMatrix", name=n + "_reader_rel")
+        cmds.connectAttr(joint + ".matrix", rel + ".matrixIn[0]", force=True)
+        cmds.setAttr(rel + ".matrixIn[1]", inv_flat, type="matrix")
+        quat = cmds.createNode("decomposeMatrix", name=n + "_reader_quat")
+        cmds.connectAttr(rel + ".matrixSum", quat + ".inputMatrix", force=True)
+        # The reader's axis (model space) in the joint's own frame at rest.
+        world = cmds.xform(joint, q=True, ws=True, matrix=True)
+        a = d["axis"]
+        local = [sum(a[k] * world[r * 4 + k] for k in range(3)) for r in range(3)]
+        length = math.sqrt(sum(x * x for x in local)) or 1.0
+        local = [x / length for x in local]
+        dot = cmds.createNode("vectorProduct", name=n + "_reader_dot")
+        cmds.setAttr(dot + ".operation", 1)
+        cmds.setAttr(dot + ".normalizeOutput", 0)
+        for axis, value in zip("XYZ", local):
+            cmds.connectAttr(quat + ".outputQuat" + axis, dot + ".input1" + axis, force=True)
+            cmds.setAttr(dot + ".input2" + axis, value)
+        span = (d["end"] - d["start"]) or 1e-6
+        for bs, i in shape_nodes[s["name"]]:
+            cmds.expression(name=n + "_reader_expr", string=(
+                "float $s = {dot}.outputX;\n"
+                "float $w = {quat}.outputQuatW;\n"
+                "float $turn = rad_to_deg(atan2(2 * $w * $s, $w * $w - $s * $s));\n"
+                "{bs}.weight[{i}] = clamp(0, 1, ($turn - ({start})) / ({span}));"
+            ).format(dot=dot, quat=quat, bs=bs, i=i, start=d["start"], span=span))
+
+
+def build(RIG, geos=None):
+    """Build the skeleton, skin and controls for RIG. With `geos`, re-skin those
+    existing meshes instead of creating new ones."""
     BONES = RIG["skeleton"]["bones"]
     CONTROLS = RIG["controls"]["controls"]
     CHAINS = RIG["controls"]["ik_chains"]
@@ -66,20 +333,11 @@ def build(RIG, geo=None):
 
     # --------------------------------------------------------------------------- mesh
     positions = RIG["mesh"]["positions"]
-    indices = RIG["mesh"]["indices"]
-    if geo is None:
-        points = om.MPointArray([om.MPoint(*mpos(p)) for p in positions])
-        fn_mesh = om.MFnMesh()
-        mesh_obj = fn_mesh.create(points, [3] * (len(indices) // 3), indices)
-        geo = cmds.rename(om.MFnDagNode(mesh_obj).fullPathName(), NAME + "_geo")
-        cmds.parent(geo, geo_grp)
-        geo_shape = cmds.listRelatives(geo, shapes=True, fullPath=True)[0]
-        cmds.sets(geo_shape, edit=True, forceElement="initialShadingGroup")
-        cmds.polySoftEdge(geo, angle=180, constructionHistory=False)
+    if not geos:
+        geos = build_meshes(RIG, geo_grp)
     else:
-        # Rebuilding: keep the user's mesh (materials, edits) and re-skin it.
-        geo = cmds.parent(geo, geo_grp)[0]
-        geo_shape = cmds.listRelatives(geo, shapes=True, fullPath=True)[0]
+        # Rebuilding: keep the user's meshes (materials, edits, blend shapes) and re-skin them.
+        geos = [cmds.parent(g, geo_grp)[0] for g in geos]
 
     # --------------------------------------------------------------------------- joints
     joints = []
@@ -104,30 +362,36 @@ def build(RIG, geo=None):
     bone_by_name = {b["name"]: b for b in BONES}
 
     # --------------------------------------------------------------------------- skin
+    # Blend shapes go first, so the skin moves the shaped mesh.
+    shape_nodes = build_shapes(RIG, geos)
     deform_joints = [joints[i] for i, b in enumerate(BONES) if b["deform"]]
-    skin = cmds.skinCluster(
-        deform_joints, geo, toSelectedBones=True, bindMethod=0, maximumInfluences=4,
-        normalizeWeights=1, obeyMaxInfluences=True, name=NAME + "_skinCluster",
-    )[0]
-
-    sel = om.MSelectionList()
-    sel.add(skin)
-    sel.add(geo_shape)
-    fn_skin = oma.MFnSkinCluster(sel.getDependNode(0))
-    shape_path = sel.getDagPath(1)
-    influences = [p.partialPathName() for p in fn_skin.influenceObjects()]
-    column = {name.split("|")[-1]: k for k, name in enumerate(influences)}
-    n_inf = len(influences)
-    n_verts = len(positions)
-    weights = om.MDoubleArray(n_verts * n_inf, 0.0)
-    for v, (js, ws) in enumerate(zip(RIG["skin"]["joints"], RIG["skin"]["weights"])):
-        for j, w in zip(js, ws):
-            if w > 0.0:
-                weights[v * n_inf + column[BONES[j]["name"]]] += w
-    comp_fn = om.MFnSingleIndexedComponent()
-    comp = comp_fn.create(om.MFn.kMeshVertComponent)
-    comp_fn.addElements(list(range(n_verts)))
-    fn_skin.setWeights(shape_path, comp, om.MIntArray(list(range(n_inf))), weights, False)
+    for geo in geos:
+        # Each mesh takes the weights of its run of hive-rig's vertices.
+        start, n_verts = vertex_run(geo, len(positions) if len(geos) == 1 else None)
+        skin = cmds.skinCluster(
+            deform_joints, geo, toSelectedBones=True, bindMethod=0, maximumInfluences=4,
+            normalizeWeights=1, obeyMaxInfluences=True, name=geo.split("|")[-1] + "_skinCluster",
+        )[0]
+        geo_shape = cmds.listRelatives(geo, shapes=True, fullPath=True)[0]
+        sel = om.MSelectionList()
+        sel.add(skin)
+        sel.add(geo_shape)
+        fn_skin = oma.MFnSkinCluster(sel.getDependNode(0))
+        shape_path = sel.getDagPath(1)
+        influences = [p.partialPathName() for p in fn_skin.influenceObjects()]
+        column = {name.split("|")[-1]: k for k, name in enumerate(influences)}
+        n_inf = len(influences)
+        weights = om.MDoubleArray(n_verts * n_inf, 0.0)
+        for v in range(n_verts):
+            js, ws = RIG["skin"]["joints"][start + v], RIG["skin"]["weights"][start + v]
+            for j, w in zip(js, ws):
+                if w > 0.0:
+                    weights[v * n_inf + column[BONES[j]["name"]]] += w
+        comp_fn = om.MFnSingleIndexedComponent()
+        comp = comp_fn.create(om.MFn.kMeshVertComponent)
+        comp_fn.addElements(list(range(n_verts)))
+        fn_skin.setWeights(shape_path, comp, om.MIntArray(list(range(n_inf))), weights, False)
+    build_shape_drivers(RIG, shape_nodes, joint_of)
 
     # --------------------------------------------------------------------------- control shapes
     def outline_curves(c):
@@ -656,7 +920,7 @@ def build(RIG, geo=None):
         cmds.setAttr(top + "." + attr, value, type="string")
     cmds.select(clear=True)
     print("hive-rig: built %s with %d joints and %d controls" % (NAME, len(joints), len(CONTROLS)))
-    return top, geo
+    return top, geos
 
 
 # --------------------------------------------------------------------------- animator tools
@@ -1055,6 +1319,15 @@ def change_components(*args):
     return out.strip()
 
 
+def rig_meshes():
+    """The rig's meshes, in hive-rig's vertex order."""
+    meshes = [m for m in GEO_RUNS if cmds.objExists(m)]
+    if not meshes:
+        meshes = [m for m in (cmds.listRelatives(NAME + "_geo_grp", children=True, fullPath=False) or [])
+                  if cmds.objExists(m)]
+    return sorted(meshes, key=lambda m: vertex_run(m)[0])
+
+
 def skin_fn(geo):
     skins = cmds.ls(cmds.listHistory(geo) or [], type="skinCluster") or []
     if not skins:
@@ -1105,29 +1378,40 @@ def rebuild(keep_weights=True):
     with open(hive_path) as f:
         data = json.load(f)
 
-    geo = NAME + "_geo"
-    old = read_weights(geo) if keep_weights else None
+    geos = rig_meshes()
+    old = None
+    if keep_weights:
+        old = []
+        for geo in geos:
+            old += read_weights(geo) or []
     old_joints = set(cmds.ls(cmds.listRelatives(NAME + "_skeleton_grp", allDescendents=True) or [], type="joint") or [])
-    skins = cmds.ls(cmds.listHistory(geo) or [], type="skinCluster") or []
-    if skins:
-        cmds.skinCluster(skins[0], edit=True, unbind=True)
-    geo = cmds.parent(geo, world=True)[0]
+    for geo in geos:
+        skins = cmds.ls(cmds.listHistory(geo) or [], type="skinCluster") or []
+        if skins:
+            cmds.skinCluster(skins[0], edit=True, unbind=True)
+    geos = [cmds.parent(geo, world=True)[0] for geo in geos]
     remove_guides()
     cmds.delete(TOP)
 
-    top, geo = build(data, geo)
+    top, geos = build(data, geos)
     kept = 0
     if old is not None:
-        new = read_weights(geo)
-        if new is not None and len(new) == len(old):
-            merged = []
-            for before, after in zip(old, new):
-                if before and set(after) <= old_joints:
-                    merged.append(before)
-                    kept += 1
-                else:
-                    merged.append(after)
-            write_weights(geo, merged)
+        new = []
+        for geo in geos:
+            new += read_weights(geo) or []
+        if len(new) == len(old):
+            at = 0
+            for geo in geos:
+                count = len(read_weights(geo) or [])
+                merged = []
+                for before, after in zip(old[at : at + count], new[at : at + count]):
+                    if before and set(after) <= old_joints:
+                        merged.append(before)
+                        kept += 1
+                    else:
+                        merged.append(after)
+                write_weights(geo, merged)
+                at += count
     print("hive-rig: rebuilt %s; kept the weights of %d vertices" % (NAME, kept))
     return top
 

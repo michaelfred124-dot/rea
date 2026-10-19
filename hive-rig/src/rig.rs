@@ -102,7 +102,7 @@ impl Rig {
         use anyhow::Context;
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let rig: Rig = serde_json::from_str(&text).with_context(|| {
+        let mut rig: Rig = serde_json::from_str(&text).with_context(|| {
             format!(
                 "{} is not a hive-rig file from this version",
                 path.display()
@@ -113,6 +113,16 @@ impl Rig {
             "{} is not a hive-rig file",
             path.display()
         );
+        // Texture images are named relative to the rig file.
+        let dir = path.parent().unwrap_or(std::path::Path::new("."));
+        for image in &mut rig.mesh.images {
+            if !image.uri.is_empty() {
+                image.path = Some(dir.join(&image.uri));
+            }
+        }
+        rig.mesh
+            .validate()
+            .with_context(|| format!("{} has a broken mesh", path.display()))?;
         Ok(rig)
     }
 

@@ -4,9 +4,10 @@
 //! natively and, unlike FBX, it is an open specification that can be written
 //! without a proprietary SDK.
 
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Vec2, Vec3, Vec4};
 use serde_json::{Value, json};
 
+use crate::mesh::{AlphaMode, Material, TextureRef};
 use crate::rig::Rig;
 
 const ARRAY_BUFFER: u32 = 34962;
@@ -71,7 +72,83 @@ fn vec3_bytes(v: &[Vec3]) -> Vec<u8> {
     f32_bytes(v.iter().flat_map(|p| p.to_array()))
 }
 
-/// Encode the rig's mesh, skeleton and weights as a .glb file.
+fn vec2_bytes(v: &[Vec2]) -> Vec<u8> {
+    f32_bytes(v.iter().flat_map(|p| p.to_array()))
+}
+
+fn vec4_bytes(v: &[Vec4]) -> Vec<u8> {
+    f32_bytes(v.iter().flat_map(|p| p.to_array()))
+}
+
+fn bounds(v: &[Vec3]) -> Value {
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    for p in v {
+        min = min.min(*p);
+        max = max.max(*p);
+    }
+    if v.is_empty() {
+        min = Vec3::ZERO;
+        max = Vec3::ZERO;
+    }
+    json!({ "min": min.to_array(), "max": max.to_array() })
+}
+
+fn texture_info(t: &TextureRef, textures: &mut Vec<Value>, key: Option<&str>) -> Value {
+    textures.push(json!({ "source": t.image, "sampler": 0 }));
+    let mut info = json!({ "index": textures.len() - 1 });
+    if t.uv_set != 0 {
+        info["texCoord"] = json!(t.uv_set);
+    }
+    if let Some(k) = key {
+        info[k] = json!(t.scale);
+    }
+    info
+}
+
+fn material_json(m: &Material, textures: &mut Vec<Value>) -> Value {
+    let mut pbr = json!({
+        "baseColorFactor": m.base_color,
+        "metallicFactor": m.metallic,
+        "roughnessFactor": m.roughness,
+    });
+    if let Some(t) = &m.base_color_texture {
+        pbr["baseColorTexture"] = texture_info(t, textures, None);
+    }
+    if let Some(t) = &m.metallic_roughness_texture {
+        pbr["metallicRoughnessTexture"] = texture_info(t, textures, None);
+    }
+    let mut out = json!({ "name": m.name, "pbrMetallicRoughness": pbr });
+    if m.emissive != [0.0; 3] {
+        out["emissiveFactor"] = json!(m.emissive);
+    }
+    if let Some(t) = &m.normal_texture {
+        out["normalTexture"] = texture_info(t, textures, Some("scale"));
+    }
+    if let Some(t) = &m.occlusion_texture {
+        out["occlusionTexture"] = texture_info(t, textures, Some("strength"));
+    }
+    if let Some(t) = &m.emissive_texture {
+        out["emissiveTexture"] = texture_info(t, textures, None);
+    }
+    match m.alpha_mode {
+        AlphaMode::Opaque => {}
+        AlphaMode::Mask => {
+            out["alphaMode"] = json!("MASK");
+            out["alphaCutoff"] = json!(m.alpha_cutoff);
+        }
+        AlphaMode::Blend => out["alphaMode"] = json!("BLEND"),
+    }
+    if m.double_sided {
+        out["doubleSided"] = json!(true);
+    }
+    out
+}
+
+/// Encode the rig as a .glb file: one node per object of the mesh (each a mesh
+/// with a primitive per piece and material), sharing one skin; normals, UV
+/// sets, tangents and colours; the materials with their images embedded; the
+/// blendshapes as morph targets named in `extras.targetNames`.
 pub fn write(rig: &Rig) -> Vec<u8> {
     let mesh = &rig.mesh;
     let sk = &rig.skeleton;
@@ -81,70 +158,222 @@ pub fn write(rig: &Rig) -> Vec<u8> {
         accessors: Vec::new(),
     };
 
-    let (min, max) = mesh.bounds();
-    let pos = b.accessor(
-        &vec3_bytes(&mesh.positions),
-        Some(ARRAY_BUFFER),
-        FLOAT,
-        mesh.vertex_count(),
-        "VEC3",
-        json!({ "min": min.to_array(), "max": max.to_array() }),
-    );
-    let nrm = b.accessor(
-        &vec3_bytes(&mesh.normals),
-        Some(ARRAY_BUFFER),
-        FLOAT,
-        mesh.vertex_count(),
-        "VEC3",
-        json!({}),
-    );
-    // glTF carries influences in sets of four (JOINTS_0/WEIGHTS_0, JOINTS_1/
-    // WEIGHTS_1, ...); unused slots are joint 0 with weight 0.
-    let sets = rig.skin.width().div_ceil(4).max(1);
-    let mut skin_attributes = serde_json::Map::new();
-    for set in 0..sets {
-        let mut joints: Vec<u8> = Vec::with_capacity(mesh.vertex_count() * 8);
-        let mut weights: Vec<f32> = Vec::with_capacity(mesh.vertex_count() * 4);
-        for v in 0..mesh.vertex_count() {
-            let pairs: Vec<(usize, f32)> = if v < rig.skin.vertex_count() {
-                rig.skin.influences(v).collect()
-            } else {
-                Vec::new()
-            };
-            for slot in set * 4..set * 4 + 4 {
-                let (j, w) = pairs.get(slot).copied().unwrap_or((0, 0.0));
-                joints.extend_from_slice(&(j as u16).to_le_bytes());
-                weights.push(w);
+    // Images, embedded so the file stands on its own (Unreal imports it as is).
+    let mut images = Vec::new();
+    for (i, image) in mesh.images.iter().enumerate() {
+        match image.bytes() {
+            Some(bytes) => {
+                let view = b.push(&bytes, None);
+                images.push(json!({ "name": image.name, "bufferView": view, "mimeType": image.mime_type() }));
+            }
+            None => {
+                // Not readable: name the file, so a reader next to it can find it.
+                eprintln!(
+                    "warning: image {i} ('{}') isn't in the .glb: its file can't be read",
+                    image.name
+                );
+                images.push(json!({ "name": image.name, "uri": image.uri }));
             }
         }
-        let jnt = b.accessor(
-            &joints,
-            Some(ARRAY_BUFFER),
-            UNSIGNED_SHORT,
-            mesh.vertex_count(),
-            "VEC4",
-            json!({}),
-        );
-        let wgt = b.accessor(
-            &f32_bytes(weights),
+    }
+    let mut textures = Vec::new();
+    let mut materials: Vec<Value> = mesh
+        .materials
+        .iter()
+        .map(|m| material_json(m, &mut textures))
+        .collect();
+    let pieces = mesh.pieces();
+    let default_material = if materials.is_empty() || pieces.iter().any(|p| p.material.is_none()) {
+        materials.push(json!({
+            "name": format!("{}_mat", rig.name),
+            "pbrMetallicRoughness": { "baseColorFactor": [0.8, 0.8, 0.8, 1.0], "metallicFactor": 0.0, "roughnessFactor": 0.6 },
+        }));
+        materials.len() - 1
+    } else {
+        0
+    };
+
+    let sets = rig.skin.width().div_ceil(4).max(1);
+    let shapes_dense: Vec<Vec<Vec3>> = mesh
+        .shapes
+        .iter()
+        .map(|s| s.dense(mesh.vertex_count()))
+        .collect();
+    let shape_normals: Vec<Option<Vec<Vec3>>> = mesh
+        .shapes
+        .iter()
+        .map(|s| (!s.normal_offsets.is_empty()).then(|| s.dense_normals(mesh.vertex_count())))
+        .collect();
+
+    let groups = mesh.object_groups(&rig.name);
+    let mut meshes = Vec::new();
+    for (gi, g) in groups.iter().enumerate() {
+        let r = g.vertices.clone();
+        let count = r.len();
+        let mut attributes = serde_json::Map::new();
+        let pos = &mesh.positions[r.clone()];
+        let a = b.accessor(
+            &vec3_bytes(pos),
             Some(ARRAY_BUFFER),
             FLOAT,
-            mesh.vertex_count(),
-            "VEC4",
+            count,
+            "VEC3",
+            bounds(pos),
+        );
+        attributes.insert("POSITION".into(), json!(a));
+        let a = b.accessor(
+            &vec3_bytes(&mesh.normals[r.clone()]),
+            Some(ARRAY_BUFFER),
+            FLOAT,
+            count,
+            "VEC3",
             json!({}),
         );
-        skin_attributes.insert(format!("JOINTS_{set}"), json!(jnt));
-        skin_attributes.insert(format!("WEIGHTS_{set}"), json!(wgt));
+        attributes.insert("NORMAL".into(), json!(a));
+        if mesh.tangents.len() == mesh.vertex_count() {
+            let a = b.accessor(
+                &vec4_bytes(&mesh.tangents[r.clone()]),
+                Some(ARRAY_BUFFER),
+                FLOAT,
+                count,
+                "VEC4",
+                json!({}),
+            );
+            attributes.insert("TANGENT".into(), json!(a));
+        }
+        for (k, set) in mesh.uvs.iter().enumerate() {
+            let a = b.accessor(
+                &vec2_bytes(&set[r.clone()]),
+                Some(ARRAY_BUFFER),
+                FLOAT,
+                count,
+                "VEC2",
+                json!({}),
+            );
+            attributes.insert(format!("TEXCOORD_{k}"), json!(a));
+        }
+        if mesh.colors.len() == mesh.vertex_count() {
+            let a = b.accessor(
+                &vec4_bytes(&mesh.colors[r.clone()]),
+                Some(ARRAY_BUFFER),
+                FLOAT,
+                count,
+                "VEC4",
+                json!({}),
+            );
+            attributes.insert("COLOR_0".into(), json!(a));
+        }
+        // glTF carries influences in sets of four (JOINTS_0/WEIGHTS_0, JOINTS_1/
+        // WEIGHTS_1, ...); unused slots are joint 0 with weight 0.
+        for set in 0..sets {
+            let mut joints: Vec<u8> = Vec::with_capacity(count * 8);
+            let mut weights: Vec<f32> = Vec::with_capacity(count * 4);
+            for v in r.clone() {
+                let pairs: Vec<(usize, f32)> = if v < rig.skin.vertex_count() {
+                    rig.skin.influences(v).collect()
+                } else {
+                    Vec::new()
+                };
+                for slot in set * 4..set * 4 + 4 {
+                    let (j, w) = pairs.get(slot).copied().unwrap_or((0, 0.0));
+                    joints.extend_from_slice(&(j as u16).to_le_bytes());
+                    weights.push(w);
+                }
+            }
+            let jnt = b.accessor(
+                &joints,
+                Some(ARRAY_BUFFER),
+                UNSIGNED_SHORT,
+                count,
+                "VEC4",
+                json!({}),
+            );
+            let wgt = b.accessor(
+                &f32_bytes(weights),
+                Some(ARRAY_BUFFER),
+                FLOAT,
+                count,
+                "VEC4",
+                json!({}),
+            );
+            attributes.insert(format!("JOINTS_{set}"), json!(jnt));
+            attributes.insert(format!("WEIGHTS_{set}"), json!(wgt));
+        }
+        // Morph targets: the shapes that move this object (a shape that moves
+        // nothing at all is kept on the first object, so it isn't lost).
+        let mine: Vec<usize> = (0..mesh.shapes.len())
+            .filter(|&s| {
+                let sh = &mesh.shapes[s];
+                sh.vertices.iter().any(|&v| r.contains(&(v as usize)))
+                    || (gi == 0 && sh.vertices.is_empty())
+            })
+            .collect();
+        let mut targets = Vec::new();
+        for &s in &mine {
+            let d = &shapes_dense[s][r.clone()];
+            let pa = b.accessor(
+                &vec3_bytes(d),
+                Some(ARRAY_BUFFER),
+                FLOAT,
+                count,
+                "VEC3",
+                bounds(d),
+            );
+            let mut t = json!({ "POSITION": pa });
+            if let Some(n) = &shape_normals[s] {
+                let na = b.accessor(
+                    &vec3_bytes(&n[r.clone()]),
+                    Some(ARRAY_BUFFER),
+                    FLOAT,
+                    count,
+                    "VEC3",
+                    json!({}),
+                );
+                t["NORMAL"] = json!(na);
+            }
+            targets.push(t);
+        }
+        let primitives: Vec<Value> = g
+            .parts
+            .iter()
+            .map(|p| {
+                let local: Vec<u8> = mesh.indices[p.index_range()]
+                    .iter()
+                    .flat_map(|&i| (i - r.start as u32).to_le_bytes())
+                    .collect();
+                let idx = b.accessor(
+                    &local,
+                    Some(ELEMENT_ARRAY_BUFFER),
+                    UNSIGNED_INT,
+                    p.index_count,
+                    "SCALAR",
+                    json!({}),
+                );
+                let mut prim = json!({
+                    "attributes": attributes,
+                    "indices": idx,
+                    "material": p.material.unwrap_or(default_material),
+                });
+                if !targets.is_empty() {
+                    prim["targets"] = json!(targets);
+                }
+                prim
+            })
+            .collect();
+        let mut m = json!({ "name": g.name, "primitives": primitives });
+        if !mine.is_empty() {
+            m["weights"] = json!(
+                mine.iter()
+                    .map(|&s| mesh.shapes[s].weight)
+                    .collect::<Vec<_>>()
+            );
+            m["extras"] = json!({
+                "targetNames": mine.iter().map(|&s| mesh.shapes[s].name.as_str()).collect::<Vec<_>>()
+            });
+        }
+        meshes.push(m);
     }
-    let idx_bytes: Vec<u8> = mesh.indices.iter().flat_map(|i| i.to_le_bytes()).collect();
-    let idx = b.accessor(
-        &idx_bytes,
-        Some(ELEMENT_ARRAY_BUFFER),
-        UNSIGNED_INT,
-        mesh.indices.len(),
-        "SCALAR",
-        json!({}),
-    );
+
     // Bind pose: joints carry translation only, so the inverse bind matrix of each
     // joint is the inverse of its model-space head translation.
     let ibm = f32_bytes(
@@ -170,39 +399,32 @@ pub fn write(rig: &Rig) -> Vec<u8> {
             node
         })
         .collect();
-    let mesh_node = nodes.len();
-    nodes.push(json!({ "name": rig.name, "mesh": 0, "skin": 0 }));
+    let first_mesh_node = nodes.len();
+    for (i, g) in groups.iter().enumerate() {
+        // A single object keeps the rig's name, as before objects were kept.
+        let name = if groups.len() == 1 {
+            rig.name.clone()
+        } else {
+            g.name.clone()
+        };
+        nodes.push(json!({ "name": name, "mesh": i, "skin": 0 }));
+    }
     let roots: Vec<usize> = sk
         .bones
         .iter()
         .enumerate()
         .filter(|(_, b)| b.parent.is_none())
         .map(|(i, _)| i)
-        .chain([mesh_node])
+        .chain(first_mesh_node..first_mesh_node + groups.len())
         .collect();
 
-    let mut attributes = serde_json::Map::new();
-    attributes.insert("POSITION".into(), json!(pos));
-    attributes.insert("NORMAL".into(), json!(nrm));
-    attributes.extend(skin_attributes);
-
-    let doc = json!({
+    let mut doc = json!({
         "asset": { "version": "2.0", "generator": concat!("hive-rig ", env!("CARGO_PKG_VERSION")) },
         "scene": 0,
         "scenes": [{ "name": rig.name, "nodes": roots }],
         "nodes": nodes,
-        "meshes": [{
-            "name": rig.name,
-            "primitives": [{
-                "attributes": attributes,
-                "indices": idx,
-                "material": 0,
-            }],
-        }],
-        "materials": [{
-            "name": format!("{}_mat", rig.name),
-            "pbrMetallicRoughness": { "baseColorFactor": [0.8, 0.8, 0.8, 1.0], "metallicFactor": 0.0, "roughnessFactor": 0.6 },
-        }],
+        "meshes": meshes,
+        "materials": materials,
         "skins": [{
             "name": format!("{}_skin", rig.name),
             "inverseBindMatrices": ibm,
@@ -213,6 +435,11 @@ pub fn write(rig: &Rig) -> Vec<u8> {
         "bufferViews": b.views,
         "buffers": [{ "byteLength": b.bin.len() }],
     });
+    if !images.is_empty() {
+        doc["images"] = json!(images);
+        doc["textures"] = json!(textures);
+        doc["samplers"] = json!([{ "wrapS": 10497, "wrapT": 10497 }]);
+    }
 
     let mut json_bytes = serde_json::to_vec(&doc).expect("glTF JSON serialises");
     while !json_bytes.len().is_multiple_of(4) {
@@ -306,5 +533,76 @@ mod tests {
         let blob = g.blob.as_deref().unwrap();
         let prim = g.meshes().next().unwrap().primitives().next().unwrap();
         assert!(prim.reader(|_| Some(blob)).read_joints(1).is_none());
+    }
+
+    #[test]
+    fn glb_keeps_objects_materials_attributes_and_shapes() {
+        let r = rig::auto_rig(
+            crate::demo::dressed_humanoid(),
+            "dressed",
+            Default::default(),
+        )
+        .unwrap();
+        let bytes = write(&r);
+        let g = gltf::Gltf::from_slice(&bytes).expect("valid glb");
+        // One mesh per object, sharing one skin; a primitive per piece.
+        assert_eq!(g.meshes().count(), 2);
+        let skinned: Vec<_> = g.nodes().filter(|n| n.mesh().is_some()).collect();
+        assert_eq!(skinned.len(), 2);
+        assert!(
+            skinned
+                .iter()
+                .all(|n| n.skin().map(|s| s.index()) == Some(0))
+        );
+        assert_eq!(g.materials().count(), 2);
+        assert_eq!(g.images().count(), 1);
+        let img = g.images().next().unwrap();
+        assert!(matches!(img.source(), gltf::image::Source::View { .. }));
+        let gem = g
+            .meshes()
+            .find(|m| m.name() == Some("gem"))
+            .expect("gem mesh");
+        let names = gem
+            .extras()
+            .as_ref()
+            .map(|e| e.get().to_string())
+            .unwrap_or_default();
+        assert!(names.contains("gem_puff"), "{names}");
+
+        // Back through our own loader: the same pieces, attributes and shape.
+        let dir = std::env::temp_dir().join(format!("hive-rig-glb-dressed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dressed.glb");
+        std::fs::write(&path, &bytes).unwrap();
+        let back = crate::import::load_mesh(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        let m = &r.mesh;
+        assert_eq!(back.objects, vec!["body".to_string(), "gem".to_string()]);
+        assert_eq!(back.parts.len(), 2);
+        assert_eq!(back.vertex_count(), m.vertex_count());
+        assert_eq!(back.indices, m.indices);
+        assert_eq!(back.uvs.len(), 2);
+        for (a, b) in back.uvs.iter().flatten().zip(m.uvs.iter().flatten()) {
+            assert!((*a - *b).length() < 1e-6);
+        }
+        assert_eq!(back.colors.len(), m.colors.len());
+        for (a, b) in back.colors.iter().zip(&m.colors) {
+            assert!((*a - *b).length() < 1e-6);
+        }
+        assert_eq!(
+            back.materials[0].base_color_texture.map(|t| t.image),
+            Some(0)
+        );
+        assert_eq!(back.materials[1].metallic, 1.0);
+        assert_eq!(
+            back.images[0].bytes().as_deref(),
+            m.images[0].bytes().as_deref()
+        );
+        let (a, b) = (&back.shapes[0], &m.shapes[0]);
+        assert_eq!(a.name, "gem_puff");
+        assert_eq!(a.vertices, b.vertices);
+        for (x, y) in a.offsets.iter().zip(&b.offsets) {
+            assert!((*x - *y).length() < 1e-5);
+        }
     }
 }
