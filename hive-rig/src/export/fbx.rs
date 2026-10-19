@@ -9,15 +9,19 @@
 //! centimetres (`UnitScaleFactor` 1), the unit Unreal and Maya work in. Unity
 //! and Blender scale it to metres on import.
 //!
-//! * One `Mesh` model with its geometry (triangles, smooth normals, one material).
+//! * One `Mesh` model per object of the mesh, with its geometry (triangles,
+//!   normals, UV sets, vertex colours, a material per piece) and its blend shapes.
+//! * A material per mesh material, with its base colour, normal and emissive
+//!   images as textures naming the files next to the .fbx.
 //! * One `LimbNode` model per bone, named with the rig's naming convention and
 //!   parented as in the skeleton. Joints carry translation only, like the .glb.
-//! * A `Skin` deformer with one `Cluster` per bone that weighs on the mesh,
+//! * A `Skin` deformer per object with one `Cluster` per bone that weighs on it,
 //!   holding every influence the skin stores (no limit of four).
 //! * A `BindPose` with the mesh and every bone.
 
 use glam::{Mat4, Vec3};
 
+use crate::mesh::Material;
 use crate::rig::Rig;
 
 const VERSION: u32 = 7400;
@@ -230,94 +234,39 @@ fn connect(child: i64, parent: i64) -> Node {
     Node::new("C", ["OO".into(), child.into(), parent.into()])
 }
 
-/// Encode the rig's mesh, skeleton, skin weights and bind pose as a binary FBX.
+/// A connection onto a property of the parent (a texture onto a material slot).
+fn connect_property(child: i64, parent: i64, property: &str) -> Node {
+    Node::new(
+        "C",
+        ["OP".into(), child.into(), parent.into(), property.into()],
+    )
+}
+
+fn layer_element(kind: &str, index: i32) -> Node {
+    Node::new("LayerElement", []).with([Node::one("Type", kind), Node::one("TypedIndex", index)])
+}
+
+/// Encode the rig's mesh, skeleton, skin weights, materials, blendshapes and
+/// bind pose as a binary FBX: one mesh model per object of the mesh, each with
+/// its own skin (clusters per bone), its pieces' materials and its shapes.
 pub fn write(rig: &Rig) -> Vec<u8> {
     let mesh = &rig.mesh;
     let sk = &rig.skeleton;
 
     // Object ids: any distinct non-zero 64-bit numbers (0 is the scene root).
-    let geometry_id: i64 = 1000;
-    let mesh_id: i64 = 1001;
-    let material_id: i64 = 1002;
-    let skin_id: i64 = 1003;
-    let pose_id: i64 = 1004;
-    let bone_id = |i: usize| 2000 + 3 * i as i64;
-    let attribute_id = |i: usize| 2001 + 3 * i as i64;
-    let cluster_id = |i: usize| 2002 + 3 * i as i64;
-
-    // Every bone's influences, gathered per bone for its cluster.
-    let mut clusters: Vec<(Vec<i32>, Vec<f64>)> = vec![(Vec::new(), Vec::new()); sk.bones.len()];
-    for v in 0..mesh.vertex_count().min(rig.skin.vertex_count()) {
-        for (j, w) in rig.skin.influences(v) {
-            if let Some(c) = clusters.get_mut(j) {
-                c.0.push(v as i32);
-                c.1.push(w as f64);
-            }
-        }
-    }
-    let skinned: Vec<usize> = (0..sk.bones.len())
-        .filter(|&i| !clusters[i].0.is_empty())
-        .collect();
+    let mut next_id: i64 = 1000;
+    let mut new_id = || {
+        next_id += 1;
+        next_id
+    };
+    let bone_ids: Vec<i64> = (0..sk.bones.len()).map(|_| new_id()).collect();
+    let attribute_ids: Vec<i64> = (0..sk.bones.len()).map(|_| new_id()).collect();
+    let pose_id = new_id();
 
     let mut objects = Vec::new();
-
-    // Geometry: triangles, with the last corner of each polygon stored as !index.
-    let vertices: Vec<f64> = mesh
-        .positions
-        .iter()
-        .flat_map(|p| (*p * CM).to_array())
-        .map(|x| x as f64)
-        .collect();
-    let polygons: Vec<i32> = mesh
-        .triangles()
-        .flat_map(|[a, b, c]| [a as i32, b as i32, !(c as i32)])
-        .collect();
-    let normals: Vec<f64> = mesh
-        .normals
-        .iter()
-        .flat_map(|n| n.to_array())
-        .map(|x| x as f64)
-        .collect();
-    objects.push(
-        Node::new(
-            "Geometry",
-            [
-                geometry_id.into(),
-                object_name(&rig.name, "Geometry").into(),
-                "Mesh".into(),
-            ],
-        )
-        .with([
-            Node::one("GeometryVersion", 124),
-            Node::one("Vertices", Prop::F64s(vertices)),
-            Node::one("PolygonVertexIndex", Prop::I32s(polygons)),
-            Node::one("LayerElementNormal", 0).with([
-                Node::one("Version", 101),
-                Node::one("Name", ""),
-                Node::one("MappingInformationType", "ByVertice"),
-                Node::one("ReferenceInformationType", "Direct"),
-                Node::one("Normals", Prop::F64s(normals)),
-            ]),
-            Node::one("LayerElementMaterial", 0).with([
-                Node::one("Version", 101),
-                Node::one("Name", ""),
-                Node::one("MappingInformationType", "AllSame"),
-                Node::one("ReferenceInformationType", "IndexToDirect"),
-                Node::one("Materials", Prop::I32s(vec![0])),
-            ]),
-            Node::one("Layer", 0).with([
-                Node::one("Version", 100),
-                Node::new("LayerElement", []).with([
-                    Node::one("Type", "LayerElementNormal"),
-                    Node::one("TypedIndex", 0),
-                ]),
-                Node::new("LayerElement", []).with([
-                    Node::one("Type", "LayerElementMaterial"),
-                    Node::one("TypedIndex", 0),
-                ]),
-            ]),
-        ]),
-    );
+    let mut connections = Vec::new();
+    let mut counts: std::collections::BTreeMap<&'static str, usize> = Default::default();
+    let mut count = |k: &'static str| *counts.entry(k).or_default() += 1;
 
     let model = |id: i64, name: &str, kind: &str, translation: Vec3| {
         Node::new(
@@ -335,29 +284,133 @@ pub fn write(rig: &Rig) -> Vec<u8> {
             Node::one("Culling", "CullingOff"),
         ])
     };
-    objects.push(model(mesh_id, &rig.name, "Mesh", Vec3::ZERO));
 
-    objects.push(
-        Node::new(
-            "Material",
-            [
-                material_id.into(),
-                object_name(&format!("{}_mat", rig.name), "Material").into(),
-                "".into(),
-            ],
-        )
-        .with([
-            Node::one("Version", 102),
-            Node::one("ShadingModel", "lambert"),
-            Node::one("MultiLayer", 0),
-            properties([p_vec("DiffuseColor", "Color", Vec3::splat(0.8))]),
-        ]),
-    );
+    // Materials, with a texture (and its video clip) per image they use.
+    let pieces = mesh.pieces();
+    let mut materials: Vec<Material> = mesh.materials.clone();
+    let default_material = if materials.is_empty() || pieces.iter().any(|p| p.material.is_none()) {
+        materials.push(Material {
+            name: format!("{}_mat", rig.name),
+            ..Default::default()
+        });
+        materials.len() - 1
+    } else {
+        0
+    };
+    let material_ids: Vec<i64> = materials.iter().map(|_| new_id()).collect();
+    for (m, &id) in materials.iter().zip(&material_ids) {
+        let rgb = Vec3::new(m.base_color[0], m.base_color[1], m.base_color[2]);
+        objects.push(
+            Node::new(
+                "Material",
+                [
+                    id.into(),
+                    object_name(&m.name, "Material").into(),
+                    "".into(),
+                ],
+            )
+            .with([
+                Node::one("Version", 102),
+                Node::one("ShadingModel", "phong"),
+                Node::one("MultiLayer", 0),
+                properties([
+                    p_vec("DiffuseColor", "Color", rgb),
+                    p_double("DiffuseFactor", 1.0),
+                    p_vec("EmissiveColor", "Color", Vec3::from(m.emissive)),
+                    p_double("Opacity", m.base_color[3] as f64),
+                    p_double("TransparencyFactor", 1.0 - m.base_color[3] as f64),
+                    p_double("Shininess", ((1.0 - m.roughness) * 100.0) as f64),
+                    p_double("ReflectionFactor", m.metallic as f64),
+                ]),
+            ]),
+        );
+        count("Material");
+        let slots = [
+            ("DiffuseColor", m.base_color_texture.as_ref()),
+            ("NormalMap", m.normal_texture.as_ref()),
+            ("EmissiveColor", m.emissive_texture.as_ref()),
+        ];
+        for (slot, t) in slots {
+            let Some(t) = t else { continue };
+            let Some(image) = mesh.images.get(t.image) else {
+                continue;
+            };
+            let absolute = image
+                .path
+                .as_ref()
+                .and_then(|p| std::path::absolute(p).ok())
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let (texture_id, video_id) = (new_id(), new_id());
+            let label = format!("{}_{}", m.name, slot);
+            let uv = if t.uv_set == 0 {
+                "UVMap".to_string()
+            } else {
+                format!("UVMap_{}", t.uv_set)
+            };
+            objects.push(
+                Node::new(
+                    "Video",
+                    [
+                        video_id.into(),
+                        object_name(&image.name, "Video").into(),
+                        "Clip".into(),
+                    ],
+                )
+                .with([
+                    Node::one("Type", "Clip"),
+                    properties([p(
+                        "Path",
+                        "KString",
+                        "XRefUrl",
+                        "",
+                        [absolute.clone().into()],
+                    )]),
+                    Node::one("UseMipMap", 0),
+                    Node::one("Filename", absolute.clone()),
+                    Node::one("RelativeFilename", image.uri.clone()),
+                ]),
+            );
+            objects.push(
+                Node::new(
+                    "Texture",
+                    [
+                        texture_id.into(),
+                        object_name(&label, "Texture").into(),
+                        "".into(),
+                    ],
+                )
+                .with([
+                    Node::one("Type", "TextureVideoClip"),
+                    Node::one("Version", 202),
+                    Node::one("TextureName", object_name(&label, "Texture")),
+                    properties([
+                        p("UVSet", "KString", "", "", [uv.into()]),
+                        p("UseMaterial", "bool", "", "", [Prop::I32(1)]),
+                    ]),
+                    Node::one("Media", object_name(&image.name, "Video")),
+                    Node::one("FileName", absolute),
+                    Node::one("RelativeFilename", image.uri.clone()),
+                    Node::new("ModelUVTranslation", [Prop::F64(0.0), Prop::F64(0.0)]),
+                    Node::new("ModelUVScaling", [Prop::F64(1.0), Prop::F64(1.0)]),
+                    Node::one("Texture_Alpha_Source", "None"),
+                    Node::new(
+                        "Cropping",
+                        [Prop::I32(0), Prop::I32(0), Prop::I32(0), Prop::I32(0)],
+                    ),
+                ]),
+            );
+            count("Video");
+            count("Texture");
+            connections.push(connect(video_id, texture_id));
+            connections.push(connect_property(texture_id, id, slot));
+        }
+    }
 
     // Bones: a LimbNode model and its skeleton attribute each.
     for (i, bone) in sk.bones.iter().enumerate() {
         objects.push(model(
-            bone_id(i),
+            bone_ids[i],
             &bone.name,
             "LimbNode",
             sk.local_offset(i) * CM,
@@ -366,7 +419,7 @@ pub fn write(rig: &Rig) -> Vec<u8> {
             Node::new(
                 "NodeAttribute",
                 [
-                    attribute_id(i).into(),
+                    attribute_ids[i].into(),
                     object_name(&bone.name, "NodeAttribute").into(),
                     "LimbNode".into(),
                 ],
@@ -376,51 +429,314 @@ pub fn write(rig: &Rig) -> Vec<u8> {
                 Node::one("TypeFlags", "Skeleton"),
             ]),
         );
+        count("Model");
+        count("NodeAttribute");
+        connections.push(connect(bone_ids[i], bone.parent.map_or(0, |p| bone_ids[p])));
+        connections.push(connect(attribute_ids[i], bone_ids[i]));
     }
 
-    // Skin: one cluster per weighted bone. The bind pose is the rest pose, with
-    // the mesh at the origin: each link sits at its head, and `Transform` is the
-    // mesh's bind transform relative to the link.
+    // The bind pose is the rest pose, with the meshes at the origin: each link
+    // sits at its head, and a cluster's `Transform` is the mesh's bind transform
+    // relative to the link.
     let bind = |i: usize| Mat4::from_translation(sk.bones[i].head * CM);
-    objects.push(
-        Node::new(
-            "Deformer",
-            [
-                skin_id.into(),
-                object_name(&format!("{}_skin", rig.name), "Deformer").into(),
-                "Skin".into(),
-            ],
-        )
-        .with([
-            Node::one("Version", 101),
-            Node::one("Link_DeformAcuracy", 50.0),
-        ]),
-    );
-    for &i in &skinned {
-        let (indexes, weights) = std::mem::take(&mut clusters[i]);
+    let mut pose_nodes = Vec::new();
+    let pose_node = |id: i64, m: Mat4| {
+        Node::new("PoseNode", []).with([Node::one("Node", id), Node::one("Matrix", matrix(m))])
+    };
+
+    let groups = mesh.object_groups(&rig.name);
+    for g in &groups {
+        let r = g.vertices.clone();
+        let start = r.start as u32;
+        let name = if groups.len() == 1 {
+            rig.name.clone()
+        } else {
+            g.name.clone()
+        };
+        let (geometry_id, mesh_id, skin_id) = (new_id(), new_id(), new_id());
+
+        // This object's materials, in slot order.
+        let mut slots: Vec<usize> = Vec::new();
+        let mut poly_material: Vec<i32> = Vec::new();
+        for p in &g.parts {
+            let m = p.material.unwrap_or(default_material);
+            let slot = match slots.iter().position(|&s| s == m) {
+                Some(k) => k,
+                None => {
+                    slots.push(m);
+                    slots.len() - 1
+                }
+            };
+            poly_material.extend(std::iter::repeat_n(slot as i32, p.index_count / 3));
+        }
+
+        let local: Vec<i32> = g
+            .parts
+            .iter()
+            .flat_map(|p| mesh.indices[p.index_range()].iter())
+            .map(|&i| (i - start) as i32)
+            .collect();
+        // Triangles, with the last corner of each polygon stored as !index.
+        let polygons: Vec<i32> = local
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .flat_map(|&[a, b, c]| [a, b, !c])
+            .collect();
+        let vertices: Vec<f64> = mesh.positions[r.clone()]
+            .iter()
+            .flat_map(|p| (*p * CM).to_array())
+            .map(|x| x as f64)
+            .collect();
+        let normals: Vec<f64> = mesh.normals[r.clone()]
+            .iter()
+            .flat_map(|n| n.to_array())
+            .map(|x| x as f64)
+            .collect();
+
+        let mut children = vec![
+            Node::one("GeometryVersion", 124),
+            Node::one("Vertices", Prop::F64s(vertices)),
+            Node::one("PolygonVertexIndex", Prop::I32s(polygons)),
+            Node::one("LayerElementNormal", 0).with([
+                Node::one("Version", 101),
+                Node::one("Name", ""),
+                Node::one("MappingInformationType", "ByVertice"),
+                Node::one("ReferenceInformationType", "Direct"),
+                Node::one("Normals", Prop::F64s(normals)),
+            ]),
+        ];
+        // UVs are stored per vertex and indexed per polygon corner; FBX has its
+        // origin at the bottom left, so V flips.
+        for (k, set) in mesh.uvs.iter().enumerate() {
+            let uv: Vec<f64> = set[r.clone()]
+                .iter()
+                .flat_map(|t| [t.x as f64, 1.0 - t.y as f64])
+                .collect();
+            children.push(Node::one("LayerElementUV", k as i32).with([
+                Node::one("Version", 101),
+                Node::one(
+                    "Name",
+                    if k == 0 {
+                        "UVMap".to_string()
+                    } else {
+                        format!("UVMap_{k}")
+                    },
+                ),
+                Node::one("MappingInformationType", "ByPolygonVertex"),
+                Node::one("ReferenceInformationType", "IndexToDirect"),
+                Node::one("UV", Prop::F64s(uv)),
+                Node::one("UVIndex", Prop::I32s(local.clone())),
+            ]));
+        }
+        let has_colors = mesh.colors.len() == mesh.vertex_count();
+        if has_colors {
+            let colors: Vec<f64> = mesh.colors[r.clone()]
+                .iter()
+                .flat_map(|c| c.to_array())
+                .map(|x| x as f64)
+                .collect();
+            children.push(Node::one("LayerElementColor", 0).with([
+                Node::one("Version", 101),
+                Node::one("Name", "Color"),
+                Node::one("MappingInformationType", "ByPolygonVertex"),
+                Node::one("ReferenceInformationType", "IndexToDirect"),
+                Node::one("Colors", Prop::F64s(colors)),
+                Node::one("ColorIndex", Prop::I32s(local.clone())),
+            ]));
+        }
+        children.push(if slots.len() == 1 {
+            Node::one("LayerElementMaterial", 0).with([
+                Node::one("Version", 101),
+                Node::one("Name", ""),
+                Node::one("MappingInformationType", "AllSame"),
+                Node::one("ReferenceInformationType", "IndexToDirect"),
+                Node::one("Materials", Prop::I32s(vec![0])),
+            ])
+        } else {
+            Node::one("LayerElementMaterial", 0).with([
+                Node::one("Version", 101),
+                Node::one("Name", ""),
+                Node::one("MappingInformationType", "ByPolygon"),
+                Node::one("ReferenceInformationType", "IndexToDirect"),
+                Node::one("Materials", Prop::I32s(poly_material)),
+            ])
+        });
+        let mut layer0 = vec![
+            Node::one("Version", 100),
+            layer_element("LayerElementNormal", 0),
+            layer_element("LayerElementMaterial", 0),
+        ];
+        if !mesh.uvs.is_empty() {
+            layer0.push(layer_element("LayerElementUV", 0));
+        }
+        if has_colors {
+            layer0.push(layer_element("LayerElementColor", 0));
+        }
+        children.push(Node::one("Layer", 0).with(layer0));
+        for k in 1..mesh.uvs.len() {
+            children.push(Node::one("Layer", k as i32).with([
+                Node::one("Version", 100),
+                layer_element("LayerElementUV", k as i32),
+            ]));
+        }
+        objects.push(
+            Node::new(
+                "Geometry",
+                [
+                    geometry_id.into(),
+                    object_name(&name, "Geometry").into(),
+                    "Mesh".into(),
+                ],
+            )
+            .with(children),
+        );
+        count("Geometry");
+        objects.push(model(mesh_id, &name, "Mesh", Vec3::ZERO));
+        count("Model");
+        connections.push(connect(mesh_id, 0));
+        connections.push(connect(geometry_id, mesh_id));
+        for &m in &slots {
+            connections.push(connect(material_ids[m], mesh_id));
+        }
+        pose_nodes.push(pose_node(mesh_id, Mat4::IDENTITY));
+
+        // Skin: one cluster per bone that weighs on this object.
+        let mut clusters: Vec<(Vec<i32>, Vec<f64>)> =
+            vec![(Vec::new(), Vec::new()); sk.bones.len()];
+        for v in r.clone() {
+            if v >= rig.skin.vertex_count() {
+                continue;
+            }
+            for (j, w) in rig.skin.influences(v) {
+                if let Some(c) = clusters.get_mut(j) {
+                    c.0.push((v - r.start) as i32);
+                    c.1.push(w as f64);
+                }
+            }
+        }
         objects.push(
             Node::new(
                 "Deformer",
                 [
-                    cluster_id(i).into(),
-                    object_name(&sk.bones[i].name, "SubDeformer").into(),
-                    "Cluster".into(),
+                    skin_id.into(),
+                    object_name(&format!("{name}_skin"), "Deformer").into(),
+                    "Skin".into(),
                 ],
             )
             .with([
-                Node::one("Version", 100),
-                Node::new("UserData", ["".into(), "".into()]),
-                Node::one("Indexes", Prop::I32s(indexes)),
-                Node::one("Weights", Prop::F64s(weights)),
-                Node::one("Transform", matrix(bind(i).inverse())),
-                Node::one("TransformLink", matrix(bind(i))),
+                Node::one("Version", 101),
+                Node::one("Link_DeformAcuracy", 50.0),
             ]),
         );
+        count("Deformer");
+        connections.push(connect(skin_id, geometry_id));
+        for (i, (indexes, weights)) in clusters.into_iter().enumerate() {
+            if indexes.is_empty() {
+                continue;
+            }
+            let cluster_id = new_id();
+            objects.push(
+                Node::new(
+                    "Deformer",
+                    [
+                        cluster_id.into(),
+                        object_name(&sk.bones[i].name, "SubDeformer").into(),
+                        "Cluster".into(),
+                    ],
+                )
+                .with([
+                    Node::one("Version", 100),
+                    Node::new("UserData", ["".into(), "".into()]),
+                    Node::one("Indexes", Prop::I32s(indexes)),
+                    Node::one("Weights", Prop::F64s(weights)),
+                    Node::one("Transform", matrix(bind(i).inverse())),
+                    Node::one("TransformLink", matrix(bind(i))),
+                ]),
+            );
+            count("Deformer");
+            connections.push(connect(cluster_id, skin_id));
+            connections.push(connect(bone_ids[i], cluster_id));
+        }
+
+        // Blend shapes: a channel and a shape geometry per shape that moves
+        // this object (a shape that moves nothing stays on the first object).
+        let mine: Vec<&crate::shapes::Shape> = mesh
+            .shapes
+            .iter()
+            .filter(|s| {
+                s.vertices.iter().any(|&v| r.contains(&(v as usize)))
+                    || (g.object == groups[0].object && s.vertices.is_empty())
+            })
+            .collect();
+        if !mine.is_empty() {
+            let blend_id = new_id();
+            objects.push(
+                Node::new(
+                    "Deformer",
+                    [
+                        blend_id.into(),
+                        object_name(&format!("{name}_shapes"), "Deformer").into(),
+                        "BlendShape".into(),
+                    ],
+                )
+                .with([Node::one("Version", 100)]),
+            );
+            count("Deformer");
+            connections.push(connect(blend_id, geometry_id));
+            for s in mine {
+                let (channel_id, shape_id) = (new_id(), new_id());
+                let mut idx = Vec::new();
+                let mut offsets = Vec::new();
+                let mut normals = Vec::new();
+                for (k, (&v, d)) in s.vertices.iter().zip(&s.offsets).enumerate() {
+                    if !r.contains(&(v as usize)) {
+                        continue;
+                    }
+                    idx.push((v - start) as i32);
+                    offsets.extend((*d * CM).to_array().map(|x| x as f64));
+                    let n = s.normal_offsets.get(k).copied().unwrap_or(Vec3::ZERO);
+                    normals.extend(n.to_array().map(|x| x as f64));
+                }
+                objects.push(
+                    Node::new(
+                        "Geometry",
+                        [
+                            shape_id.into(),
+                            object_name(&s.name, "Geometry").into(),
+                            "Shape".into(),
+                        ],
+                    )
+                    .with([
+                        Node::one("Version", 100),
+                        Node::one("Indexes", Prop::I32s(idx)),
+                        Node::one("Vertices", Prop::F64s(offsets)),
+                        Node::one("Normals", Prop::F64s(normals)),
+                    ]),
+                );
+                objects.push(
+                    Node::new(
+                        "Deformer",
+                        [
+                            channel_id.into(),
+                            object_name(&s.name, "SubDeformer").into(),
+                            "BlendShapeChannel".into(),
+                        ],
+                    )
+                    .with([
+                        Node::one("Version", 100),
+                        Node::one("DeformPercent", (s.weight * 100.0) as f64),
+                        Node::one("FullWeights", Prop::F64s(vec![100.0])),
+                    ]),
+                );
+                count("Geometry");
+                count("Deformer");
+                connections.push(connect(shape_id, channel_id));
+                connections.push(connect(channel_id, blend_id));
+            }
+        }
     }
 
-    let pose_node = |id: i64, m: Mat4| {
-        Node::new("PoseNode", []).with([Node::one("Node", id), Node::one("Matrix", matrix(m))])
-    };
     objects.push(
         Node::new(
             "Pose",
@@ -434,39 +750,19 @@ pub fn write(rig: &Rig) -> Vec<u8> {
             [
                 Node::one("Type", "BindPose"),
                 Node::one("Version", 100),
-                Node::one("NbPoseNodes", (sk.bones.len() + 1) as i32),
-                pose_node(mesh_id, Mat4::IDENTITY),
+                Node::one("NbPoseNodes", (sk.bones.len() + groups.len()) as i32),
             ]
             .into_iter()
-            .chain((0..sk.bones.len()).map(|i| pose_node(bone_id(i), bind(i)))),
+            .chain(pose_nodes)
+            .chain((0..sk.bones.len()).map(|i| pose_node(bone_ids[i], bind(i)))),
         ),
     );
-
-    let mut connections = vec![
-        connect(mesh_id, 0),
-        connect(geometry_id, mesh_id),
-        connect(material_id, mesh_id),
-        connect(skin_id, geometry_id),
-    ];
-    for (i, bone) in sk.bones.iter().enumerate() {
-        connections.push(connect(bone_id(i), bone.parent.map_or(0, bone_id)));
-        connections.push(connect(attribute_id(i), bone_id(i)));
-    }
-    for &i in &skinned {
-        connections.push(connect(cluster_id(i), skin_id));
-        connections.push(connect(bone_id(i), cluster_id(i)));
-    }
+    count("Pose");
 
     let definitions = {
-        let types: [(&str, usize); 7] = [
-            ("GlobalSettings", 1),
-            ("Model", sk.bones.len() + 1),
-            ("Geometry", 1),
-            ("Material", 1),
-            ("NodeAttribute", sk.bones.len()),
-            ("Deformer", skinned.len() + 1),
-            ("Pose", 1),
-        ];
+        let types: Vec<(&str, usize)> = std::iter::once(("GlobalSettings", 1))
+            .chain(counts.iter().map(|(k, v)| (*k, *v)))
+            .collect();
         let total: usize = types.iter().map(|t| t.1).sum();
         Node::new("Definitions", []).with(
             [Node::one("Version", 100), Node::one("Count", total as i32)]
@@ -825,6 +1121,81 @@ mod tests {
         let r = rig::build_rig(mesh, "demo", guides, Default::default()).unwrap();
         assert!(r.skin.width() > 4);
         check(&r);
+    }
+
+    #[test]
+    fn fbx_keeps_objects_uvs_materials_and_shapes() {
+        let r = rig::auto_rig(
+            crate::demo::dressed_humanoid(),
+            "dressed",
+            Default::default(),
+        )
+        .unwrap();
+        let doc = parse(&write(&r));
+        let objects = doc.child("Objects");
+        let kind = |n: &Read| text(&n.props[2]).to_string();
+        let models: Vec<&Read> = objects.all("Model").filter(|m| kind(m) == "Mesh").collect();
+        assert_eq!(models.len(), 2);
+        let meshes: Vec<&Read> = objects
+            .all("Geometry")
+            .filter(|g| kind(g) == "Mesh")
+            .collect();
+        assert_eq!(meshes.len(), 2);
+        for (g, piece) in meshes.iter().zip(r.mesh.object_groups("dressed")) {
+            let Prop::F64s(verts) = &g.child("Vertices").props[0] else {
+                panic!()
+            };
+            assert_eq!(verts.len(), piece.vertices.len() * 3);
+            assert_eq!(g.all("LayerElementUV").count(), 2);
+            assert_eq!(g.all("LayerElementColor").count(), 1);
+            assert_eq!(g.all("LayerElementMaterial").count(), 1);
+            // UVs by polygon vertex, V flipped back to FBX's bottom-left origin.
+            let uv = g.all("LayerElementUV").next().unwrap();
+            let (Prop::F64s(values), Prop::I32s(index)) =
+                (&uv.child("UV").props[0], &uv.child("UVIndex").props[0])
+            else {
+                panic!()
+            };
+            let Prop::I32s(polys) = &g.child("PolygonVertexIndex").props[0] else {
+                panic!()
+            };
+            assert_eq!(index.len(), polys.len());
+            for (&corner, &at) in polys.iter().zip(index) {
+                let v = piece.vertices.start + if corner < 0 { !corner } else { corner } as usize;
+                let want = r.mesh.uvs[0][v];
+                let got = (values[2 * at as usize], values[2 * at as usize + 1]);
+                assert!((got.0 - want.x as f64).abs() < 1e-6);
+                assert!((got.1 - (1.0 - want.y as f64)).abs() < 1e-6);
+            }
+        }
+        assert_eq!(objects.all("Material").count(), 2);
+        let texture = objects.child("Texture");
+        assert_eq!(
+            text(&texture.child("RelativeFilename").props[0]),
+            "skin.png"
+        );
+        assert_eq!(objects.all("Video").count(), 1);
+        let deformers: Vec<String> = objects.all("Deformer").map(kind).collect();
+        assert_eq!(deformers.iter().filter(|k| *k == "BlendShape").count(), 1);
+        assert_eq!(
+            deformers
+                .iter()
+                .filter(|k| *k == "BlendShapeChannel")
+                .count(),
+            1
+        );
+        assert_eq!(deformers.iter().filter(|k| *k == "Skin").count(), 2);
+        let shape = objects
+            .all("Geometry")
+            .find(|g| kind(g) == "Shape")
+            .expect("shape");
+        let Prop::I32s(idx) = &shape.child("Indexes").props[0] else {
+            panic!()
+        };
+        assert_eq!(idx.len(), r.mesh.shapes[0].vertices.len());
+        // Bind pose: both meshes and every bone.
+        let pose = objects.child("Pose");
+        assert_eq!(pose.all("PoseNode").count(), r.skeleton.bones.len() + 2);
     }
 
     #[test]

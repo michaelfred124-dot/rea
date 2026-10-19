@@ -92,6 +92,16 @@ enum Command {
         #[command(subcommand)]
         action: WeightsCommand,
     },
+    /// Blendshapes on a built rig: sculpt corrective shapes in a pose, drive
+    /// them from a joint's rotation, mirror, split, combine and set weights.
+    /// Writes the rig again (its .glb, .hive.json and the scripts and .fbx
+    /// already next to it).
+    Shape {
+        /// The `<name>.hive.json` of the rig.
+        rig: PathBuf,
+        #[command(subcommand)]
+        action: ShapeCommand,
+    },
     /// Add a premade component to a guides file.
     Add {
         guides: PathBuf,
@@ -217,6 +227,103 @@ enum TemplateCommand {
     },
     /// List the built-in templates and the ones in the template folders.
     List,
+}
+
+#[derive(Subcommand)]
+enum ShapeCommand {
+    /// List the shapes, their weights and what drives them.
+    List,
+    /// Move vertices in a pose and keep the change as (part of) a shape: the
+    /// offsets are worked back through the skin, so the shape puts the
+    /// vertices there in that pose.
+    Sculpt {
+        name: String,
+        /// The pose to sculpt in: BONE=DEGREES, or BONE=DEGREES@DIRECTION for
+        /// the way the bone's tip swings (up, down, forward, back, left, right
+        /// or x,y,z). A limb's middle bone (lowerarm_l, calf_r) bends the way
+        /// its IK bends without a direction. Leave out to sculpt at rest.
+        #[arg(long)]
+        pose: Option<String>,
+        /// Brush centre (x,y,z in metres, in the posed mesh).
+        #[arg(long, requires_all = ["radius", "offset"], conflicts_with = "from")]
+        at: Option<String>,
+        /// Brush radius in metres; vertices fade out toward the edge.
+        #[arg(long)]
+        radius: Option<f32>,
+        /// How far the brush moves the vertices at its centre (x,y,z metres).
+        #[arg(long)]
+        offset: Option<String>,
+        /// A sculpted copy of the mesh (same vertices, .obj/.gltf/.glb), posed
+        /// as `--pose` says (or at rest).
+        #[arg(long)]
+        from: Option<PathBuf>,
+        /// Also drive the shape from the pose: off at rest, fully on at the
+        /// pose's angle.
+        #[arg(long, requires = "pose")]
+        drive: bool,
+    },
+    /// Drive a shape from a bone's rotation (a corrective shape): its weight
+    /// goes from 0 at `--start` degrees to 1 at `--end` degrees of turn.
+    Drive {
+        name: String,
+        #[arg(long)]
+        bone: String,
+        /// The way the bone's tip swings to turn the shape on (up, down,
+        /// forward, back, left, right or x,y,z). Default for a limb's middle
+        /// bone: the way it bends.
+        #[arg(long, conflicts_with = "axis")]
+        toward: Option<String>,
+        /// The axis the turn is read about (x,y,z, model space, right-handed).
+        #[arg(long)]
+        axis: Option<String>,
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+        start: f32,
+        #[arg(long, default_value_t = 90.0, allow_hyphen_values = true)]
+        end: f32,
+    },
+    /// Stop driving a shape; it keeps its own weight.
+    Undrive {
+        name: String,
+    },
+    /// Mirror a shape onto the other side (smile_l to smile_r), with its driver.
+    Mirror {
+        name: String,
+        /// Name of the mirrored shape (default: the side token swapped).
+        #[arg(long = "as")]
+        new: Option<String>,
+    },
+    /// Split a shape into left and right halves (`<name>_l`, `<name>_r`).
+    Split {
+        name: String,
+        /// Width of the blend across the centre line, in metres (default 2% of
+        /// the body height).
+        #[arg(long)]
+        width: Option<f32>,
+        /// Names of the halves: LEFT,RIGHT.
+        #[arg(long, value_delimiter = ',')]
+        names: Option<Vec<String>>,
+    },
+    /// Add shapes together as a new shape.
+    Combine {
+        /// The shapes to add, comma separated.
+        #[arg(value_delimiter = ',')]
+        names: Vec<String>,
+        #[arg(long = "as")]
+        new: String,
+    },
+    /// Set the weight a shape sits at (0 off, 1 fully on).
+    Weight {
+        name: String,
+        #[arg(allow_hyphen_values = true)]
+        value: f32,
+    },
+    Remove {
+        name: String,
+    },
+    Rename {
+        name: String,
+        new: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -662,6 +769,184 @@ fn template_command(action: TemplateCommand) -> Result<()> {
     }
 }
 
+/// The outputs next to a rig besides the .glb and JSON: the scripts and .fbx
+/// that are already there, so editing shapes refreshes them.
+fn existing_targets(dir: &Path, name: &str) -> Vec<Target> {
+    Target::ALL
+        .into_iter()
+        .filter(|t| {
+            let file = match t {
+                Target::Fbx => format!("{name}.fbx"),
+                _ => format!("{name}_{}.py", t.key()),
+            };
+            dir.join(file).is_file()
+        })
+        .collect()
+}
+
+fn vector(text: &str) -> Result<glam::Vec3> {
+    let n: Vec<f32> = text
+        .split(',')
+        .map(|x| x.trim().parse::<f32>())
+        .collect::<Result<_, _>>()
+        .map_err(|_| anyhow::anyhow!("'{text}' isn't x,y,z"))?;
+    anyhow::ensure!(n.len() == 3, "'{text}' needs three numbers");
+    Ok(glam::Vec3::new(n[0], n[1], n[2]))
+}
+
+fn shape_command(path: &Path, action: ShapeCommand) -> Result<()> {
+    use hive_rig::shapes;
+    let mut rig = load_rig(path)?;
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let done = match action {
+        ShapeCommand::List => {
+            if rig.mesh.shapes.is_empty() {
+                println!("{} has no shapes.", rig.name);
+            }
+            for s in &rig.mesh.shapes {
+                let what = match &s.driver {
+                    Some(d) => format!(
+                        "driven by {} turning {:.0} to {:.0} degrees about ({:.2}, {:.2}, {:.2})",
+                        d.bone, d.start, d.end, d.axis.x, d.axis.y, d.axis.z
+                    ),
+                    None => format!("weight {:.2}", s.weight),
+                };
+                println!("{:<24} {:>6} vertices  {what}", s.name, s.vertices.len());
+            }
+            return Ok(());
+        }
+        ShapeCommand::Sculpt {
+            name,
+            pose,
+            at,
+            radius,
+            offset,
+            from,
+            drive,
+        } => {
+            let pose = pose.map(|p| shapes::parse_pose(&rig, &p)).transpose()?;
+            let locals = pose.as_ref().map_or_else(
+                || vec![glam::Quat::IDENTITY; rig.skeleton.bones.len()],
+                |p| p.locals(&rig),
+            );
+            let moves = match (at, from) {
+                (Some(at), None) => {
+                    let posed = shapes::posed_mesh(&rig, &locals);
+                    shapes::brush_moves(
+                        &posed,
+                        vector(&at)?,
+                        radius.unwrap_or(0.05),
+                        vector(&offset.unwrap_or_default())?,
+                    )
+                }
+                (None, Some(file)) => {
+                    let target = import::load_mesh(&file)?;
+                    anyhow::ensure!(
+                        target.vertex_count() == rig.mesh.vertex_count(),
+                        "{} has {} vertices; the rig's mesh has {}",
+                        file.display(),
+                        target.vertex_count(),
+                        rig.mesh.vertex_count()
+                    );
+                    let posed = shapes::posed_mesh(&rig, &locals);
+                    target
+                        .positions
+                        .iter()
+                        .enumerate()
+                        .filter(|(v, p)| p.distance(posed[*v]) > shapes::EPSILON)
+                        .map(|(v, p)| (v, *p))
+                        .collect()
+                }
+                _ => anyhow::bail!("say what to move: --at, --radius and --offset, or --from"),
+            };
+            let moved = shapes::sculpt(&mut rig, &name, &locals, &moves)?;
+            if drive && let Some(p) = &pose {
+                let bone = rig.skeleton.bones[p.bone].name.clone();
+                shapes::set_driver(
+                    &mut rig,
+                    &name,
+                    Some(shapes::PoseReader {
+                        bone,
+                        axis: p.axis,
+                        start: 0.0,
+                        end: p.degrees,
+                    }),
+                )?;
+            }
+            format!("Sculpted {moved} vertices into '{name}'.")
+        }
+        ShapeCommand::Drive {
+            name,
+            bone,
+            toward,
+            axis,
+            start,
+            end,
+        } => {
+            let index = rig
+                .skeleton
+                .index_of(&bone)
+                .ok_or_else(|| anyhow::anyhow!("the rig has no bone '{bone}'"))?;
+            let axis = match axis {
+                Some(a) => vector(&a)?.normalize_or_zero(),
+                None => shapes::bend_axis(
+                    &rig,
+                    index,
+                    toward.map(|t| shapes::parse_direction(&t)).transpose()?,
+                )?,
+            };
+            shapes::set_driver(
+                &mut rig,
+                &name,
+                Some(shapes::PoseReader {
+                    bone: bone.clone(),
+                    axis,
+                    start,
+                    end,
+                }),
+            )?;
+            format!("'{name}' now follows {bone}: off at {start} degrees, on at {end}.")
+        }
+        ShapeCommand::Undrive { name } => {
+            shapes::set_driver(&mut rig, &name, None)?;
+            format!("'{name}' is no longer driven.")
+        }
+        ShapeCommand::Mirror { name, new } => {
+            let made = shapes::mirror_on_rig(&mut rig, &name, new.as_deref())?;
+            format!("Mirrored '{name}' as '{made}'.")
+        }
+        ShapeCommand::Split { name, width, names } => {
+            if let Some(n) = &names {
+                anyhow::ensure!(n.len() == 2, "--names takes two names: LEFT,RIGHT");
+            }
+            let names = names.as_ref().map(|n| [n[0].as_str(), n[1].as_str()]);
+            let [l, r] = shapes::split_on_rig(&mut rig, &name, names, width)?;
+            format!("Split '{name}' into '{l}' and '{r}'.")
+        }
+        ShapeCommand::Combine { names, new } => {
+            shapes::combine_on_rig(&mut rig, &names, &new)?;
+            format!("Combined {} into '{new}'.", names.join(", "))
+        }
+        ShapeCommand::Weight { name, value } => {
+            shapes::set_weight(&mut rig, &name, value)?;
+            format!("'{name}' sits at {value}.")
+        }
+        ShapeCommand::Remove { name } => {
+            shapes::remove(&mut rig, &name)?;
+            format!("Removed '{name}'.")
+        }
+        ShapeCommand::Rename { name, new } => {
+            shapes::rename(&mut rig, &name, &new)?;
+            format!("Renamed '{name}' to '{new}'.")
+        }
+    };
+    rig.mesh.validate()?;
+    let targets = existing_targets(dir, &rig.name);
+    export::write_all(&rig, dir, &targets)?;
+    println!("{done} Wrote {} again.", path.display());
+    Ok(())
+}
+
 fn weights_command(action: WeightsCommand) -> Result<()> {
     match action {
         WeightsCommand::Copy {
@@ -788,19 +1073,25 @@ fn main() -> Result<()> {
                 guides.unwrap_or_else(|| dir.join(format!("{}.guides.json", old.name)));
             let mut guides = load_guides(&guides_path)?;
             let out = out.unwrap_or_else(|| dir.to_path_buf());
-            if !keep_weights {
-                return run(old.mesh, &old.name, guides, &out, &common);
-            }
             common.skin.apply(&mut guides.skin)?;
+            if !keep_weights {
+                print_warnings(&guides, &old.mesh);
+            }
             let opts = common.options();
             let mut new = build_rig(old.mesh.clone(), &old.name, guides, opts)?;
-            // The old rig's automatic weights tell its hand edits apart.
-            let base = old.auto_weights(opts.skin);
-            let kept = rig::keep_weights(&old, Some(&base), &mut new);
-            println!("Kept the hand-edited weights of {kept} vertices.");
+            if keep_weights {
+                // The old rig's automatic weights tell its hand edits apart.
+                let base = old.auto_weights(opts.skin);
+                let kept = rig::keep_weights(&old, Some(&base), &mut new);
+                println!("Kept the hand-edited weights of {kept} vertices.");
+            }
+            for lost in hive_rig::shapes::carry_drivers(&old, &mut new) {
+                eprintln!("warning: shape '{lost}' lost its driver: its bone is gone");
+            }
             write(&new, &out, &common.output)
         }
         Command::Weights { action } => weights_command(action),
+        Command::Shape { rig, action } => shape_command(&rig, action),
         Command::Add {
             guides,
             preset,

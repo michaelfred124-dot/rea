@@ -141,8 +141,25 @@ pub fn weight_color(w: f32) -> Color32 {
     Color32::from_rgb(c[0], c[1], c[2])
 }
 
-/// Flat-shaded, depth-sorted triangles. `vertex_colors` overrides the base colour
-/// per vertex (for the weight view); `alpha` below 1 lets the bones show through.
+/// Linear 0..1 to an sRGB byte, roughly (a 2.2 gamma is plenty for a viewport).
+fn srgb(x: f32) -> f32 {
+    x.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0
+}
+
+/// What a triangle is drawn with: the texture of its piece's material (if
+/// loaded) with the UV set that maps it, and the colour it's multiplied by.
+#[derive(Clone, Copy)]
+struct TriLook {
+    texture: Option<(egui::TextureId, usize)>,
+    tint: [f32; 4],
+}
+
+/// Shaded, depth-sorted triangles. `vertex_colors` overrides the colours per
+/// vertex (for the weight view). Otherwise each piece takes its material's
+/// colour, vertex colours and, where `textures` has its image loaded (one
+/// entry per mesh image), the base colour texture; pieces without a material
+/// are `base`. `alpha` below 1 lets the bones show through.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_mesh(
     painter: &egui::Painter,
     pr: &Projector,
@@ -150,11 +167,39 @@ pub fn draw_mesh(
     positions: &[Vec3],
     base: Color32,
     vertex_colors: Option<&[Color32]>,
+    textures: Option<&[Option<egui::TextureId>]>,
     alpha: f32,
 ) {
     let screen: Vec<Option<(Pos2, f32)>> = positions.iter().map(|&p| pr.project(p)).collect();
-    let mut tris: Vec<(f32, [usize; 3])> = Vec::with_capacity(mesh.indices.len() / 3);
-    for t in mesh.triangles() {
+    // Each triangle's look, from its piece's material.
+    let plain = TriLook {
+        texture: None,
+        tint: [1.0; 4],
+    };
+    let mut looks: Vec<TriLook> = Vec::new();
+    if vertex_colors.is_none() && !mesh.materials.is_empty() {
+        looks = vec![plain; mesh.indices.len() / 3];
+        for part in mesh.pieces().iter() {
+            let Some(m) = part.material.and_then(|m| mesh.materials.get(m)) else {
+                continue;
+            };
+            let texture = m.base_color_texture.and_then(|t| {
+                let id = textures?.get(t.image).copied().flatten()?;
+                (t.uv_set < mesh.uvs.len()).then_some((id, t.uv_set))
+            });
+            let look = TriLook {
+                texture,
+                tint: m.base_color,
+            };
+            for t in part.index_range().step_by(3) {
+                if let Some(l) = looks.get_mut(t / 3) {
+                    *l = look;
+                }
+            }
+        }
+    }
+    let mut tris: Vec<(f32, usize, [usize; 3])> = Vec::with_capacity(mesh.indices.len() / 3);
+    for (k, t) in mesh.triangles().enumerate() {
         let (Some(a), Some(b), Some(c)) = (screen[t[0]], screen[t[1]], screen[t[2]]) else {
             continue;
         };
@@ -162,15 +207,25 @@ pub fn draw_mesh(
         if depth > 1.0 || a.1.min(b.1).min(c.1) < 0.0 {
             continue;
         }
-        tris.push((depth, t));
+        tris.push((depth, k, t));
     }
     // Far to near, so nearer triangles paint over farther ones.
     tris.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
 
+    // Consecutive triangles with the same texture share one egui mesh.
     let mut out = egui::Mesh::default();
-    out.reserve_triangles(tris.len());
-    out.reserve_vertices(tris.len() * 3);
-    for (_, t) in tris {
+    let flush = |out: &mut egui::Mesh| {
+        if !out.is_empty() {
+            painter.add(Shape::mesh(std::mem::take(out)));
+        }
+    };
+    for (_, k, t) in tris {
+        let look = looks.get(k).copied().unwrap_or(plain);
+        let texture_id = look.texture.map_or(egui::TextureId::default(), |t| t.0);
+        if out.texture_id != texture_id {
+            flush(&mut out);
+            out.texture_id = texture_id;
+        }
         let [p0, p1, p2] = t.map(|i| positions[i]);
         let n = (p1 - p0).cross(p2 - p0).normalize_or_zero();
         let to_eye = (pr.eye - (p0 + p1 + p2) / 3.0).normalize_or_zero();
@@ -178,18 +233,40 @@ pub fn draw_mesh(
         let shade = 0.35 + 0.65 * n.dot(to_eye).abs();
         let base_index = out.vertices.len() as u32;
         for &i in &t {
-            let c = vertex_colors.map_or(base, |cols| cols[i]);
-            let c = Color32::from_rgba_unmultiplied(
-                (c.r() as f32 * shade) as u8,
-                (c.g() as f32 * shade) as u8,
-                (c.b() as f32 * shade) as u8,
-                (alpha * 255.0) as u8,
+            let c = match vertex_colors {
+                Some(cols) => {
+                    let c = cols[i];
+                    [c.r() as f32, c.g() as f32, c.b() as f32]
+                }
+                None if looks.is_empty() => [base.r() as f32, base.g() as f32, base.b() as f32],
+                None => {
+                    let vc = mesh.colors.get(i).copied().unwrap_or(glam::Vec4::ONE);
+                    [0, 1, 2].map(|k| srgb(look.tint[k] * vc[k]))
+                }
+            };
+            let a = alpha * look.tint[3] * mesh.colors.get(i).map_or(1.0, |c| c.w);
+            let color = Color32::from_rgba_unmultiplied(
+                (c[0] * shade) as u8,
+                (c[1] * shade) as u8,
+                (c[2] * shade) as u8,
+                (a.clamp(0.0, 1.0) * 255.0) as u8,
             );
-            out.colored_vertex(screen[i].unwrap().0, c);
+            let uv = match look.texture {
+                Some((_, set)) => {
+                    let uv = mesh.uvs[set][i];
+                    Pos2::new(uv.x, uv.y)
+                }
+                None => egui::epaint::WHITE_UV,
+            };
+            out.vertices.push(egui::epaint::Vertex {
+                pos: screen[i].unwrap().0,
+                uv,
+                color,
+            });
         }
         out.add_triangle(base_index, base_index + 1, base_index + 2);
     }
-    painter.add(Shape::mesh(out));
+    flush(&mut out);
 }
 
 /// Model-space line strips, such as a control's outline. A strip that crosses

@@ -8,6 +8,13 @@ Bendy limbs are an approximation here: the bend joints slide onto the curve the
 bend and pin controls describe but don't turn along it. Soft IK isn't built in
 Unreal; the limbs solve as plain (stretchy) two-bone IK.
 
+The mesh's pieces, materials, textures and blendshapes (as morph targets) come
+in with the .glb import. Each corrective shape gets a curve of its name, set by
+a pose reader in the Control Rig (the driving bone's turn about the reader's
+axis, mapped from start to end degrees onto 0..1); the curve drives the morph
+target when the Control Rig runs in the mesh's Anim Blueprint. Shapes without
+a driver are left at zero here (a weight set in hive-rig is not applied).
+
 Requirements: Unreal Engine 5.2+ with the "Python Editor Script Plugin" and
 "Control Rig" plugins enabled. Run from Tools > Execute Python Script, or
 from the Output Log in Python mode: py "<path to this file>"
@@ -709,6 +716,103 @@ for chain in CHAINS:
                          {"Item": item_pin("Bone", joint), "Space": "GlobalSpace", "bPropagateToChildren": "False"})
             vm.add_link(moved + ".Result", place + ".Value")
             chain_exec(place)
+
+# Corrective shapes: a curve per driven morph target, set from a pose reader.
+# The reader turns a vector across the reader's axis by the bone's own turn
+# since rest (its global turn with its parent's turn taken off, in the rest
+# frame), measures how far it swung about the axis, and maps start..end
+# degrees onto 0..1. A curve with a morph target's name drives that morph
+# target when this Control Rig runs in the mesh's Anim Blueprint.
+BLEND_SHAPES = RIG.get("shapes", [])
+
+
+def _sub(a, b):
+    return [a[k] - b[k] for k in range(3)]
+
+
+def _unit(a):
+    n = _length(a) or 1.0
+    return [x / n for x in a]
+
+
+def bone_turn(bone):
+    """The bone's own turn since rest, in the rest frame (quaternion pin)."""
+    def get(name, initial_pose):
+        node = unit("RigUnit_GetTransform", "Reader_%s_%s" % (name, "rest" if initial_pose else "now"),
+                    {"Item": item_pin("Bone", name), "Space": "GlobalSpace",
+                     "bInitial": "True" if initial_pose else "False"})
+        return node + ".Transform.Rotation"
+
+    def turn(name):
+        inverse = math("QuaternionInverse", "Reader_%s_rest_inv" % name, {})
+        vm.add_link(get(name, True), inverse + ".Value")
+        delta = math("QuaternionMul", "Reader_%s_delta" % name, {})
+        vm.add_link(get(name, False), delta + ".A")
+        vm.add_link(inverse + ".Result", delta + ".B")
+        return delta + ".Result"
+
+    own = turn(bone)
+    parent = next(b["parent"] for b in BONES if b["name"] == bone)
+    if parent is None:
+        return own
+    parent_name = BONES[parent]["name"]
+    undo = math("QuaternionInverse", "Reader_%s_parent_inv" % bone, {})
+    vm.add_link(turn(parent_name), undo + ".Value")
+    result = math("QuaternionMul", "Reader_%s_own" % bone, {})
+    vm.add_link(undo + ".Result", result + ".A")
+    vm.add_link(own, result + ".B")
+    return result + ".Result"
+
+
+def build_reader(shape):
+    d = shape["driver"]
+    if not any(b["name"] == d["bone"] for b in BONES):
+        unreal.log_warning("hive-rig: shape %s reads bone %s, which the rig doesn't have" % (shape["name"], d["bone"]))
+        return
+    name = shape["name"]
+    axis = _unit(d["axis"])
+    bone = next(b for b in BONES if b["name"] == d["bone"])
+    along = _sub(bone.get("tail", [0, 1, 0]), bone["head"]) if bone.get("tail") else [0.0, 1.0, 0.0]
+    # A reference across the axis, and the way it swings for a positive turn.
+    p = _sub(along, [axis[k] * sum(along[j] * axis[j] for j in range(3)) for k in range(3)])
+    if _length(p) < 1e-6:
+        p = _cross(axis, [1.0, 0.0, 0.0] if abs(axis[0]) < 0.9 else [0.0, 1.0, 0.0])
+    p = _unit(p)
+    q = _cross(axis, p)
+    p_ue, q_ue = to_ue_dir(p), to_ue_dir(q)
+    n_ue = p_ue ^ q_ue
+    n_ue = n_ue.normal() if hasattr(n_ue, "normal") else n_ue
+    hc.add_curve(name, float(shape.get("weight", 0.0)))
+    swung = math("QuaternionRotateVector", "Reader_%s_swing" % name, {"Vector": vector_text(p_ue)})
+    vm.add_link(bone_turn(d["bone"]), swung + ".Transform")
+    off_plane = math("VectorDot", "Reader_%s_off" % name, {"B": vector_text(n_ue)})
+    vm.add_link(swung + ".Result", off_plane + ".A")
+    lift = math("VectorScale", "Reader_%s_lift" % name, {"Value": vector_text(n_ue)})
+    vm.add_link(off_plane + ".Result", lift + ".Factor")
+    flat = math("VectorSub", "Reader_%s_flat" % name, {})
+    vm.add_link(swung + ".Result", flat + ".A")
+    vm.add_link(lift + ".Result", flat + ".B")
+    angle = math("VectorAngle", "Reader_%s_angle" % name, {"A": vector_text(p_ue)})
+    vm.add_link(flat + ".Result", angle + ".B")
+    side = math("VectorDot", "Reader_%s_side" % name, {"B": vector_text(q_ue)})
+    vm.add_link(flat + ".Result", side + ".A")
+    sign = math("FloatSign", "Reader_%s_sign" % name, {})
+    vm.add_link(side + ".Result", sign + ".Value")
+    signed = math("FloatMul", "Reader_%s_turn" % name, {})
+    vm.add_link(angle + ".Result", signed + ".A")
+    vm.add_link(sign + ".Result", signed + ".B")
+    remap = math("FloatRemap", "Reader_%s_weight" % name, {
+        "SourceMinimum": str(_math.radians(d["start"])), "SourceMaximum": str(_math.radians(d["end"])),
+        "TargetMinimum": "0.0", "TargetMaximum": "1.0", "bClamp": "True"})
+    vm.add_link(signed + ".Result", remap + ".Value")
+    set_curve = unit("RigUnit_SetCurveValue", "Curve_" + name, {"Curve": name})
+    vm.add_link(remap + ".Result", set_curve + ".Value")
+    chain_exec(set_curve)
+
+
+for shape in BLEND_SHAPES:
+    if shape.get("driver"):
+        build_reader(shape)
 
 unreal.ControlRigBlueprintLibrary.recompile_vm(blueprint)
 unreal.EditorAssetLibrary.save_loaded_asset(blueprint)

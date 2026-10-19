@@ -455,6 +455,99 @@ pub fn demo_snake() -> Mesh {
     m
 }
 
+/// The demo humanoid dressed like an imported character, for the fidelity
+/// tests: a "body" object with two UV sets, vertex colours and a textured
+/// material (the image held in memory), a second "gem" object inside the chest
+/// with its own material, and a shape on the gem.
+#[cfg(test)]
+pub(crate) fn dressed_humanoid() -> Mesh {
+    use crate::mesh::{Image, Material, Part, TextureRef};
+    use glam::{Vec2, Vec4};
+    let planar = |m: &Mesh| -> Vec<Vec<Vec2>> {
+        let (min, max) = m.bounds();
+        let size = (max - min).max(Vec3::splat(1e-6));
+        let front = m
+            .positions
+            .iter()
+            .map(|p| {
+                let t = (*p - min) / size;
+                Vec2::new(t.x, 1.0 - t.y)
+            })
+            .collect();
+        let side = m
+            .positions
+            .iter()
+            .map(|p| {
+                let t = (*p - min) / size;
+                Vec2::new(t.z * 2.0, t.y)
+            })
+            .collect();
+        vec![front, side]
+    };
+    let mut body = demo_humanoid();
+    body.uvs = planar(&body);
+    body.colors = body
+        .positions
+        .iter()
+        .map(|p| Vec4::new(p.y / 1.8, 0.5, 1.0 - p.y / 1.8, 1.0))
+        .collect();
+    body.objects = vec!["body".into()];
+    body.parts = vec![Part {
+        object: 0,
+        material: Some(0),
+        first_vertex: 0,
+        vertex_count: body.positions.len(),
+        first_index: 0,
+        index_count: body.indices.len(),
+    }];
+    body.materials = vec![Material {
+        name: "skin".into(),
+        base_color_texture: Some(TextureRef {
+            image: 0,
+            uv_set: 0,
+            scale: 1.0,
+        }),
+        ..Material::default()
+    }];
+    body.images = vec![Image {
+        name: "skin".into(),
+        uri: "skin.png".into(),
+        mime: "image/png".into(),
+        // Stand-in bytes: nothing here decodes the image.
+        data: Some(std::sync::Arc::from(
+            &b"\x89PNG\r\n\x1a\nhive-rig test image"[..],
+        )),
+        path: None,
+    }];
+    let mut gem = ellipsoid(vec3(0.0, 1.32, 0.0), Vec3::splat(0.03));
+    gem.uvs = planar(&gem);
+    gem.colors = vec![Vec4::new(0.2, 0.9, 0.3, 0.8); gem.positions.len()];
+    gem.objects = vec!["gem".into()];
+    gem.parts = vec![Part {
+        object: 0,
+        material: Some(0),
+        first_vertex: 0,
+        vertex_count: gem.positions.len(),
+        first_index: 0,
+        index_count: gem.indices.len(),
+    }];
+    gem.materials = vec![Material {
+        name: "metal".into(),
+        base_color: [0.2, 0.3, 0.9, 1.0],
+        metallic: 1.0,
+        roughness: 0.25,
+        ..Material::default()
+    }];
+    let puff: Vec<Vec3> = gem
+        .positions
+        .iter()
+        .map(|p| (*p - vec3(0.0, 1.32, 0.0)) * 0.5)
+        .collect();
+    gem.shapes = vec![crate::shapes::Shape::from_dense("gem_puff", &puff)];
+    body.append(&gem);
+    body
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

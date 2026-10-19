@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use eframe::egui::Color32;
+use eframe::egui::{self, Color32};
 use glam::Vec3;
 
 use hive_rig::checks::{self, Issue, Surface};
@@ -250,6 +250,19 @@ pub struct Studio {
     /// Where the brush last dabbed in the stroke being painted.
     stroke: Option<Vec3>,
     weight_colors: Option<(String, Vec<Color32>)>,
+    /// Shape lists before each shape edit, newest last.
+    shape_undo: Vec<Vec<hive_rig::shapes::Shape>>,
+    /// The shape the sculpt brush edits.
+    pub shape_pick: Option<String>,
+    /// The sculpt brush is on: dragging on the mesh moves vertices into `shape_pick`.
+    pub sculpting: bool,
+    /// Sculpt brush radius, as a fraction of the body height.
+    pub sculpt_radius: f32,
+    /// The mesh images loaded for the viewport, one entry per mesh image
+    /// (`None` where it couldn't be decoded), keyed by the document's serial.
+    textures: Option<(u64, Vec<Option<egui::TextureHandle>>)>,
+    /// Bumped whenever a document is opened, so caches can tell documents apart.
+    doc_serial: u64,
 }
 
 impl Default for Studio {
@@ -293,6 +306,12 @@ impl Default for Studio {
             drag: None,
             stroke: None,
             weight_colors: None,
+            shape_undo: Vec::new(),
+            shape_pick: None,
+            sculpting: false,
+            sculpt_radius: 0.03,
+            textures: None,
+            doc_serial: 0,
         }
     }
 }
@@ -343,6 +362,11 @@ impl Studio {
         self.painting = false;
         self.brush_at = None;
         self.drag = None;
+        self.shape_undo.clear();
+        self.shape_pick = None;
+        self.sculpting = false;
+        self.textures = None;
+        self.doc_serial += 1;
         self.doc = Some(doc);
     }
 
@@ -797,6 +821,9 @@ impl Studio {
             control_axes: built.controls.controls.iter().map(|c| c.axis).collect(),
             mesh: None,
         };
+        if self.pose.is_none() && self.shapes_show() {
+            frame.mesh = self.shaped_rest();
+        }
         let (Some(pose), Some(rig)) = (&self.pose, &doc.rig) else {
             return Some(frame);
         };
@@ -826,14 +853,12 @@ impl Studio {
                 frame.control_axes[i] = turn_about(Vec3::ZERO, axis, radians, c.axis);
             }
         }
-        frame.mesh = Some(skin::deform_turn(
-            &doc.mesh.positions,
-            &rig.skin,
-            &moved,
-            pivot,
-            axis,
-            radians,
-        ));
+        frame.mesh = Some(if rig.mesh.shapes.is_empty() {
+            skin::deform_turn(&doc.mesh.positions, &rig.skin, &moved, pivot, axis, radians)
+        } else {
+            // Shapes (and correctives driven by the pose) go on before the skin.
+            hive_rig::shapes::posed_mesh(rig, &self.pose_locals())
+        });
         Some(frame)
     }
 
@@ -1195,6 +1220,52 @@ impl Studio {
                 }
             ))
         })
+    }
+
+    /// The mesh's images as viewport textures, one per mesh image (`None` where
+    /// an image couldn't be read or decoded). Decoded once per document, and
+    /// scaled down to at most `TEXTURE_MAX` pixels a side: the viewport needs
+    /// no more.
+    pub fn mesh_textures(&mut self, ctx: &egui::Context) -> Vec<Option<egui::TextureId>> {
+        const TEXTURE_MAX: u32 = 2048;
+        let Some(doc) = &self.doc else {
+            return Vec::new();
+        };
+        let fresh = self.textures.as_ref().is_some_and(|(serial, t)| {
+            *serial == self.doc_serial && t.len() == doc.mesh.images.len()
+        });
+        if !fresh {
+            let handles = doc
+                .mesh
+                .images
+                .iter()
+                .enumerate()
+                .map(|(i, img)| {
+                    let bytes = img.bytes()?;
+                    let mut decoded = image::load_from_memory(&bytes).ok()?;
+                    if decoded.width() > TEXTURE_MAX || decoded.height() > TEXTURE_MAX {
+                        decoded = decoded.thumbnail(TEXTURE_MAX, TEXTURE_MAX);
+                    }
+                    let rgba = decoded.to_rgba8();
+                    let size = [rgba.width() as usize, rgba.height() as usize];
+                    let pixels = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                    Some(ctx.load_texture(
+                        format!("mesh-image-{}-{i}", self.doc_serial),
+                        pixels,
+                        egui::TextureOptions::LINEAR_REPEAT,
+                    ))
+                })
+                .collect();
+            self.textures = Some((self.doc_serial, handles));
+        }
+        self.textures
+            .as_ref()
+            .map(|(_, t)| {
+                t.iter()
+                    .map(|h| h.as_ref().map(egui::TextureHandle::id))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// The mesh positions as drawn: posed by the test pose, or at rest.
@@ -1773,6 +1844,7 @@ fn push_undo(undo: &mut Vec<Guides>, g: &Guides) {
     }
 }
 
+mod shapes;
 mod ui;
 
 #[cfg(test)]
@@ -2434,6 +2506,86 @@ mod tests {
         let flat = outliner_rows(&broken, built.ok().as_ref());
         assert_eq!(flat.len(), broken.components.len());
         assert!(flat.iter().all(|&(_, d)| d == 0));
+    }
+
+    #[test]
+    fn correctives_sculpt_in_the_pose_mirror_and_undo() {
+        let mut s = demo_studio();
+        assert!(!s.new_shape(), "shapes need a built rig");
+        assert!(s.build(), "{}", s.status);
+        s.pose = Some(Pose {
+            bone: "lowerarm_l".into(),
+            axis: 1,
+            degrees: 90.0,
+        });
+        assert!(s.new_corrective(), "{}", s.status);
+        assert_eq!(s.shape_pick.as_deref(), Some("lowerarm_l_fix"));
+        assert!(s.sculpting);
+        let elbow = {
+            let rig = s.doc.as_ref().unwrap().rig.as_ref().unwrap();
+            rig.skeleton.bones[rig.skeleton.index_of("lowerarm_l").unwrap()].head
+        };
+        let before = s.frame().unwrap().mesh.unwrap();
+        assert!(s.begin_sculpt());
+        let up = Vec3::new(0.0, 0.02, 0.0);
+        assert!(s.sculpt_at(elbow, up) > 0, "{}", s.status);
+        let after = s.frame().unwrap().mesh.unwrap();
+        let moved = before
+            .iter()
+            .zip(&after)
+            .filter(|(a, b)| a.distance(**b) > 1e-4)
+            .count();
+        assert!(moved > 0);
+        // In the pose (driver fully on at 90) the vertices moved along the
+        // offset, by at most its length.
+        for (a, b) in before.iter().zip(&after) {
+            let d = *b - *a;
+            if d.length() > 1e-4 {
+                assert!(d.normalize().dot(Vec3::Y) > 0.99, "{d}");
+                assert!(d.length() < up.length() + 1e-4, "{d}");
+            }
+        }
+        // Unposed, the corrective is off and the mesh is at rest.
+        s.pose = None;
+        assert!(s.frame().unwrap().mesh.is_none());
+        assert!(s.mirror_shape("lowerarm_l_fix"), "{}", s.status);
+        let names: Vec<&str> = s.shapes().iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(names, ["lowerarm_l_fix", "lowerarm_r_fix"]);
+        assert_eq!(s.shapes()[1].driver.as_ref().unwrap().bone, "lowerarm_r");
+        // A weight on a free shape shows at rest.
+        assert!(s.new_shape());
+        assert!(s.begin_sculpt());
+        assert!(s.sculpt_at(elbow, up) > 0);
+        assert!(s.frame().unwrap().mesh.is_some());
+        s.undo_shapes();
+        s.undo_shapes();
+        assert_eq!(s.shapes().len(), 2);
+        // The built rig carries the shapes, and a rebuild keeps them.
+        assert_eq!(
+            s.doc
+                .as_ref()
+                .unwrap()
+                .rig
+                .as_ref()
+                .unwrap()
+                .mesh
+                .shapes
+                .len(),
+            2
+        );
+        assert!(s.build(), "{}", s.status);
+        assert_eq!(
+            s.doc
+                .as_ref()
+                .unwrap()
+                .rig
+                .as_ref()
+                .unwrap()
+                .mesh
+                .shapes
+                .len(),
+            2
+        );
     }
 
     #[test]

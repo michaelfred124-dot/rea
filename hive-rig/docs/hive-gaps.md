@@ -49,6 +49,19 @@ patterns) applied to every export, and now:
 - **FBX output**: `<name>.fbx` (binary 7.4) for game engines, with the mesh,
   the skeleton in the rig's naming convention, all skin influences and a bind
   pose, written from the public binary layout without an SDK; see gap 8.
+- **Mesh fidelity**: a real character keeps its objects and material pieces,
+  normals, every UV set, tangents, vertex colours, glTF and MTL materials with
+  their textures (written once into `<name>_textures/`, named from the rig
+  file) and its morph targets, through import, `.hive.json`, `.glb`, `.fbx` and
+  the Blender, Maya and Unreal builders. Checked in real Blender (and through
+  Blender's FBX importer) on public Khronos sample models.
+- **Blendshapes and correctives**: shapes with weights, sculpted at rest or in a
+  test pose (worked back through the skin), mirrored with their drivers,
+  split, combined, renamed; in the app (weight sliders, a sculpt brush,
+  Corrective from pose) and the CLI (`hive-rig shape`). Correctives are driven by
+  angle pose readers: Blender shape-key drivers (checked in real Blender), a
+  Maya blendShape and node network, Unreal Control Rig curves (both only
+  against stubs); see gap 9.
 
 ## Gaps, ranked by how much they'd help a rigger
 
@@ -61,8 +74,8 @@ patterns) applied to every export, and now:
 | 5 | IK/FK and space matching | Snap IK to FK and back without a pop | Done in the Blender tab and Maya window. Next: the same in Unreal (a Control Rig function or editor utility), and matching across a frame range | Small |
 | 6 | Animator tools | Mirror poses, select-all-controls, reset pose | Done in Blender and Maya. Next: flip a whole pose (centre controls too), a pose library | Small |
 | 7 | Joints to guides, next steps | Turn an existing skeleton into guides | Done for .glb. Next: unknown chains (ears, tails, hair) read back as chain components, and FBX input | Small |
-| 8 | FBX and more targets | FBX export; Unity and Houdini use | Done: a hand-written binary FBX 7.4 writer (`--targets fbx`, Export FBX in the app) with mesh, skeleton, every skin influence and a bind pose, checked through Blender's FBX importer. Next: try it in Unreal, Unity and Houdini (not yet done), FBX input, Unity Humanoid bone names, animation takes | Small |
-| 9 | Pose-driven correctives | Corrective shapes and helper joints driven by joint angles (Brave Rabbit's weightDriver is the well-known Maya RBF/pose reader) | Our own pose reader: a cone angle between a joint and its rest pose drives a helper joint or shape, written as Blender drivers and Maya nodes | Large |
+| 8 | FBX and more targets | FBX export; Unity and Houdini use | Done: a hand-written binary FBX 7.4 writer (`--targets fbx`, Export FBX in the app) with mesh, skeleton, every skin influence and a bind pose, checked through Blender's FBX importer. Also done: objects, UV sets, vertex colours, materials with texture files and blend shapes, checked through Blender's FBX importer. Next: try it in Unreal, Unity and Houdini (not yet done), FBX input, Unity Humanoid bone names, animation takes, embedded textures | Small |
+| 9 | Pose-driven correctives | Corrective shapes and helper joints driven by joint angles (Brave Rabbit's weightDriver is the well-known Maya RBF/pose reader) | Done: angle pose readers (one bone's turn about an axis, start to end degrees) driving corrective shapes sculpted in the pose, in Blender, Maya and Unreal. Next: cone readers (a swing of any direction), RBF readers over several poses, readers driving helper joints, trying the Maya and Unreal setups in the real applications, and applying undriven shape weights in Unreal | Medium |
 | 10 | Control shapes | A library of control curve shapes, recolouring | More shapes and per-control colour/size in the app | Small |
 | 11 | Skin tools, next steps | Auto skin plus weight tools | Done: mirror, smooth, paint brush (add, subtract, smooth, symmetry, undo; edits kept on rebuild), prune, max influences per engine (glTF writes a second joints/weights set past four), and copy weights between characters by closest surface point with naming-aware bone matching. Next: weight transfer for unmatched extra chains (tails, ears) by position, a flood/set-value tool, locking bones while painting, painting in Blender/Maya round-tripping into the guides | Small |
 | 12 | Proximity controls | Controls appear as the mouse comes near (lesterbanks) | Blender-only overlay; Maya has no clean equivalent | Small |

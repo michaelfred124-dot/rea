@@ -2,7 +2,8 @@
 //! the guides, build and export.
 //!
 //! `HiveRig [character, rig or guides file] [--demo [dog|bird|spider|snake]] [--build] [--weights BONE] [--paint] [--dab add|subtract|smooth] [--library] [--templates] [--export]
-//! [--select COMPONENT[,COMPONENT...]] [--pick NAME] [--pose BONE] [--screenshot OUT.ppm]`
+//! [--select COMPONENT[,COMPONENT...]] [--pick NAME] [--pose BONE[=DEGREES[@x|y|z]]] [--shape NAME=WEIGHT]...
+//! [--screenshot OUT.ppm]`
 //! (the flags exist so the window can be checked automatically).
 
 // No console window behind the app on Windows.
@@ -36,6 +37,8 @@ struct Launch {
     select: Option<String>,
     pick: Option<String>,
     pose: Option<String>,
+    /// `--shape NAME=WEIGHT`: set a shape's weight and pick it (repeatable).
+    shapes: Vec<String>,
     screenshot: Option<PathBuf>,
 }
 
@@ -75,6 +78,9 @@ fn parse_args() -> Launch {
             Some("--pick") => launch.pick = args.next().map(|s| s.to_string_lossy().into_owned()),
             Some("--pose") => launch.pose = args.next().map(|s| s.to_string_lossy().into_owned()),
             Some("--screenshot") => launch.screenshot = args.next().map(PathBuf::from),
+            Some("--shape") => launch
+                .shapes
+                .extend(args.next().map(|s| s.to_string_lossy().into_owned())),
             _ => launch.file = Some(PathBuf::from(a)),
         }
     }
@@ -161,11 +167,24 @@ fn main() -> eframe::Result {
         studio.category = app::Category::Templates;
     }
     studio.export_open = launch.export;
-    if let Some(bone) = &launch.pose {
+    if let Some(text) = &launch.pose {
+        // BONE, BONE=DEGREES or BONE=DEGREES@x|y|z.
+        let (bone, turn) = text.split_once('=').unwrap_or((text, "40"));
+        let (degrees, axis) = turn.split_once('@').unwrap_or((turn, "x"));
         studio.start_pose(bone);
         if let Some(p) = studio.pose.as_mut() {
-            p.degrees = 40.0;
+            p.degrees = degrees.trim().parse().unwrap_or(40.0);
+            p.axis = match axis.trim() {
+                "y" | "Y" => 1,
+                "z" | "Z" => 2,
+                _ => 0,
+            };
         }
+    }
+    for text in &launch.shapes {
+        let (name, weight) = text.split_once('=').unwrap_or((text, "1"));
+        studio.set_shape_weight(name, weight.trim().parse().unwrap_or(1.0));
+        studio.shape_pick = Some(name.to_string());
     }
     if let Some(name) = &launch.pick {
         studio.rig_pick = Some(if name.starts_with("ctrl") || name.ends_with("_ctrl") {
