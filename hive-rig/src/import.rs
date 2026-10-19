@@ -16,7 +16,43 @@ use glam::{Mat3, Mat4, Vec2, Vec3, Vec4};
 
 use crate::joints::Joint;
 use crate::mesh::{AlphaMode, Image, Material, Mesh, Part, TextureRef, smooth_normals};
+use crate::orient::{self, Choice, Detection};
 use crate::shapes::Shape;
+
+/// A character as read from its file and turned into hive-rig's frame (Y up,
+/// facing +Z, its left on +X).
+#[derive(Debug, Clone)]
+pub struct Character {
+    pub mesh: Mesh,
+    /// The skeleton it came with (empty for none), turned the same way.
+    pub joints: Vec<Joint>,
+    /// How it stood in the file, the body kind, and why.
+    pub detection: Detection,
+}
+
+/// Load a character: its mesh and skeleton, its orientation (detected, or as
+/// `choice` says) and its body kind, and turn it into hive-rig's frame.
+pub fn load_character(path: &Path, choice: Choice) -> Result<Character> {
+    let mesh = load_mesh(path)?;
+    let joints = load_joints(path)?;
+    Ok(orient_character(mesh, joints, choice))
+}
+
+/// Detect (or take from `choice`) how a mesh and skeleton in a file's frame
+/// stand, and turn them into hive-rig's frame.
+pub fn orient_character(mut mesh: Mesh, mut joints: Vec<Joint>, choice: Choice) -> Character {
+    let detection = orient::detect(&mesh, &joints, choice);
+    let o = detection.orientation;
+    if !o.is_standard() {
+        orient::turn_mesh(&mut mesh, o.to_standard());
+        orient::turn_joints(&mut joints, o.to_standard());
+    }
+    Character {
+        mesh,
+        joints,
+        detection,
+    }
+}
 
 /// Load a mesh, picking the importer from the file extension.
 pub fn load_mesh(path: &Path) -> Result<Mesh> {
@@ -588,8 +624,9 @@ pub fn load_gltf(path: &Path) -> Result<Mesh> {
     let mut g = Gathered::default();
     g.mesh.materials = doc.materials().map(|m| gltf_material(&m)).collect();
     g.mesh.images = gltf_images(&doc, &buffers, path.parent());
+    let world = scene_world(&doc, &scene).0;
     for node in scene.nodes() {
-        collect_node(&node, Mat4::IDENTITY, &buffers, &mut g);
+        collect_node(&node, Mat4::IDENTITY, &buffers, &world, &mut g);
     }
     if g.mesh.positions.is_empty() {
         bail!("glTF file contains no triangle meshes");
@@ -649,12 +686,124 @@ pub fn load_gltf(path: &Path) -> Result<Mesh> {
     Ok(mesh)
 }
 
-fn collect_node(node: &gltf::Node, parent: Mat4, buffers: &[gltf::buffer::Data], g: &mut Gathered) {
+/// The world matrix of every node of `scene` at its rest transform, and each
+/// node's parent.
+fn scene_world(
+    doc: &gltf::Document,
+    scene: &gltf::Scene,
+) -> (Vec<Option<Mat4>>, Vec<Option<usize>>) {
+    let mut world = vec![None; doc.nodes().len()];
+    let mut parent = vec![None; doc.nodes().len()];
+    fn walk(
+        node: &gltf::Node,
+        m: Mat4,
+        up: Option<usize>,
+        world: &mut [Option<Mat4>],
+        parent: &mut [Option<usize>],
+    ) {
+        let m = m * Mat4::from_cols_array_2d(&node.transform().matrix());
+        world[node.index()] = Some(m);
+        parent[node.index()] = up;
+        for child in node.children() {
+            walk(&child, m, Some(node.index()), world, parent);
+        }
+    }
+    for node in scene.nodes() {
+        walk(&node, Mat4::IDENTITY, None, &mut world, &mut parent);
+    }
+    (world, parent)
+}
+
+/// Where a skinned primitive's vertices sit in the scene. glTF ignores a skinned
+/// mesh node's own transform: each vertex is placed by its joints, as
+/// `sum(weight * joint_world * inverse_bind)`. Usually every joint agrees (one
+/// matrix for the whole primitive); when the rest pose differs from the bind
+/// pose each vertex gets its own blend, which is what a viewer shows at rest.
+enum Placement {
+    One(Mat4),
+    PerVertex(Vec<Mat4>),
+}
+
+impl Placement {
+    fn at(&self, i: usize) -> Mat4 {
+        match self {
+            Placement::One(m) => *m,
+            Placement::PerVertex(v) => v[i],
+        }
+    }
+}
+
+fn skinned_placement(
+    node: &gltf::Node,
+    prim: &gltf::Primitive,
+    count: usize,
+    buffers: &[gltf::buffer::Data],
+    world: &[Option<Mat4>],
+) -> Option<Placement> {
+    let skin = node.skin()?;
+    let reader = skin.reader(|b| Some(&buffers[b.index()]));
+    let ibms: Vec<Mat4> = reader
+        .read_inverse_bind_matrices()
+        .map(|it| it.map(|m| Mat4::from_cols_array_2d(&m)).collect())
+        .unwrap_or_default();
+    let joints: Vec<Mat4> = skin
+        .joints()
+        .enumerate()
+        .map(|(k, j)| {
+            world[j.index()].unwrap_or(Mat4::IDENTITY)
+                * ibms.get(k).copied().unwrap_or(Mat4::IDENTITY)
+        })
+        .collect();
+    let first = *joints.first()?;
+    let scale = first
+        .abs()
+        .to_cols_array()
+        .iter()
+        .fold(1e-6f32, |a, b| a.max(*b));
+    if joints.iter().all(|m| {
+        (*m - first)
+            .abs()
+            .to_cols_array()
+            .iter()
+            .all(|d| *d <= 1e-4 * scale)
+    }) {
+        return Some(Placement::One(first));
+    }
+    let r = prim.reader(|b| Some(&buffers[b.index()]));
+    let mut acc = vec![(Mat4::ZERO, 0.0f32); count];
+    let mut set = 0;
+    while let (Some(js), Some(ws)) = (r.read_joints(set), r.read_weights(set)) {
+        for (v, (j, w)) in js.into_u16().zip(ws.into_f32()).enumerate().take(count) {
+            for k in 0..4 {
+                if w[k] > 0.0
+                    && let Some(m) = joints.get(j[k] as usize)
+                {
+                    acc[v].0 += *m * w[k];
+                    acc[v].1 += w[k];
+                }
+            }
+        }
+        set += 1;
+    }
+    if set == 0 {
+        return Some(Placement::One(first));
+    }
+    Some(Placement::PerVertex(
+        acc.into_iter()
+            .map(|(m, w)| if w > 0.0 { m * (1.0 / w) } else { first })
+            .collect(),
+    ))
+}
+
+fn collect_node(
+    node: &gltf::Node,
+    parent: Mat4,
+    buffers: &[gltf::buffer::Data],
+    scene: &[Option<Mat4>],
+    g: &mut Gathered,
+) {
     let world = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
     if let Some(gmesh) = node.mesh() {
-        let linear = Mat3::from_mat4(world);
-        let normal_m = linear.inverse().transpose();
-        let flips = linear.determinant() < 0.0;
         let object = g.mesh.objects.len();
         let mut object_used = false;
         let names = target_names(&gmesh);
@@ -669,6 +818,15 @@ fn collect_node(node: &gltf::Node, parent: Mat4, buffers: &[gltf::buffer::Data],
             };
             let pos: Vec<Vec3> = pos.map(Vec3::from).collect();
             let count = pos.len();
+            let place = skinned_placement(node, &prim, count, buffers, scene)
+                .unwrap_or(Placement::One(world));
+            let flips = Mat3::from_mat4(place.at(0)).determinant() < 0.0;
+            // Per vertex: the point matrix, its linear part and the normal matrix.
+            let frame = |i: usize| {
+                let m = place.at(i);
+                let linear = Mat3::from_mat4(m);
+                (m, linear, linear.inverse().transpose())
+            };
             let tris: Vec<u32> = match reader.read_indices() {
                 Some(idx) => idx.into_u32().collect(),
                 None => (0..count as u32).collect(),
@@ -698,13 +856,13 @@ fn collect_node(node: &gltf::Node, parent: Mat4, buffers: &[gltf::buffer::Data],
             let first_index = g.mesh.indices.len();
             g.mesh
                 .positions
-                .extend(kept.iter().map(|&i| world.transform_point3(pos[i])));
+                .extend(kept.iter().map(|&i| frame(i).0.transform_point3(pos[i])));
             match reader.read_normals() {
                 Some(nr) => {
                     let nr: Vec<Vec3> = nr.map(Vec3::from).collect();
                     g.mesh.normals.extend(
                         kept.iter()
-                            .map(|&i| (normal_m * nr[i]).try_normalize().unwrap_or(Vec3::Y)),
+                            .map(|&i| (frame(i).2 * nr[i]).try_normalize().unwrap_or(Vec3::Y)),
                     );
                     g.has_normal.extend(std::iter::repeat_n(true, kept.len()));
                 }
@@ -720,7 +878,7 @@ fn collect_node(node: &gltf::Node, parent: Mat4, buffers: &[gltf::buffer::Data],
                     let t: Vec<[f32; 4]> = t.collect();
                     g.tangents.extend(kept.iter().map(|&i| {
                         let [x, y, z, w] = t[i];
-                        let d = (linear * Vec3::new(x, y, z)).normalize_or_zero();
+                        let d = (frame(i).1 * Vec3::new(x, y, z)).normalize_or_zero();
                         Some(d.extend(if flips { -w } else { w }))
                     }));
                 }
@@ -785,6 +943,7 @@ fn collect_node(node: &gltf::Node, parent: Mat4, buffers: &[gltf::buffer::Data],
                 let shape = &mut g.shapes[slot];
                 shape.has_normals |= !dn.is_empty();
                 for (j, &i) in kept.iter().enumerate() {
+                    let (_, linear, normal_m) = frame(i);
                     let p = dp.get(i).map_or(Vec3::ZERO, |d| linear * *d);
                     let nn = dn.get(i).map_or(Vec3::ZERO, |d| normal_m * *d);
                     if p.length_squared() > crate::shapes::EPSILON.powi(2) || nn != Vec3::ZERO {
@@ -811,12 +970,14 @@ fn collect_node(node: &gltf::Node, parent: Mat4, buffers: &[gltf::buffer::Data],
         }
     }
     for child in node.children() {
-        collect_node(&child, world, buffers, g);
+        collect_node(&child, world, buffers, scene, g);
     }
 }
 
-/// The joints of the first skin in a glTF file, at their bind pose in the same
-/// space [`load_gltf`] puts the mesh in. Empty for files without a skin.
+/// The joints of the first skin in a glTF file at their rest pose, in the same
+/// space [`load_gltf`] puts the mesh in (which places skinned vertices by these
+/// same joints), each with its nearest ancestor that is also a joint of the
+/// skin. Empty for files without a skin.
 pub fn load_joints(path: &Path) -> Result<Vec<Joint>> {
     let ext = path
         .extension()
@@ -826,50 +987,41 @@ pub fn load_joints(path: &Path) -> Result<Vec<Joint>> {
     if ext != "gltf" && ext != "glb" {
         return Ok(Vec::new());
     }
-    let (doc, buffers) = open_gltf(path)?;
+    let (doc, _) = open_gltf(path)?;
     let scene = doc
         .default_scene()
         .or_else(|| doc.scenes().next())
         .context("glTF file has no scene")?;
-    // World matrix of every node in the scene.
-    let mut world = vec![None; doc.nodes().len()];
-    fn walk(node: &gltf::Node, parent: Mat4, world: &mut [Option<Mat4>]) {
-        let m = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
-        world[node.index()] = Some(m);
-        for child in node.children() {
-            walk(&child, m, world);
-        }
-    }
-    for node in scene.nodes() {
-        walk(&node, Mat4::IDENTITY, &mut world);
-    }
-    let Some((mesh_node, skin)) = doc.nodes().find_map(|n| n.skin().map(|s| (n.index(), s))) else {
+    let (world, parent) = scene_world(&doc, &scene);
+    let Some(skin) = doc
+        .nodes()
+        .filter(|n| world[n.index()].is_some())
+        .find_map(|n| n.skin())
+    else {
         return Ok(Vec::new());
     };
-    let mesh_world = world[mesh_node].unwrap_or(Mat4::IDENTITY);
-    let reader = skin.reader(|b| Some(&buffers[b.index()]));
-    let inverse_binds: Vec<Mat4> = reader
-        .read_inverse_bind_matrices()
-        .map(|it| it.map(|m| Mat4::from_cols_array_2d(&m)).collect())
-        .unwrap_or_default();
+    let nodes: Vec<usize> = skin.joints().map(|n| n.index()).collect();
+    let slot: HashMap<usize, usize> = nodes.iter().enumerate().map(|(i, n)| (*n, i)).collect();
     Ok(skin
         .joints()
         .enumerate()
         .map(|(i, node)| {
-            // The bind pose, where the mesh was skinned; the node's own transform
-            // when the file has no inverse bind matrices.
-            let position = match inverse_binds.get(i) {
-                Some(ibm) => mesh_world.transform_point3(ibm.inverse().w_axis.truncate()),
-                None => world[node.index()]
-                    .unwrap_or(Mat4::IDENTITY)
-                    .w_axis
-                    .truncate(),
-            };
+            let mut up = parent[node.index()];
+            while let Some(p) = up {
+                if slot.contains_key(&p) {
+                    break;
+                }
+                up = parent[p];
+            }
             Joint {
                 name: node
                     .name()
                     .map_or_else(|| format!("joint_{i}"), str::to_string),
-                position,
+                position: world[node.index()]
+                    .unwrap_or(Mat4::IDENTITY)
+                    .w_axis
+                    .truncate(),
+                parent: up.map(|p| slot[&p]),
             }
         })
         .collect())

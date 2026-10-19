@@ -212,13 +212,84 @@ summed weight difference from the artist's weights per vertex (0 is identical).
 
 Michelle, Soldier, Xbot and RobotExpressive are three.js example models (the
 first three from Mixamo, RobotExpressive CC0); the rest are Khronos glTF sample
-models. Soldier faces -Z, so its left and right guides land on the wrong sides:
-the old body regions then fought the bones, the distance through the body
-doesn't care. CesiumMan, RiggedFigure and BrainStem have joint names hive-rig
-doesn't recognise, so their guides come from body detection and sit off the
-artist's joints; their arm leak and artist difference measure those guides more
-than the weights.
+models. When this table was measured, Soldier (which faces -Z) had its left
+and right guides on the wrong sides: the old body regions then fought the
+bones, the distance through the body doesn't care. CesiumMan, RiggedFigure and
+BrainStem have joint names hive-rig doesn't recognise, so their guides came
+from body detection and sat off the artist's joints; their arm leak and artist
+difference measure those guides more than the weights. Both are fixed since:
+see [Orientation and joint reading](#orientation-and-joint-reading).
 
 The automatic weights take about a second for a 30,000-vertex character in a
 release build on 4 cores (Xbot 0.9 s, Michelle 0.8 s, BrainStem 0.7 s for the
 whole `hive-rig rig` run; about 2.3 s on one core).
+
+## Orientation and joint reading
+
+The same eight characters, rigged with `hive-rig rig model.glb` before and after
+characters were turned into hive-rig's frame (Y up, facing +Z, left on +X) on
+import and joints were read by the skeleton's shape (see the README's
+[Input requirements](../README.md#input-requirements) and
+[Bring your own skeleton](../README.md#bring-your-own-skeleton-joints-to-guides)).
+Both runs were measured with the current `blender_skin_eval.py`, which places a
+skinned source where its skeleton puts it at rest and turns it into the rig's
+frame.
+
+Columns: **template** is the layout chosen; **up** whether the character stands
+upright in the rig; **left** how many of the shoulder, elbow, wrist, hip, knee
+and ankle guides that have an artist's joint are on the character's own side
+(the left on +X); **guide to joint** is the mean and largest distance from each
+body guide to the artist's joint for it, as a share of the character's height
+(the expected joints are listed by hand per model); the skin columns are as
+above, and **vs artist** is the mean weight difference and the share of
+vertices with the same strongest bone. "–" is not measured: the old rig's
+vertices didn't line up with the source as a viewer shows it (so there is no
+artist reference), or the rig has no such bone.
+
+| Model | | template | up | left | guide to joint | leg leak | arm leak | thickness | vs artist |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Michelle | before | biped | **lying** | 12/12 | 0 / 0 | 0.001 | 0 | 0.945 | – |
+| | after | biped | yes | 12/12 | 0 / 0 | 0.011 | 0.020 | 0.939 | 0.229 / 0.883 |
+| Soldier | before | biped | yes | **0/12** | 0 / 0 | 0.023 | 0.021 | 0.882 | 0.283 / 0.707 |
+| | after | biped | yes | 12/12 | 0 / 0 | 0.023 | 0.021 | 0.931 | 0.278 / 0.705 |
+| Xbot | before | biped | yes | 12/12 | 0 / 0 | 0.001 | 0 | 0.940 | – |
+| | after | biped | yes | 12/12 | 0 / 0 | 0.001 | 0.004 | 0.940 | 0.354 / 0.719 |
+| RobotExpressive | before | biped | yes | 10/10 | 0 / 0 | 0 | 0.002 | 0.956 | – |
+| | after | biped | yes | 10/10 | 0.003 / 0.033 | – | 0 | 0.875 | 0.103 / 0.988 |
+| CesiumMan | before | biped | yes | 12/12 | 0.066 / 0.195 | 0.001 | 0.153 | 0.941 | 0.683 / 0.306 |
+| | after | biped | yes | 12/12 | 0 / 0 | 0 | 0.054 | 0.838 | 0.485 / 0.558 |
+| RiggedFigure | before | biped | yes | 12/12 | 0.071 / 0.182 | 0.005 | 0.142 | 1.083 | 0.484 / 0.489 |
+| | after | biped | yes | 12/12 | 0 / 0 | 0.004 | 0.077 | 0.780 | 0.460 / 0.514 |
+| BrainStem | before | biped | yes | 8/8 | 0.048 / 0.132 | 0 | 0.229 | 0.890 | 0.639 / 0.348 |
+| | after | biped | yes | 8/8 | 0 / 0 | 0 | 0.053 | 0.812 | 0.401 / 0.675 |
+| Fox | before | **biped** | yes | 12/12 | 0.216 / 0.455 | 0 | 0.032 | – | 0.572 / 0.636 |
+| | after | dog | yes | 12/12 | 0 / 0 | 0.006 | – | 0.774 | 0.521 / 0.502 |
+
+* **Michelle** and **Xbot**: the old reader applied the skinned mesh node's
+  own transform, which glTF ignores for skinned meshes. Michelle came out lying
+  down, and neither lined up with the source as a viewer shows it. Vertices are
+  now placed by their joints at rest.
+* **Soldier** faces -Z. Its guides were read onto the right joints by name, but
+  with its left on -X: every left guide was flagged across the mid-line, and
+  elbows and knees were judged for a character facing the other way. It is now
+  turned to face +Z; the bend test, which folds elbows forward and knees back,
+  now folds them the way they bend (thickness 0.88 to 0.93).
+* **CesiumMan**, **RiggedFigure** and **BrainStem** have numbered or no joint
+  names. Their guides now sit on the artist's joints. Arm leak falls (0.153 to
+  0.054, 0.142 to 0.077, 0.229 to 0.053) and the weights get closer to the
+  artist's. Bent-joint thickness falls too, to 0.78–0.84: the joints are now
+  where the artist put them, and CesiumMan's own weights score 0.816 on the
+  same bend.
+* **RobotExpressive** is rigid parts hung from joints, posed at rest with the
+  arms down. Only the hands are skinned, and they are bound in a T-pose. The
+  old reader left the hands at their bind pose, out at the sides and away from
+  the arms. Now they hang at the ends of the arms, and the wrist is read where
+  the finger joints fan out. Its feet hang from the root, as in an IK rig, and
+  are joined to the legs ending above them. The pelvis guide sits on the joint
+  where the legs and spine meet (`Body`), 3% of the height above the artist's
+  `Hips`.
+* **Fox** gets the dog layout, with its guides on its joints (hips, shoulders,
+  spine, neck, head, tail and four legs).
+
+With the skeleton left out of detection, the mesh alone gave the same
+orientation and template for all eight.

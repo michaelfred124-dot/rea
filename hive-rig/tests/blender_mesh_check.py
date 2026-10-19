@@ -7,7 +7,9 @@ files came from:
 
 The source .glb is read here with a small reader of its own (not hive-rig's
 importer, not Blender's), as data only. After building the rig with the
-generated script, it checks against the source:
+generated script, it checks against the source (turned upright as the script
+builds it, when the rig records that the source stood otherwise; the FBX is
+checked against the source as it stands):
 
 * the mesh objects: one per mesh node, with the source's material pieces;
 * UVs (every set), per object, matched by vertex position (order-free);
@@ -299,13 +301,41 @@ rig = next(o for o in bpy.data.objects if o.type == "ARMATURE")
 built = [o for o in bpy.data.objects if o.type == "MESH" and o.parent == rig]
 ok("built %d mesh object(s): %s" % (len(built), ", ".join(o.name for o in built)))
 
+AXES = {"+x": (1, 0, 0), "-x": (-1, 0, 0), "+y": (0, 1, 0), "-y": (0, -1, 0), "+z": (0, 0, 1), "-z": (0, 0, -1)}
+
+
+def upright(objs, orientation):
+    """The source objects turned into hive-rig's frame (Y up, facing +Z), where
+    the Blender script builds the character; the .glb and .fbx keep the
+    source's own placement."""
+    if not orientation:
+        return objs
+    up, fwd = Vector(AXES[orientation["up"]]), Vector(AXES[orientation["forward"]])
+    turn = Matrix((up.cross(fwd), up, fwd))  # rows: source to standard
+
+    def t(p):
+        return tuple(turn @ Vector(p))
+
+    out = []
+    for o in objs:
+        o = dict(o)
+        o["verts"] = [(t(p), uvs) for p, uvs in o["verts"]]
+        o["targets"] = {n: [(t(p), t(d)) for p, d in lst] for n, lst in o["targets"].items()}
+        out.append(o)
+    return out
+
+
 if source_path:
     src, doc = source_objects(source_path)
+    rig_data = json.loads(open(script).read().split('r"""', 1)[1].split('"""', 1)[0])
+    if rig_data.get("orientation"):
+        ok("the source stands up %(up)s, facing %(forward)s; the script builds it upright" % rig_data["orientation"])
+    src_upright = upright(src, rig_data.get("orientation"))
     if len(built) != len(src):
         fail("%d mesh objects built, the source has %d" % (len(built), len(src)))
     else:
         ok("object count kept (%d)" % len(src))
-    for s in src:
+    for s in src_upright:
         obj = by_name(built, s["name"]) if len(src) > 1 else built[0]
         if obj is None:
             fail("no object for the source's '%s'" % s["name"])

@@ -213,7 +213,9 @@ pub fn write_all(rig: &Rig, out_dir: &Path, targets: &[Target]) -> Result<Vec<Pa
     };
 
     let glb_path = out_dir.join(format!("{}.glb", rig.name));
-    std::fs::write(&glb_path, glb::write(rig))?;
+    // The .glb and .fbx put the character back the way its source file stood it.
+    let source = rig.in_source_frame();
+    std::fs::write(&glb_path, glb::write(&source))?;
     written.push(glb_path.clone());
 
     let json_path = out_dir.join(format!("{}.hive.json", rig.name));
@@ -227,7 +229,7 @@ pub fn write_all(rig: &Rig, out_dir: &Path, targets: &[Target]) -> Result<Vec<Pa
     for &t in targets {
         let path = if t == Target::Fbx {
             let path = out_dir.join(format!("{}.fbx", rig.name));
-            std::fs::write(&path, fbx::write(rig))?;
+            std::fs::write(&path, fbx::write(&source))?;
             path
         } else {
             let path = out_dir.join(format!("{}_{}.py", rig.name, t.key()));

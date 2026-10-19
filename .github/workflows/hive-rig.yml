@@ -316,9 +316,12 @@ jobs:
           # Downloaded at pinned commits, never committed; read with python -I.
           sh tests/fetch_skin_models.sh "$w/models" CesiumMan RobotExpressive
           cargo run -q --release -- rig "$w/models/CesiumMan/CesiumMan.glb" -o "$w/cesium" -t blender
+          # The guides sit on CesiumMan's own joints; its artist weights keep 0.82 of
+          # the thickness on the same bend.
           python -I tests/blender_skin_eval.py "$w/cesium/CesiumMan.hive.json" \
             --source "$w/models/CesiumMan/CesiumMan.glb" \
-            --max-leg-leak 0.02 --min-thickness 0.85 --max-spikes 0.4
+            --max-leg-leak 0.02 --max-arm-leak 0.08 --min-thickness 0.8 --max-spikes 0.4 \
+            --max-artist-diff 0.55 --require-artist
           cargo run -q --release -- rig "$w/models/RobotExpressive/RobotExpressive.glb" -o "$w/robot" -t blender
           python -I tests/blender_skin_eval.py "$w/robot/RobotExpressive.hive.json" \
             --source "$w/models/RobotExpressive/RobotExpressive.glb" \
@@ -333,6 +336,43 @@ jobs:
             python -I tests/blender_skin_eval.py "$w/$creature/hive_$creature.hive.json" \
               --max-leg-leak 0.02 --min-thickness 0.75 --max-spikes 0.4 --max-piece-wrong 0.1
           done
+      - name: Orientation, facing and body template read from public characters
+        run: |
+          o="$RUNNER_TEMP/orient"
+          # Soldier faces -Z (its left and right were swapped), Michelle is stood
+          # up by her armature (she loaded lying down), and Fox is a quadruped
+          # whose joints the dog layout reads by their shape.
+          sh tests/fetch_skin_models.sh "$o/models" Soldier Michelle Fox
+          for m in Soldier Michelle Fox; do
+            cargo run -q --release -- rig "$o/models/$m/$m.glb" -o "$o/$m" -t blender,fbx | tee "$o/$m.log"
+          done
+          # The Blender script builds Soldier upright facing +Z; the .fbx stands it
+          # as in the source.
+          python -I tests/blender_mesh_check.py "$o/Soldier/Soldier_blender.py" \
+            --source "$o/models/Soldier/Soldier.glb" --fbx "$o/Soldier/Soldier.fbx"
+          grep -q "^Orientation: up +Y, facing -Z" "$o/Soldier.log"
+          grep -q "^Orientation: up +Y, facing +Z" "$o/Michelle.log"
+          grep -q "^Template: dog" "$o/Fox.log"
+          cargo run -q --release -- check "$o/Fox/Fox.guides.json" --mesh "$o/models/Fox/Fox.glb" | tee "$o/check.log"
+          grep -q "template: dog" "$o/check.log"
+          # The guides stand upright with the character's left on +X.
+          python3 -I - "$o/Soldier/Soldier.guides.json" "$o/Michelle/Michelle.guides.json" <<'EOF'
+          import json, sys
+          for path in sys.argv[1:]:
+              g = json.load(open(path))
+              def pos(comp, name):
+                  c = next(c for c in g["components"] if c["id"] == comp)
+                  return next(x["position"] for x in c["guides"] if x["name"] == name)
+              assert pos("arm_l", "shoulder")[0] > pos("arm_r", "shoulder")[0], path
+              assert pos("leg_l", "hip")[0] > pos("leg_r", "hip")[0], path
+              assert pos("head", "head")[1] > pos("spine", "pelvis")[1] > pos("leg_l", "ankle")[1], path
+          print("upright, left on +X")
+          EOF
+          python -I tests/blender_skin_eval.py "$o/Soldier/Soldier.hive.json" \
+            --source "$o/models/Soldier/Soldier.glb" --require-artist \
+            --max-leg-leak 0.05 --max-arm-leak 0.05 --min-thickness 0.85 --max-artist-diff 0.35
+          python -I tests/blender_skin_eval.py "$o/Fox/Fox.hive.json" \
+            --source "$o/models/Fox/Fox.glb" --require-artist --max-artist-diff 0.6
       - name: Animator tools - IK/FK matching, mirror, reset and space switching in Blender
         run: |
           for drop in 0 45; do

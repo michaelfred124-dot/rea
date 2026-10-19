@@ -1508,6 +1508,7 @@ impl Studio {
             .inner_margin(Margin::symmetric(10, 8))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
+                self.orientation_rows(ui);
                 if issues.is_empty() {
                     ui.label(
                         RichText::new("No problems found in the guides.")
@@ -1532,6 +1533,95 @@ impl Studio {
                 }
                 ui.label(RichText::new(origin).size(11.0).color(TEXT_FAINT));
             });
+    }
+
+    /// How the character stands in its file and the layout its guides are, with
+    /// Up and Facing pickers that turn it (the view shows it turned at once, and
+    /// the guides are placed again) and Detect to go back to what was found.
+    fn orientation_rows(&mut self, ui: &mut Ui) {
+        use hive_rig::orient::{self, Axis, Choice};
+        let Some(doc) = &self.doc else { return };
+        let o = doc.orientation;
+        let layout = orient::layout_name(&doc.guides);
+        let (summary, body, from_file) = match &doc.source {
+            Some(s) => (s.detection.summary(), Some(s.detection.body), true),
+            None => (o.to_string(), None, false),
+        };
+        let advice = body.and_then(|b| orient::template_advice(&doc.guides, b));
+        ui.label(
+            RichText::new(format!("Orientation: {summary}"))
+                .size(12.0)
+                .color(TEXT_DIM),
+        )
+        .on_hover_text(
+            "How the character stands in its file. hive-rig turns it upright, facing +Z, \
+             to rig it; the .glb and .fbx put it back the way the file had it.",
+        );
+        ui.label(
+            RichText::new(format!(
+                "Template: {layout}{}",
+                body.map(|b| format!(" (the body looks like a {})", b.template()))
+                    .unwrap_or_default()
+            ))
+            .size(12.0)
+            .color(TEXT_DIM),
+        );
+        if let Some(a) = &advice {
+            ui.label(RichText::new(a).size(12.0).color(WARN));
+        }
+        if !from_file {
+            ui.add_space(4.0);
+            return;
+        }
+        let mut choice = None;
+        ui.horizontal(|ui| {
+            let mut up = o.up;
+            let mut forward = o.forward;
+            ui.label(RichText::new("Up").size(11.5).color(TEXT_FAINT));
+            egui::ComboBox::from_id_salt("orient_up")
+                .width(52.0)
+                .selected_text(up.label())
+                .show_ui(ui, |ui| {
+                    for a in Axis::ALL {
+                        ui.selectable_value(&mut up, a, a.label());
+                    }
+                })
+                .response
+                .on_hover_text("The file's axis that points up through the character");
+            ui.label(RichText::new("Facing").size(11.5).color(TEXT_FAINT));
+            egui::ComboBox::from_id_salt("orient_forward")
+                .width(52.0)
+                .selected_text(forward.label())
+                .show_ui(ui, |ui| {
+                    for a in Axis::ALL.into_iter().filter(|a| a.index() != o.up.index()) {
+                        ui.selectable_value(&mut forward, a, a.label());
+                    }
+                })
+                .response
+                .on_hover_text("The file's axis the character faces along");
+            if up != o.up {
+                choice = Some(Choice {
+                    up: Some(up),
+                    forward: (forward.index() != up.index()).then_some(forward),
+                });
+            } else if forward != o.forward {
+                choice = Some(Choice {
+                    up: Some(up),
+                    forward: Some(forward),
+                });
+            }
+            if ui
+                .add(egui::Button::new(RichText::new("Detect").size(11.5)).corner_radius(7))
+                .on_hover_text("Find the up axis and facing from the body again")
+                .clicked()
+            {
+                choice = Some(Choice::default());
+            }
+        });
+        ui.add_space(4.0);
+        if let Some(c) = choice {
+            self.reorient(c);
+        }
     }
 
     /// Rows for the checks at `indices`: the place (click to select it), what's

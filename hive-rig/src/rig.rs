@@ -8,6 +8,7 @@ use crate::export;
 use crate::joints::{self, Joint, JointReport};
 use crate::landmarks::{self, Detected};
 use crate::mesh::Mesh;
+use crate::orient::{BodyKind, Orientation};
 use crate::skeleton::Skeleton;
 use crate::skin::{self, SkinOptions, SkinWeights, Skinned};
 
@@ -25,6 +26,11 @@ pub struct Rig {
     pub name: String,
     /// Always "Y": model space is Y-up, metres, facing +Z (glTF convention).
     pub up_axis: String,
+    /// How the character stood in its source file. The mesh, skeleton and
+    /// guides here are turned into hive-rig's frame (Y up, facing +Z); the .glb
+    /// and .fbx turn it back. Absent means the source was already in it.
+    #[serde(default, skip_serializing_if = "Orientation::is_standard")]
+    pub orientation: Orientation,
     pub units: String,
     /// The component layout the rig was built from.
     pub guides: Guides,
@@ -47,13 +53,38 @@ pub fn detect_guides(mesh: &Mesh) -> (Guides, Detected) {
     (components::biped(&lm), detected)
 }
 
-/// Guides for a character: detected on the mesh, then moved onto the joints of
-/// the skeleton it came with, if any. The third value is `None` without joints,
-/// and an error (with the detected guides returned) when they couldn't be used.
+/// Guides for a character (turned into hive-rig's frame): detected on the mesh,
+/// or for a four-legged `body` the dog layout fitted to it, then moved onto the
+/// joints of the skeleton it came with, if any. The third value is `None`
+/// without joints, and an error (with the detected guides returned) when they
+/// couldn't be used.
 pub fn character_guides(
     mesh: &Mesh,
     joints: &[Joint],
+    body: BodyKind,
 ) -> (Guides, Detected, Option<anyhow::Result<JointReport>>) {
+    if body == BodyKind::Quadruped {
+        let fitted = joints::fit_quadruped(mesh);
+        let found = Detected {
+            crotch: true,
+            arms: true,
+            neck: true,
+        };
+        if joints.is_empty() {
+            return (fitted, found, None);
+        }
+        return match joints::quad_guides_from_joints(fitted.clone(), joints) {
+            Ok(Some((g, report))) => (g, found, Some(Ok(report))),
+            Ok(None) => (
+                fitted,
+                found,
+                Some(Err(anyhow::anyhow!(
+                    "the skeleton doesn't show four legs, so the dog layout was fitted to the body"
+                ))),
+            ),
+            Err(e) => (fitted, found, Some(Err(e))),
+        };
+    }
     let (guides, detected) = detect_guides(mesh);
     if joints.is_empty() {
         return (guides, detected, None);
@@ -87,6 +118,7 @@ pub fn build_rig(mesh: Mesh, name: &str, guides: Guides, opts: RigOptions) -> an
         written_by: None,
         name,
         up_axis: "Y".into(),
+        orientation: Orientation::STANDARD,
         units: "m".into(),
         guides,
         mesh,
@@ -97,6 +129,24 @@ pub fn build_rig(mesh: Mesh, name: &str, guides: Guides, opts: RigOptions) -> an
 }
 
 impl Rig {
+    /// The mesh and skeleton turned back to how the character stood in its
+    /// source file, for the formats that carry no controls (.glb and .fbx):
+    /// joints carry translation only, so turning them is turning their heads.
+    /// The guides and controls stay in hive-rig's frame.
+    pub fn in_source_frame(&self) -> std::borrow::Cow<'_, Rig> {
+        if self.orientation.is_standard() {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let m = self.orientation.to_source();
+        let mut r = self.clone();
+        crate::orient::turn_mesh(&mut r.mesh, m);
+        for b in &mut r.skeleton.bones {
+            b.head = m * b.head;
+            b.tail = m * b.tail;
+        }
+        std::borrow::Cow::Owned(r)
+    }
+
     /// Read a `<name>.hive.json` written by `export::write_all`.
     pub fn load(path: &std::path::Path) -> anyhow::Result<Rig> {
         use anyhow::Context;
@@ -304,5 +354,91 @@ mod tests {
         assert_eq!(keep_weights(&old, Some(&base), &mut new), 1);
         assert_eq!(new.skin.joints[0], vec![head]);
         assert_eq!(new.skin.joints[1], fresh.joints[1]);
+    }
+
+    /// A character lying Z-up and facing -Y in its file: the .glb and .fbx put
+    /// it back that way, and opening the .glb again finds that orientation,
+    /// turns it upright onto the same mesh, and its joints become the guides on
+    /// the right sides.
+    #[test]
+    fn orientation_round_trip() {
+        use crate::orient::{Axis, Choice};
+        let o = Orientation::new(Axis::PosZ, Axis::NegY).unwrap();
+        let mut rig = auto_rig(demo::humanoid(0.0), "turned", RigOptions::default()).unwrap();
+        rig.orientation = o;
+        let dir = std::env::temp_dir().join(format!("hive-rig-orient-{}", std::process::id()));
+        let files = crate::export::write_all(&rig, &dir, &[crate::Target::Fbx]).unwrap();
+        assert!(
+            files
+                .iter()
+                .any(|f| f.extension().is_some_and(|e| e == "fbx"))
+        );
+        let glb = dir.join("turned.glb");
+        // In the file it stands along +Z.
+        let raw = crate::import::load_mesh(&glb).unwrap();
+        let (lo, hi) = raw.bounds();
+        assert!(hi.z - lo.z > 2.0 * (hi.y - lo.y), "{lo} {hi}");
+        let ch = crate::import::load_character(&glb, Choice::default()).unwrap();
+        assert_eq!(ch.detection.orientation, o, "{:?}", ch.detection);
+        assert_eq!(ch.detection.body, BodyKind::Biped);
+        for (a, b) in ch.mesh.positions.iter().zip(&rig.mesh.positions) {
+            assert!(a.distance(*b) < 1e-4);
+        }
+        let (g, _, report) = character_guides(&ch.mesh, &ch.joints, ch.detection.body);
+        assert!(report.unwrap().unwrap().placed.len() > 10);
+        let want = rig.skeleton.bone("upperarm_l").unwrap().head;
+        let got = g.component("arm_l").unwrap().position("shoulder").unwrap();
+        assert!(got.distance(want) < 1e-4, "{got} {want}");
+        assert!(got.x > g.body.center_x);
+        // The rig file keeps the orientation.
+        let back = Rig::load(&dir.join("turned.hive.json")).unwrap();
+        assert_eq!(back.orientation, o);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The dog's skeleton with no names is read by its shape into the dog layout.
+    #[test]
+    fn a_nameless_dog_skeleton_gives_the_dog_layout() {
+        let rig = build_rig(
+            demo::demo_quadruped(),
+            "dog",
+            crate::components::quadruped(demo::DOG_HEIGHT),
+            RigOptions::default(),
+        )
+        .unwrap();
+        let mut joints: Vec<Joint> = rig
+            .skeleton
+            .bones
+            .iter()
+            .enumerate()
+            .map(|(i, b)| Joint {
+                name: format!("bone{i}"),
+                position: b.head,
+                parent: b.parent,
+            })
+            .collect();
+        // Paw ends at the floor.
+        for (i, b) in rig.skeleton.bones.iter().enumerate() {
+            if b.name.starts_with("ball_") || b.name.starts_with("hand_") {
+                joints.push(Joint {
+                    name: format!("end{i}"),
+                    position: b.tail,
+                    parent: Some(i),
+                });
+            }
+        }
+        let ch = crate::import::orient_character(
+            rig.mesh.clone(),
+            joints,
+            crate::orient::Choice::default(),
+        );
+        assert_eq!(ch.detection.body, BodyKind::Quadruped);
+        let (g, _, report) = character_guides(&ch.mesh, &ch.joints, ch.detection.body);
+        let report = report.unwrap().unwrap();
+        assert!(!report.by_shape.is_empty());
+        assert_eq!(crate::orient::layout_name(&g), "dog");
+        let want = rig.skeleton.bone("calf_l").unwrap().head;
+        let got = g.component("hind_leg_l").unwrap().position("knee").unwrap();
+        assert!(got.distance(want) < 1e-4, "{got} {want}");
     }
 }

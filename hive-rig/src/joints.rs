@@ -1,24 +1,32 @@
 //! Joints to guides: read an existing skeleton back into editable guides.
 //!
 //! A character that already has joints (from Maya, Blender, Mixamo, an Unreal
-//! mannequin or a 3ds Max biped) keeps its joint placement: each guide whose
-//! joint can be recognised by name moves onto that joint, eyes, a jaw, face
-//! joints and fingers are added when the skeleton has them, and every other
-//! guide keeps the position detected on the mesh.
+//! mannequin, a 3ds Max biped, or unnamed) keeps its joint placement. The
+//! skeleton's shape says which chain is which limb ([`crate::structure`]); each
+//! guide moves onto the joint recognised by name when that joint lies in the
+//! right limb, and otherwise onto the joint its place in the limb gives it
+//! (hip, knee, ankle by where the chain bends and how long its parts are).
+//! Eyes, a jaw, face joints and fingers are added by name when the skeleton has
+//! them, and every guide neither finds keeps the position detected on the mesh.
 
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use glam::Vec3;
 
-use crate::components::{self, AddOptions, FACE_GUIDES, Guides, Kind, Preset};
+use crate::components::{self, AddOptions, FACE_GUIDES, Guide, Guides, Kind, Preset};
+use crate::orient::BodyKind;
 use crate::skeleton::Side;
+use crate::structure::{self, BodyMap, Part};
 
 /// A joint of an imported skeleton, in the mesh's model space.
 #[derive(Debug, Clone)]
 pub struct Joint {
     pub name: String,
     pub position: Vec3,
+    /// Index of its parent joint in the same list (the nearest ancestor that
+    /// is a joint), if any.
+    pub parent: Option<usize>,
 }
 
 /// What [`guides_from_joints`] did.
@@ -28,6 +36,8 @@ pub struct JointReport {
     pub placed: Vec<String>,
     /// Components added because the skeleton has them (eyes, jaw, face, fingers).
     pub added: Vec<String>,
+    /// Of `placed`, the guides placed by the skeleton's shape rather than a name.
+    pub by_shape: Vec<String>,
     /// Joints no guide used, such as twist, IK or helper joints.
     pub unused: Vec<String>,
 }
@@ -192,12 +202,24 @@ impl<'a> Lookup<'a> {
 
     /// The first unused joint with one of `names` on `side`.
     fn take(&mut self, names: &[&str], side: Side) -> Option<Vec3> {
+        self.take_index(names, side, |_| true)
+            .map(|j| self.joints[j].position)
+    }
+
+    /// The first unused joint with one of `names` on `side` that `fits`.
+    fn take_index(
+        &mut self,
+        names: &[&str],
+        side: Side,
+        fits: impl Fn(usize) -> bool,
+    ) -> Option<usize> {
         for n in names {
             if let Some(&(_, j)) = self.best.get(&(n.to_string(), side))
                 && !self.used[j]
+                && fits(j)
             {
                 self.used[j] = true;
-                return Some(self.joints[j].position);
+                return Some(j);
             }
         }
         None
@@ -217,6 +239,11 @@ pub fn guides_from_joints(detected: Guides, joints: &[Joint]) -> Result<(Guides,
     let mut g = detected;
     let mut report = JointReport::default();
     let mut look = Lookup::new(joints);
+    let body = structure::map(joints, &g.body, BodyKind::Biped);
+    let shaped = body
+        .as_ref()
+        .map(|m| biped_roles(m, joints))
+        .unwrap_or_default();
 
     // Spine joints between the pelvis and the neck.
     let spine: Vec<usize> = joints
@@ -238,6 +265,14 @@ pub fn guides_from_joints(detected: Guides, joints: &[Joint]) -> Result<(Guides,
         for i in spine {
             look.used[i] = true;
         }
+    } else if let Some(m) = &body
+        && m.chest.is_some()
+        && (1..=16).contains(&m.spine.len())
+    {
+        components::set_spine_joints(&mut g, "spine", m.spine.len())?;
+        for &i in &m.spine {
+            look.used[i] = true;
+        }
     }
 
     for c in &mut g.components {
@@ -249,26 +284,56 @@ pub fn guides_from_joints(detected: Guides, joints: &[Joint]) -> Result<(Guides,
             Kind::Leg => "leg",
             _ => continue,
         };
+        let side_index = usize::from(c.side == Side::Right);
+        let part = match c.kind {
+            Kind::Spine => Some(Part::Spine),
+            Kind::Head => Some(Part::Head),
+            Kind::Arm => Some(Part::Arm(side_index)),
+            Kind::Leg => Some(Part::Leg(side_index)),
+            _ => None,
+        };
+        // A name only counts when its joint lies in the limb the skeleton's
+        // shape gives this component (when the shape found that limb).
+        let members: Option<Vec<usize>> = body
+            .as_ref()
+            .zip(part)
+            .map(|(m, p)| m.part(p))
+            .filter(|v| v.len() > 1);
         for &(kind, guide, names) in BIPED {
             if kind != kind_name {
                 continue;
             }
+            let fits = |j: usize| members.as_ref().is_none_or(|v| v.contains(&j));
             // The chest guide marks the top of the spine, where the neck starts,
             // without using up the neck joint.
-            let found = if guide == "chest" {
+            let by_name = if guide == "chest" {
+                let head = body.as_ref().map(|m| m.part(Part::Head));
                 names.iter().find_map(|n| {
                     look.best
                         .get(&(n.to_string(), Side::Center))
-                        .map(|&(_, j)| joints[j].position)
+                        .map(|&(_, j)| j)
+                        .filter(|j| head.as_ref().is_none_or(|v| v.len() < 2 || v.contains(j)))
                 })
             } else {
-                look.take(names, c.side)
+                look.take_index(names, c.side, fits)
             };
-            if let Some(p) = found
+            // A role read from the shape never takes a joint a name placed.
+            let shape = shaped
+                .get(&(c.id.clone(), guide))
+                .copied()
+                .filter(|&j| !look.used[j]);
+            let found = by_name.map(|j| (j, false)).or(shape.map(|j| (j, true)));
+            if let Some((j, from_shape)) = found
                 && let Some(gd) = c.guides.iter_mut().find(|x| x.name == guide)
             {
-                gd.position = p;
+                gd.position = joints[j].position;
+                if guide != "chest" {
+                    look.used[j] = true;
+                }
                 report.placed.push(format!("{}.{guide}", c.id));
+                if from_shape {
+                    report.by_shape.push(format!("{}.{guide}", c.id));
+                }
             }
         }
     }
@@ -370,6 +435,18 @@ pub fn guides_from_joints(detected: Guides, joints: &[Joint]) -> Result<(Guides,
         }
     }
 
+    // The skeleton's pelvis marks the mid-line better than the mesh's bounds
+    // (one arm raised or longer moves those).
+    if report.placed.iter().any(|p| p == "spine.pelvis")
+        && let Some(pelvis) = g.component("spine").and_then(|c| c.position("pelvis"))
+    {
+        g.body.center_x = pelvis.x;
+        if let Some(c) = g.components.iter_mut().find(|c| c.kind == Kind::Root)
+            && let Some(gd) = c.guides.first_mut()
+        {
+            gd.position.x = pelvis.x;
+        }
+    }
     components::build(&g).context("the guides read from the joints don't build")?;
     report.unused = joints
         .iter()
@@ -378,6 +455,237 @@ pub fn guides_from_joints(detected: Guides, joints: &[Joint]) -> Result<(Guides,
         .map(|(j, _)| j.name.clone())
         .collect();
     Ok((g, report))
+}
+
+/// Joints by (component id, guide) for the biped layout, from the skeleton's shape.
+fn biped_roles(m: &BodyMap, joints: &[Joint]) -> HashMap<(String, &'static str), usize> {
+    let mut out = HashMap::new();
+    out.insert(("spine".to_string(), "pelvis"), m.pelvis);
+    if let Some(chest) = m.chest {
+        let top = joints
+            .iter()
+            .map(|j| j.position.y)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let h = &m.head;
+        out.insert(
+            ("spine".to_string(), "chest"),
+            h.first().copied().unwrap_or(chest),
+        );
+        match h.len() {
+            0 => {}
+            1 => {
+                out.insert(("head".to_string(), "neck"), chest);
+                out.insert(("head".to_string(), "head"), h[0]);
+            }
+            n => {
+                out.insert(("head".to_string(), "neck"), h[0]);
+                // The last joint is the top of the head only when it is the
+                // top of the skeleton; then the head is the one before it.
+                let last = h[n - 1];
+                let is_top = n >= 3 && top - joints[last].position.y < 1e-4;
+                if is_top {
+                    out.insert(("head".to_string(), "head"), h[n - 2]);
+                    out.insert(("head".to_string(), "head_top"), last);
+                } else {
+                    out.insert(("head".to_string(), "head"), last);
+                }
+            }
+        }
+    }
+    for (k, side) in ["l", "r"].iter().enumerate() {
+        let arm = &m.arms[k];
+        let r = structure::arm_roles(joints, arm);
+        for (guide, role) in [
+            ("clavicle", r.clavicle),
+            ("shoulder", r.shoulder),
+            ("elbow", r.elbow),
+            ("wrist", r.wrist),
+            ("hand_tip", r.hand_tip),
+        ] {
+            if let Some(i) = role {
+                out.insert((format!("arm_{side}"), guide), arm[i]);
+            }
+        }
+        let leg = &m.legs[k];
+        let r = structure::leg_roles(joints, leg);
+        for (guide, role) in [
+            ("hip", r.hip),
+            ("knee", r.knee),
+            ("ankle", r.ankle),
+            ("ball", r.ball),
+            ("toe", r.toe),
+        ] {
+            if let Some(i) = role {
+                out.insert((format!("leg_{side}"), guide), leg[i]);
+            }
+        }
+    }
+    out
+}
+
+/// The dog layout stretched over a four-legged body: as tall as it, as long
+/// (nose to tail tip) as it along +Z, standing on its floor at its mid-line.
+pub fn fit_quadruped(mesh: &crate::mesh::Mesh) -> Guides {
+    let (min, max) = mesh.bounds();
+    let h = (max.y - min.y).max(1e-3);
+    let mut g = components::quadruped(h);
+    let (lo, hi) = g
+        .components
+        .iter()
+        .flat_map(|c| c.guides.iter())
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |a, gd| {
+            (a.0.min(gd.position.z), a.1.max(gd.position.z))
+        });
+    let scale_z = (max.z - min.z) / (hi - lo).max(1e-6);
+    let cx = 0.5 * (min.x + max.x);
+    for c in &mut g.components {
+        for gd in &mut c.guides {
+            let p = gd.position;
+            gd.position = Vec3::new(cx + p.x, min.y + p.y, min.z + (p.z - lo) * scale_z);
+        }
+    }
+    g.body.floor = min.y;
+    g.body.center_x = cx;
+    g.body.crotch_y += min.y;
+    g
+}
+
+fn put(g: &mut Guides, id: &str, guide: &str, at: Vec3, report: Option<&mut JointReport>) {
+    if let Some(c) = g.components.iter_mut().find(|c| c.id == id)
+        && let Some(gd) = c.guides.iter_mut().find(|x| x.name == guide)
+    {
+        gd.position = at;
+        if let Some(report) = report {
+            report.placed.push(format!("{id}.{guide}"));
+            report.by_shape.push(format!("{id}.{guide}"));
+        }
+    }
+}
+
+/// Move the dog layout's guides onto a four-legged skeleton: the spine from the
+/// pelvis to the shoulders, neck and head, the front legs (shoulder, elbow,
+/// wrist), the hind legs (hip, knee, hock, and the paw under it) and the tail.
+/// `None` when the skeleton doesn't show four legs.
+pub fn quad_guides_from_joints(
+    fitted: Guides,
+    joints: &[Joint],
+) -> Result<Option<(Guides, JointReport)>> {
+    let Some(m) = structure::map(joints, &fitted.body, BodyKind::Quadruped) else {
+        return Ok(None);
+    };
+    let mut g = fitted;
+    let mut report = JointReport::default();
+    let mut used = vec![false; joints.len()];
+    let p = |i: usize| joints[i].position;
+    used[m.pelvis] = true;
+    put(&mut g, "spine", "pelvis", p(m.pelvis), Some(&mut report));
+    if let Some(chest) = m.chest {
+        if (1..=16).contains(&m.spine.len()) {
+            components::set_spine_joints(&mut g, "spine", m.spine.len())?;
+        }
+        for &i in &m.spine {
+            used[i] = true;
+        }
+        let base = m.head.first().copied().unwrap_or(chest);
+        put(&mut g, "spine", "chest", p(base), Some(&mut report));
+        let head_names = ["neck", "head", "head_top"];
+        for (n, &i) in head_names.iter().zip(&m.head) {
+            used[i] = true;
+            put(&mut g, "head", n, p(i), Some(&mut report));
+        }
+    }
+    for (k, side) in ["l", "r"].iter().enumerate() {
+        // Front legs: an arm laid out as a leg.
+        let arm = &m.arms[k];
+        let r = structure::arm_roles(joints, arm);
+        let id = format!("front_leg_{side}");
+        let before = g.component(&id).cloned();
+        for (guide, role) in [
+            ("clavicle", r.clavicle),
+            ("shoulder", r.shoulder),
+            ("elbow", r.elbow),
+            ("wrist", r.wrist),
+            ("hand_tip", r.hand_tip),
+        ] {
+            if let Some(i) = role {
+                used[arm[i]] = true;
+                put(&mut g, &id, guide, p(arm[i]), Some(&mut report));
+            }
+        }
+        // Without a hand end, the paw keeps the layout's length past the wrist.
+        if r.hand_tip.is_none()
+            && let (Some(c), Some(i)) = (&before, r.wrist)
+            && let (Some(old), Some(tip)) = (c.position("wrist"), c.position("hand_tip"))
+        {
+            put(&mut g, &id, "hand_tip", p(arm[i]) + (tip - old), None);
+        }
+        // Hind legs: hip, knee and hock from the chain; the paw keeps the
+        // layout's shape under the hock, on the joint at the floor if there is one.
+        let leg = &m.legs[k];
+        let id = format!("hind_leg_{side}");
+        let Some(c) = g.component(&id) else { continue };
+        let old: Vec<Vec3> = c.guides.iter().map(|x| x.position).collect();
+        let floor = g.body.floor;
+        for (n, &i) in ["hip", "knee", "hock"].iter().zip(leg.iter()) {
+            used[i] = true;
+            put(&mut g, &id, n, p(i), Some(&mut report));
+        }
+        if leg.len() >= 3 && old.len() == 7 {
+            let shift = p(leg[2]) - old[2];
+            let mut paw = [old[3], old[4], old[5], old[6]]
+                .map(|q| Vec3::new(q.x + shift.x, q.y, q.z + shift.z));
+            if let Some(&end) = leg.get(3) {
+                used[end] = true;
+                let e = p(end);
+                if e.y - floor < 0.05 * g.body.height {
+                    // The joint at the floor is the ball of the paw.
+                    let d = Vec3::new(e.x - paw[1].x, 0.0, e.z - paw[1].z);
+                    paw = paw.map(|q| q + d);
+                    paw[1] = e;
+                    // The ankle (where the paw starts) on the way down from the
+                    // hock, at the layout's height for it.
+                    let hock = p(leg[2]);
+                    let target = paw[0].y.clamp(e.y, hock.y);
+                    let t = (hock.y - target) / (hock.y - e.y).max(1e-6);
+                    paw[0] = hock.lerp(e, t);
+                } else {
+                    paw[0] = e;
+                }
+            }
+            for (n, q) in ["ankle", "ball", "toe", "heel"].iter().zip(paw) {
+                put(&mut g, &id, n, q, None);
+            }
+        }
+    }
+    // Tail: its joints and a tip continuing the last bone.
+    if m.tail.len() >= 2
+        && let Some(c) = g.components.iter_mut().find(|c| c.id == "tail")
+    {
+        let mut pts: Vec<Vec3> = m.tail.iter().map(|&i| p(i)).collect();
+        let n = pts.len();
+        pts.push(pts[n - 1] + (pts[n - 1] - pts[n - 2]));
+        c.guides = pts
+            .into_iter()
+            .enumerate()
+            .map(|(k, position)| Guide {
+                name: format!("j{}", k + 1),
+                position,
+            })
+            .collect();
+        for &i in &m.tail {
+            used[i] = true;
+        }
+        report.placed.push("tail".into());
+        report.by_shape.push("tail".into());
+    }
+    components::build(&g).context("the dog guides read from the joints don't build")?;
+    report.unused = joints
+        .iter()
+        .zip(&used)
+        .filter(|(_, u)| !**u)
+        .map(|(j, _)| j.name.clone())
+        .collect();
+    Ok(Some((g, report)))
 }
 
 /// A finger's joints from its base to its tip, as many as the skeleton has.
@@ -463,10 +771,12 @@ mod tests {
             Joint {
                 name: "ik_hand_l".into(),
                 position: Vec3::ONE,
+                parent: None,
             },
             Joint {
                 name: "hand_l".into(),
                 position: Vec3::X,
+                parent: None,
             },
         ];
         let mut look = Lookup::new(&joints);
@@ -507,6 +817,7 @@ mod tests {
             .map(|b| Joint {
                 name: mixamo(&b.name),
                 position: b.head + shift,
+                parent: b.parent,
             })
             .collect();
         let (fresh, _) = rig::detect_guides(&mesh);

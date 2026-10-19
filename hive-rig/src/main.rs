@@ -4,6 +4,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use hive_rig::components::{self, AddOptions, Guides, Kind, Preset};
+use hive_rig::import::Character;
+use hive_rig::orient::{self, Axis, Choice, Detection, Orientation};
 use hive_rig::rig::detect_guides;
 use hive_rig::skeleton::Side;
 use hive_rig::skin::{Engine, SkinLimits, SkinOptions};
@@ -25,7 +27,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Rig a humanoid mesh (.obj, .gltf or .glb; Y-up, facing +Z, T- or A-pose).
+    /// Rig a character (.obj, .gltf or .glb; a biped in T- or A-pose, or an
+    /// animal on four legs). Its up axis and facing are detected (or given with
+    /// --up and --forward).
     Rig {
         input: PathBuf,
         /// Output directory.
@@ -41,6 +45,8 @@ enum Command {
         /// joints become the guides).
         #[arg(long)]
         ignore_joints: bool,
+        #[command(flatten)]
+        orient: OrientFlags,
         #[command(flatten)]
         common: Common,
     },
@@ -171,6 +177,8 @@ enum Command {
         /// Apply the fixes that are mechanical and save the guides file.
         #[arg(long)]
         fix: bool,
+        #[command(flatten)]
+        orient: OrientFlags,
     },
     /// Save a layout as a template, load one onto a layout, or list them.
     Template {
@@ -429,6 +437,32 @@ impl WeightEdit {
     }
 }
 
+/// The source file's up axis and facing, when detection gets them wrong.
+#[derive(clap::Args, Default, Clone, Copy)]
+struct OrientFlags {
+    /// The file's axis that points up through the character: +x, -x, +y, -y,
+    /// +z or -z (default: detected from the feet, legs, head and skeleton).
+    #[arg(long, value_parser = parse_axis, allow_hyphen_values = true)]
+    up: Option<Axis>,
+    /// The file's axis the character faces along (default: detected from the
+    /// toes, or for an animal on four legs its head end).
+    #[arg(long, value_parser = parse_axis, allow_hyphen_values = true)]
+    forward: Option<Axis>,
+}
+
+impl OrientFlags {
+    fn choice(self) -> Choice {
+        Choice {
+            up: self.up,
+            forward: self.forward,
+        }
+    }
+}
+
+fn parse_axis(s: &str) -> std::result::Result<Axis, String> {
+    s.parse::<Axis>().map_err(|e| e.to_string())
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum SideArg {
     Left,
@@ -503,11 +537,25 @@ impl Common {
     }
 }
 
-fn run(mesh: Mesh, name: &str, mut guides: Guides, out: &Path, common: &Common) -> Result<()> {
+fn run(
+    mesh: Mesh,
+    name: &str,
+    mut guides: Guides,
+    out: &Path,
+    common: &Common,
+    orientation: Orientation,
+) -> Result<()> {
     common.skin.apply(&mut guides.skin)?;
     print_warnings(&guides, &mesh);
-    let rig = build_rig(mesh, name, guides, common.options())?;
-    write(&rig, out, &common.output)
+    let mut rig = build_rig(mesh, name, guides, common.options())?;
+    rig.orientation = orientation;
+    write(&rig, out, &common.output)?;
+    if !orientation.is_standard() {
+        println!(
+            "  The .glb and .fbx stand it as in the source ({orientation}); the Blender and Maya scripts build it upright, facing front."
+        );
+    }
+    Ok(())
 }
 
 fn write(rig: &Rig, out: &Path, output: &Outputs) -> Result<()> {
@@ -541,20 +589,32 @@ fn warn_undetected(d: &hive_rig::landmarks::Detected) {
     }
 }
 
-/// Guides for a character file: from its joints when it has a skeleton,
-/// otherwise detected on the mesh.
-fn character(mesh: &Mesh, path: &Path) -> Result<Guides> {
-    let joints = import::load_joints(path)?;
-    let (guides, d, used) = rig::character_guides(mesh, &joints);
+/// Say how the character stands in its file and which layout it gets.
+fn print_orientation(d: &Detection) {
+    println!("Orientation: {}", d.summary());
+    println!("Template: {}", d.body.template());
+}
+
+/// Guides for a character: from its joints when it has a skeleton (unless
+/// `ignore_joints`), otherwise detected on the mesh; the dog layout for an
+/// animal on four legs.
+fn character(ch: &Character, ignore_joints: bool) -> Result<Guides> {
+    let joints: &[hive_rig::joints::Joint] = if ignore_joints { &[] } else { &ch.joints };
+    let (guides, d, used) = rig::character_guides(&ch.mesh, joints, ch.detection.body);
     match used {
         None => {
             warn_undetected(&d);
         }
         Some(Ok(report)) => {
             println!(
-                "Read {} guides from the file's {} joints{}.",
+                "Read {} guides from the file's {} joints{}{}.",
                 report.placed.len(),
                 joints.len(),
+                if report.by_shape.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({} by the skeleton's shape)", report.by_shape.len())
+                },
                 if report.added.is_empty() {
                     String::new()
                 } else {
@@ -617,13 +677,15 @@ fn print_warnings(guides: &Guides, mesh: &Mesh) {
     }
 }
 
-fn check_command(file: &Path, mesh: Option<&Path>, fix: bool) -> Result<()> {
+fn check_command(file: &Path, mesh: Option<&Path>, fix: bool, orient: OrientFlags) -> Result<()> {
     let is_rig = file
         .to_string_lossy()
         .to_lowercase()
         .ends_with(".hive.json");
+    let mut orientation_line = None;
     let (guides_path, mut guides, rig_mesh) = if is_rig {
         let rig = load_rig(file)?;
+        orientation_line = Some(format!("{} (from the rig)", rig.orientation));
         let dir = file.parent().unwrap_or(Path::new("."));
         let next_to = dir.join(format!("{}.guides.json", rig.name));
         // A rebuild reads the guides next to the rig, so those are the ones to check.
@@ -636,13 +698,31 @@ fn check_command(file: &Path, mesh: Option<&Path>, fix: bool) -> Result<()> {
     } else {
         (Some(file.to_path_buf()), load_guides(file)?, None)
     };
+    let mut body = None;
     let mesh = match mesh {
-        Some(m) => Some(import::load_mesh(m)?),
+        Some(m) => {
+            let ch = import::load_character(m, orient.choice())?;
+            orientation_line = Some(ch.detection.summary());
+            body = Some(ch.detection.body);
+            Some(ch.mesh)
+        }
         None => rig_mesh,
     };
     let mut surface = mesh.as_ref().map(checks::Surface::new);
     let shown = guides_path.as_deref().unwrap_or(file);
     println!("{}: {}", shown.display(), guides.origin());
+    if let Some(o) = &orientation_line {
+        println!("  orientation: {o}");
+    }
+    println!(
+        "  template: {}{}",
+        orient::layout_name(&guides),
+        body.map(|b| format!(" (the body looks like a {} layout)", b.template()))
+            .unwrap_or_default()
+    );
+    if let Some(advice) = body.and_then(|b| orient::template_advice(&guides, b)) {
+        println!("warning: {advice}");
+    }
     if surface.is_none() {
         println!("  (no mesh given: pass --mesh or a .hive.json to check guides against the body)");
     }
@@ -712,8 +792,8 @@ fn guided_rig(dropped: Option<PathBuf>) -> Result<()> {
     };
     let out = match input {
         Some(input) => {
-            let mesh = import::load_mesh(&input)?;
-            mesh.validate()?;
+            let ch = import::load_character(&input, Choice::default())?;
+            ch.mesh.validate()?;
             let stem = input
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
@@ -723,8 +803,10 @@ fn guided_rig(dropped: Option<PathBuf>) -> Result<()> {
                 .unwrap_or(Path::new("."))
                 .join(format!("{stem}_rig"));
             println!();
-            let guides = character(&mesh, &input)?;
-            run(mesh, &stem, guides, &out, &common)?;
+            print_orientation(&ch.detection);
+            let guides = character(&ch, false)?;
+            let o = ch.detection.orientation;
+            run(ch.mesh, &stem, guides, &out, &common, o)?;
             out
         }
         None => {
@@ -733,7 +815,14 @@ fn guided_rig(dropped: Option<PathBuf>) -> Result<()> {
             println!();
             let mesh = demo::humanoid(0.0);
             let guides = detect(&mesh);
-            run(mesh, "hive_demo", guides, &out, &common)?;
+            run(
+                mesh,
+                "hive_demo",
+                guides,
+                &out,
+                &common,
+                Orientation::STANDARD,
+            )?;
             out
         }
     };
@@ -910,7 +999,9 @@ fn shape_command(path: &Path, action: ShapeCommand) -> Result<()> {
                     )
                 }
                 (None, Some(file)) => {
-                    let target = import::load_mesh(&file)?;
+                    // The sculpt is in the source file's frame, like the source.
+                    let mut target = import::load_mesh(&file)?;
+                    orient::turn_mesh(&mut target, rig.orientation.to_standard());
                     anyhow::ensure!(
                         target.vertex_count() == rig.mesh.vertex_count(),
                         "{} has {} vertices; the rig's mesh has {}",
@@ -1155,10 +1246,12 @@ fn main() -> Result<()> {
             name,
             guides,
             ignore_joints,
+            orient,
             common,
         } => {
-            let mesh = import::load_mesh(&input)?;
-            mesh.validate()?;
+            let ch = import::load_character(&input, orient.choice())?;
+            ch.mesh.validate()?;
+            print_orientation(&ch.detection);
             let name = name.unwrap_or_else(|| {
                 input
                     .file_stem()
@@ -1167,10 +1260,10 @@ fn main() -> Result<()> {
             });
             let guides = match guides {
                 Some(path) => load_guides(&path)?,
-                None if ignore_joints => detect(&mesh),
-                None => character(&mesh, &input)?,
+                None => character(&ch, ignore_joints)?,
             };
-            run(mesh, &name, guides, &out, &common)
+            let o = ch.detection.orientation;
+            run(ch.mesh, &name, guides, &out, &common, o)
         }
         Command::Demo {
             out,
@@ -1180,7 +1273,14 @@ fn main() -> Result<()> {
             ..
         } if quadruped || creature.is_some() => {
             let c = creature.unwrap_or(demo::Creature::Dog);
-            run(c.mesh(), &c.rig_name(), c.guides(), &out, &common)
+            run(
+                c.mesh(),
+                &c.rig_name(),
+                c.guides(),
+                &out,
+                &common,
+                Orientation::STANDARD,
+            )
         }
         Command::Demo {
             out,
@@ -1193,7 +1293,14 @@ fn main() -> Result<()> {
             let mesh = demo::humanoid(arm_drop);
             let mut guides = detect(&mesh);
             components::set_limb_options(&mut guides, bendy, soft);
-            run(mesh, "hive_demo", guides, &out, &common)
+            run(
+                mesh,
+                "hive_demo",
+                guides,
+                &out,
+                &common,
+                Orientation::STANDARD,
+            )
         }
         Command::Rebuild {
             rig,
@@ -1214,6 +1321,7 @@ fn main() -> Result<()> {
             }
             let opts = common.options();
             let mut new = build_rig(old.mesh.clone(), &old.name, guides, opts)?;
+            new.orientation = old.orientation;
             if keep_weights {
                 // The old rig's automatic weights tell its hand edits apart.
                 let base = old.auto_weights(opts.skin);
@@ -1338,7 +1446,12 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Check { file, mesh, fix } => check_command(&file, mesh.as_deref(), fix),
+        Command::Check {
+            file,
+            mesh,
+            fix,
+            orient,
+        } => check_command(&file, mesh.as_deref(), fix, orient),
         Command::Template { action } => template_command(action),
         Command::Naming {
             guides,

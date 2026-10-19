@@ -2,13 +2,15 @@
 
     python blender_skin_eval.py <name>.hive.json [--source model.glb] [--json out.json]
         [--max-leg-leak X] [--max-arm-leak X] [--min-thickness X] [--max-spikes X]
-        [--max-piece-wrong X] [--max-artist-diff X]
+        [--max-piece-wrong X] [--max-artist-diff X] [--require-artist]
 
 The rig's mesh, bones and weights are rebuilt in Blender as a plain armature
 with an Armature modifier (the control rig isn't needed to judge the weights).
 With `--source`, the glTF the rig was made from (`hive-rig rig model.glb`) is
 read for the artist's weights, which are mapped onto the rig's bones and judged
-the same way, as a reference row.
+the same way, as a reference row. `--require-artist` fails when the source's
+vertices don't line up with the rig's (it was placed, turned or stood up
+differently), so no artist reference can be read.
 
 Measured, for the rig's weights and (with --source) the artist's:
 
@@ -48,6 +50,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("rig")
 ap.add_argument("--source")
 ap.add_argument("--json")
+ap.add_argument("--require-artist", action="store_true")
 for flag in ("max-leg-leak", "max-arm-leak", "min-thickness", "max-spikes", "max-piece-wrong", "max-artist-diff"):
     ap.add_argument("--" + flag, type=float)
 argv = sys.argv[sys.argv.index("--") + 1 :] if "--" in sys.argv else sys.argv[1:]
@@ -203,9 +206,24 @@ def node_matrix(n):
     return t @ r @ s
 
 
+AXES = {"+x": (1, 0, 0), "-x": (-1, 0, 0), "+y": (0, 1, 0), "-y": (0, -1, 0), "+z": (0, 0, 1), "-z": (0, 0, -1)}
+
+
+def to_rig_frame():
+    """The turn from the source file's frame into the rig's (hive-rig stands a
+    character Y up, facing +Z, and records how the source stood it)."""
+    o = rig.get("orientation")
+    if not o:
+        return np.eye(3)
+    up, fwd = np.array(AXES[o["up"]], float), np.array(AXES[o["forward"]], float)
+    return np.stack([np.cross(up, fwd), up, fwd], axis=1).T
+
+
 def artist_weights(path):
     """The source file's weights in the order hive-rig loads its vertices, with
-    each joint as a segment to its children, in the same space."""
+    each joint as a segment to its children, in the rig's frame. Skinned
+    vertices sit where their joints put them at rest (glTF ignores a skinned
+    mesh node's own transform), joints at their rest pose."""
     g, binary = read_glb(path)
     scene = g["scenes"][g.get("scene", 0)]
     world = {}
@@ -218,6 +236,7 @@ def artist_weights(path):
 
     for i in scene["nodes"]:
         walk(i, Matrix.Identity(4))
+    W = {i: np.array(m) for i, m in world.items()}
     rows, joint_pos, joint_children = [], {}, {}
     positions = []
 
@@ -225,21 +244,23 @@ def artist_weights(path):
         n = g["nodes"][i]
         if "mesh" in n:
             skin = g["skins"][n["skin"]] if "skin" in n else None
+            S = None
             if skin is not None:
                 ibm = accessor(g, binary, skin["inverseBindMatrices"]) if "inverseBindMatrices" in skin else None
+                S = []
                 for k, jn in enumerate(skin["joints"]):
-                    if ibm is not None:
-                        m = Matrix([ibm[k][c::4] for c in range(4)]).inverted()
-                        joint_pos[jn] = np.array(world[i] @ m.translation)
-                    else:
-                        joint_pos[jn] = np.array(world[jn].translation)
+                    joint_pos[jn] = W[jn][:3, 3].copy()
+                    b = np.array(ibm[k]).reshape(4, 4).T if ibm is not None else np.eye(4)
+                    S.append(W[jn] @ b)
+                S = np.array(S)
             for prim in g["meshes"][n["mesh"]]["primitives"]:
                 if prim.get("mode", 4) != 4:
                     continue
                 attrs = prim["attributes"]
                 pos = accessor(g, binary, attrs["POSITION"])
-                positions.extend(np.array(world[i] @ Vector(p)) for p in pos)
+                ph = np.c_[pos, np.ones(len(pos))]
                 if skin is None or "JOINTS_0" not in attrs:
+                    positions.extend((W[i] @ ph.T).T[:, :3])
                     rows.extend([{}] * len(pos))
                     continue
                 sets = []
@@ -247,13 +268,21 @@ def artist_weights(path):
                 while f"JOINTS_{k}" in attrs:
                     sets.append((accessor(g, binary, attrs[f"JOINTS_{k}"]), accessor(g, binary, attrs[f"WEIGHTS_{k}"])))
                     k += 1
+                same = np.abs(S - S[0]).max() <= 1e-4 * max(np.abs(S[0]).max(), 1e-6)
                 for v in range(len(pos)):
                     row = {}
+                    m = np.zeros((4, 4))
                     for js, ws in sets:
                         for j, w in zip(js[v], ws[v]):
                             if w > 0:
                                 jn = skin["joints"][int(j)]
                                 row[jn] = row.get(jn, 0.0) + w
+                                m += w * S[int(j)]
+                    if same or not row:
+                        m = S[0]
+                    else:
+                        m /= sum(row.values())
+                    positions.append((m @ ph[v])[:3])
                     rows.append(row)
         for c in n.get("children", []):
             collect(c)
@@ -263,7 +292,10 @@ def artist_weights(path):
     for jn in joint_pos:
         joint_children[jn] = [c for c in g["nodes"][jn].get("children", []) if c in joint_pos]
     names = {jn: g["nodes"][jn].get("name", f"joint_{jn}") for jn in joint_pos}
-    return np.array(positions), rows, joint_pos, joint_children, names
+    turn = to_rig_frame()
+    positions = np.array(positions) @ turn.T
+    joint_pos = {jn: turn @ q for jn, q in joint_pos.items()}
+    return positions, rows, joint_pos, joint_children, names
 
 
 def map_artist(path):
@@ -502,6 +534,8 @@ if args.source:
         artist, unweighted = mapped
         if unweighted:
             print(f"  {unweighted} source vertices have no artist weights; they are left out")
+    elif args.require_artist:
+        sys.exit("skin weights fail: no artist reference (the source doesn't line up with the rig)")
 truth = truth_parts(artist)
 rows = {"rig": evaluate(OURS, artist, truth, "rig")}
 if artist is not None:

@@ -6,7 +6,8 @@
 #
 # Khronos glTF sample models (CC-BY 4.0 unless the model's README says
 # otherwise): CesiumMan, RiggedFigure, RiggedSimple, BrainStem, Fox.
-# three.js example models: RobotExpressive (CC0, by Tomás Laulhé).
+# three.js example models: RobotExpressive (CC0, by Tomás Laulhé); Michelle,
+# Soldier and Xbot (Mixamo characters shipped with the three.js examples).
 # Each lands at OUT_DIR/<model>/<model>.glb. Treat the files as untrusted data:
 # run Python on them with -I.
 set -eu
@@ -17,6 +18,7 @@ shift
 for model in "$@"; do
   case "$model" in
     RobotExpressive) url="$THREE/RobotExpressive/RobotExpressive.glb" ;;
+    Michelle | Soldier | Xbot) url="$THREE/$model.glb" ;;
     CesiumMan | RiggedFigure | RiggedSimple | BrainStem | Fox) url="$KHRONOS/$model/glTF-Binary/$model.glb" ;;
     *) echo "unknown model $model" >&2; exit 2 ;;
   esac

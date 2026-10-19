@@ -92,7 +92,9 @@ their texture files, and blend shapes; see [Mesh fidelity](#mesh-fidelity)), one
 [naming convention](#naming-conventions) and parented as in the skeleton, the
 skin weights with every influence the skin keeps (8 for `--engine unreal`, up to
 12; FBX has no limit of four), and a bind pose for the mesh and every bone. It
-is Y-up, facing +Z, in centimetres; Unity and Blender scale it to metres. Joints
+is a Y-up file in centimetres (Unity and Blender scale it to metres), with the
+character standing as it stood in the source (see
+[Input requirements](#input-requirements)). Joints
 carry translation only, like the `.glb`. FBX has no controls: use the Unreal
 script for a Control Rig.
 
@@ -376,9 +378,18 @@ layout's.
   below the belly line (`crotch_y`) skins as a leg, starts in IK and gets an
   upright IK control.
 
-Body detection only knows bipeds. To rig your own four-legged mesh, start from
-the dog's guides and move them onto it (in the app, or Edit Guides in Blender
-or Maya): `hive-rig rig my_dog.glb --guides out/hive_dog.guides.json`.
+A four-legged character is recognised when it is opened or rigged: by four
+limb ends on the floor under a skeleton with two pairs of legs, or, with no
+skeleton, by mirrored pairs of feet and legs spread out front to back. It then
+gets the dog layout, with the guides fitted to the mesh (body, head end, tail
+and four legs) and, when it has a skeleton, moved onto its joints by their
+shape: hips and shoulders where each pair of legs meets, the spine between
+them, the neck and head forward of the shoulders and the tail behind the hips.
+`rig` and `check` print `Template: dog`; the Checks card says so too, and
+suggests the dog template when a biped layout sits on a four-legged body. For a
+body it gets wrong, start from the dog's guides and move them onto it (in the
+app, or Edit Guides in Blender or Maya):
+`hive-rig rig my_dog.glb --guides out/hive_dog.guides.json`.
 
 ### More creatures: bird, spider and snake
 
@@ -438,6 +449,20 @@ guides: Unreal mannequin, Mixamo (`mixamorig:LeftArm`), 3ds Max biped
 are added when the skeleton has them; twist and helper joints are listed as not
 used. Guides with no matching joint stay where body detection put them. Pass
 `--ignore-joints` to place the guides on the mesh instead.
+
+Names are checked against the skeleton's shape, and the shape fills in what the
+names don't say, so unnamed or numbered joints (`leg_joint_L_2`, `Bone.012`)
+work too. The limbs are the chains ending at the floor on each side, the pelvis
+is where the two legs meet, the arms are the chains reaching furthest out on
+each side above them (followed down to the hands when the arms hang), the chest
+is where the two arms meet and the head chain runs up from it. A joint's side
+comes from where it is, not from its name. Along a limb, the wrist is where the
+fingers branch, the ankle where the chain turns along the floor, and the elbow
+and knee the joints about halfway. A name is used only when its joint lies in
+the limb the shape found; `rig` says how many guides came from the shape. Feet
+hung from the root rather than the legs (as IK rigs do) are joined to the leg
+ending just above them. Joints are read at the file's rest pose, where a glTF
+viewer shows the character.
 
 ### Parenting, test poses and control looks
 
@@ -582,7 +607,11 @@ hive-rig check out/hero.guides.json --fix             # apply the offered fixes 
 ```
 
 `check` prints each warning with what to do, and exits non-zero only when the
-guides can't build. Given a `.hive.json` it uses the rig's mesh and the guides
+guides can't build. It also prints the character's orientation (from the rig,
+or detected from `--mesh`) and the layout the guides use, with a warning when
+the body looks like the other template (a biped layout on a four-legged body).
+The Checks card shows the same two lines, with the orientation control (see
+[Input requirements](#input-requirements)). Given a `.hive.json` it uses the rig's mesh and the guides
 next to it (the ones `rebuild` reads). `rig`, `rebuild` and `demo` print the
 same warnings before building.
 
@@ -750,13 +779,45 @@ Unreal doesn't have these tools yet.
 ## Input requirements
 
 * `.obj`, `.gltf` or `.glb`
-* One humanoid standing on the ground in T-pose or A-pose
-* Y-up, facing +Z (the glTF convention, and the default for Blender's glTF
-  and OBJ exporters)
+* One humanoid standing on the ground in T-pose or A-pose, or a four-legged
+  animal standing on all fours
+* Any up axis and facing (see below)
 * Arms clear of the body and legs apart
 
 If the legs, arms or neck can't be found from the geometry, the rigger falls
 back to average human proportions and prints a warning.
+
+**Orientation.** hive-rig works in one frame: Y up, facing +Z, with the
+character's left on +X (the glTF convention). A character that stands
+otherwise (Z-up, facing -Z or +X, lying on its back) is turned into that frame
+when it is read. The turn is one of the 24 that swap and flip axes, chosen from
+the mesh and, when there is one, the skeleton: the axis the body is mirrored
+across is left and right; up is the axis with feet (or four feet) on the floor
+at one end, legs above them and a head at the top, and the skeleton's legs
+hanging below their hips; the facing is the side the toes point to (soles
+against the shins, toe joints ahead of their ankles), or a four-legged body's
+head end. When nothing stands out (a sphere, say) the file's own axes are kept
+and the result says it is unsure. A skinned glTF is read where its skeleton
+puts it at rest, as a glTF viewer shows it: the mesh node's own transform,
+which glTF ignores for skinned meshes, isn't applied.
+
+```bash
+hive-rig rig zup_hero.glb -o out                      # prints: Orientation: up +Z, facing -Y (detected from ...)
+hive-rig rig hero.glb -o out --up +z --forward -y     # set either or both; the rest is detected
+hive-rig check hero.guides.json --mesh hero.glb --up +y
+```
+
+`--up` and `--forward` take `+x`, `-x`, `+y`, `-y`, `+z` or `-z` in the
+source file's axes. In the app, the **Checks** card shows the orientation with
+**Up** and **Facing** menus that turn the character at once (the guides are
+placed again), and **Detect** to go back to the detected one.
+
+The rig records the orientation (`orientation` in `.hive.json`; `rebuild` keeps
+it). The `.glb` and `.fbx` turn the character back, so it stands where it stood
+in the source and drops into the same scene. The Blender and Maya scripts build
+it upright, Y-up facing +Z in glTF terms (Blender's Z up, facing -Y; Maya's Y
+up, facing +Z), so their controls face the usual way. The Unreal script follows
+the `.glb` it imports. Guides files are always in hive-rig's frame.
 
 ## How it works
 
@@ -807,6 +868,21 @@ python tests/blender_anim_check.py out/hive_demo_blender.py             # animat
 python tests/blender_fbx_check.py out/hive_demo.fbx out/hive_demo.hive.json   # after demo --targets fbx -o out
 python tests/blender_anim_check.py bird/hive_bird_blender.py   # after demo --creature bird -o bird (or spider, snake)
 ```
+
+Orientation and joint reading are tested in `cargo test` on built-in bodies in
+every one of the 24 orientations (a T-pose, an A-pose and the dog: up, facing
+and template), a round trip of a turned rig through the `.glb`, `.fbx` and
+`.hive.json`, nameless biped and dog skeletons read by their shape, and the app
+opening a turned character and turning it by hand. CI rigs three public
+characters fetched at pinned commits (`tests/fetch_skin_models.sh`): Soldier,
+which faces -Z, Michelle, whose armature stands her up, and Fox, a quadruped.
+It checks the printed orientation and template, that the guides stand upright
+with the left side on +X, and the skin weights against the artist's with
+`blender_skin_eval.py --require-artist`, which fails when the source's vertices
+don't line up with the rig's. The fetch script also gets Xbot, RobotExpressive,
+CesiumMan, RiggedFigure and BrainStem;
+[docs/skinning.md](docs/skinning.md#orientation-and-joint-reading) has the
+before and after measurements on all eight.
 
 `blender_fbx_check.py` imports the `.fbx` with Blender's own FBX importer and
 compares it with the `.hive.json`: the bone count, names, parents and rest

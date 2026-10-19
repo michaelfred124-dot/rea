@@ -14,7 +14,9 @@ use hive_rig::checks::{self, Issue, Surface};
 use hive_rig::components::{
     self, AddOptions, Built, Component, ControlStyle, Guide, Guides, Kind, Options, Preset,
 };
+use hive_rig::joints::Joint;
 use hive_rig::naming::Naming;
+use hive_rig::orient::{Choice, Detection, Orientation};
 use hive_rig::rig::detect_guides;
 use hive_rig::skeleton::{Side, turn_about};
 use hive_rig::skin::{BrushMode, Dab, SkinLimits, SkinOptions, SkinWeights};
@@ -52,6 +54,19 @@ pub struct Doc {
     /// before any guide edit.
     skin_undo: Vec<SkinWeights>,
     skin_redo: Vec<SkinWeights>,
+    /// How the character stood in its source file; builds record it so the
+    /// .glb and .fbx put it back that way.
+    pub orientation: Orientation,
+    /// The character as read from its file (its own frame), and what was
+    /// detected, so the orientation can be changed after opening.
+    pub source: Option<SourceFile>,
+}
+
+/// A character as its file has it, before it was turned into hive-rig's frame.
+pub struct SourceFile {
+    pub mesh: Mesh,
+    pub joints: Vec<Joint>,
+    pub detection: Detection,
 }
 
 impl Doc {
@@ -73,6 +88,8 @@ impl Doc {
             kept: None,
             skin_undo: Vec::new(),
             skin_redo: Vec::new(),
+            orientation: Orientation::STANDARD,
+            source: None,
         };
         doc.refresh();
         doc
@@ -399,6 +416,7 @@ impl Studio {
     fn open_character(&mut self, path: &Path) -> anyhow::Result<()> {
         let mesh = import::load_mesh(path)?;
         mesh.validate()?;
+        let joints = import::load_joints(path)?;
         let stem = path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
@@ -407,8 +425,62 @@ impl Studio {
             .parent()
             .unwrap_or(Path::new("."))
             .join(format!("{stem}_rig"));
-        let joints = import::load_joints(path)?;
-        let (guides, found, from_joints) = hive_rig::rig::character_guides(&mesh, &joints);
+        self.place_character(
+            stem,
+            mesh,
+            joints,
+            Choice::default(),
+            out_dir,
+            &path.display().to_string(),
+        )
+    }
+
+    /// Turn the open character to `choice` (unset parts detected) and place its
+    /// guides again. The view shows it turned at once.
+    pub fn reorient(&mut self, choice: Choice) {
+        let Some(doc) = &self.doc else { return };
+        let Some(src) = &doc.source else {
+            self.warning("Only a character opened from a file can be turned.");
+            return;
+        };
+        let (name, mesh, joints, out_dir) = (
+            doc.name.clone(),
+            src.mesh.clone(),
+            src.joints.clone(),
+            doc.out_dir.clone(),
+        );
+        if let Err(e) = self.place_character(name.clone(), mesh, joints, choice, out_dir, &name) {
+            self.fail(format!("Couldn't turn the character: {e:#}"));
+        }
+    }
+
+    /// Orient a character read from a file, place its guides and open it.
+    fn place_character(
+        &mut self,
+        stem: String,
+        source_mesh: Mesh,
+        source_joints: Vec<Joint>,
+        choice: Choice,
+        out_dir: PathBuf,
+        shown: &str,
+    ) -> anyhow::Result<()> {
+        let ch = import::orient_character(source_mesh.clone(), source_joints.clone(), choice);
+        let (mesh, joints, detection) = (ch.mesh, ch.joints, ch.detection);
+        let (guides, found, from_joints) =
+            hive_rig::rig::character_guides(&mesh, &joints, detection.body);
+        let summary = format!(
+            "{}; {} layout",
+            detection.summary(),
+            detection.body.template()
+        );
+        let mut doc = Doc::new(stem, mesh, guides, out_dir);
+        doc.orientation = detection.orientation;
+        doc.source = Some(SourceFile {
+            mesh: source_mesh,
+            joints: source_joints,
+            detection,
+        });
+        let path = shown;
         let missing: Vec<&str> = [
             (found.crotch, "legs"),
             (found.arms, "arms"),
@@ -418,8 +490,8 @@ impl Studio {
         .filter(|(ok, _)| !ok)
         .map(|(_, what)| what)
         .collect();
-        let verts = mesh.vertex_count();
-        self.set_doc(Doc::new(stem, mesh, guides, out_dir));
+        let verts = doc.mesh.vertex_count();
+        self.set_doc(doc);
         match from_joints {
             Some(Ok(report)) if !report.placed.is_empty() => {
                 let added = if report.added.is_empty() {
@@ -428,7 +500,7 @@ impl Studio {
                     format!(", with {}", report.added.join(", "))
                 };
                 self.info(format!(
-                    "Loaded {verts} vertices and read {} guides from its {} joints{added}. Check them, then Build Rig.",
+                    "Loaded {verts} vertices and read {} guides from its {} joints{added}. Orientation: {summary}. Check them, then Build Rig.",
                     report.placed.len(),
                     joints.len()
                 ));
@@ -444,8 +516,7 @@ impl Studio {
         }
         if missing.is_empty() {
             self.info(format!(
-                "Loaded {} ({verts} vertices). Guides placed on the body: drag them to adjust, then Build Rig.",
-                path.display()
+                "Loaded {path} ({verts} vertices). Orientation: {summary}. Guides placed on the body: drag them to adjust, then Build Rig."
             ));
         } else {
             self.fail(format!(
@@ -461,6 +532,7 @@ impl Studio {
         let newer = rig.newer_warning();
         let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
         let mut doc = Doc::new(rig.name.clone(), rig.mesh.clone(), rig.guides.clone(), dir);
+        doc.orientation = rig.orientation;
         // The automatic weights of the saved guides tell its painted vertices apart.
         doc.auto_skin = Some(rig.auto_weights(SkinOptions::default()));
         doc.rig = Some(rig);
@@ -1571,6 +1643,7 @@ impl Studio {
             RigOptions::default(),
         ) {
             Ok(mut rig) => {
+                rig.orientation = doc.orientation;
                 let auto = rig.skin.clone();
                 // Building again over a built rig keeps its edits too.
                 let old = match doc.rig.take() {
@@ -1889,6 +1962,41 @@ mod tests {
             .iter()
             .position(|c| c.id == id)
             .unwrap()
+    }
+
+    /// A character saved lying along +Z opens upright, can be turned by hand,
+    /// and the built rig keeps the orientation it was opened with.
+    #[test]
+    fn opens_a_turned_character_upright() {
+        use hive_rig::orient::Axis;
+        let o = Orientation::new(Axis::PosZ, Axis::NegY).unwrap();
+        let mut rig =
+            hive_rig::auto_rig(demo::humanoid(0.0), "turned", RigOptions::default()).unwrap();
+        rig.orientation = o;
+        let dir = std::env::temp_dir().join(format!("hive_studio_turned_{}", std::process::id()));
+        export::write_all(&rig, &dir, &[]).unwrap();
+        let mut s = Studio::default();
+        s.open(&dir.join("turned.glb"));
+        assert!(!s.error, "{}", s.status);
+        let doc = s.doc.as_ref().unwrap();
+        assert_eq!(doc.orientation, o);
+        let (lo, hi) = doc.mesh.bounds();
+        assert!(hi.y - lo.y > 2.0 * (hi.z - lo.z), "{lo} {hi}");
+        assert!(s.build(), "{}", s.status);
+        assert_eq!(s.doc.as_ref().unwrap().rig.as_ref().unwrap().orientation, o);
+        // Forcing the file's own axes leaves it lying down.
+        s.reorient(Choice {
+            up: Some(Axis::PosY),
+            forward: Some(Axis::PosZ),
+        });
+        let doc = s.doc.as_ref().unwrap();
+        assert!(doc.orientation.is_standard());
+        let (lo, hi) = doc.mesh.bounds();
+        assert!(hi.z - lo.z > 2.0 * (hi.y - lo.y), "{lo} {hi}");
+        // Detecting again stands it up.
+        s.reorient(Choice::default());
+        assert_eq!(s.doc.as_ref().unwrap().orientation, o);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
