@@ -208,6 +208,17 @@ pub fn compute(mesh: &Mesh, sk: &Skeleton, opts: SkinOptions, limits: SkinLimits
         .collect();
 
     smooth_dense(&mut dense, &surface_adjacency(mesh), opts, None, max);
+    // Smoothing carries weight a few edges further; a bone with a reach (a face
+    // joint) still moves nothing beyond it. `limit` renormalises below.
+    for (k, &b) in deform.iter().enumerate() {
+        if let Some(r) = sk.bones[b].reach {
+            for (w, d) in dense.iter_mut().zip(&dist[k]) {
+                if d.is_nan() || *d >= r {
+                    w[b] = 0.0;
+                }
+            }
+        }
+    }
     let mut out = SkinWeights::from_dense(&dense);
     for v in 0..out.vertex_count() {
         if out.joints[v].is_empty() {
@@ -1130,6 +1141,7 @@ pub fn deform_turn(
 mod tests {
     use super::*;
     use crate::components::Body;
+    use crate::skeleton::Bone;
     use crate::{components, demo, landmarks::detect};
 
     struct Built {
@@ -1361,6 +1373,55 @@ mod tests {
             assert_eq!(dominant(&skin, v), eye, "eyeball vertex {v}");
             assert!(skin.weight(v, eye) > 0.8, "{}", skin.weight(v, eye));
         }
+    }
+
+    #[test]
+    fn face_joints_weigh_nothing_beyond_their_reach() {
+        // Smoothing spreads weight a few edges; seam copies (as in a mesh
+        // exported from Blender) let it spread further. Reach still holds.
+        let mut mesh = demo::humanoid(0.0);
+        let mut guides = components::biped(&detect(&mesh));
+        components::add_preset(
+            &mut guides,
+            components::Preset::Face,
+            &components::AddOptions::default(),
+        )
+        .unwrap();
+        let sk = components::build(&guides).unwrap().skeleton;
+        let n = mesh.vertex_count() as u32;
+        mesh.positions.extend(mesh.positions.clone());
+        mesh.normals.extend(mesh.normals.clone());
+        for (t, tri) in mesh.indices.chunks_mut(3).enumerate() {
+            if t % 2 == 0 {
+                for i in tri {
+                    *i += n;
+                }
+            }
+        }
+        let skin = compute(&mesh, &sk, SkinOptions::default(), SkinLimits::default());
+        let mut checked = 0;
+        for (b, bone) in sk.bones.iter().enumerate() {
+            let Some(r) = bone.reach else { continue };
+            let (head, tail) = sk.skin_segment(b);
+            let seg = Bone {
+                head,
+                tail,
+                ..bone.clone()
+            };
+            for v in 0..mesh.vertex_count() {
+                if skin.weight(v, b) > 0.0 {
+                    let d = seg.distance_to(mesh.positions[v]);
+                    assert!(
+                        d < r,
+                        "{} weighs vertex {v} at {d} beyond reach {r}",
+                        bone.name
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0, "no face joint weighs any vertex");
+        assert_normalised(&skin);
     }
 
     #[test]
