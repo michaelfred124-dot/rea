@@ -22,7 +22,9 @@ use hive_rig::skeleton::Side;
 use hive_rig::skin::{Engine, INFLUENCE_CAP};
 use hive_rig::template::{self, Listed, Scope, Source, Template};
 
-use super::{Category, Doc, Drag, FingerSides, Mode, Pose, RigPick, Studio, count, push_undo};
+use super::{
+    Category, Doc, Drag, FingerSides, Mode, Pose, RigPick, Studio, Tool, count, push_undo,
+};
 use crate::theme::{
     self, ACCENT, BORDER, CARD, CARD_HI, ERR, OK, TEXT, TEXT_DIM, TEXT_FAINT, WARN,
 };
@@ -270,6 +272,7 @@ impl Studio {
         if let Some(path) = dropped.first() {
             self.open(path);
         }
+        self.sync_control_selection();
         self.shortcuts(&ctx);
         self.sync_picks();
 
@@ -1120,6 +1123,11 @@ impl Studio {
                     .color(TEXT_FAINT),
                 );
                 ui.add_space(8.0);
+                if self.mode == Mode::Rig {
+                    theme::label_caps(ui, "Pose");
+                    self.channel_box(ui, &name);
+                    ui.add_space(8.0);
+                }
                 let mut style = self.style_of(&name);
                 let before = style;
                 let mut changed = false;
@@ -2689,6 +2697,15 @@ impl Studio {
                     self.parent_picked();
                 }
             }
+            // Maya's tools: Q select, W move, E rotate, R scale.
+            if self.mode == Mode::Rig && ui.input(|i| i.modifiers.is_none()) {
+                let keys = [Key::Q, Key::W, Key::E, Key::R];
+                for (key, tool) in keys.into_iter().zip(Tool::ALL) {
+                    if ui.input(|i| i.key_pressed(key)) {
+                        self.posing.tool = tool;
+                    }
+                }
+            }
         }
         let shift = ui.input(|i| i.modifiers.shift);
         let pr = self.camera.projector(rect);
@@ -2792,6 +2809,28 @@ impl Studio {
             self.stroke = None;
         }
 
+        // The pose manipulator on the picked controls.
+        let mut posing = self.posing.gizmo.is_some();
+        if !posing
+            && !stroking
+            && response.drag_started_by(PointerButton::Primary)
+            && let Some(p) = press.or(pointer)
+            && let Some(h) = self.gizmo_handle(&pr, p)
+        {
+            posing = self.begin_gizmo(&pr, h, p);
+        }
+        if posing {
+            if response.dragged_by(PointerButton::Primary)
+                && let Some(p) = pointer
+            {
+                self.drag_gizmo(&pr, p);
+            }
+            if response.drag_stopped() {
+                self.end_gizmo();
+            }
+        }
+        let stroking = stroking || posing;
+
         // Pick where the button went down: a drag only starts once the pointer has moved.
         if response.drag_started_by(PointerButton::Primary)
             && !stroking
@@ -2858,6 +2897,21 @@ impl Studio {
                         self.sync_picks();
                     }
                 }
+            } else if self.mode == Mode::Rig {
+                if self.gizmo_handle(&pr, p).is_none() {
+                    match self.pick_rig(&pr, p) {
+                        Some(RigPick::Control(name)) => self.select_control(&name, shift),
+                        Some(bone) => {
+                            self.posing.selected.clear();
+                            self.rig_pick = Some(bone);
+                        }
+                        None if shift => {}
+                        None => {
+                            self.clear_control_selection();
+                            self.rig_pick = None;
+                        }
+                    }
+                }
             } else {
                 self.rig_pick = self.pick_rig(&pr, p);
             }
@@ -2883,6 +2937,7 @@ impl Studio {
             paint_grid(&painter, &pr, min.y, (max - min).max_element().max(0.5));
         }
         self.paint(&painter, &pr, pointer);
+        self.paint_gizmo(&painter, &pr, pointer);
         if brush_on || sculpt_on {
             self.paint_brush(&painter, &pr);
         }
@@ -3093,12 +3148,22 @@ impl Studio {
             for (i, c) in built.controls.controls.iter().enumerate() {
                 let position = frame.map_or(c.position, |f| f.controls[i]);
                 let axis = frame.map_or(c.axis, |f| f.control_axes[i]);
-                let picked = self.rig_pick == Some(RigPick::Control(c.name.clone()));
-                // The same lines the Blender and Maya builders draw.
+                let picked = self.rig_pick == Some(RigPick::Control(c.name.clone()))
+                    || self.posing.selected.contains(&c.name);
+                // The same lines the Blender and Maya builders draw; a posed
+                // control turns and scales with its channels.
+                let outline = match frame.and_then(|f| f.control_mats.as_ref()) {
+                    Some(mats) => c
+                        .outline_at(c.position, c.axis)
+                        .into_iter()
+                        .map(|l| l.into_iter().map(|p| mats[i].transform_point3(p)).collect())
+                        .collect(),
+                    None => c.outline_at(position, axis),
+                };
                 view::strokes(
                     painter,
                     pr,
-                    &c.outline_at(position, axis),
+                    &outline,
                     Stroke::new(if picked { 3.5 } else { 2.0 }, rgb(c.color)),
                 );
             }

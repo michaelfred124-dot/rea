@@ -35,6 +35,12 @@ impl Studio {
         let Some(doc) = &self.doc else {
             return Vec::new();
         };
+        // The control-rig pose, when it is what shows.
+        if self.pose_shows()
+            && let Some(posed) = self.posed()
+        {
+            return posed.locals();
+        }
         let sk = match (&doc.rig, &doc.preview) {
             (Some(rig), _) => &rig.skeleton,
             (None, Ok(built)) => &built.skeleton,
@@ -237,10 +243,18 @@ impl Studio {
         let locals = self.pose_locals();
         let mut rig = rig.clone();
         rig.mesh.shapes = doc.mesh.shapes.clone();
-        let posed = shapes::posed_mesh(&rig, &locals);
+        let mats = self.pose_mats();
+        let posed = match &mats {
+            Some(m) => shapes::posed_mesh_with(&rig, &locals, m),
+            None => shapes::posed_mesh(&rig, &locals),
+        };
         let radius = self.sculpt_radius * doc.guides.body.height;
         let moves = shapes::brush_moves(&posed, at, radius, offset);
-        match shapes::sculpt(&mut rig, &name, &locals, &moves) {
+        let done = match &mats {
+            Some(m) => shapes::sculpt_with(&mut rig, &name, &locals, m, &moves),
+            None => shapes::sculpt(&mut rig, &name, &locals, &moves),
+        };
+        match done {
             Ok(n) => {
                 self.set_shapes(rig.mesh.shapes);
                 n

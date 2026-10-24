@@ -184,6 +184,8 @@ pub struct Frame {
     pub bones: Vec<(Vec3, Vec3)>,
     pub controls: Vec<Vec3>,
     pub control_axes: Vec<Vec3>,
+    /// Each control's posed transform, when the control rig poses the frame.
+    pub control_mats: Option<Vec<glam::Mat4>>,
     /// Deformed mesh vertices, when the rig is built.
     pub mesh: Option<Vec<Vec3>>,
 }
@@ -258,6 +260,8 @@ pub struct Studio {
     /// Bone or control picked in the build stages, shown in Properties.
     pub rig_pick: Option<RigPick>,
     pub pose: Option<Pose>,
+    /// The control-rig pose, its control selection and manipulator.
+    pub posing: posing::Posing,
     /// What a right-click in the viewport landed on, for its menu.
     pub menu_guide: Option<(usize, Option<usize>)>,
     pub menu_rig: Option<RigPick>,
@@ -296,6 +300,7 @@ impl Default for Studio {
             picked: Vec::new(),
             rig_pick: None,
             pose: None,
+            posing: posing::Posing::default(),
             menu_guide: None,
             menu_rig: None,
             handle_drag: None,
@@ -898,8 +903,31 @@ impl Studio {
             bones: sk.bones.iter().map(|b| (b.head, b.tail)).collect(),
             controls: built.controls.controls.iter().map(|c| c.position).collect(),
             control_axes: built.controls.controls.iter().map(|c| c.axis).collect(),
+            control_mats: None,
             mesh: None,
         };
+        if self.pose_shows() {
+            let posed = hive_rig::pose::evaluate(sk, &built.controls, &self.posing.pose);
+            frame.bones = (0..sk.bones.len())
+                .map(|i| (posed.head(sk, i), posed.tail(sk, i)))
+                .collect();
+            for (i, c) in built.controls.controls.iter().enumerate() {
+                let m = posed.controls[i];
+                frame.controls[i] = m.transform_point3(c.position);
+                frame.control_axes[i] = m.transform_vector3(c.axis).normalize_or_zero();
+            }
+            frame.control_mats = Some(posed.controls.clone());
+            if let Some(rig) = &doc.rig
+                && rig.skeleton.bones.len() == sk.bones.len()
+            {
+                frame.mesh = Some(hive_rig::shapes::posed_mesh_with(
+                    rig,
+                    &posed.locals(),
+                    &posed.bones,
+                ));
+            }
+            return Some(frame);
+        }
         if self.pose.is_none() && self.shapes_show() {
             frame.mesh = self.shaped_rest();
         }
@@ -976,6 +1004,11 @@ impl Studio {
     }
 
     pub fn undo(&mut self) {
+        // In the Rig stage the pose's own history comes first.
+        if self.mode == Mode::Rig && self.posing.can_undo() {
+            self.undo_pose();
+            return;
+        }
         let Some(doc) = &mut self.doc else { return };
         if let Some(rig) = &mut doc.rig
             && let Some(skin) = doc.skin_undo.pop()
@@ -1000,6 +1033,10 @@ impl Studio {
     }
 
     pub fn redo(&mut self) {
+        if self.mode == Mode::Rig && self.posing.can_redo() {
+            self.redo_pose();
+            return;
+        }
         let Some(doc) = &mut self.doc else { return };
         if let Some(rig) = &mut doc.rig
             && let Some(skin) = doc.skin_redo.pop()
@@ -1024,15 +1061,19 @@ impl Studio {
     }
 
     pub fn can_undo(&self) -> bool {
-        self.doc
-            .as_ref()
-            .is_some_and(|d| !d.undo.is_empty() || (d.rig.is_some() && !d.skin_undo.is_empty()))
+        (self.mode == Mode::Rig && self.posing.can_undo())
+            || self
+                .doc
+                .as_ref()
+                .is_some_and(|d| !d.undo.is_empty() || (d.rig.is_some() && !d.skin_undo.is_empty()))
     }
 
     pub fn can_redo(&self) -> bool {
-        self.doc
-            .as_ref()
-            .is_some_and(|d| !d.redo.is_empty() || (d.rig.is_some() && !d.skin_redo.is_empty()))
+        (self.mode == Mode::Rig && self.posing.can_redo())
+            || self
+                .doc
+                .as_ref()
+                .is_some_and(|d| !d.redo.is_empty() || (d.rig.is_some() && !d.skin_redo.is_empty()))
     }
 
     /// Move one guide (and its mirror twin when symmetry is on) without an undo
@@ -1937,10 +1978,12 @@ fn push_undo(undo: &mut Vec<Guides>, g: &Guides) {
     }
 }
 
+mod posing;
 mod shapes;
 mod skin_edit;
 mod ui;
 
+pub use posing::Tool;
 pub use skin_edit::{SelectOp, SkinTools};
 
 #[cfg(test)]
