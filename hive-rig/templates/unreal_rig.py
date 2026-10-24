@@ -24,6 +24,10 @@ axis, mapped from start to end degrees onto 0..1); the curve drives the morph
 target when the Control Rig runs in the mesh's Anim Blueprint. Shapes without
 a driver are left at zero here (a weight set in hive-rig is not applied).
 
+The script also adds a "Hive Poses" menu: flip the pose into its mirror image
+and a pose library (save, apply, apply mirrored), on the Level Sequence that
+animates the Control Rig; poses are kept in <name>.poses.json next to it.
+
 Requirements: Unreal Engine 5.2+ with the "Python Editor Script Plugin" and
 "Control Rig" plugins enabled. Run from Tools > Execute Python Script, or
 from the Output Log in Python mode: py "<path to this file>"
@@ -1300,6 +1304,287 @@ def register_menu():
     return count
 
 
+# ----------------------------------------------------------------------- pose tools (Sequencer)
+# Flip a pose into its mirror image and keep named poses, on the Control Rig the
+# open Level Sequence animates. Left/right twins come from hive-rig
+# (mirror_pairs). The mirror plane is found from the twins' rest places, so it
+# doesn't depend on how the character was imported. Poses are kept next to this
+# script in <name>.poses.json.
+def twins():
+    twin = {}
+    for left, right in RIG.get("mirror_pairs", []):
+        twin[left], twin[right] = right, left
+    return twin
+
+
+def float_twins():
+    """Each limb setting (arm_l_ik_fk...) mapped to its twin limb's."""
+    out = {}
+    twin = twins()
+    by_ik = {c["ik_control"]: c["name"] for c in CHAINS}
+    for c in CHAINS:
+        other = by_ik.get(twin.get(c["ik_control"]))
+        if other:
+            for f in ANIM["floats"]:
+                if f.startswith(c["name"] + "_"):
+                    out[f] = other + f[len(c["name"]):]
+    return out
+
+
+def quat_matrix(q):
+    x, y, z, w = q.x, q.y, q.z, q.w
+    return [[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]]
+
+
+def matrix_quat(m):
+    """The unit quaternion (x, y, z, w) of a rotation matrix."""
+    t = m[0][0] + m[1][1] + m[2][2]
+    if t > 0:
+        s = (t + 1.0) ** 0.5 * 2
+        return ((m[2][1] - m[1][2]) / s, (m[0][2] - m[2][0]) / s, (m[1][0] - m[0][1]) / s, 0.25 * s)
+    if m[0][0] > m[1][1] and m[0][0] > m[2][2]:
+        s = (1.0 + m[0][0] - m[1][1] - m[2][2]) ** 0.5 * 2
+        return (0.25 * s, (m[0][1] + m[1][0]) / s, (m[0][2] + m[2][0]) / s, (m[2][1] - m[1][2]) / s)
+    if m[1][1] > m[2][2]:
+        s = (1.0 + m[1][1] - m[0][0] - m[2][2]) ** 0.5 * 2
+        return ((m[0][1] + m[1][0]) / s, 0.25 * s, (m[1][2] + m[2][1]) / s, (m[0][2] - m[2][0]) / s)
+    s = (1.0 + m[2][2] - m[0][0] - m[1][1]) ** 0.5 * 2
+    return ((m[0][2] + m[2][0]) / s, (m[1][2] + m[2][1]) / s, 0.25 * s, (m[1][0] - m[0][1]) / s)
+
+
+def m_mul(a, b):
+    return [[sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+
+
+def m_t(a):
+    return [[a[j][i] for j in range(3)] for i in range(3)]
+
+
+def mirror_plane(ctx):
+    """The plane the rig is mirrored across, as (point, normal), from the rest
+    places of the left/right twins."""
+    pairs = RIG.get("mirror_pairs", [])
+    if not pairs:
+        raise RuntimeError("hive-rig: %s has no left/right controls to mirror across" % NAME)
+    across, middle = [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
+    for left, right in pairs:
+        a = vec(global_of(ctx, control_key(left), True).translation)
+        b = vec(global_of(ctx, control_key(right), True).translation)
+        across = v_add(across, v_sub(a, b))
+        middle = v_add(middle, v_scale(v_add(a, b), 0.5 / len(pairs)))
+    return middle, v_norm(across)
+
+
+def flip_targets(ctx, names, plane):
+    """Where each control of `names` goes when its twin's (or, in the centre,
+    its own) pose is mirrored: a global transform per control, read before any
+    moves. Each rest frame is matched to its twin's through the mirror."""
+    point, n = plane
+    mirror = [[(1.0 if i == j else 0.0) - 2 * n[i] * n[j] for j in range(3)] for i in range(3)]
+    twin = twins()
+    out = {}
+    for dst in names:
+        src = twin.get(dst, dst)
+        rs = quat_matrix(global_of(ctx, control_key(src), True).rotation)
+        rd = quat_matrix(global_of(ctx, control_key(dst), True).rotation)
+        now = global_of(ctx, control_key(src))
+        # Mirrored, then turned back to a right-handed frame like dst's at rest.
+        f = m_mul(m_mul(m_t(rs), mirror), rd)
+        turn = m_mul(m_mul(mirror, quat_matrix(now.rotation)), f)
+        p = vec(now.translation)
+        p = v_sub(p, v_scale(n, 2 * v_dot(v_sub(p, point), n)))
+        out[dst] = (p, matrix_quat(turn))
+    return out
+
+
+def flip_in_rig(ctx, names):
+    """Mirror the pose of `names` (with their twins) in the rig, without keying.
+    Returns the controls and settings it changed."""
+    twin = twins()
+    names = [c["name"] for c in CONTROLS if c["name"] in names or twin.get(c["name"]) in names]
+    plane = mirror_plane(ctx)
+    targets = flip_targets(ctx, names, plane)
+    for name in names:  # parents come before their children
+        p, q = targets[name]
+        place(ctx, control_key(name), unreal.Transform(location=unreal.Vector(*p),
+                                                       rotation=unreal.Quat(*q).rotator()))
+    swapped = []
+    pairs = float_twins()
+    limbs = {c["name"] for c in CHAINS if c["ik_control"] in names}
+    values = {f: get_float(ctx, f) for f in ANIM["floats"]}
+    for f, other in pairs.items():
+        if any(f.startswith(l + "_") for l in limbs):
+            set_float(ctx, f, values[other])
+            swapped.append(f)
+    return names + swapped
+
+
+def selected_controls(ctx):
+    try:
+        return [str(n) for n in ctx[1].current_control_selection()]
+    except Exception:
+        return []
+
+
+def flip_pose(frames=None, names=None):
+    """Turn the pose into its mirror image on `frames` (the current frame when
+    None): twins swap poses, mirrored, and centre controls mirror onto
+    themselves. Only `names` (or the selected controls) and their twins, when
+    given. Returns how many controls flipped on the last frame."""
+    ctx = rig_in_sequencer()
+    here = current_frame()
+    names = names or selected_controls(ctx) or [c["name"] for c in CONTROLS]
+    count = 0
+    for f in ([here] if frames is None else list(frames)):
+        load_frame(ctx, f)
+        changed = flip_in_rig(ctx, names)
+        key_controls(ctx, changed, f)
+        count = len([c for c in changed if c not in ANIM["floats"]])
+    unreal.log("hive-rig: flipped %d controls" % count)
+    return count
+
+
+def poses_path():
+    return os.path.join(os.path.dirname(script_path()), NAME + ".poses.json")
+
+
+def pose_library():
+    try:
+        with open(poses_path()) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def write_library(library):
+    with open(poses_path(), "w") as f:
+        json.dump(library, f, indent=1)
+    register_pose_menu()
+
+
+def stored_value(h, name):
+    value = h.get_control_value(control_key(name), unreal.RigControlValueType.CURRENT)
+    if name in ANIM["floats"]:
+        return {"float": float(VALUE.get_float_from_control_value(value))}
+    if name in ANIM["positions"]:
+        return {"position": vec(VALUE.get_vector_from_control_value(value))}
+    e = VALUE.get_euler_transform_from_control_value(value)
+    r = e.rotation
+    return {"location": vec(e.location), "rotation": [r.roll, r.pitch, r.yaw], "scale": vec(e.scale)}
+
+
+def control_value(stored):
+    if "float" in stored:
+        return VALUE.make_control_value_from_float(stored["float"])
+    if "position" in stored:
+        return VALUE.make_control_value_from_vector(unreal.Vector(*stored["position"]))
+    roll, pitch, yaw = stored["rotation"]
+    return VALUE.make_control_value_from_euler_transform(unreal.EulerTransform(
+        location=unreal.Vector(*stored["location"]), rotation=unreal.Rotator(roll=roll, pitch=pitch, yaw=yaw),
+        scale=unreal.Vector(*stored["scale"])))
+
+
+def save_pose(name, names=None):
+    """Keep the pose on the current frame (the selected controls, or every
+    control and setting) as `name` ("Pose 1", "Pose 2"... when empty).
+    Returns how many values it holds."""
+    library = pose_library()
+    name = (name or "").strip()
+    if not name:
+        name = next("Pose %d" % i for i in range(1, len(library) + 2) if "Pose %d" % i not in library)
+    ctx = rig_in_sequencer()
+    load_frame(ctx, current_frame())
+    h = ctx[1].get_hierarchy()
+    names = names or selected_controls(ctx) or [c["name"] for c in CONTROLS] + ANIM["floats"]
+    library[name] = {n: stored_value(h, n) for n in names}
+    write_library(library)
+    unreal.log("hive-rig: saved pose %s (%d values) in %s" % (name, len(names), poses_path()))
+    return len(names)
+
+
+def apply_pose(name, mirrored=False, frames=None):
+    """Put the controls the pose holds into pose `name` on `frames` (the current
+    frame when None) and key them. Mirrored, each control's pose lands mirrored
+    on its twin and centre controls mirror onto themselves."""
+    library = pose_library()
+    if name not in library:
+        raise RuntimeError("hive-rig: no pose named %s (there are %s)" % (name, ", ".join(sorted(library)) or "none"))
+    stored = library[name]
+    ctx = rig_in_sequencer()
+    here = current_frame()
+    h = ctx[1].get_hierarchy()
+    for f in ([here] if frames is None else list(frames)):
+        load_frame(ctx, f)
+        for n, v in stored.items():
+            h.set_control_value(control_key(n), control_value(v), unreal.RigControlValueType.CURRENT)
+        solve(ctx[1])
+        changed = list(stored)
+        if mirrored:
+            changed = flip_in_rig(ctx, [n for n in stored if n not in ANIM["floats"]])
+        key_controls(ctx, changed, f)
+    return len(stored)
+
+
+def delete_pose(name):
+    library = pose_library()
+    library.pop(name, None)
+    write_library(library)
+
+
+def pose_tool(fn):
+    """A pose tool taking a pose name, `--mirrored` and `--range`."""
+    def run(args):
+        rest = [a for a in args if not a.startswith("--")]
+        frames = playback_frames(rig_in_sequencer()[0]) if "--range" in args else None
+        if fn is flip_pose:
+            return flip_pose(frames)
+        if fn is apply_pose:
+            return apply_pose(" ".join(rest), "--mirrored" in args, frames)
+        return fn(" ".join(rest))
+    return run
+
+
+TOOLS.update({
+    "flip_pose": pose_tool(flip_pose),
+    "save_pose": pose_tool(save_pose),
+    "apply_pose": pose_tool(apply_pose),
+    "delete_pose": pose_tool(delete_pose),
+})
+
+
+def register_pose_menu():
+    """A "Hive Rig poses" menu: Flip Pose, Save Pose (named by the frame) and,
+    per saved pose, Apply and Apply Mirrored."""
+    menus = unreal.ToolMenus.get()
+    bar = menus.find_menu("LevelEditor.MainMenu")
+    if bar is None:
+        return None
+    menu_name = "HivePoses_" + NAME
+    try:
+        menus.remove_menu("LevelEditor.MainMenu." + menu_name)
+    except Exception:
+        pass
+    menu = bar.add_sub_menu("HiveRig", "", menu_name, "Hive Poses: " + NAME,
+                            "Flip the pose and the pose library of the %s Control Rig" % NAME)
+    path = script_path().replace("\\", "/")
+    entries = [("flip", "Flip pose (this frame)", "flip_pose"),
+               ("flip_range", "Flip pose (playback range)", "flip_pose --range"),
+               ("save", "Save pose (as Pose N; rename it in the .poses.json)", "save_pose"),
+               ]
+    for pose in sorted(pose_library()):
+        entries.append(("apply_" + pose, "Apply %s" % pose, 'apply_pose "%s"' % pose))
+        entries.append(("mirror_" + pose, "Apply %s mirrored" % pose, 'apply_pose "%s" --mirrored' % pose))
+    for key_name, label, command in entries:
+        entry = unreal.ToolMenuEntry(name="HivePoses_%s_%s" % (NAME, key_name), type=unreal.MultiBlockType.MENU_ENTRY)
+        entry.set_label(label)
+        entry.set_string_command(unreal.ToolMenuStringCommandType.COMMAND, "", 'py "%s" %s' % (path, command))
+        menu.add_menu_entry("Poses", entry)
+    menus.refresh_all_widgets()
+    return len(entries)
+
+
 def main(argv=None):
     import sys
 
@@ -1307,9 +1592,11 @@ def main(argv=None):
     if args and args[0] in TOOLS:
         return TOOLS[args[0]](args[1:])
     if args and args[0] == "menu":
+        register_pose_menu()
         return register_menu()
     blueprint = build()
     register_menu()
+    register_pose_menu()
     return blueprint
 
 

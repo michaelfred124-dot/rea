@@ -897,8 +897,19 @@ for the playback range. Each frame is loaded from the Sequencer's keys into the
 rig, matched and keyed back. From the Output Log the same is
 `py "<name>_unreal.py" ik_to_fk arm_l` (add `--range` for the playback range),
 and `py "<name>_unreal.py" menu` brings the menu back after an editor restart.
-Mirror and reset pose and the space switch are Blender and Maya only; Control
-Rig's own space switching covers the last.
+A second menu, **Hive Poses**, has **Flip pose** (this frame, or the playback
+range) and the pose library: **Save pose** keeps the current frame's pose of
+the selected controls (or every control and setting) as "Pose 1", "Pose 2"...
+in `<name>.poses.json` next to the script (rename them there), and each saved
+pose has **Apply** and **Apply mirrored**, keyed on the current frame. From the
+Output Log: `py "<name>_unreal.py" flip_pose [--range]`,
+`py "<name>_unreal.py" save_pose Arms up`,
+`py "<name>_unreal.py" apply_pose Arms up [--mirrored] [--range]` and
+`delete_pose`. Unreal flips in world space, across the plane halfway between
+the left and right controls at rest (so it needs a rig with twins; a snake
+can't be flipped there), which for a whole pose is the same mirror image as
+Blender and Maya give. Mirror and reset pose and the space switch are Blender
+and Maya only; Control Rig's own space switching covers the last.
 
 ## Input requirements
 

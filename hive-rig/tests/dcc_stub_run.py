@@ -236,6 +236,9 @@ def stub_unreal():
     unreal.AssetImportTask.return_value.imported_object_paths = ["/Game/HiveRig/mesh"]
 
     class Q:
+        x = y = z = 0.0
+        w = 1.0
+
         def rotator(self):
             return self
 
@@ -291,6 +294,9 @@ def stub_unreal():
     proxy.control_rig.get_hierarchy.return_value = blueprint.hierarchy
     unreal.ControlRigSequencerLibrary.get_control_rigs.return_value = [proxy]
     unreal.RigHierarchy.get_float_from_control_value.return_value = 0.5
+    unreal.RigHierarchy.get_vector_from_control_value.return_value = Vec()
+    unreal.RigHierarchy.get_euler_transform_from_control_value.return_value = types.SimpleNamespace(
+        location=Vec(0.0, 1.0, 2.0), rotation=types.SimpleNamespace(roll=10.0, pitch=0.0, yaw=-5.0), scale=Vec(1.0, 1.0, 1.0))
     unreal.FrameNumber = int
     sys.modules["unreal"] = unreal
     return vm, blueprint.get_hierarchy_controller.return_value
@@ -463,6 +469,86 @@ if __name__ == "__main__":
         assert entries == 4 * len(rig["ik_chains"]), entries
         if rig["ik_chains"]:
             print("unreal animator tools ran against stubs: %d limbs: ok" % len(rig["ik_chains"]))
+        # Pose tools: flip (every control, on this frame and over the range),
+        # the pose library (save, apply, apply mirrored, delete) and their menu.
+        names = [c["name"] for c in rig["controls"]]
+        hierarchy = lib.get_control_rigs.return_value[0].control_rig.get_hierarchy.return_value
+        poses = ns["poses_path"]()
+        if os.path.exists(poses):
+            os.remove(poses)
+        if rig.get("mirror_pairs"):
+            for argv, frames in ((["flip_pose"], {7}), (["flip_pose", "--range"], {1, 2, 3})):
+                lib.reset_mock()
+                hierarchy.set_global_transform.reset_mock()
+                assert ns["main"](argv) == len(names)
+                placed = {c.args[0].name for c in hierarchy.set_global_transform.call_args_list}
+                assert placed == set(names), sorted(set(names) - placed)
+                keyed = {c.args[3] for c in lib.set_local_control_rig_euler_transform.call_args_list}
+                assert keyed == frames, keyed
+            # The limb settings swap between twin limbs.
+            twins_f = ns["float_twins"]()
+            for chain in rig["ik_chains"]:
+                if chain["name"].endswith("_l"):
+                    assert twins_f[chain["name"] + "_ik_fk"] == chain["name"][:-2] + "_r_ik_fk", twins_f
+            # Twins land on each other's mirror image: with every rest frame
+            # the same, a centre control stays on the mirror plane.
+            point, normal = ns["mirror_plane"]((None, lib.get_control_rigs.return_value[0].control_rig))
+            assert abs(sum(n * n for n in normal) - 1.0) < 1e-6
+        else:
+            try:
+                ns["main"](["flip_pose"])
+                raise AssertionError("a rig without twins can't be flipped")
+            except RuntimeError:
+                pass
+        # The flip's maths with real turns: quaternions survive the round trip,
+        # and a posed left control's twin lands on its mirror image.
+        import math as m_
+        from types import SimpleNamespace as NS_
+
+        def quat(axis, angle):
+            n = sum(a * a for a in axis) ** 0.5
+            s_ = m_.sin(angle / 2) / n
+            return NS_(x=axis[0] * s_, y=axis[1] * s_, z=axis[2] * s_, w=m_.cos(angle / 2))
+
+        for q in (quat((1, 2, 3), 0.7), quat((0, 0, 1), 3.0), quat((1, 0, 0), m_.pi), quat((0.2, -1, 0.1), 2.9)):
+            back = ns["matrix_quat"](ns["quat_matrix"](q))
+            sign = 1.0 if sum(a * b for a, b in zip(back, (q.x, q.y, q.z, q.w))) > 0 else -1.0
+            assert max(abs(a - sign * b) for a, b in zip(back, (q.x, q.y, q.z, q.w))) < 1e-9, (back, q)
+        mm, qm = ns["m_mul"], ns["quat_matrix"]
+        flip_x = [[-1.0, 0, 0], [0, 1.0, 0], [0, 0, 1.0]]
+        r_left = qm(quat((0.3, 1.0, -0.4), 1.1))
+        r_right = mm(mm(flip_x, r_left), flip_x)  # a mirror image, right-handed again
+        pose = qm(quat((1.0, 0.5, 0.2), 0.6))
+        frames = {"L": (r_left, [0.3, 1.0, 0.2]), "R": (r_right, [-0.3, 1.0, 0.2])}
+        posed_left = (mm(pose, r_left), [0.35, 1.1, 0.1])
+
+        def fake_global(ctx, k, rest=False):
+            rot, loc = frames[k.name] if rest or k.name == "R" else posed_left
+            qx, qy, qz, qw = ns["matrix_quat"](rot)
+            return NS_(rotation=NS_(x=qx, y=qy, z=qz, w=qw), translation=NS_(x=loc[0], y=loc[1], z=loc[2]))
+
+        live = ns["flip_targets"].__globals__  # run_path returned a copy of these
+        saved_global, saved_twins = live["global_of"], live["twins"]
+        live["global_of"], live["twins"] = fake_global, lambda: {"L": "R", "R": "L"}
+        target = ns["flip_targets"](None, ["R"], ([0.0, 0.0, 0.0], [1.0, 0.0, 0.0]))["R"]
+        live["global_of"], live["twins"] = saved_global, saved_twins
+        want = mm(mm(mm(flip_x, pose), flip_x), r_right)  # the left turn, mirrored, from the right's rest
+        got = qm(NS_(x=target[1][0], y=target[1][1], z=target[1][2], w=target[1][3]))
+        assert max(abs(got[i][j] - want[i][j]) for i in range(3) for j in range(3)) < 1e-9, (got, want)
+        assert max(abs(a - b) for a, b in zip(target[0], [-0.35, 1.1, 0.1])) < 1e-9, target[0]
+        assert ns["main"](["save_pose", "Arms", "up"]) == len(names) + len(ns["ANIM"]["floats"])
+        assert ns["main"](["save_pose"]) > 0 and sorted(ns["pose_library"]()) == ["Arms up", "Pose 1"]
+        lib.reset_mock()
+        assert ns["main"](["apply_pose", "Arms", "up"]) == len(names) + len(ns["ANIM"]["floats"])
+        assert {c.args[3] for c in lib.set_local_control_rig_euler_transform.call_args_list} == {7}
+        if rig.get("mirror_pairs"):
+            assert ns["main"](["apply_pose", "Arms", "up", "--mirrored", "--range"]) > 0
+        entries = ns["register_pose_menu"]()
+        assert entries == 3 + 2 * 2, entries
+        ns["main"](["delete_pose", "Pose 1"])
+        assert sorted(ns["pose_library"]()) == ["Arms up"]
+        os.remove(poses)
+        print("unreal pose tools ran against stubs: ok")
     else:
         raise SystemExit("unknown kind " + kind)
     print("%s builder ran against stubs: ok" % kind)
