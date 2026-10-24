@@ -589,9 +589,16 @@ pub fn parse_pose(rig: &Rig, text: &str) -> anyhow::Result<BonePose> {
 /// Where the skin puts each vertex in a pose, with the shapes at their
 /// weights in that pose (corrective shapes from their readers).
 pub fn posed_mesh(rig: &Rig, locals: &[Quat]) -> Vec<Vec3> {
+    posed_mesh_with(rig, locals, &skin_matrices(&rig.skeleton, locals))
+}
+
+/// [`posed_mesh`] with the skinning matrices given (a pose from the control
+/// rig, which moves and scales bones as well as turning them); `locals` are
+/// the same pose's local rotations, for the corrective readers.
+pub fn posed_mesh_with(rig: &Rig, locals: &[Quat], mats: &[Mat4]) -> Vec<Vec3> {
     let weights = weights_in_pose(&rig.mesh.shapes, locals, |n| rig.skeleton.index_of(n));
     let base = apply(&rig.mesh.positions, &rig.mesh.shapes, &weights);
-    deform(&base, &rig.skin, &skin_matrices(&rig.skeleton, locals))
+    deform(&base, &rig.skin, mats)
 }
 
 /// Add `moves` (vertex, where it should be in the pose) to the shape `name`,
@@ -604,6 +611,18 @@ pub fn sculpt(
     locals: &[Quat],
     moves: &[(usize, Vec3)],
 ) -> anyhow::Result<usize> {
+    let mats = skin_matrices(&rig.skeleton, locals);
+    sculpt_with(rig, name, locals, &mats, moves)
+}
+
+/// [`sculpt`] in a pose given by its skinning matrices (and local rotations).
+pub fn sculpt_with(
+    rig: &mut Rig,
+    name: &str,
+    locals: &[Quat],
+    mats: &[Mat4],
+    moves: &[(usize, Vec3)],
+) -> anyhow::Result<usize> {
     anyhow::ensure!(!name.trim().is_empty(), "the shape needs a name");
     let shapes = &rig.mesh.shapes;
     let mine = shapes.iter().position(|s| s.name == name);
@@ -613,8 +632,7 @@ pub fn sculpt(
         weights[i] = 1.0;
     }
     let base = apply(&rig.mesh.positions, shapes, &weights);
-    let mats = skin_matrices(&rig.skeleton, locals);
-    let offsets = corrective_offsets(&base, &rig.skin, &mats, moves);
+    let offsets = corrective_offsets(&base, &rig.skin, mats, moves);
     let n = rig.mesh.vertex_count();
     let mut dense = vec![Vec3::ZERO; n];
     for (v, d) in &offsets {

@@ -26,6 +26,7 @@ pub mod landmarks;
 pub mod mesh;
 pub mod naming;
 pub mod orient;
+pub mod pose;
 pub mod rig;
 pub mod shapes;
 pub mod skeleton;
