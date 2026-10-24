@@ -1,0 +1,448 @@
+//! Writers for the interchange mesh and the per-DCC control-rig builders.
+//!
+//! Skeleton and skin travel as glTF (open, imported natively by Blender and
+//! Unreal), and on request as a binary FBX for game engines (Unreal, Unity).
+//! Controls do not survive any generic format, so each DCC also gets a
+//! generated Python script that rebuilds the control rig with native tools.
+
+pub mod fbx;
+pub mod glb;
+
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+
+use anyhow::{Context, Result};
+use serde_json::json;
+
+use crate::rig::Rig;
+
+const BLENDER_TEMPLATE: &str = include_str!("../../templates/blender_rig.py");
+const MAYA_TEMPLATE: &str = include_str!("../../templates/maya_rig.py");
+const UNREAL_TEMPLATE: &str = include_str!("../../templates/unreal_rig.py");
+
+const JSON_SLOT: &str = "__HIVE_RIG_JSON__";
+const GLB_SLOT: &str = "__HIVE_GLB_PATH__";
+const EXE_SLOT: &str = "__HIVE_EXE__";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    Blender,
+    Maya,
+    Unreal,
+    /// A binary `<name>.fbx` with mesh, skeleton, skin and bind pose, for game
+    /// engines. Not a builder script: FBX carries no controls.
+    Fbx,
+}
+
+impl Target {
+    pub const ALL: [Target; 4] = [Target::Blender, Target::Maya, Target::Unreal, Target::Fbx];
+    /// The targets that get a builder script.
+    pub const SCRIPTS: [Target; 3] = [Target::Blender, Target::Maya, Target::Unreal];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Target::Blender => "blender",
+            Target::Maya => "maya",
+            Target::Unreal => "unreal",
+            Target::Fbx => "fbx",
+        }
+    }
+}
+
+impl FromStr for Target {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "blender" => Ok(Target::Blender),
+            "maya" => Ok(Target::Maya),
+            "unreal" | "ue" | "ue5" => Ok(Target::Unreal),
+            "fbx" => Ok(Target::Fbx),
+            other => {
+                anyhow::bail!("unknown target '{other}' (expected blender, maya, unreal or fbx)")
+            }
+        }
+    }
+}
+
+/// Make a name safe for file names, node names and Python string literals.
+pub fn sanitize_name(name: &str) -> String {
+    let mut out: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if out.is_empty() || out.starts_with(|c: char| c.is_ascii_digit()) {
+        out.insert_str(0, "rig_");
+    }
+    out
+}
+
+/// The command-line `hive-rig`, so builder scripts can call it back to rebuild
+/// from edited guides. When the scripts are written by the desktop app, that's
+/// the `hive-rig` program next to it.
+fn exe_path() -> String {
+    let Ok(exe) = std::env::current_exe() else {
+        return String::new();
+    };
+    let cli = format!("hive-rig{}", std::env::consts::EXE_SUFFIX);
+    let path = if exe.file_name().is_some_and(|n| n == cli.as_str()) {
+        exe
+    } else {
+        exe.with_file_name(cli)
+    };
+    path.to_string_lossy().replace('"', "")
+}
+
+fn fill(template: &str, json: &str, glb_path: &str) -> String {
+    // The data is placed inside a raw triple-quoted Python string. Names are
+    // sanitised and the rest is numbers, so the data cannot contain `"""`.
+    debug_assert!(!json.contains("\"\"\""));
+    template
+        .replace(JSON_SLOT, json)
+        .replace(GLB_SLOT, glb_path)
+        .replace(EXE_SLOT, &exe_path())
+}
+
+/// Bones whose imported positions recover the Unreal import's axes; the first
+/// also places the COG. The pelvis, left hand, head and left ball of the foot
+/// where the rig has them, otherwise other deforming bones, each picked only
+/// when it lies off the line or plane through the ones before it. Four bones
+/// pin the axes down; a flat rig (every bone in one plane, like a snake along
+/// its mid-line) gets three, and the builder takes the plane's normal from them.
+fn basis_bones(rig: &Rig) -> Vec<String> {
+    let sk = &rig.skeleton;
+    let min_gain = 0.01 * rig.guides.body.height;
+    let preferred = ["pelvis", "hand_l", "head", "ball_l"].map(|b| rig.guides.naming.bone(b));
+    let candidates = preferred
+        .iter()
+        .filter_map(|n| sk.bone(n))
+        .chain(sk.bones.iter().filter(|b| b.deform));
+    let mut picked: Vec<(&str, glam::Vec3)> = Vec::new();
+    for b in candidates {
+        if picked.len() == 4 {
+            break;
+        }
+        let p = b.head;
+        // How far `p` lies from the line or plane through the bones picked so far.
+        let gain = match picked.as_slice() {
+            [] => f32::INFINITY,
+            [(_, a)] => p.distance(*a),
+            [(_, a), (_, b)] => (p - *a).cross((*b - *a).normalize_or_zero()).length(),
+            [(_, a), (_, b), (_, c), ..] => (p - *a)
+                .dot((*b - *a).cross(*c - *a).normalize_or_zero())
+                .abs(),
+        };
+        if gain > min_gain && !picked.iter().any(|(n, _)| *n == b.name) {
+            picked.push((&b.name, p));
+        }
+    }
+    picked.into_iter().map(|(n, _)| n.to_string()).collect()
+}
+
+/// Generate the builder script for one DCC.
+pub fn script(rig: &Rig, target: Target, glb_path: &Path) -> Result<String> {
+    let glb = glb_path.to_string_lossy().replace('"', "");
+    Ok(match target {
+        Target::Blender => fill(BLENDER_TEMPLATE, &serde_json::to_string(rig)?, &glb),
+        Target::Maya => fill(MAYA_TEMPLATE, &serde_json::to_string(rig)?, &glb),
+        Target::Unreal => {
+            // Unreal imports mesh and skin from the .glb; the script only needs
+            // bone names and the control description.
+            let bones: Vec<_> = rig
+                .skeleton
+                .bones
+                .iter()
+                .map(|b| json!({ "name": b.name, "parent": b.parent, "deform": b.deform, "head": b.head, "tail": b.tail, "translate": b.translate }))
+                .collect();
+            let basis = basis_bones(rig);
+            // The morph targets come in with the .glb; the script only needs
+            // their names, weights and pose readers.
+            let shapes: Vec<_> = rig
+                .mesh
+                .shapes
+                .iter()
+                .map(|s| json!({ "name": s.name, "weight": s.weight, "driver": s.driver }))
+                .collect();
+            let data = json!({
+                "name": rig.name,
+                "height": rig.guides.body.height,
+                "bones": bones,
+                "controls": rig.controls.controls,
+                "ik_chains": rig.controls.ik_chains,
+                "splines": rig.controls.splines,
+                "basis": basis,
+                "shapes": shapes,
+            });
+            fill(UNREAL_TEMPLATE, &serde_json::to_string(&data)?, &glb)
+        }
+        Target::Fbx => anyhow::bail!("FBX is written as a file, not a builder script"),
+    })
+}
+
+/// Write `<name>.glb`, `<name>.hive.json`, `<name>.guides.json`, one builder
+/// script per DCC target and `<name>.fbx` for the FBX target.
+pub fn write_all(rig: &Rig, out_dir: &Path, targets: &[Target]) -> Result<Vec<PathBuf>> {
+    // A bare file name's parent is the empty path: that's the current folder.
+    let out_dir = if out_dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        out_dir
+    };
+    std::fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
+    // `absolute` rather than `canonicalize`: on Windows the latter adds a `\\?\` prefix
+    // that DCC importers such as Unreal's may not accept in the embedded .glb path.
+    let out_dir = std::path::absolute(out_dir)?;
+    let mut written = Vec::new();
+
+    // Texture images go next to the rig, and the rig file names them there.
+    let (images, copied) = place_images(rig, &out_dir)?;
+    written.extend(copied);
+    let placed;
+    let rig = if images.is_empty() {
+        rig
+    } else {
+        let mut r = rig.clone();
+        r.mesh.images = images;
+        placed = r;
+        &placed
+    };
+
+    let glb_path = out_dir.join(format!("{}.glb", rig.name));
+    // The .glb and .fbx put the character back the way its source file stood it.
+    let source = rig.in_source_frame();
+    std::fs::write(&glb_path, glb::write(&source))?;
+    written.push(glb_path.clone());
+
+    let json_path = out_dir.join(format!("{}.hive.json", rig.name));
+    std::fs::write(&json_path, serde_json::to_vec_pretty(rig)?)?;
+    written.push(json_path);
+
+    let guides_path = out_dir.join(format!("{}.guides.json", rig.name));
+    std::fs::write(&guides_path, serde_json::to_vec_pretty(&rig.guides)?)?;
+    written.push(guides_path);
+
+    for &t in targets {
+        let path = if t == Target::Fbx {
+            let path = out_dir.join(format!("{}.fbx", rig.name));
+            std::fs::write(&path, fbx::write(&source))?;
+            path
+        } else {
+            let path = out_dir.join(format!("{}_{}.py", rig.name, t.key()));
+            std::fs::write(&path, script(rig, t, &glb_path)?)?;
+            path
+        };
+        written.push(path);
+    }
+    Ok(written)
+}
+
+/// The folder the rig's texture images are written to, next to the rig.
+pub fn textures_folder(rig: &Rig) -> String {
+    format!("{}_textures", rig.name)
+}
+
+/// Write every texture image of the rig into `<out>/<name>_textures/` (from the
+/// bytes held for embedded images, or by copying the source file), and return
+/// the images named relative to `out` together with the files written. An
+/// image already there is left alone; one whose file can't be found keeps its
+/// name and a warning is printed.
+pub fn place_images(rig: &Rig, out_dir: &Path) -> Result<(Vec<crate::mesh::Image>, Vec<PathBuf>)> {
+    let images = &rig.mesh.images;
+    if images.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let folder = textures_folder(rig);
+    let dir = out_dir.join(&folder);
+    let mut used = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(images.len());
+    let mut written = Vec::new();
+    for (i, image) in images.iter().enumerate() {
+        let stem = sanitize_name(if image.name.is_empty() {
+            "image"
+        } else {
+            &image.name
+        });
+        let mut file = format!("{stem}.{}", image.extension());
+        let mut k = 2;
+        while !used.insert(file.to_ascii_lowercase()) {
+            file = format!("{stem}_{k}.{}", image.extension());
+            k += 1;
+        }
+        let target = dir.join(&file);
+        let mut placed = image.clone();
+        placed.uri = format!("{folder}/{file}");
+        let already_there = image
+            .path
+            .as_ref()
+            .is_some_and(|p| std::path::absolute(p).ok().as_deref() == Some(target.as_path()))
+            && target.is_file();
+        if !already_there {
+            match image.bytes() {
+                Some(bytes) => {
+                    std::fs::create_dir_all(&dir)
+                        .with_context(|| format!("creating {}", dir.display()))?;
+                    std::fs::write(&target, &bytes)
+                        .with_context(|| format!("writing {}", target.display()))?;
+                    written.push(target.clone());
+                }
+                None => {
+                    eprintln!(
+                        "warning: texture image {i} ('{}') can't be read from {}; the rig still names it",
+                        image.name,
+                        image
+                            .path
+                            .as_ref()
+                            .map_or_else(|| image.uri.clone(), |p| p.display().to_string())
+                    );
+                    placed.uri = image.uri.clone();
+                    out.push(placed);
+                    continue;
+                }
+            }
+        }
+        placed.data = None;
+        placed.path = Some(target);
+        out.push(placed);
+    }
+    Ok((out, written))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{demo::demo_humanoid, rig};
+
+    #[test]
+    fn images_go_next_to_the_rig_and_load_back() {
+        let r = rig::auto_rig(
+            crate::demo::dressed_humanoid(),
+            "dressed",
+            Default::default(),
+        )
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("hive-rig-images-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let written = write_all(&r, &dir, &[Target::Fbx]).unwrap();
+        let png = dir.join("dressed_textures").join("skin.png");
+        assert!(written.contains(&std::path::absolute(&png).unwrap()));
+        assert_eq!(
+            std::fs::read(&png).unwrap(),
+            &*r.mesh.images[0].bytes().unwrap()
+        );
+        // The rig file names the image by its place, with no image data in it.
+        let json = std::fs::read_to_string(dir.join("dressed.hive.json")).unwrap();
+        assert!(json.contains("\"uri\": \"dressed_textures/skin.png\""));
+        assert!(!json.contains("hive-rig test image") && !json.contains("base64"));
+        let back = Rig::load(&dir.join("dressed.hive.json")).unwrap();
+        assert_eq!(
+            back.mesh.images[0].bytes().as_deref(),
+            r.mesh.images[0].bytes().as_deref()
+        );
+        assert_eq!(back.mesh.objects, r.mesh.objects);
+        assert_eq!(back.mesh.shapes[0].vertices, r.mesh.shapes[0].vertices);
+        // Writing again from the loaded rig leaves the placed image alone.
+        write_all(&back, &dir, &[]).unwrap();
+        assert_eq!(
+            std::fs::read(&png).unwrap(),
+            &*r.mesh.images[0].bytes().unwrap()
+        );
+        assert!(!dir.join("dressed_textures").join("skin_2.png").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sanitizes_names() {
+        assert_eq!(sanitize_name("my hero-01"), "my_hero_01");
+        assert_eq!(sanitize_name("3d"), "rig_3d");
+        assert_eq!(sanitize_name(""), "rig_");
+    }
+
+    #[test]
+    fn unreal_basis_uses_bones_the_rig_has() {
+        use crate::demo::Creature;
+        let r = rig::auto_rig(demo_humanoid(), "demo", Default::default()).unwrap();
+        assert_eq!(basis_bones(&r), ["pelvis", "hand_l", "head", "ball_l"]);
+        let built =
+            |c: Creature| rig::build_rig(c.mesh(), "c", c.guides(), Default::default()).unwrap();
+        // The bird has a left hand (wing) and ball (foot); the spider has neither,
+        // so other bones off the plane stand in.
+        assert_eq!(
+            basis_bones(&built(Creature::Bird)),
+            ["pelvis", "hand_l", "head", "ball_l"]
+        );
+        let spider = built(Creature::Spider);
+        let basis = basis_bones(&spider);
+        assert_eq!(
+            (basis.len(), &basis[..2]),
+            (4, &["pelvis".to_string(), "head".into()][..])
+        );
+        // The snake lies in its mid-plane: three bones, and the builder adds the normal.
+        let snake = built(Creature::Snake);
+        let basis = basis_bones(&snake);
+        assert_eq!(basis.len(), 3);
+        assert!(basis.iter().all(|n| snake.skeleton.bone(n).is_some()));
+        let s = script(&snake, Target::Unreal, Path::new("/tmp/snake.glb")).unwrap();
+        assert!(s.contains("\"basis\":[\"pelvis\",\"head\""), "{basis:?}");
+    }
+
+    #[test]
+    fn parses_targets() {
+        assert_eq!("UE5".parse::<Target>().unwrap(), Target::Unreal);
+        assert_eq!("FBX".parse::<Target>().unwrap(), Target::Fbx);
+        assert!("houdini".parse::<Target>().is_err());
+    }
+
+    #[test]
+    fn scripts_embed_valid_json_and_no_placeholders() {
+        let r = rig::auto_rig(demo_humanoid(), "demo", Default::default()).unwrap();
+        assert!(script(&r, Target::Fbx, Path::new("/tmp/demo.glb")).is_err());
+        for t in Target::SCRIPTS {
+            let s = script(&r, t, Path::new("/tmp/demo.glb")).unwrap();
+            assert!(
+                !s.contains(JSON_SLOT) && !s.contains(GLB_SLOT) && !s.contains(EXE_SLOT),
+                "{t:?}"
+            );
+            let start = s.find("r\"\"\"").unwrap() + 4;
+            let end = start + s[start..].find("\"\"\"").unwrap();
+            let v: serde_json::Value = serde_json::from_str(&s[start..end]).unwrap();
+            assert_eq!(v["name"], "demo");
+        }
+    }
+
+    #[test]
+    fn every_shape_reaches_every_builder() {
+        use crate::controls::Shape;
+        // Blender and Maya draw the outline hive-rig writes, so they have no
+        // shape table of their own to fall behind.
+        for template in [BLENDER_TEMPLATE, MAYA_TEMPLATE] {
+            assert!(template.contains("[\"outline\"]"));
+            assert!(!template.contains("\"circle\""));
+        }
+        // Unreal maps every shape to a library shape.
+        for shape in Shape::ALL {
+            let key = serde_json::to_string(&shape).unwrap();
+            assert!(
+                UNREAL_TEMPLATE.contains(&format!("    {key}: \"")),
+                "{key} missing from Unreal's SHAPES"
+            );
+        }
+        // The embedded rig carries each control's outline.
+        let r = rig::auto_rig(demo_humanoid(), "demo", Default::default()).unwrap();
+        let s = script(&r, Target::Maya, Path::new("/tmp/demo.glb")).unwrap();
+        let start = s.find("r\"\"\"").unwrap() + 4;
+        let end = start + s[start..].find("\"\"\"").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s[start..end]).unwrap();
+        for c in v["controls"]["controls"].as_array().unwrap() {
+            assert!(
+                !c["outline"].as_array().unwrap().is_empty(),
+                "{}",
+                c["name"]
+            );
+        }
+    }
+}
