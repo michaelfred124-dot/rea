@@ -16,9 +16,15 @@ patterns) applied to every export, and now:
 - **Face joints**: brows, eyelids, cheeks, nose and lips as joints with
   move-and-rotate controls. Joints rather than blendshapes, as Maya face rigs
   usually are, so the face reaches Blender and Unreal in the same .glb.
-- **Joints to guides**: a .glb that already has a skeleton (Mixamo, Unreal,
-  3ds Max biped, Maya or Blender names) becomes guides, with its eyes, jaw,
-  face and fingers. Checked by renaming and editing a rig in real Blender.
+- **Joints to guides**: a .glb or binary .fbx that already has a skeleton
+  (Mixamo, Unreal, 3ds Max biped, Maya or Blender names) becomes guides, with
+  its eyes, jaw, face and fingers, and its unknown parts (ears, tails, hair)
+  as chain components. Checked by renaming and editing a rig in real Blender.
+- **FBX input**: a hand-written binary FBX 7.x reader (no SDK): meshes,
+  normals, UV sets, colours, materials and textures, blend shapes, bones and
+  skin, placed with the full FBX transform and axis/unit settings; every
+  command that takes a .glb takes an .fbx. Checked against Blender-made FBX
+  files of public models (gap 8).
 - **Weight tools**: mirror weights left to right (or back), smooth one bone's
   weights or all of them, a paint brush in the app, prune, a max-influences
   limit per engine, and copying weights from another character (gap 11).
@@ -73,11 +79,11 @@ patterns) applied to every export, and now:
 | 4 | Spine and tentacles | Spline (IK) spine, tentacles, multi-branch FK | Done: a `spline` component (`hive-rig add <guides> tentacle`; joint and curve-control counts) whose curve controls bend a smooth curve the joints follow, with an FK layer, `stretch` on/off and `volume`, and `spine --spline true` for a spline spine (hips and chest controls end the curve). Spline IK on a hooked curve in Blender (checked in real Blender), ikSplineHandle with advanced twist in Maya, Fit Chain on Curve in Unreal (both only against stubs). Volume in Unreal (only against stubs). Next: twist along the chain in Blender, an exact curve in Unreal past four controls, a sliding (offset) attribute, multi-branch FK | Medium |
 | 5 | IK/FK and space matching | Snap IK to FK and back without a pop | Done in the Blender tab and Maya window, with matching across the playback range (keyed per frame). Unreal: IK/FK matching on the Sequencer's Control Rig track, per frame or over the playback range, from a Hive Rig editor menu or the Output Log (only against stubs). Next: try it in Unreal, mirror and reset pose in Unreal | Small |
 | 6 | Animator tools | Mirror poses, select-all-controls, reset pose | Done in Blender and Maya. Next: flip a whole pose (centre controls too), a pose library | Small |
-| 7 | Joints to guides, next steps | Turn an existing skeleton into guides | Done for .glb. Next: unknown chains (ears, tails, hair) read back as chain components, and FBX input | Small |
-| 8 | FBX and more targets | FBX export; Unity and Houdini use | Done: a hand-written binary FBX 7.4 writer (`--targets fbx`, Export FBX in the app) with mesh, skeleton, every skin influence and a bind pose, checked through Blender's FBX importer. Also done: objects, UV sets, vertex colours, materials with texture files and blend shapes, checked through Blender's FBX importer. Next: try it in Unreal, Unity and Houdini (not yet done), FBX input, Unity Humanoid bone names, animation takes, embedded textures | Small |
+| 7 | Joints to guides, next steps | Turn an existing skeleton into guides | Done for .glb and binary .fbx, with unknown chains (ears, tails, hair, side branches) read back as chain components hung from the bone they grow from. Next: ASCII FBX, reading a chain's spline (tentacle) or bendy setup back, and recognising helper joints by what they drive rather than by name | Small |
+| 8 | FBX and more targets | FBX export; Unity and Houdini use | Done: a hand-written binary FBX 7.4 writer (`--targets fbx`, Export FBX in the app) with mesh, skeleton, every skin influence and a bind pose, checked through Blender's FBX importer. Also done: objects, UV sets, vertex colours, materials with texture files and blend shapes, checked through Blender's FBX importer. Also done: FBX input (binary 7.x, 32- and 64-bit records, compressed arrays; meshes, materials, textures, shapes, skeleton and skin), checked on public models turned into FBX by Blender against their .glb and Blender's importer. Next: try it in Unreal, Unity and Houdini (not yet done), ASCII FBX input, Unity Humanoid bone names, animation takes, embedded textures on export | Small |
 | 9 | Pose-driven correctives | Corrective shapes and helper joints driven by joint angles (Brave Rabbit's weightDriver is the well-known Maya RBF/pose reader) | Done: angle pose readers (one bone's turn about an axis, start to end degrees) driving corrective shapes sculpted in the pose, in Blender, Maya and Unreal. Next: cone readers (a swing of any direction), RBF readers over several poses, readers driving helper joints, trying the Maya and Unreal setups in the real applications, and applying undriven shape weights in Unreal | Medium |
 | 10 | Control shapes | A library of control curve shapes, recolouring | More shapes and per-control colour/size in the app | Small |
-| 11 | Skin tools, next steps | Auto skin plus weight tools | Done: mirror, smooth, paint brush (add, subtract, smooth, symmetry, undo; edits kept on rebuild), prune, max influences per engine (glTF writes a second joints/weights set past four), and copy weights between characters by closest surface point with naming-aware bone matching. Next: weight transfer for unmatched extra chains (tails, ears) by position, a flood/set-value tool, locking bones while painting, painting in Blender/Maya round-tripping into the guides | Small |
+| 11 | Skin tools, next steps | Auto skin plus weight tools | Done: mirror, smooth, paint brush (add, subtract, smooth, symmetry, undo; edits kept on rebuild), prune, max influences per engine (glTF writes a second joints/weights set past four), and copy weights between characters by closest surface point with naming-aware bone matching, and extra chains left unmatched by name (tails, ears with other names or joint counts) matched by position. Next: a flood/set-value tool, locking bones while painting, painting in Blender/Maya round-tripping into the guides | Small |
 | 12 | Proximity controls | Controls appear as the mouse comes near (lesterbanks) | Blender-only overlay; Maya has no clean equivalent | Small |
 | 13 | Developer API | Scriptable rig building | Already partly there: the CLI and the guides JSON; document it | Small |
 

@@ -251,7 +251,7 @@ jobs:
   blender:
     name: Build and exercise the rig in Blender
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
@@ -373,6 +373,33 @@ jobs:
             --max-leg-leak 0.05 --max-arm-leak 0.05 --min-thickness 0.85 --max-artist-diff 0.35
           python -I tests/blender_skin_eval.py "$o/Fox/Fox.hive.json" \
             --source "$o/models/Fox/Fox.glb" --require-artist --max-artist-diff 0.6
+      - name: FBX input - public characters turned into FBX by Blender, rigged from .glb and .fbx
+        run: |
+          f="$RUNNER_TEMP/fbx_in"
+          sh tests/fetch_skin_models.sh "$f/models" Soldier Michelle Fox CesiumMan
+          for m in Soldier Michelle Fox CesiumMan; do
+            # CesiumMan with Blender's `_end` leaf bones, which stay unused.
+            leaf=""; [ "$m" = CesiumMan ] && leaf=--leaf-bones
+            python -I tests/blender_glb_to_fbx.py "$f/models/$m/$m.glb" "$f/models/$m/$m.fbx" $leaf
+            for ext in glb fbx; do
+              cargo run -q --release -- rig "$f/models/$m/$m.$ext" -o "$f/$m-$ext" -t blender | tee "$f/$m-$ext.log"
+            done
+            # The same guides (and components) from either file.
+            python3 -I tests/compare_guides.py "$f/$m-glb/$m.guides.json" "$f/$m-fbx/$m.guides.json"
+          done
+          grep -q "^Orientation: up +Y, facing -Z" "$f/Soldier-fbx.log"
+          grep -q "^Template: dog" "$f/Fox-fbx.log"
+          # Every rig vertex sits where Blender's own FBX importer puts one, and
+          # the weights compare with the artist's as from the .glb.
+          python -I tests/blender_skin_eval.py "$f/Soldier-fbx/Soldier.hive.json" \
+            --source "$f/models/Soldier/Soldier.fbx" --require-artist \
+            --max-leg-leak 0.05 --max-arm-leak 0.05 --min-thickness 0.85 --max-artist-diff 0.35
+          python -I tests/blender_skin_eval.py "$f/Fox-fbx/Fox.hive.json" \
+            --source "$f/models/Fox/Fox.fbx" --require-artist --max-artist-diff 0.6
+          python -I tests/blender_skin_eval.py "$f/CesiumMan-fbx/CesiumMan.hive.json" \
+            --source "$f/models/CesiumMan/CesiumMan.fbx" --require-artist
+          # The rig built from the .fbx works in Blender.
+          python tests/blender_check.py "$f/Soldier-fbx/Soldier_blender.py" "$f/Soldier-fbx/Soldier.glb"
       - name: Animator tools - IK/FK matching, mirror, reset and space switching in Blender
         run: |
           for drop in 0 45; do

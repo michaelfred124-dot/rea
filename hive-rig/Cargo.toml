@@ -11,6 +11,8 @@ glam = { version = "0.34.1", features = ["serde"] }
 gltf = { version = "1.4.1", features = ["extras"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+# Inflates the zlib-compressed arrays of binary FBX files (already built for png).
+miniz_oxide = "0.9.1"
 eframe = { version = "0.37.0", optional = true, default-features = false, features = ["glow", "default_fonts", "x11", "wayland", "accesskit", "clipboard", "links"] }
 rfd = { version = "0.17.2", optional = true }
 # Decodes texture images for the app's viewport (already built for gltf).

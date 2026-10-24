@@ -1,8 +1,9 @@
-//! Mesh importers: Wavefront OBJ (with its .mtl) and glTF 2.0 (.gltf / .glb).
+//! Mesh importers: Wavefront OBJ (with its .mtl), glTF 2.0 (.gltf / .glb) and
+//! binary FBX 7.x ([`fbx`]).
 //!
-//! Both keep what the character looks like: every object and material piece,
+//! All keep what the character looks like: every object and material piece,
 //! normals, UV sets, tangents and vertex colours, materials with their texture
-//! images, and (glTF) morph targets. Images are not decoded: embedded ones are
+//! images, and (glTF, FBX) morph targets; glTF and FBX also bring their skeleton. Images are not decoded: embedded ones are
 //! held as their encoded bytes and referenced ones by path, until an export
 //! writes them next to the rig.
 
@@ -19,6 +20,8 @@ use crate::mesh::{AlphaMode, Image, Material, Mesh, Part, TextureRef, smooth_nor
 use crate::orient::{self, Choice, Detection};
 use crate::shapes::Shape;
 
+pub mod fbx;
+
 /// A character as read from its file and turned into hive-rig's frame (Y up,
 /// facing +Z, its left on +X).
 #[derive(Debug, Clone)]
@@ -33,9 +36,35 @@ pub struct Character {
 /// Load a character: its mesh and skeleton, its orientation (detected, or as
 /// `choice` says) and its body kind, and turn it into hive-rig's frame.
 pub fn load_character(path: &Path, choice: Choice) -> Result<Character> {
-    let mesh = load_mesh(path)?;
-    let joints = load_joints(path)?;
+    let (mesh, joints) = load_mesh_and_joints(path)?;
     Ok(orient_character(mesh, joints, choice))
+}
+
+/// A file's mesh ([`load_mesh`]) and skeleton ([`load_joints`]), reading the
+/// file once.
+pub fn load_mesh_and_joints(path: &Path) -> Result<(Mesh, Vec<Joint>)> {
+    if extension(path) == "fbx" {
+        let scene = load_fbx(path)?;
+        return Ok((scene.mesh, scene.joints));
+    }
+    Ok((load_mesh(path)?, load_joints(path)?))
+}
+
+fn extension(path: &Path) -> String {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+/// Read a binary FBX and check it has a mesh.
+fn load_fbx(path: &Path) -> Result<fbx::FbxScene> {
+    let scene = fbx::load(path)?;
+    if scene.mesh.positions.is_empty() {
+        bail!("{} contains no meshes", path.display());
+    }
+    scene.mesh.validate()?;
+    Ok(scene)
 }
 
 /// Detect (or take from `choice`) how a mesh and skeleton in a file's frame
@@ -56,19 +85,15 @@ pub fn orient_character(mut mesh: Mesh, mut joints: Vec<Joint>, choice: Choice) 
 
 /// Load a mesh, picking the importer from the file extension.
 pub fn load_mesh(path: &Path) -> Result<Mesh> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .unwrap_or_default();
-    let mesh = match ext.as_str() {
+    let mesh = match extension(path).as_str() {
         "obj" => {
             let text = std::fs::read_to_string(path)
                 .with_context(|| format!("reading {}", path.display()))?;
             parse_obj_with(&text, path.parent())?
         }
         "gltf" | "glb" => load_gltf(path)?,
-        other => bail!("unsupported mesh format '.{other}' (use .obj, .gltf or .glb)"),
+        "fbx" => load_fbx(path)?.mesh,
+        other => bail!("unsupported mesh format '.{other}' (use .obj, .gltf, .glb or .fbx)"),
     };
     mesh.validate()?;
     Ok(mesh)
@@ -977,13 +1002,13 @@ fn collect_node(
 /// The joints of the first skin in a glTF file at their rest pose, in the same
 /// space [`load_gltf`] puts the mesh in (which places skinned vertices by these
 /// same joints), each with its nearest ancestor that is also a joint of the
-/// skin. Empty for files without a skin.
+/// skin. Empty for files without a skin. For an FBX, every bone of the file
+/// (see [`fbx::FbxScene::joints`]).
 pub fn load_joints(path: &Path) -> Result<Vec<Joint>> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .unwrap_or_default();
+    let ext = extension(path);
+    if ext == "fbx" {
+        return Ok(fbx::load(path)?.joints);
+    }
     if ext != "gltf" && ext != "glb" {
         return Ok(Vec::new());
     }

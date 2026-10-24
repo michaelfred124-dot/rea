@@ -447,6 +447,8 @@ pub fn guides_from_joints(detected: Guides, joints: &[Joint]) -> Result<(Guides,
             gd.position.x = pelvis.x;
         }
     }
+    // Ears, tails, hair and other parts the layout has no guide for.
+    add_unknown_chains(&mut g, joints, &mut look.used, &mut report);
     components::build(&g).context("the guides read from the joints don't build")?;
     report.unused = joints
         .iter()
@@ -678,6 +680,7 @@ pub fn quad_guides_from_joints(
         report.placed.push("tail".into());
         report.by_shape.push("tail".into());
     }
+    add_unknown_chains(&mut g, joints, &mut used, &mut report);
     components::build(&g).context("the dog guides read from the joints don't build")?;
     report.unused = joints
         .iter()
@@ -686,6 +689,235 @@ pub fn quad_guides_from_joints(
         .map(|(j, _)| j.name.clone())
         .collect();
     Ok(Some((g, report)))
+}
+
+/// Name tokens of rig helpers (IK targets, twist and roll joints, sockets),
+/// which are never body parts of their own.
+const HELPERS: [&str; 12] = [
+    "ik",
+    "twist",
+    "roll",
+    "helper",
+    "corrective",
+    "pole",
+    "target",
+    "socket",
+    "dummy",
+    "ctrl",
+    "locator",
+    "ikh",
+];
+
+/// Name tokens of a chain's end joint (it marks where the last bone ends).
+const ENDS: [&str; 5] = ["end", "tip", "nub", "top", "leaf"];
+
+fn tokens(name: &str) -> Vec<String> {
+    let (_, names) = candidates(name);
+    names
+        .first()
+        .map(|n| n.split('_').map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+fn is_helper(name: &str) -> bool {
+    let t = tokens(name);
+    t.iter()
+        .any(|t| HELPERS.contains(&t.as_str()) || t.contains("twist"))
+}
+
+fn is_end(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    tokens(name).last().is_some_and(|t| {
+        ENDS.contains(&t.as_str()) || ENDS.iter().any(|e| t.ends_with(e) && t.len() > e.len() + 2)
+    }) || lower.ends_with("_end")
+}
+
+/// A component id from a joint's name: its words without side, numbers or
+/// joint suffixes (`Ear.L` -> `ear`, `hair_03` -> `hair`, `b_Tail01_019` ->
+/// `b_tail`), or `chain` when nothing is left.
+fn chain_id_base(name: &str) -> String {
+    let words: Vec<String> = tokens(name)
+        .into_iter()
+        .map(|t| {
+            t.trim_end_matches(|c: char| c.is_ascii_digit())
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .collect::<String>()
+        })
+        .filter(|t| !t.is_empty())
+        .collect();
+    let id = words.join("_");
+    if id.is_empty() || id.starts_with(|c: char| c.is_ascii_digit()) {
+        "chain".into()
+    } else {
+        id
+    }
+}
+
+/// Read the joints no guide took that hang from the rest of the skeleton
+/// (ears, tails, hair, antennae: branches whose every joint went unused) back
+/// as FK chain components, each hung from the rig bone at the joint it grows
+/// from. A branching part becomes a chain along its longest run, with chains
+/// for its side branches hung from it. Helpers (IK, twist, roll, sockets) and
+/// single joints with nothing to aim at are left out. Returns the added ids.
+pub fn add_unknown_chains(
+    g: &mut Guides,
+    joints: &[Joint],
+    used: &mut [bool],
+    report: &mut JointReport,
+) -> Vec<String> {
+    let n = joints.len();
+    let mut children = vec![Vec::new(); n];
+    for (i, j) in joints.iter().enumerate() {
+        if let Some(p) = j.parent.filter(|&p| p < n && p != i) {
+            children[p].push(i);
+        }
+    }
+    // Whether every joint below (and at) i went unused; a cycle counts as used.
+    let mut free = vec![None::<bool>; n];
+    fn all_free(
+        i: usize,
+        used: &[bool],
+        children: &[Vec<usize>],
+        free: &mut [Option<bool>],
+    ) -> bool {
+        let mut order = vec![i];
+        let mut k = 0;
+        while k < order.len() {
+            let at = order[k];
+            if order.len() > used.len() {
+                return false;
+            }
+            order.extend(children[at].iter().copied());
+            k += 1;
+        }
+        for &at in order.iter().rev() {
+            let v = !used[at] && children[at].iter().all(|&c| free[c].unwrap_or(false));
+            free[at] = Some(v);
+        }
+        free[i].unwrap_or(false)
+    }
+    let h = g.body.height.max(1e-6);
+    let pos = |i: usize| joints[i].position;
+    let reach = |i: usize, children: &[Vec<usize>]| -> f32 {
+        let mut best = 0.0f32;
+        let mut stack = vec![(i, 0.0f32, 0usize)];
+        while let Some((at, d, depth)) = stack.pop() {
+            best = best.max(d);
+            if depth > n {
+                break;
+            }
+            for &c in &children[at] {
+                stack.push((c, d + pos(at).distance(pos(c)), depth + 1));
+            }
+        }
+        best
+    };
+    // Branch roots: free subtrees hanging from a joint a guide took (a part
+    // hanging from joints nothing recognised is more likely a misread limb).
+    let mut roots: Vec<(usize, Option<usize>)> = (0..n)
+        .filter(|&i| {
+            let Some(p) = joints[i].parent.filter(|&p| p < n) else {
+                return false;
+            };
+            used[p] && all_free(i, used, &children, &mut free)
+        })
+        .map(|i| (i, None))
+        .collect();
+    let mut added = Vec::new();
+    // Each entry: the root joint and, for a side branch, the chain it grows from.
+    while let Some((root, from_chain)) = roots.pop() {
+        if is_helper(&joints[root].name) {
+            continue;
+        }
+        // The run: on through the child reaching furthest; other children
+        // start their own chains.
+        let mut path = vec![root];
+        let mut branches: Vec<(usize, usize)> = Vec::new(); // (joint, path index)
+        loop {
+            let at = *path.last().unwrap();
+            let kids: Vec<usize> = children[at]
+                .iter()
+                .copied()
+                .filter(|&c| !is_helper(&joints[c].name))
+                .collect();
+            let Some(&next) = kids.iter().max_by(|a, b| {
+                (reach(**a, &children) + pos(at).distance(pos(**a)))
+                    .total_cmp(&(reach(**b, &children) + pos(at).distance(pos(**b))))
+            }) else {
+                break;
+            };
+            for &k in &kids {
+                if k != next {
+                    branches.push((k, path.len() - 1));
+                }
+            }
+            if path.len() > n {
+                break;
+            }
+            path.push(next);
+        }
+        let mut points: Vec<Vec3> = Vec::new();
+        for &j in &path {
+            if points.last().is_none_or(|p| p.distance(pos(j)) > 1e-4 * h) {
+                points.push(pos(j));
+            }
+        }
+        let last = *path.last().unwrap();
+        if points.len() >= 2 && !is_end(&joints[last].name) {
+            // No end joint: carry the last bone on, as long again.
+            let k = points.len();
+            points.push(points[k - 1] + (points[k - 1] - points[k - 2]));
+        }
+        if points.len() < 2 || points[0].distance(*points.last().unwrap()) < 0.005 * h {
+            continue;
+        }
+        let Ok(built) = components::build(g) else {
+            break;
+        };
+        // The bone it hangs from: the rig bone through the parent joint
+        // (starting there, when several are), or the chain it branches from.
+        let anchor = match from_chain {
+            Some(j) => pos(j),
+            None => pos(joints[root].parent.unwrap()),
+        };
+        let bones = &built.skeleton.bones;
+        let Some(parent) = (0..bones.len()).min_by(|&a, &b| {
+            let key = |i: usize| {
+                let d = bones[i].distance_to(anchor);
+                ((d / (1e-3 * h)).round(), bones[i].head.distance(anchor))
+            };
+            let (ka, kb) = (key(a), key(b));
+            ka.0.total_cmp(&kb.0).then(ka.1.total_cmp(&kb.1))
+        }) else {
+            break;
+        };
+        let x = points[0].x - g.body.center_x;
+        let side = if x > 0.01 * h {
+            Side::Left
+        } else if x < -0.01 * h {
+            Side::Right
+        } else {
+            Side::Center
+        };
+        let id = components::unique_id(g, &chain_id_base(&joints[root].name), side);
+        let parent_name = bones[parent].name.clone();
+        g.components
+            .push(components::chain(id.clone(), side, &parent_name, points));
+        if components::build(g).is_err() {
+            g.components.pop();
+            continue;
+        }
+        for &j in &path {
+            used[j] = true;
+        }
+        report.added.push(id.clone());
+        added.push(id);
+        for (b, k) in branches {
+            roots.push((b, Some(path[k])));
+        }
+    }
+    added
 }
 
 /// A finger's joints from its base to its tip, as many as the skeleton has.
@@ -840,5 +1072,199 @@ mod tests {
             );
         }
         assert!(report.unused.iter().any(|u| u.contains("twist")));
+    }
+
+    /// Ears, a branching tail and hair the layout has no guides for come back
+    /// as chains on the bones they grow from; IK helpers and lone end joints
+    /// don't.
+    #[test]
+    fn unknown_chains_become_chain_components() {
+        let mesh = demo::humanoid(0.0);
+        let (guides, _) = rig::detect_guides(&mesh);
+        let built = components::build(&guides).unwrap();
+        let sk = &built.skeleton;
+        let h = guides.body.height;
+        let mut joints: Vec<Joint> = sk
+            .bones
+            .iter()
+            .map(|b| Joint {
+                name: b.name.clone(),
+                position: b.head,
+                parent: b.parent,
+            })
+            .collect();
+        let chain = |joints: &mut Vec<Joint>, from: &str, names: &[&str], step: Vec3| {
+            let mut parent = joints.iter().position(|j| j.name == from).unwrap();
+            let mut at = joints[parent].position;
+            let mut out = Vec::new();
+            for n in names {
+                at += step * h;
+                joints.push(Joint {
+                    name: n.to_string(),
+                    position: at,
+                    parent: Some(parent),
+                });
+                parent = joints.len() - 1;
+                out.push(parent);
+            }
+            out
+        };
+        let head_top = sk.bone("head").unwrap().tail;
+        let ear_l = chain(
+            &mut joints,
+            "head",
+            &["Ear.L", "Ear.L.001", "Ear_end.L"],
+            Vec3::new(0.04, 0.03, 0.0),
+        );
+        let ear_r = chain(
+            &mut joints,
+            "head",
+            &["Ear.R", "Ear.R.001", "Ear_end.R"],
+            Vec3::new(-0.04, 0.03, 0.0),
+        );
+        // The ears start off the head joint: move them up beside its top.
+        for (k, &j) in ear_l.iter().chain(&ear_r).enumerate() {
+            joints[j].position.y +=
+                head_top.y - sk.bone("head").unwrap().head.y - 0.02 * h * (k % 3) as f32;
+        }
+        let tail = chain(
+            &mut joints,
+            "pelvis",
+            &["tail1", "tail2", "tail3", "tail4"],
+            Vec3::new(0.0, -0.03, -0.06),
+        );
+        // A side branch off the second tail joint (a fin), unnamed.
+        let fin_parent = tail[1];
+        let p = joints[fin_parent].position;
+        joints.push(Joint {
+            name: "Bone.012".into(),
+            position: p + Vec3::new(0.0, 0.05, 0.0) * h,
+            parent: Some(fin_parent),
+        });
+        joints.push(Joint {
+            name: "Bone.013".into(),
+            position: p + Vec3::new(0.0, 0.09, -0.01) * h,
+            parent: Some(joints.len() - 1),
+        });
+        let hair = chain(
+            &mut joints,
+            "head",
+            &["hair_01", "hair_02", "hair_03"],
+            Vec3::new(0.0, -0.04, -0.03),
+        );
+        // Helpers (an IK chain off the floor, so the legs are still the
+        // lowest) and a lone leaf.
+        chain(
+            &mut joints,
+            "root",
+            &["ik_foot_root", "ik_foot_l"],
+            Vec3::new(0.05, 0.2, 0.0),
+        );
+        chain(
+            &mut joints,
+            "hand_l",
+            &["weapon_l"],
+            Vec3::new(0.02, 0.0, 0.0),
+        );
+        let (fresh, _) = rig::detect_guides(&mesh);
+        let (g, report) = guides_from_joints(fresh, &joints).unwrap();
+        let c = |id: &str| {
+            g.component(id)
+                .unwrap_or_else(|| panic!("no {id}: {:?}", report.added))
+        };
+        let at = |j: usize| joints[j].position;
+        // Ears on the head, on their own sides, through their joints to the end joint.
+        for (id, js, side) in [
+            ("ear_l", &ear_l, Side::Left),
+            ("ear_r", &ear_r, Side::Right),
+        ] {
+            let e = c(id);
+            assert_eq!(e.kind, Kind::Chain);
+            assert_eq!(e.side, side);
+            assert_eq!(e.parent.as_deref(), Some("head"));
+            assert_eq!(e.guides.len(), 3);
+            for (gd, &j) in e.guides.iter().zip(js.iter()) {
+                assert!(gd.position.distance(at(j)) < 1e-6);
+            }
+        }
+        // The tail from the pelvis, carried one bone past its last joint; the
+        // fin on the tail's second bone.
+        let t = c("tail");
+        assert_eq!(t.parent.as_deref(), Some("pelvis"));
+        assert_eq!(t.guides.len(), 5);
+        let fin = g
+            .components
+            .iter()
+            .find(|x| x.id.starts_with("bone"))
+            .expect("fin");
+        assert_eq!(fin.parent.as_deref(), Some("tail_02"));
+        let hr = c("hair");
+        assert_eq!(hr.parent.as_deref(), Some("head"));
+        assert!(hr.guides[0].position.distance(at(hair[0])) < 1e-6);
+        assert!(
+            !g.components
+                .iter()
+                .any(|x| x.id.contains("ik") || x.id.contains("weapon"))
+        );
+        assert!(
+            report.unused.iter().any(|u| u == "ik_foot_l"),
+            "{:?} {:?}",
+            report.unused,
+            report.added
+        );
+        assert!(
+            !report
+                .unused
+                .iter()
+                .any(|u| u.starts_with("Ear") || u.starts_with("tail"))
+        );
+        components::build(&g).unwrap();
+        // The same on the dog: ears on its head.
+        let dog = components::quadruped(demo::DOG_HEIGHT);
+        let built = components::build(&dog).unwrap();
+        let mut joints: Vec<Joint> = built
+            .skeleton
+            .bones
+            .iter()
+            .map(|b| Joint {
+                name: String::new(),
+                position: b.head,
+                parent: b.parent,
+            })
+            .collect();
+        for (i, b) in built.skeleton.bones.iter().enumerate() {
+            if b.tail.y < 0.03 * dog.body.height
+                && !built.skeleton.bones.iter().any(|c| c.parent == Some(i))
+            {
+                joints.push(Joint {
+                    name: String::new(),
+                    position: b.tail,
+                    parent: Some(i),
+                });
+            }
+        }
+        let head = built.skeleton.index_of("head").unwrap();
+        let top = built.skeleton.bones[head].tail;
+        for s in [1.0f32, -1.0] {
+            let d = dog.body.height;
+            joints.push(Joint {
+                name: "ear".into(),
+                position: top + Vec3::new(0.05 * s, 0.0, -0.02) * d,
+                parent: Some(head),
+            });
+            joints.push(Joint {
+                name: "ear_tip".into(),
+                position: top + Vec3::new(0.08 * s, 0.1, -0.03) * d,
+                parent: Some(joints.len() - 1),
+            });
+        }
+        let fitted = fit_quadruped(&demo::demo_quadruped());
+        let (g, report) = quad_guides_from_joints(fitted, &joints).unwrap().unwrap();
+        for id in ["ear_l", "ear_r"] {
+            let e = g
+                .component(id)
+                .unwrap_or_else(|| panic!("no {id}: {:?}", report.added));
+            assert_eq!(e.parent.as_deref(), Some("head"));
+        }
     }
 }

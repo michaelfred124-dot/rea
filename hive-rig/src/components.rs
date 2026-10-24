@@ -612,7 +612,7 @@ fn creature(h: f32, components: Vec<Component>, crotch_y: f32, torso_half_width:
 }
 
 /// A chain component through `points`, with guides `j1`, `j2`, ...
-fn chain(
+pub(crate) fn chain(
     id: String,
     side: Side,
     parent: &str,
@@ -1317,7 +1317,7 @@ pub fn add_preset(g: &mut Guides, preset: Preset, opts: &AddOptions) -> Result<V
     Ok(added)
 }
 
-fn unique_id(g: &Guides, base: &str, side: Side) -> String {
+pub(crate) fn unique_id(g: &Guides, base: &str, side: Side) -> String {
     let s = side.suffix();
     let first = format!("{base}{s}");
     if g.component(&first).is_none() {

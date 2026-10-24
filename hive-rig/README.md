@@ -107,6 +107,30 @@ The writer is a small hand-written one in `src/export/fbx.rs` (no FBX SDK, no ne
 crates), from the publicly described binary layout. Arrays are written
 uncompressed, so files are larger than ones written with compression.
 
+### FBX input
+
+Every command and the app that take a `.glb` also take a binary `.fbx` (7.x,
+from Maya, Blender, 3ds Max, Mixamo or hive-rig itself): `hive-rig rig
+hero.fbx -o out`, `check --mesh hero.fbx`, `shape --from sculpt.fbx`, or
+dropping it on the app. The reader (`src/import/fbx.rs`, inflating with `miniz_oxide`) is written from the
+public binary layout too, with no SDK: it reads 32- and 64-bit records (7.4
+and 7.5+), zlib-compressed arrays, every mesh with its normals, UV sets,
+vertex colours, a piece per material (materials with their colour, opacity and
+diffuse, normal and emissive texture files, or the images embedded in the
+file), blend shapes, the bones (LimbNodes and anything a skin cluster links
+to) and the skin. Models are placed as the format describes: translation,
+rotation in its rotation order, pre- and post-rotation, pivots and offsets,
+scaling and the geometric transform; the scene is turned from the file's axes
+(`GlobalSettings`) to Y up and scaled from its unit to metres, and a skinned
+vertex sits where its clusters put it at the file's pose. Bones become guides
+as for a `.glb` ([joints to guides](#bring-your-own-skeleton-joints-to-guides)).
+A vertex is split only where its corners' normals, UVs or colours really
+differ (not by rounding noise), so an FBX that Blender made from a `.glb`
+reads back with the `.glb`'s vertices in the same order. Leaf bones an
+exporter adds to mark where a bone ends (Blender's `<bone>_end`) are left out.
+ASCII FBX isn't read (save it as binary). A texture is looked for only under
+the `.fbx`'s folder: an absolute path in the file keeps just its file name.
+
 ### Mesh fidelity
 
 A character comes out looking as it went in, only rigged. hive-rig keeps:
@@ -463,7 +487,18 @@ and knee the joints about halfway. A name is used only when its joint lies in
 the limb the shape found; `rig` says how many guides came from the shape. Feet
 hung from the root rather than the legs (as IK rigs do) are joined to the leg
 ending just above them. Joints are read at the file's rest pose, where a glTF
-viewer shows the character.
+viewer shows the character. A binary `.fbx` works the same way.
+
+Parts the layout has no guide for come back as **chains**: a branch of the
+skeleton whose joints no guide took (ears, a tail on a biped, hair, antennae,
+a cape) becomes a `chain` component through its joints, hung from the rig
+bone at the joint it grows from (`Ear.L` on the head gives `ear_l` on `head`;
+`hair_01` to `hair_03` give `hair`). Its side comes from where it is. A part
+that branches becomes a chain along its longest run, with chains for its side
+branches hung from it. Without an end joint, the last bone is carried on as
+long again. IK, twist, roll, pole and socket helpers and lone end joints are
+left out. The dog layout does the same for parts besides its tail. `rig`
+lists the chains it added with the other added components.
 
 ### Parenting, test poses and control looks
 
@@ -722,8 +757,15 @@ then by name after side tokens, prefixes and suffixes are read (`L_arm_jnt`,
 `upperarm_l`). Each target vertex is carried into the source's pose by its own
 bones (each matched bone turned onto its source bone), then takes the weights
 at the closest point of the source surface, blended across that triangle.
-Source bones with no match hand their weight to the nearest matched parent. The
-target is written again in its own folder (or `-o`).
+Extra chains left over on both sides (a tail called `brush` on one and `tail` on
+the other, ears with two joints on one and three on the other) are then
+matched **by position**: each leftover target chain, carried into the source's
+pose with the bones it hangs from, pairs with the leftover source chain lying
+closest along it (within 5% of the height on average), and along the pair
+every bone takes the weight of the bones nearest it, so different joint counts
+share the weight out by place. `weights copy` lists the bones it matched by
+position. Source bones with no match hand their weight to the nearest matched
+parent. The target is written again in its own folder (or `-o`).
 
 `guides.json` is plain JSON, so you can also edit guide positions, the spine's
 `joints` option, or `twist: false`, `bendy: true` or `soft` on a limb by hand.
@@ -793,7 +835,7 @@ Rig's own space switching covers the last.
 
 ## Input requirements
 
-* `.obj`, `.gltf` or `.glb`
+* `.obj`, `.gltf`, `.glb` or binary `.fbx`
 * One humanoid standing on the ground in T-pose or A-pose, or a four-legged
   animal standing on all fours
 * Any up axis and facing (see below)
@@ -882,7 +924,27 @@ python3 tests/dcc_stub_run.py maya out/hive_demo_maya.py --guides       # Maya g
 python tests/blender_anim_check.py out/hive_demo_blender.py             # animator tools
 python tests/blender_fbx_check.py out/hive_demo.fbx out/hive_demo.hive.json   # after demo --targets fbx -o out
 python tests/blender_anim_check.py bird/hive_bird_blender.py   # after demo --creature bird -o bird (or spider, snake)
+python -I tests/blender_glb_to_fbx.py /tmp/models/Fox/Fox.glb /tmp/models/Fox/Fox.fbx   # an FBX made by Blender
+hive-rig rig /tmp/models/Fox/Fox.fbx -o /tmp/fox_fbx   # and the same from Fox.glb into /tmp/fox_glb, then:
+python3 -I tests/compare_guides.py /tmp/fox_glb/Fox.guides.json /tmp/fox_fbx/Fox.guides.json
+python -I tests/blender_skin_eval.py /tmp/fox_fbx/Fox.hive.json --source /tmp/models/Fox/Fox.fbx --require-artist
 ```
+
+FBX input is tested in `cargo test` against hive-rig's own writer (every
+vertex, normal, UV, colour, piece, material, texture, blend shape, bone and
+skin influence reads back), on the same file rewritten with compressed arrays,
+64-bit records, a Z-up axis system in inches and a model turned by rotation,
+pre-rotation and pivot, with clusters storing their mesh transform either way
+the format is written in the wild, on damaged and ASCII files, and by reading a
+turned rig's `.fbx` back into the same guides. In CI, Blender's own importer
+and exporter turn public models (Fox, Soldier, Michelle, CesiumMan) into FBX
+files; hive-rig rigs each from its `.glb` and its `.fbx`, and the two guides
+files must agree (`compare_guides.py`), and `blender_skin_eval.py` reads the
+`.fbx` with Blender's FBX importer and requires every rig vertex to sit on one
+of Blender's, then compares the weights with the artist's. Unknown chains
+(ears, a branching tail, hair, with IK helpers left out, on a biped and on the
+dog) and copying weights onto extra chains named differently (by position)
+have unit tests in `src/joints.rs` and `src/rig.rs`.
 
 Orientation and joint reading are tested in `cargo test` on built-in bodies in
 every one of the 24 orientations (a T-pose, an A-pose and the dog: up, facing
@@ -1032,5 +1094,5 @@ glTF-to-Unreal import mirrors, which is untested in Unreal.
 See [the gap list](docs/hive-gaps.md)
 for what's planned. In short: cone and RBF pose readers, more creature templates (horse, dinosaur), IK legs beyond one
 arm and one leg a side (the spider's legs are FK chains), guide editing in Unreal (rebuild with the CLI and rerun the script), mirror
-and reset pose in Unreal, FBX input,
+and reset pose in Unreal, ASCII FBX input,
 FBX animation, and the mesh details listed under [Mesh fidelity](#mesh-fidelity).

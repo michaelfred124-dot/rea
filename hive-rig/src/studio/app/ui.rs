@@ -118,7 +118,10 @@ fn template_dialog(title: &str) -> rfd::FileDialog {
 fn character_dialog() -> rfd::FileDialog {
     rfd::FileDialog::new()
         .set_title("Open a character")
-        .add_filter("Characters and rigs", &["glb", "gltf", "obj", "json"])
+        .add_filter(
+            "Characters and rigs",
+            &["glb", "gltf", "fbx", "obj", "json"],
+        )
 }
 
 /// Whether two layouts have identical components and guide positions.
@@ -678,7 +681,7 @@ impl Studio {
                     card_w,
                     Glyph::Folder,
                     "Open a character",
-                    "Drop a .glb, .gltf or .obj file here, or click to browse.",
+                    "Drop a .glb, .gltf, .fbx or .obj file here, or click to browse.",
                     true,
                 )
                 .clicked()

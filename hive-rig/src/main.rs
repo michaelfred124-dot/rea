@@ -27,7 +27,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Rig a character (.obj, .gltf or .glb; a biped in T- or A-pose, or an
+    /// Rig a character (.obj, .gltf, .glb or binary .fbx; a biped in T- or A-pose, or an
     /// animal on four legs). Its up axis and facing are detected (or given with
     /// --up and --forward).
     Rig {
@@ -177,7 +177,7 @@ enum Command {
         /// A `.guides.json`, or a `.hive.json` (its mesh is checked against,
         /// and the guides next to it, which a rebuild would use).
         file: PathBuf,
-        /// A character mesh (.obj, .gltf, .glb) to check the guides against.
+        /// A character mesh (.obj, .gltf, .glb, .fbx) to check the guides against.
         #[arg(long)]
         mesh: Option<PathBuf>,
         /// Apply the fixes that are mechanical and save the guides file.
@@ -777,7 +777,7 @@ fn guided_rig(dropped: Option<PathBuf>) -> Result<()> {
         Some(p) => Some(p),
         None => {
             println!(
-                "Drag your character file (.glb, .gltf or .obj) into this window and press Enter,"
+                "Drag your character file (.glb, .gltf, .fbx or .obj) into this window and press Enter,"
             );
             println!("or just press Enter to rig the built-in demo character.");
             print!("> ");
@@ -1138,6 +1138,12 @@ fn weights_command(action: WeightsCommand) -> Result<()> {
                 report.matched,
                 target.skeleton.bones.len()
             );
+            if !report.by_position.is_empty() {
+                println!(
+                    "  matched by position (extra chains named differently): {}",
+                    report.by_position.join(", ")
+                );
+            }
             if !report.unmatched.is_empty() {
                 println!(
                     "  no match (skinned from the nearest matched bones): {}",

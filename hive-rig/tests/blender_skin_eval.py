@@ -1,6 +1,6 @@
 """Measure how well a rig's skin weights deform, in real Blender.
 
-    python blender_skin_eval.py <name>.hive.json [--source model.glb] [--json out.json]
+    python blender_skin_eval.py <name>.hive.json [--source model.glb|.fbx] [--json out.json]
         [--max-leg-leak X] [--max-arm-leak X] [--min-thickness X] [--max-spikes X]
         [--max-piece-wrong X] [--max-artist-diff X] [--require-artist]
 
@@ -8,7 +8,10 @@ The rig's mesh, bones and weights are rebuilt in Blender as a plain armature
 with an Armature modifier (the control rig isn't needed to judge the weights).
 With `--source`, the glTF the rig was made from (`hive-rig rig model.glb`) is
 read for the artist's weights, which are mapped onto the rig's bones and judged
-the same way, as a reference row. `--require-artist` fails when the source's
+the same way, as a reference row. A binary .fbx source is read with Blender's
+own FBX importer instead, each rig vertex taking the imported vertex at its
+place (so it also checks that hive-rig's FBX reader puts every vertex where
+Blender does). `--require-artist` fails when the source's
 vertices don't line up with the rig's (it was placed, turned or stood up
 differently), so no artist reference can be read.
 
@@ -298,8 +301,67 @@ def artist_weights(path):
     return positions, rows, joint_pos, joint_children, names
 
 
+def fbx_artist_weights(path):
+    """The source .fbx's weights read by Blender's own FBX importer (not
+    hive-rig's reader), per rig vertex: each rig vertex takes the imported
+    vertex at its place (the importers split vertices differently), which must
+    lie within 0.1% of the character's size. Blender stands the file Z up;
+    hive-rig reads it Y up, so Blender's (x, y, z) is the file's (x, z, -y)."""
+    from mathutils.kdtree import KDTree
+
+    before = set(bpy.data.objects)
+    bpy.ops.import_scene.fbx(filepath=path)
+    new = [o for o in bpy.data.objects if o not in before]
+    to_file = np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]], float)
+    turn = to_rig_frame() @ to_file
+    points, rows = [], []
+    joint_pos, joint_children, names = {}, {}, {}
+    graph = bpy.context.evaluated_depsgraph_get()
+    for ob in new:
+        if ob.type == "ARMATURE":
+            for b in ob.data.bones:
+                key = f"{ob.name}/{b.name}"
+                joint_pos[key] = turn @ np.array(ob.matrix_world @ b.head_local)
+                joint_children[key] = [f"{ob.name}/{c.name}" for c in b.children]
+                names[key] = b.name
+    for ob in new:
+        if ob.type != "MESH":
+            continue
+        arm = next((m.object for m in ob.modifiers if m.type == "ARMATURE" and m.object), None)
+        groups = {g.index: g.name for g in ob.vertex_groups}
+        evaluated = ob.evaluated_get(graph).to_mesh()
+        for v, ev in zip(ob.data.vertices, evaluated.vertices):
+            points.append(turn @ np.array(ob.matrix_world @ ev.co))
+            row = {}
+            for g in v.groups:
+                key = f"{arm.name}/{groups.get(g.group, '')}" if arm else None
+                if key in joint_pos and g.weight > 0:
+                    row[key] = row.get(key, 0.0) + g.weight
+            rows.append(row)
+        ob.evaluated_get(graph).to_mesh_clear()
+    points = np.array(points)
+    tree = KDTree(len(points))
+    for i, q in enumerate(points):
+        tree.insert(q, i)
+    tree.balance()
+    order, far = [], 0.0
+    for q in P:
+        _, i, d = tree.find(q)
+        order.append(i)
+        far = max(far, d)
+    for ob in new:
+        bpy.data.objects.remove(ob)
+    print(f"  {len(points)} vertices imported by Blender's FBX importer; the furthest rig vertex is {far / SIZE:.2e} of the size from one")
+    if far > 1e-3 * SIZE:
+        return np.zeros((0, 3)), [], joint_pos, joint_children, names
+    return P.copy(), [rows[i] for i in order], joint_pos, joint_children, names
+
+
 def map_artist(path):
-    pos, rows, joint_pos, kids, names = artist_weights(path)
+    if path.lower().endswith(".fbx"):
+        pos, rows, joint_pos, kids, names = fbx_artist_weights(path)
+    else:
+        pos, rows, joint_pos, kids, names = artist_weights(path)
     if len(pos) != NV or np.abs(pos - P).max() > 1e-3 * SIZE:
         print(f"  source vertices don't line up with the rig's ({len(pos)} vs {NV}); no artist reference")
         return None

@@ -399,7 +399,7 @@ impl Studio {
         self.doc = Some(doc);
     }
 
-    /// Open a character (.glb, .gltf, .obj), a saved rig (`.hive.json`) or, onto
+    /// Open a character (.glb, .gltf, .fbx, .obj), a saved rig (`.hive.json`) or, onto
     /// the current character, a guides file (`.guides.json`).
     pub fn open(&mut self, path: &Path) {
         let file = path
@@ -419,9 +419,8 @@ impl Studio {
     }
 
     fn open_character(&mut self, path: &Path) -> anyhow::Result<()> {
-        let mesh = import::load_mesh(path)?;
+        let (mesh, joints) = import::load_mesh_and_joints(path)?;
         mesh.validate()?;
-        let joints = import::load_joints(path)?;
         let stem = path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())

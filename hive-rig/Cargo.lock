@@ -1509,6 +1509,7 @@ dependencies = [
  "glam",
  "gltf",
  "image",
+ "miniz_oxide 0.9.1",
  "rfd",
  "serde",
  "serde_json",

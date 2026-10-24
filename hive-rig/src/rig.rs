@@ -263,38 +263,45 @@ pub fn bone_map(from: &Rig, to: &Rig) -> Vec<Option<usize>> {
 /// What [`copy_weights`] matched.
 #[derive(Debug, Clone, Default)]
 pub struct CopyReport {
-    /// Target bones that found a source bone.
+    /// Target bones that found a source bone (by name or by position).
     pub matched: usize,
+    /// Of those, the bones of extra chains (tails, ears, hair named
+    /// differently) matched by where they lie rather than by name.
+    pub by_position: Vec<String>,
     /// Target deform bones with no source bone; their skin comes from the
     /// nearest matched bones.
     pub unmatched: Vec<String>,
 }
 
 /// Copy `from`'s skin weights onto `to`'s mesh, which may be another character
-/// with the same or a similar skeleton, in another pose or size. The result
-/// follows `to`'s influence limits.
+/// with the same or a similar skeleton, in another pose or size. Bones match
+/// by name ([`bone_map`]), then chains left over on both sides by position
+/// ([`skin::match_bones`]). The result follows `to`'s influence limits.
 pub fn copy_weights(from: &Rig, to: &Rig) -> (SkinWeights, CopyReport) {
-    let map = bone_map(from, to);
-    let skin = skin::transfer(
-        &Skinned {
-            mesh: &from.mesh,
-            skeleton: &from.skeleton,
-            skin: &from.skin,
-        },
-        &Skinned {
-            mesh: &to.mesh,
-            skeleton: &to.skeleton,
-            skin: &to.skin,
-        },
-        &map,
-    );
+    let src = Skinned {
+        mesh: &from.mesh,
+        skeleton: &from.skeleton,
+        skin: &from.skin,
+    };
+    let dst = Skinned {
+        mesh: &to.mesh,
+        skeleton: &to.skeleton,
+        skin: &to.skin,
+    };
+    let m = skin::match_bones(&src, &dst, &bone_map(from, to));
+    let skin = skin::transfer_matched(&src, &dst, &m);
     let report = CopyReport {
-        matched: map.iter().filter(|m| m.is_some()).count(),
+        matched: m.dst_to_src.iter().filter(|m| m.is_some()).count(),
+        by_position: m
+            .by_position
+            .iter()
+            .map(|&b| to.skeleton.bones[b].name.clone())
+            .collect(),
         unmatched: to
             .skeleton
             .bones
             .iter()
-            .zip(&map)
+            .zip(&m.dst_to_src)
             .filter(|(b, m)| b.deform && m.is_none())
             .map(|(b, _)| b.name.clone())
             .collect(),
@@ -337,6 +344,142 @@ mod tests {
         let n = skin.vertex_count();
         let agree = (0..n).filter(|&v| top(&skin, v) == top(&a.skin, v)).count();
         assert!(agree as f32 > 0.9 * n as f32, "{agree} of {n}");
+    }
+
+    /// A tail and ears named differently, with other joint counts, still take
+    /// the source's tail and ear weights, matched by where they lie.
+    #[test]
+    fn copy_weights_matches_extra_chains_by_position() {
+        use crate::components::{self, Component};
+        use crate::skeleton::Side;
+        let guides = components::quadruped(demo::DOG_HEIGHT);
+        let mut src_guides = guides.clone();
+        let mut dst_guides = guides;
+        let h = demo::DOG_HEIGHT;
+        // Ears on the head: `ear_l`/`ear_r` (three joints) on the source,
+        // `flap_l`/`flap_r` (two) on the target, the tail renamed `brush`
+        // with fewer joints.
+        let built = components::build(&src_guides).unwrap();
+        let head = built.skeleton.bone("head").unwrap().clone();
+        let ear = |id: &str, s: f32, joints: usize| {
+            let mut c = components::chain(
+                id.to_string(),
+                if s > 0.0 { Side::Left } else { Side::Right },
+                "head",
+                (0..=joints).map(|k| {
+                    let t = k as f32 / joints as f32;
+                    head.tail + glam::Vec3::new(s * (0.03 + 0.04 * t), 0.06 * t, -0.03) * h
+                }),
+            );
+            c.options = Default::default();
+            c
+        };
+        src_guides.components.push(ear("ear_l", 1.0, 3));
+        src_guides.components.push(ear("ear_r", -1.0, 3));
+        dst_guides.components.push(ear("flap_l", 1.0, 2));
+        dst_guides.components.push(ear("flap_r", -1.0, 2));
+        let tail: &mut Component = dst_guides
+            .components
+            .iter_mut()
+            .find(|c| c.id == "tail")
+            .unwrap();
+        tail.id = "brush".into();
+        let n = tail.guides.len();
+        let keep = [0, n / 2, n - 1];
+        tail.guides = keep
+            .iter()
+            .enumerate()
+            .map(|(k, &i)| components::Guide {
+                name: format!("j{}", k + 1),
+                position: tail.guides[i].position,
+            })
+            .collect();
+        let src = build_rig(
+            demo::demo_quadruped(),
+            "src",
+            src_guides,
+            RigOptions::default(),
+        )
+        .unwrap();
+        let dst = build_rig(
+            demo::demo_quadruped(),
+            "dst",
+            dst_guides,
+            RigOptions::default(),
+        )
+        .unwrap();
+        let (skin, report) = copy_weights(&src, &dst);
+        for prefix in ["brush_", "flap_"] {
+            assert!(
+                report.by_position.iter().any(|b| b.starts_with(prefix)),
+                "{:?}",
+                report.by_position
+            );
+            assert!(!report.unmatched.iter().any(|b| b.starts_with(prefix)));
+        }
+        // Where the source's tail and ear bones weigh most, the copy's tail and
+        // ear bones do, on the same side.
+        let top = |s: &SkinWeights, sk: &crate::skeleton::Skeleton, v: usize| {
+            let b = s
+                .influences(v)
+                .max_by(|x, y| x.1.total_cmp(&y.1))
+                .unwrap()
+                .0;
+            sk.bones[b].name.clone()
+        };
+        let (mut tail_n, mut tail_ok, mut ear_n, mut ear_ok) = (0, 0, 0, 0);
+        for v in 0..skin.vertex_count() {
+            let was = top(&src.skin, &src.skeleton, v);
+            let got = top(&skin, &dst.skeleton, v);
+            if was.starts_with("tail_") {
+                tail_n += 1;
+                tail_ok += usize::from(got.starts_with("brush_"));
+            }
+            if was.starts_with("ear_") {
+                ear_n += 1;
+                ear_ok +=
+                    usize::from(got.starts_with("flap_") && got.ends_with(&was[was.len() - 2..]));
+            }
+        }
+        assert!(
+            tail_n > 20 && tail_ok as f32 > 0.95 * tail_n as f32,
+            "{tail_ok} of {tail_n}"
+        );
+        assert!(
+            ear_n > 0 && ear_ok as f32 > 0.95 * ear_n as f32,
+            "{ear_ok} of {ear_n}"
+        );
+        // By name alone the tail's skin would go to the pelvis.
+        let m = skin::BoneMatch {
+            dst_to_src: bone_map(&src, &dst),
+            src_to_dst: {
+                let mut s2d = vec![None; src.skeleton.bones.len()];
+                for (d, s) in bone_map(&src, &dst).iter().enumerate() {
+                    if let Some(s) = s {
+                        s2d[*s] = s2d[*s].or(Some(d));
+                    }
+                }
+                s2d
+            },
+            by_position: Vec::new(),
+        };
+        let by_name = skin::transfer_matched(
+            &Skinned {
+                mesh: &src.mesh,
+                skeleton: &src.skeleton,
+                skin: &src.skin,
+            },
+            &Skinned {
+                mesh: &dst.mesh,
+                skeleton: &dst.skeleton,
+                skin: &dst.skin,
+            },
+            &m,
+        );
+        let brush = (0..skin.vertex_count())
+            .filter(|&v| top(&by_name, &dst.skeleton, v).starts_with("brush_"))
+            .count();
+        assert!(brush < tail_n / 10, "{brush}");
     }
 
     #[test]
@@ -390,6 +533,22 @@ mod tests {
         let got = g.component("arm_l").unwrap().position("shoulder").unwrap();
         assert!(got.distance(want) < 1e-4, "{got} {want}");
         assert!(got.x > g.body.center_x);
+        // The .fbx reads back the same way: lying in the file, found, stood up
+        // onto the same mesh, its bones the same guides.
+        let fbx = dir.join("turned.fbx");
+        let raw = crate::import::load_mesh(&fbx).unwrap();
+        let (lo, hi) = raw.bounds();
+        assert!(hi.z - lo.z > 2.0 * (hi.y - lo.y), "{lo} {hi}");
+        let ch = crate::import::load_character(&fbx, Choice::default()).unwrap();
+        assert_eq!(ch.detection.orientation, o, "{:?}", ch.detection);
+        assert_eq!(ch.mesh.vertex_count(), rig.mesh.vertex_count());
+        for (a, b) in ch.mesh.positions.iter().zip(&rig.mesh.positions) {
+            assert!(a.distance(*b) < 1e-4);
+        }
+        let (g, _, report) = character_guides(&ch.mesh, &ch.joints, ch.detection.body);
+        assert!(report.unwrap().unwrap().placed.len() > 10);
+        let got = g.component("arm_l").unwrap().position("shoulder").unwrap();
+        assert!(got.distance(want) < 1e-4, "{got} {want}");
         // The rig file keeps the orientation.
         let back = Rig::load(&dir.join("turned.hive.json")).unwrap();
         assert_eq!(back.orientation, o);

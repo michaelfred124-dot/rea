@@ -943,8 +943,211 @@ pub struct Skinned<'a> {
     pub skin: &'a SkinWeights,
 }
 
+/// Which bones correspond between two skeletons for a weight transfer.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BoneMatch {
+    /// For each target bone, its source bone.
+    pub dst_to_src: Vec<Option<usize>>,
+    /// For each source bone, the target bone its weight goes to.
+    pub src_to_dst: Vec<Option<usize>>,
+    /// Target bones matched by where they are rather than by name.
+    pub by_position: Vec<usize>,
+}
+
+/// How target points are carried into the source's pose and size: each
+/// target bone's (head, turn onto the source bone, source head), from its own
+/// match or its nearest matched ancestor's, and the overall scale.
+struct Carry {
+    scale: f32,
+    anchors: (Vec3, Vec3),
+    moves: Vec<Option<(Vec3, Quat, Vec3)>>,
+}
+
+impl Carry {
+    fn new(src: &Skinned, dst: &Skinned, dst_to_src: &[Option<usize>]) -> Carry {
+        let n_src = src.skeleton.bones.len();
+        let (smin, smax) = src.mesh.bounds();
+        let (dmin, dmax) = dst.mesh.bounds();
+        let scale = (smax.y - smin.y) / (dmax.y - dmin.y).max(1e-6);
+        let anchor =
+            |min: Vec3, max: Vec3| Vec3::new((min.x + max.x) * 0.5, min.y, (min.z + max.z) * 0.5);
+        let mut moves: Vec<Option<(Vec3, Quat, Vec3)>> = vec![None; dst.skeleton.bones.len()];
+        for (b, bone) in dst.skeleton.bones.iter().enumerate() {
+            moves[b] = match dst_to_src.get(b).copied().flatten() {
+                Some(s) if s < n_src => {
+                    let sb = &src.skeleton.bones[s];
+                    let turn = if bone.length() > 1e-6 && sb.length() > 1e-6 {
+                        Quat::from_rotation_arc(bone.direction(), sb.direction())
+                    } else {
+                        Quat::IDENTITY
+                    };
+                    Some((bone.head, turn, sb.head))
+                }
+                _ => bone.parent.and_then(|p| moves.get(p).copied().flatten()),
+            };
+        }
+        Carry {
+            scale,
+            anchors: (anchor(smin, smax), anchor(dmin, dmax)),
+            moves,
+        }
+    }
+
+    /// A point that moves with target bone `b`, in the source's space.
+    fn point(&self, b: usize, p: Vec3) -> Vec3 {
+        match self.moves.get(b).copied().flatten() {
+            Some((from, turn, to)) => to + turn * ((p - from) * self.scale),
+            None => self.anchors.0 + (p - self.anchors.1) * self.scale,
+        }
+    }
+}
+
+fn segment_distance(p: Vec3, a: Vec3, b: Vec3) -> f32 {
+    let seg = b - a;
+    let len2 = seg.length_squared();
+    let t = if len2 > 0.0 {
+        ((p - a).dot(seg) / len2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    p.distance(a + seg * t)
+}
+
+/// Unmatched deform bones grouped into chains: each group is a bone whose
+/// parent is matched (or none) and the unmatched bones below it.
+fn unmatched_chains(sk: &Skeleton, matched: &[bool]) -> Vec<Vec<usize>> {
+    let free = |i: usize| sk.bones[i].deform && !matched[i];
+    let mut group: Vec<Option<usize>> = vec![None; sk.bones.len()];
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for i in 0..sk.bones.len() {
+        if !free(i) {
+            continue;
+        }
+        let g = match sk.bones[i]
+            .parent
+            .and_then(|p| group.get(p).copied().flatten())
+        {
+            Some(g) => g,
+            None => {
+                groups.push(Vec::new());
+                groups.len() - 1
+            }
+        };
+        group[i] = Some(g);
+        groups[g].push(i);
+    }
+    groups
+}
+
+/// Match bones for a weight transfer: by name (`dst_to_src`), then, for the
+/// chains left over on both sides (a tail, ears, hair named differently or
+/// with another joint count), by position. Each leftover target chain,
+/// carried into the source's pose with the bones it hangs from, pairs with
+/// the leftover source chain lying closest along it (within 5% of the source's
+/// height on average); along a pair every target bone takes the source bone
+/// nearest its middle, and every source bone hands its weight to the target
+/// bone nearest its middle, so chains with different joint counts share
+/// their weight out by place.
+pub fn match_bones(src: &Skinned, dst: &Skinned, dst_to_src: &[Option<usize>]) -> BoneMatch {
+    let n_src = src.skeleton.bones.len();
+    let n_dst = dst.skeleton.bones.len();
+    let mut d2s: Vec<Option<usize>> = (0..n_dst)
+        .map(|d| dst_to_src.get(d).copied().flatten().filter(|&s| s < n_src))
+        .collect();
+    let mut s2d: Vec<Option<usize>> = vec![None; n_src];
+    for (d, s) in d2s.iter().enumerate() {
+        if let Some(s) = *s
+            && s2d[s].is_none()
+        {
+            s2d[s] = Some(d);
+        }
+    }
+    let carry = Carry::new(src, dst, &d2s);
+    let dst_groups = unmatched_chains(
+        dst.skeleton,
+        &d2s.iter().map(Option::is_some).collect::<Vec<_>>(),
+    );
+    let src_groups = unmatched_chains(
+        src.skeleton,
+        &s2d.iter().map(Option::is_some).collect::<Vec<_>>(),
+    );
+    let carried: Vec<(Vec3, Vec3)> = dst
+        .skeleton
+        .bones
+        .iter()
+        .enumerate()
+        .map(|(b, bone)| (carry.point(b, bone.head), carry.point(b, bone.tail)))
+        .collect();
+    let s_bone = |s: usize| (src.skeleton.bones[s].head, src.skeleton.bones[s].tail);
+    let mid = |(a, b): (Vec3, Vec3)| (a + b) * 0.5;
+    let nearest = |p: Vec3, among: &[usize], seg: &dyn Fn(usize) -> (Vec3, Vec3)| {
+        among
+            .iter()
+            .copied()
+            .map(|i| {
+                let (a, b) = seg(i);
+                (segment_distance(p, a, b), i)
+            })
+            .min_by(|x, y| x.0.total_cmp(&y.0))
+    };
+    let (smin, smax) = src.mesh.bounds();
+    let tolerance = 0.05 * (smax.y - smin.y).max(1e-6);
+    let mut pairs: Vec<(f32, usize, usize)> = Vec::new();
+    for (gi, gd) in dst_groups.iter().enumerate() {
+        for (si, gs) in src_groups.iter().enumerate() {
+            let there: f32 = gd
+                .iter()
+                .map(|&b| nearest(mid(carried[b]), gs, &s_bone).map_or(f32::INFINITY, |n| n.0))
+                .sum::<f32>()
+                / gd.len() as f32;
+            let back: f32 = gs
+                .iter()
+                .map(|&s| {
+                    nearest(mid(s_bone(s)), gd, &|b| carried[b]).map_or(f32::INFINITY, |n| n.0)
+                })
+                .sum::<f32>()
+                / gs.len() as f32;
+            let cost = 0.5 * (there + back);
+            if cost < tolerance {
+                pairs.push((cost, gi, si));
+            }
+        }
+    }
+    pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let (mut dst_taken, mut src_taken) =
+        (vec![false; dst_groups.len()], vec![false; src_groups.len()]);
+    let mut by_position = Vec::new();
+    for (_, gi, si) in pairs {
+        if dst_taken[gi] || src_taken[si] {
+            continue;
+        }
+        dst_taken[gi] = true;
+        src_taken[si] = true;
+        let (gd, gs) = (&dst_groups[gi], &src_groups[si]);
+        for &b in gd {
+            d2s[b] = nearest(mid(carried[b]), gs, &s_bone).map(|n| n.1);
+            by_position.push(b);
+        }
+        for &s in gs {
+            s2d[s] = nearest(mid(s_bone(s)), gd, &|b| carried[b]).map(|n| n.1);
+        }
+    }
+    by_position.sort_unstable();
+    BoneMatch {
+        dst_to_src: d2s,
+        src_to_dst: s2d,
+        by_position,
+    }
+}
+
 /// Copy weights from `src` onto `dst`'s mesh. `dst_to_src` gives, for each of
-/// `dst`'s bones, the matching bone of `src` (by name), if any.
+/// `dst`'s bones, the matching bone of `src` (by name), if any; chains left
+/// over are matched by position ([`match_bones`]).
+pub fn transfer(src: &Skinned, dst: &Skinned, dst_to_src: &[Option<usize>]) -> SkinWeights {
+    transfer_matched(src, dst, &match_bones(src, dst, dst_to_src))
+}
+
+/// Copy weights from `src` onto `dst`'s mesh with bones matched as `m` says.
 ///
 /// Each target vertex is first carried into the source's pose and size: every
 /// matched bone turns the vertex from its own direction onto the source bone's
@@ -953,59 +1156,27 @@ pub struct Skinned<'a> {
 /// the closest point of the source surface, blended across that triangle's
 /// corners, with each source bone renamed to its target bone. Source bones
 /// without a match hand their weight to their nearest matched ancestor.
-pub fn transfer(src: &Skinned, dst: &Skinned, dst_to_src: &[Option<usize>]) -> SkinWeights {
+pub fn transfer_matched(src: &Skinned, dst: &Skinned, m: &BoneMatch) -> SkinWeights {
     let n_src = src.skeleton.bones.len();
-    let n_dst = dst.skeleton.bones.len();
-    let (smin, smax) = src.mesh.bounds();
-    let (dmin, dmax) = dst.mesh.bounds();
-    let scale = (smax.y - smin.y) / (dmax.y - dmin.y).max(1e-6);
-    let anchor =
-        |min: Vec3, max: Vec3| Vec3::new((min.x + max.x) * 0.5, min.y, (min.z + max.z) * 0.5);
-    let (s_anchor, d_anchor) = (anchor(smin, smax), anchor(dmin, dmax));
-
-    // Each target bone's move into source space: the matched bone, or the
-    // nearest matched ancestor's.
-    let mut moves: Vec<Option<(Vec3, Quat, Vec3)>> = vec![None; n_dst];
-    for (b, bone) in dst.skeleton.bones.iter().enumerate() {
-        moves[b] = match dst_to_src.get(b).copied().flatten() {
-            Some(s) if s < n_src => {
-                let sb = &src.skeleton.bones[s];
-                let turn = if bone.length() > 1e-6 && sb.length() > 1e-6 {
-                    Quat::from_rotation_arc(bone.direction(), sb.direction())
-                } else {
-                    Quat::IDENTITY
-                };
-                Some((bone.head, turn, sb.head))
-            }
-            _ => bone.parent.and_then(|p| moves.get(p).copied().flatten()),
-        };
-    }
+    let c = Carry::new(src, dst, &m.dst_to_src);
     let carry = |v: usize, p: Vec3| -> Vec3 {
         let mut out = Vec3::ZERO;
         let mut total = 0.0;
         for (j, w) in dst.skin.influences(v) {
-            if let Some((from, turn, to)) = moves.get(j).copied().flatten() {
-                out += (to + turn * ((p - from) * scale)) * w;
+            if c.moves.get(j).copied().flatten().is_some() {
+                out += c.point(j, p) * w;
                 total += w;
             }
         }
         if total > 0.0 {
             out / total
         } else {
-            s_anchor + (p - d_anchor) * scale
+            c.anchors.0 + (p - c.anchors.1) * c.scale
         }
     };
-
-    // Each source bone's target: its match, or its nearest matched ancestor's.
-    let mut src_to_dst: Vec<Option<usize>> = vec![None; n_src];
-    for (d, s) in dst_to_src.iter().enumerate() {
-        if let Some(s) = *s
-            && s < n_src
-            && src_to_dst[s].is_none()
-        {
-            src_to_dst[s] = Some(d);
-        }
-    }
+    let src_to_dst: Vec<Option<usize>> = (0..n_src)
+        .map(|s| m.src_to_dst.get(s).copied().flatten())
+        .collect();
     let renamed: Vec<Option<usize>> = (0..n_src)
         .map(|s| {
             let mut at = Some(s);
