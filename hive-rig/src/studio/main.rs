@@ -50,6 +50,10 @@ struct Launch {
     select: Option<String>,
     pick: Option<String>,
     pose: Option<String>,
+    /// `--set CONTROL=tx,ty,tz,rx,ry,rz`: pose a control and pick it (repeatable).
+    set: Vec<String>,
+    /// `--tool move|rotate|scale`: the manipulator shown on the picked controls.
+    tool: Option<String>,
     /// `--shape NAME=WEIGHT`: set a shape's weight and pick it (repeatable).
     shapes: Vec<String>,
     screenshot: Option<PathBuf>,
@@ -104,6 +108,10 @@ fn parse_args() -> Launch {
             }
             Some("--pick") => launch.pick = args.next().map(|s| s.to_string_lossy().into_owned()),
             Some("--pose") => launch.pose = args.next().map(|s| s.to_string_lossy().into_owned()),
+            Some("--set") => launch
+                .set
+                .extend(args.next().map(|s| s.to_string_lossy().into_owned())),
+            Some("--tool") => launch.tool = args.next().map(|s| s.to_string_lossy().into_owned()),
             Some("--screenshot") => launch.screenshot = args.next().map(PathBuf::from),
             Some("--shape") => launch
                 .shapes
@@ -251,6 +259,27 @@ fn main() -> eframe::Result {
         } else {
             app::RigPick::Bone(name.clone())
         });
+    }
+    for text in &launch.set {
+        let (name, values) = text.split_once('=').unwrap_or((text, ""));
+        let mut ch = studio.posing.pose.channels(name);
+        for (i, v) in values.split(',').enumerate().take(9) {
+            if let Ok(v) = v.trim().parse() {
+                ch.set(i, v);
+            }
+        }
+        studio.mode = app::Mode::Rig;
+        studio.set_control_channels(name, ch);
+        studio.select_control(name, true);
+    }
+    if let Some(tool) = &launch.tool {
+        studio.mode = app::Mode::Rig;
+        studio.posing.tool = match tool.as_str() {
+            "move" => app::Tool::Move,
+            "rotate" => app::Tool::Rotate,
+            "scale" => app::Tool::Scale,
+            _ => app::Tool::Select,
+        };
     }
     // Several ids (comma separated) are picked in order, as with Shift+click.
     for id in launch.select.iter().flat_map(|s| s.split(',')) {
