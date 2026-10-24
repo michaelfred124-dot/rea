@@ -46,6 +46,7 @@ class Vec:
 N_VERTS = [0]
 SCRIPT = [""]
 CV_POSITIONS = {}  # "curveShape.cv[i]" -> world position set by the Maya builder
+TIME = [7.0]  # Maya's current frame
 
 
 def stub_maya():
@@ -141,6 +142,17 @@ def stub_maya():
             if name == "expression":
                 calls.append(("expression", kwargs.get("name", "")))
                 return None
+            if name == "playbackOptions":
+                return 1.0 if kwargs.get("minTime") else 3.0
+            if name == "currentTime":
+                if kwargs.get("q") or kwargs.get("query"):
+                    return TIME[0]
+                TIME[0] = args[0]
+                calls.append(("currentTime", args[0]))
+                return None
+            if name == "setKeyframe":
+                calls.append(("setKeyframe", args[0], TIME[0]))
+                return None
             return None
 
         return fn
@@ -152,7 +164,8 @@ def stub_maya():
               "spaceLocator", "listHistory", "polyEvaluate", "warning", "autoKeyframe", "setKeyframe",
               "window", "deleteUI", "columnLayout", "rowLayout", "setParent", "button", "text", "separator",
               "checkBox", "showWindow", "confirmDialog", "skinPercent", "pointConstraint",
-              "shadingNode", "uvLink", "blendShape", "aliasAttr", "loadPlugin"]:
+              "shadingNode", "uvLink", "blendShape", "aliasAttr", "loadPlugin", "currentTime",
+              "playbackOptions"]:
         setattr(cmds, n, generic(n))
 
     om = types.ModuleType("maya.api.OpenMaya")
@@ -229,13 +242,24 @@ def stub_unreal():
         def unrotate_vector(self, v):
             return v
 
+        def rotate_vector(self, v):
+            return v
+
     class T:
+        # Translation only: enough for the builder's placements and the
+        # animator tools' arithmetic.
         def __init__(self, location=None, scale=None, rotation=None):
             self.translation = location or Vec()
             self.rotation = Q()
 
         def make_relative(self, other):
             return T(self.translation - other.translation)
+
+        def inverse(self):
+            return T(self.translation * -1.0)
+
+        def __mul__(self, other):
+            return T(self.translation + other.translation)
 
         def inverse_transform_direction(self, v):
             return v
@@ -248,11 +272,28 @@ def stub_unreal():
         name = getattr(key, "name", "")
         return T(positions.setdefault(str(name), Vec(len(positions), 1.0, 0.5 * len(positions))))
 
+    def set_global_transform(key, transform, initial=False, affect_children=True):
+        positions[str(getattr(key, "name", ""))] = transform.translation
+
     blueprint.hierarchy.get_global_transform.side_effect = global_transform
+    blueprint.hierarchy.set_global_transform.side_effect = set_global_transform
+    unreal.RigElementKey.side_effect = lambda type=None, name="": types.SimpleNamespace(type=type, name=name)
     vm = blueprint.get_controller_by_name.return_value
     vm.get_graph.return_value.get_nodes.return_value = []
+    # The animator tools: an open Level Sequence (frame 7, playback 1 to 3) that
+    # animates this Control Rig, whose hierarchy is the blueprint's.
+    editor = unreal.LevelSequenceEditorBlueprintLibrary
+    editor.get_current_time.return_value = 7
+    seq = editor.get_current_level_sequence.return_value
+    seq.get_playback_start.return_value = 1
+    seq.get_playback_end.return_value = 4
+    proxy = mock.MagicMock()
+    proxy.control_rig.get_hierarchy.return_value = blueprint.hierarchy
+    unreal.ControlRigSequencerLibrary.get_control_rigs.return_value = [proxy]
+    unreal.RigHierarchy.get_float_from_control_value.return_value = 0.5
+    unreal.FrameNumber = int
     sys.modules["unreal"] = unreal
-    return vm, blueprint.get_hierarchy_controller.return_value.add_curve
+    return vm, blueprint.get_hierarchy_controller.return_value
 
 
 if __name__ == "__main__":
@@ -296,6 +337,15 @@ if __name__ == "__main__":
             assert len(limb["joints"]) == len(limb["fk"]) == len(limb["fk_joints"]) == segments, limb["name"]
             ns["ik_to_fk"](limb["name"])
             ns["fk_to_ik"](limb["name"])
+            # Across the playback range (1 to 3 here): every frame visited and
+            # keyed whatever auto key says, then back to the frame we were on.
+            for to, keyed in (("fk", limb["fk"][0]), ("ik", limb["ik"])):
+                start = len(calls)
+                assert ns["match_range"](limb["name"], to) == 3
+                made = [c for c in calls[start:] if isinstance(c, tuple)]
+                assert [c[1] for c in made if c[0] == "currentTime"] == [1, 2, 3, 7.0], made
+                frames = {c[2] for c in made if c[0] == "setKeyframe" and c[1] == keyed}
+                assert frames == {1, 2, 3}, (limb["name"], to, frames)
         # Soft IK on every two-bone limb; bendy limbs constrain each bend joint to its curve.
         for chain in rig["controls"]["ik_chains"]:
             ik = chain["ik_control"]
@@ -343,8 +393,10 @@ if __name__ == "__main__":
     elif kind == "unreal":
         import json
 
-        vm, vm_curves = stub_unreal()
-        runpy.run_path(script, run_name="__main__")
+        vm, hc = stub_unreal()
+        vm_curves = hc.add_curve
+        sys.argv = [script]  # Output Log `py "<script>"`: build
+        ns = runpy.run_path(script, run_name="__main__")
         assert vm.add_link.call_count > 20
         # Spline chains: two Fit Chain on Curve units (keep length, then stretch) each.
         splines = json.loads(open(script).read().split('r"""', 1)[1].split('"""', 1)[0]).get("splines", [])
@@ -365,6 +417,37 @@ if __name__ == "__main__":
         assert sorted(curves) == sorted(driven), (curves, driven)
         if driven:
             print("unreal corrective curves ran against stubs: %d: ok" % len(driven))
+        # Soft IK and stretch on every limb (a soft control on two-bone limbs);
+        # volume on every spline joint on the curve.
+        floats = {c.args[0] for c in hc.add_control.call_args_list}
+        for chain in rig["ik_chains"]:
+            n = chain["name"]
+            assert "SoftAim_" + n in made and "Stretch_" + chain["lower"] in made, n
+            assert (n + "_soft" in floats) != bool(chain.get("hock")), n
+        for sp in splines:
+            assert sp["name"] + "_volume" in floats, sp["name"]
+            for b in sp["bones"][:-1]:
+                assert "Volume_" + b in made, b
+        # Animator tools: IK/FK matching both ways on the current frame and over
+        # the playback range, keyed on each frame, and a menu entry for each.
+        lib = sys.modules["unreal"].ControlRigSequencerLibrary
+        for chain in rig["ik_chains"]:
+            n = chain["name"]
+            for to, keyed in (("fk", chain["fk_controls"][0]), ("ik", chain["ik_control"])):
+                for argv, frames in (([n], {7}), ([n, "--range"], {1, 2, 3})):
+                    lib.reset_mock()
+                    assert ns["main"](["%s_to_%s" % ("ik" if to == "fk" else "fk", to)] + argv) == len(frames)
+                    loaded = {c.args[3] for c in lib.get_local_control_rig_euler_transform.call_args_list}
+                    keys = {c.args[3] for c in lib.set_local_control_rig_euler_transform.call_args_list
+                            if c.args[2] == keyed}
+                    blend = {(c.args[3], c.args[4]) for c in lib.set_local_control_rig_float.call_args_list
+                             if c.args[2] == n + "_ik_fk"}
+                    assert loaded == keys == frames, (n, to, argv, loaded, keys)
+                    assert blend == {(f, 0.5) for f in frames}, blend  # the stub reads every float as 0.5
+        entries = ns["register_menu"]()
+        assert entries == 4 * len(rig["ik_chains"]), entries
+        if rig["ik_chains"]:
+            print("unreal animator tools ran against stubs: %d limbs: ok" % len(rig["ik_chains"]))
     else:
         raise SystemExit("unknown kind " + kind)
     print("%s builder ran against stubs: ok" % kind)

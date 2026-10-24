@@ -300,4 +300,56 @@ update()
 check(all(pose[n].matrix_basis == Matrix.Identity(4) for n in data["controls"]), "reset puts every control at bind")
 check(all(pose[c][p] == v for c, d in data["defaults"].items() for p, v in d.items()), "reset restores default settings")
 check(max((a - b).length for a, b in zip(rest, deformed())) < 1e-4, "after reset the mesh is back at rest")
+
+# Matching across a frame range: animate one limb, match it on every frame, and
+# each frame keeps its pose with the other side keyed onto it.
+if has_limbs:
+    name = "arm_l"
+    limb = limbs[name]
+    scene = bpy.context.scene
+    frames = list(range(1, 6))
+    ns["reset_pose"](rig)
+    ik = pose[limb["ik"]]
+    for f in frames:
+        scene.frame_set(f)
+        ik["ik_fk"] = 0.0
+        ik.keyframe_insert('["ik_fk"]')
+        for k, ctrl in enumerate(limb["fk"]):
+            pb = pose[ctrl]
+            pb.rotation_mode = "XYZ"
+            pb.rotation_euler = (0.1 * f, -0.05 * f * (k + 1), 0.15 * f) if k != 1 else (0.0, 0.0, 0.0)
+            if k == 1:
+                pb.rotation_mode = "QUATERNION"
+                pb.rotation_quaternion = Quaternion(bend_axis(limb), 0.2 + 0.15 * f)
+                pb.rotation_mode = "XYZ"
+            pb.keyframe_insert("rotation_euler")
+    fk_poses = {}
+    for f in frames:
+        scene.frame_set(f)
+        fk_poses[f] = [world(b) for b in chain_bones(limb)]
+    check(differs(fk_poses[1][0], fk_poses[5][0])[1] > 0.1, "range: the FK arm is animated")
+    scene.frame_set(3)
+    n = ns["match_range"](rig, name, "ik", frames)
+    check(n == len(frames) and scene.frame_current == 3, "range: FK to IK visits %d frames and comes back" % n)
+    for f in frames:
+        scene.frame_set(f)
+        check(pose[limb["ik"]]["ik_fk"] == 1.0, "range: frame %d is keyed to IK" % f)
+        for bone, want in zip(chain_bones(limb), fk_poses[f]):
+            ok, how = same(world(bone), want)
+            check(ok, "range: frame %d, %s keeps its FK pose in IK (%s)" % (f, bone, how))
+    # And back: the IK keys just made drive the arm; match FK onto them.
+    n = ns["match_range"](rig, name, "fk", frames)
+    for f in frames:
+        scene.frame_set(f)
+        check(pose[limb["ik"]]["ik_fk"] == 0.0, "range: frame %d is keyed back to FK" % f)
+        for bone, ctrl, want in zip(chain_bones(limb), limb["fk"], fk_poses[f]):
+            ok, how = same(world(bone), want)
+            check(ok, "range: frame %d, %s keeps its pose back in FK (%s)" % (f, bone, how))
+    # The panel's range switch reaches the match buttons.
+    rig["hive_match_range"] = True
+    layout = mock.MagicMock()
+    ns["HIVE_PT_panel"].draw(SimpleNamespace(layout=layout),
+                             SimpleNamespace(active_object=rig, active_pose_bone=None, mode="POSE"))
+    check(any(c.args[:1] == (rig,) for c in layout.mock_calls if c.args), "range: the Hive tab shows the range switch")
+    rig["hive_match_range"] = False
 print("blender animator tools check passed")

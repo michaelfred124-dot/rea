@@ -216,8 +216,9 @@ by readers, are not built yet.
   the softened chain scales along its length to land on the goal, keeping the
   eased bend. Set the starting value with the component's `soft` option. A limb
   that is nearly straight in the bind pose is eased there too when `soft` > 0.
-  Blender (drivers and constraints) and Maya (a node network) build it; Unreal
-  doesn't yet and solves plain stretchy IK.
+  Blender (drivers and constraints), Maya (a node network) and Unreal (float
+  math ahead of a non-stretching two-bone IK, which scales the bones by the
+  stretch) build it the same way.
 * Bendy limbs (`bendy: true` on an arm or leg, off by default): each segment's
   skin moves from the segment bone onto four bend joints
   (`upperarm_twist_01_l`…`_04_l`), which follow a curve from the shoulder or hip
@@ -355,9 +356,9 @@ How each program builds it:
   controls, and stretch and volume from the curve's length (`curveInfo`).
 * **Unreal:** Control Rig's **Fit Chain on Curve** on the closest four-point
   Bézier (exact up to four controls), once keeping lengths and again stretched
-  by `<name>_stretch`. Volume isn't built in Unreal yet, and Fit Chain on Curve
-  takes one cubic Bézier, so with more than four controls the curve is an
-  approximation.
+  by `<name>_stretch`. `<name>_volume` thins each joint by 1 / sqrt(stretch)
+  across its length. Fit Chain on Curve takes one cubic Bézier, so with more
+  than four controls the curve is an approximation.
 
 ### Quadrupeds: the dog layout and hind legs
 
@@ -747,7 +748,7 @@ Rebuilding runs the `hive-rig` program that generated the script. If you've
 moved it since, set `HIVE_EXE` at the top of the script. Running the script
 again in a file that already has the rig only brings back the tab or window.
 
-### Animator tools in Blender and Maya
+### Animator tools in Blender, Maya and Unreal
 
 Below the guide tools, the Hive tab (Blender) and the Hive Rig window (Maya)
 have an **Animation** section:
@@ -770,11 +771,25 @@ have an **Animation** section:
 * **Switch space without a pop**: Blender shows a button per space for the
   active control; Maya asks which space to follow for the selected control. The
   control keeps its place in the world.
+* **Match the whole playback range** (a switch above the IK/FK buttons): the
+  match runs on every frame of the scene's playback range in order, keying each
+  frame whatever auto key says, so a stretch of animation changes between IK
+  and FK without a pop. Each frame reads the keys the frames before it were
+  given.
 
 With auto key on, the tools key what they changed. Which controls make up each
 limb and which controls are left/right twins come from hive-rig (`ik_chains` and
 `mirror_pairs` in the rig data), so the tools work with any naming convention.
-Unreal doesn't have these tools yet.
+
+In Unreal, IK to FK and FK to IK work on the Level Sequence that animates the
+Control Rig: open it in Sequencer and use the **Hive Rig** menu that the script
+adds to the editor's menu bar, with an entry per limb for the current frame and
+for the playback range. Each frame is loaded from the Sequencer's keys into the
+rig, matched and keyed back. From the Output Log the same is
+`py "<name>_unreal.py" ik_to_fk arm_l` (add `--range` for the playback range),
+and `py "<name>_unreal.py" menu` brings the menu back after an editor restart.
+Mirror and reset pose and the space switch are Blender and Maya only; Control
+Rig's own space switching covers the last.
 
 ## Input requirements
 
@@ -998,7 +1013,7 @@ vertex, materials, textures, blend shapes, skins and the bind pose), OBJ and MTL
 import, the textures folder, and the corrective sculpt (in its pose the
 vertices land where they were put; at rest it's off).
 
-The Maya and Unreal builders, and the Maya guide and animator tools, are checked against stub
+The Maya and Unreal builders, and the Maya and Unreal animator tools and Maya guide tools, are checked against stub
 APIs. That catches script errors but doesn't prove the application calls behave
 as intended (the spline chains' ikSplineHandle and Fit Chain on Curve setups
 included). The Maya stub also checks that every control curve point is placed
@@ -1016,6 +1031,6 @@ glTF-to-Unreal import mirrors, which is untested in Unreal.
 
 See [the gap list](docs/hive-gaps.md)
 for what's planned. In short: cone and RBF pose readers, more creature templates (horse, dinosaur), IK legs beyond one
-arm and one leg a side (the spider's legs are FK chains), guide editing in Unreal (rebuild with the CLI and rerun the script), the
-animator tools (IK/FK matching, mirror and reset pose) in Unreal, FBX input,
+arm and one leg a side (the spider's legs are FK chains), guide editing in Unreal (rebuild with the CLI and rerun the script), mirror
+and reset pose in Unreal, FBX input,
 FBX animation, and the mesh details listed under [Mesh fidelity](#mesh-fidelity).

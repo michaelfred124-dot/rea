@@ -555,6 +555,17 @@ def build(RIG, geos=None):
             chain.append(mch("MCH_%s_spline" % b, like=b,
                              parent=chain[-1] if chain else BONES[first["parent"]]["name"]))
         tip = mch("MCH_%s_tip" % n, like=sp["bones"][-1], parent=sp["controls"][-1])
+        # Twist: Spline IK only aims the joints along the curve, so their roll
+        # comes from the chain's parent. Each end gets a pair of helpers turned
+        # like the joint there: one rides the curve control, one the chain's
+        # parent. How far the first has turned about the joint's length, seen
+        # from the second, is that end's twist, spread along the chain below.
+        base_parent = BONES[first["parent"]]["name"] if first["parent"] is not None else None
+        twist = []
+        for label, bone, ctrl in (("start", sp["bones"][0], sp["controls"][0]),
+                                  ("end", sp["bones"][-2], sp["controls"][-1])):
+            twist.append((mch("MCH_%s_twist_%s" % (n, label), like=bone, parent=ctrl),
+                          mch("MCH_%s_twist_%s_ref" % (n, label), like=bone, parent=base_parent)))
         # The last joint and the bones hanging from the chain keep their own
         # scale when it stretches or squashes.
         inside = set(sp["bones"][:-1])
@@ -562,7 +573,7 @@ def build(RIG, geos=None):
         for b in BONES:
             if b["parent"] is not None and BONES[b["parent"]]["name"] in inside and b["name"] not in inside:
                 edit[b["name"]].inherit_scale = "NONE"
-        spline_parts.append((sp, points, chain, tip))
+        spline_parts.append((sp, points, chain, tip, twist))
 
 
     def signed_angle(u, v, normal):
@@ -776,7 +787,7 @@ def build(RIG, geos=None):
             follow.subtarget = chain["_flat"]
             add_blend_driver(follow, chain["ik_control"])
 
-    for sp, points, chain, tip in spline_parts:
+    for sp, points, chain, tip, twist in spline_parts:
         settings = pose[sp["settings"]]
         add_property(settings, "stretch", float(sp["default_stretch"]), 0.0, 1.0,
                      "1 = the joints stretch to the curve, 0 = they keep their length")
@@ -819,11 +830,29 @@ def build(RIG, geos=None):
         ik.xz_scale_mode = "VOLUME_PRESERVE"
         add_driver(ik, "y_scale_mode", sp["settings"], "stretch", "floor(min(stretch, 1) + 0.5)")
         add_driver(ik, "bulge", sp["settings"], "volume", "volume")
-        for bone, src in zip(sp["bones"], chain):
+        for i, (bone, src) in enumerate(zip(sp["bones"], chain)):
             con = pose[bone].constraints.new("COPY_TRANSFORMS")
             con.name = "Spline"
             con.target = rig
             con.subtarget = src
+            # Then the joint turns about its length by its share of each end's
+            # twist: all of the start's at the base, all of the end's at the tip.
+            t = 0.5 * (sp["params"][i] + sp["params"][i + 1])
+            for (helper, ref), share in zip(twist, (1.0 - t, t)):
+                if share < 1e-4:
+                    continue
+                spin = pose[bone].constraints.new("TRANSFORM")
+                spin.name = "Spline Twist"
+                spin.target, spin.subtarget = rig, helper
+                spin.target_space = "CUSTOM"
+                spin.space_object, spin.space_subtarget = rig, ref
+                spin.owner_space = "LOCAL"
+                spin.map_from = spin.map_to = "ROTATION"
+                spin.from_rotation_mode = "SWING_TWIST_Y"
+                spin.from_min_y_rot, spin.from_max_y_rot = -math.pi, math.pi
+                spin.map_to_x_from, spin.map_to_y_from, spin.map_to_z_from = "X", "Y", "Z"
+                spin.to_min_y_rot, spin.to_max_y_rot = -math.pi * share, math.pi * share
+                spin.mix_mode_rot = "AFTER"
         end = pose[sp["bones"][-1]].constraints.new("COPY_LOCATION")
         end.name = "Spline End"
         end.target = rig
@@ -930,6 +959,8 @@ def build(RIG, geos=None):
     rig["hive_guides"] = json.dumps(RIG["guides"])
     rig["hive_dir"] = OUT_DIR
     rig["hive_anim"] = json.dumps(animator_data(RIG, foot_ik_target, hock_target, soft_rig))
+    # The Hive tab's "match the whole frame range" switch.
+    rig["hive_match_range"] = False
     bpy.context.view_layer.objects.active = rig
     print("hive-rig: built %s with %d bones and %d controls" % (NAME, len(BONES), len(CONTROLS)))
     return rig, geos
@@ -995,9 +1026,9 @@ def refresh(rig):
     bpy.context.view_layer.update()
 
 
-def key_controls(rig, names):
-    """Key what the tools changed when auto-keying is on."""
-    if not bpy.context.scene.tool_settings.use_keyframe_insert_auto:
+def key_controls(rig, names, force=False):
+    """Key what the tools changed when auto-keying is on (or `force`)."""
+    if not force and not bpy.context.scene.tool_settings.use_keyframe_insert_auto:
         return
     for n in names:
         pb = rig.pose.bones[n]
@@ -1044,7 +1075,7 @@ def pole_position(rig, limb, a, b, c, upper_matrix):
     return b + now @ (rest.transposed() @ (rest_pole - rb))
 
 
-def ik_to_fk(rig, name):
+def ik_to_fk(rig, name, force_key=False):
     """Snap the FK controls onto the IK pose, then switch the limb to FK."""
     limb = limb_of(rig, name)
     pose = rig.pose.bones
@@ -1060,7 +1091,7 @@ def ik_to_fk(rig, name):
         refresh(rig)
     ik["ik_fk"] = 0.0
     refresh(rig)
-    key_controls(rig, limb["fk"] + [limb["ik"]])
+    key_controls(rig, limb["fk"] + [limb["ik"]], force_key)
 
 
 def unsoft_reach(reach, length, soft, zone):
@@ -1073,7 +1104,7 @@ def unsoft_reach(reach, length, soft, zone):
     return start - ease * math.log(max(1.0 - (reach - start) / ease, 1e-9))
 
 
-def fk_to_ik(rig, name):
+def fk_to_ik(rig, name, force_key=False):
     """Move the IK control and pole onto the FK pose, then switch the limb to IK."""
     limb = limb_of(rig, name)
     pose = rig.pose.bones
@@ -1130,7 +1161,28 @@ def fk_to_ik(rig, name):
         m.translation = a + Matrix.Rotation(angle, 3, along) @ (m.translation - a)
         pole.matrix = m
         refresh(rig)
-    key_controls(rig, [limb["ik"], limb["pole"]] + ([hock["control"]] if hock else []))
+    key_controls(rig, [limb["ik"], limb["pole"]] + ([hock["control"]] if hock else []), force_key)
+
+
+def scene_frames():
+    scene = bpy.context.scene
+    return list(range(scene.frame_start, scene.frame_end + 1))
+
+
+def match_range(rig, name, to, frames=None):
+    """Match the limb on each of `frames` (the scene's frame range by default),
+    keying the result on every one, so a stretch of animation switches between
+    IK and FK without a pop. Frames are visited in order: each match reads the
+    pose the frame's keys give, including the keys set on the frames before."""
+    scene = bpy.context.scene
+    here = scene.frame_current
+    match = ik_to_fk if to == "fk" else fk_to_ik
+    frames = scene_frames() if frames is None else list(frames)
+    for f in frames:
+        scene.frame_set(f)
+        match(rig, name, force_key=True)
+    scene.frame_set(here)
+    return len(frames)
 
 
 def mirror_pose(rig, names=None, source="left"):
@@ -1480,9 +1532,16 @@ class HIVE_OT_match_limb(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
     limb: bpy.props.StringProperty()
     to: bpy.props.EnumProperty(items=[("fk", "To FK", "Snap FK to the IK pose"), ("ik", "To IK", "Snap IK to the FK pose")])
+    whole_range: bpy.props.BoolProperty(name="Frame Range", default=False,
+                                        description="Match and key every frame of the scene's frame range")
 
     def execute(self, context):
-        (ik_to_fk if self.to == "fk" else fk_to_ik)(find_rig(context), self.limb)
+        rig = find_rig(context)
+        if self.whole_range:
+            n = match_range(rig, self.limb, self.to)
+            self.report({"INFO"}, "Matched %s on %d frames" % (self.limb, n))
+        else:
+            (ik_to_fk if self.to == "fk" else fk_to_ik)(rig, self.limb)
         return {"FINISHED"}
 
 
@@ -1577,14 +1636,17 @@ class HIVE_PT_panel(bpy.types.Panel):
         box = layout.box()
         box.label(text="Animation")
         pose = rig.pose.bones
+        whole_range = bool(rig.get("hive_match_range", False))
+        if "hive_match_range" in rig.keys():
+            box.prop(rig, '["hive_match_range"]', text="Match the whole frame range")
         for limb in data["limbs"]:
             row = box.row(align=True)
             ik_on = pose[limb["ik"]].get("ik_fk", 0.0) >= 0.5
             row.label(text="%s (%s)" % (limb["name"], "IK" if ik_on else "FK"))
             op = row.operator("hive.match_limb", text="IK to FK")
-            op.limb, op.to = limb["name"], "fk"
+            op.limb, op.to, op.whole_range = limb["name"], "fk", whole_range
             op = row.operator("hive.match_limb", text="FK to IK")
-            op.limb, op.to = limb["name"], "ik"
+            op.limb, op.to, op.whole_range = limb["name"], "ik", whole_range
         row = box.row(align=True)
         row.operator("hive.mirror_pose", text="Mirror L to R", icon="MOD_MIRROR").source = "left"
         row.operator("hive.mirror_pose", text="Mirror R to L").source = "right"

@@ -18,7 +18,7 @@ import runpy
 import sys
 
 import bpy
-from mathutils import Vector
+from mathutils import Matrix, Vector
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hive_names  # noqa: E402
@@ -208,6 +208,36 @@ for name, sp in SPLINES.items():
     update()
     turned = (pose[bones[-1]].matrix.to_3x3() @ before.inverted()).to_quaternion().angle
     check(abs(turned - 0.6) < 0.05, "%s: the end control turns the last joint (%.2f rad)" % (name, turned))
+
+    # Twist: turning the end control about the chain's length twists the joints
+    # along it, a little at the base and most of the way at the tip, without
+    # moving them off the curve.
+    for ctrl, at_end in ((ctrls[-1], True), (ctrls[0], False)):
+        reset()
+        chain_bones = bones[:-1]
+        before = [pose[b].matrix.to_3x3().normalized() for b in chain_bones]
+        heads0 = [head(b) for b in bones]
+        axis = (before[-1 if at_end else 0] @ Vector((0.0, 1.0, 0.0))).normalized()
+        m = pose[ctrl].matrix.copy()
+        spin = Matrix.Rotation(0.8, 4, axis)
+        pose[ctrl].matrix = Matrix.Translation(m.translation) @ spin @ Matrix.Translation(-m.translation) @ m
+        update()
+        twists = []
+        for b, m0 in zip(chain_bones, before):
+            d = (m0.inverted() @ pose[b].matrix.to_3x3().normalized()).to_quaternion()
+            swing_twist = d.to_swing_twist("Y")[1]
+            twists.append(swing_twist)
+        which = "end" if at_end else "start"
+        far, near = (twists[-1], twists[0]) if at_end else (twists[0], twists[-1])
+        check(abs(far) > 0.5 and abs(near) < abs(far),
+              "%s: twisting the %s control twists the chain toward that end (%.2f near it, %.2f far)"
+              % (name, which, far, near))
+        steps = [abs(a - b) for a, b in zip(twists, twists[1:])]
+        check(not steps or max(steps) < 0.45, "%s: the %s twist spreads evenly (largest step %.2f rad)"
+              % (name, which, max(steps or [0])))
+        moved = max((head(b) - h).length for b, h in zip(bones[:-1], heads0[:-1]))
+        if at_end:
+            check(moved < 2e-3 * rest_len + 1e-4, "%s: twisting keeps the joints on the curve (%.4f m)" % (name, moved))
 
 # Spine specifics: the chest carries the head and arms, the hips the pelvis.
 reset()

@@ -1035,9 +1035,9 @@ def set_world(ctrl, m):
     set_local(ctrl, mat_mul(mat_inv(world(anim_data()["offsets"][ctrl])), m))
 
 
-def key_controls(names):
-    """Key what the tools changed when auto key is on."""
-    if not cmds.autoKeyframe(q=True, state=True):
+def key_controls(names, force=False):
+    """Key what the tools changed when auto key is on (or `force`)."""
+    if not force and not cmds.autoKeyframe(q=True, state=True):
         return
     for n in names:
         cmds.setKeyframe(n, attribute=[c for c in CHANNELS + ANIM_ATTRS if cmds.attributeQuery(c, node=n, exists=True)])
@@ -1047,7 +1047,7 @@ def limb_of(name):
     return next(l for l in anim_data()["limbs"] if l["name"] == name)
 
 
-def ik_to_fk(name):
+def ik_to_fk(name, force_key=False):
     """Snap the FK controls onto the IK pose, then switch the limb to FK."""
     limb = limb_of(name)
     offsets = anim_data()["offsets"]
@@ -1059,7 +1059,7 @@ def ik_to_fk(name):
             if settable(ctrl + "." + ch):
                 cmds.setAttr(ctrl + "." + ch, v)
     cmds.setAttr(limb["ik"] + ".ikFk", 0)
-    key_controls(limb["fk"] + [limb["ik"]])
+    key_controls(limb["fk"] + [limb["ik"]], force_key)
 
 
 def limb_frame(a, b, c, fallback):
@@ -1101,7 +1101,7 @@ def unsoft_reach(reach, length, soft, zone):
     return start - ease * math.log(max(1.0 - (reach - start) / ease, 1e-9))
 
 
-def fk_to_ik(name):
+def fk_to_ik(name, force_key=False):
     """Move the IK control and pole onto the FK pose, then switch the limb to IK."""
     limb = limb_of(name)
     fk = [world(j) for j in limb["fk_joints"]]
@@ -1143,7 +1143,28 @@ def fk_to_ik(name):
             break
         pole = world(limb["pole"])
         set_world(limb["pole"], with_translation(pole, rotate_about(translation(pole), a, along, angle)))
-    key_controls([limb["ik"], limb["pole"]] + ([hock["control"]] if hock else []))
+    key_controls([limb["ik"], limb["pole"]] + ([hock["control"]] if hock else []), force_key)
+
+
+def playback_frames():
+    start = int(round(cmds.playbackOptions(q=True, minTime=True)))
+    end = int(round(cmds.playbackOptions(q=True, maxTime=True)))
+    return list(range(start, end + 1))
+
+
+def match_range(name, to, frames=None):
+    """Match the limb on each of `frames` (the playback range by default), keying
+    the result on every one, so a stretch of animation switches between IK and
+    FK without a pop. Frames are visited in order: each match reads the pose the
+    frame's keys give, including the keys set on the frames before."""
+    here = cmds.currentTime(q=True)
+    match = ik_to_fk if to == "fk" else fk_to_ik
+    frames = playback_frames() if frames is None else list(frames)
+    for f in frames:
+        cmds.currentTime(f)
+        match(name, force_key=True)
+    cmds.currentTime(here)
+    return len(frames)
 
 
 def mirror_pose(names=None, source="left"):
@@ -1463,11 +1484,21 @@ def show_window():
 def animation_section():
     cmds.separator()
     cmds.text(label="Animation")
+    whole = cmds.checkBox(label="Match the whole playback range", value=False)
+
+    def match(name, to):
+        def call(*_):
+            if cmds.checkBox(whole, q=True, value=True):
+                _safe(match_range, name, to)()
+            else:
+                _safe(ik_to_fk if to == "fk" else fk_to_ik, name)()
+        return call
+
     for limb in anim_data()["limbs"]:
         cmds.rowLayout(numberOfColumns=3, adjustableColumn=1)
         cmds.text(label=limb["name"])
-        cmds.button(label="IK to FK", command=_safe(ik_to_fk, limb["name"]))
-        cmds.button(label="FK to IK", command=_safe(fk_to_ik, limb["name"]))
+        cmds.button(label="IK to FK", command=match(limb["name"], "fk"))
+        cmds.button(label="FK to IK", command=match(limb["name"], "ik"))
         cmds.setParent("..")
 
     def mirror(source):

@@ -5,8 +5,17 @@ with the hive controls: FK controls for every bone, Two Bone IK with pole
 vectors on each limb, and an `<limb>_ik_fk` float control blending IK and FK.
 
 Bendy limbs are an approximation here: the bend joints slide onto the curve the
-bend and pin controls describe but don't turn along it. Soft IK isn't built in
-Unreal; the limbs solve as plain (stretchy) two-bone IK.
+bend and pin controls describe but don't turn along it. Soft IK eases the reach
+near full extension like the Blender and Maya builds (the `<limb>_soft` float),
+and spline chains thin as they stretch with their `<chain>_volume` float.
+
+Animator tools (Sequencer): with the Level Sequence that animates the Control
+Rig open, the "Hive Rig" editor menu this script adds matches a limb IK to FK
+or FK to IK without a pop, on the current frame or every frame of the playback
+range, and keys the result. The same from the Output Log:
+    py "<this file>" ik_to_fk arm_l            (the current frame)
+    py "<this file>" fk_to_ik leg_r --range    (every frame of the playback range)
+    py "<this file>" menu                      (only add the menu again)
 
 The mesh's pieces, materials, textures and blendshapes (as morph targets) come
 in with the .glb import. Each corrective shape gets a curve of its name, set by
@@ -152,668 +161,1148 @@ def copy_rule(bone_name):
     return "transform" if moves else "rotation"
 
 
-mesh = import_skeletal_mesh()
-blueprint = create_control_rig(mesh)
-hierarchy = blueprint.hierarchy
-hc = blueprint.get_hierarchy_controller()
-vm = blueprint.get_controller_by_name("RigVMModel")
+# ----------------------------------------------------------------------- build
+def build():
+    """Import the mesh, make the Control Rig Blueprint and fill it."""
+    mesh = import_skeletal_mesh()
+    blueprint = create_control_rig(mesh)
+    hierarchy = blueprint.hierarchy
+    hc = blueprint.get_hierarchy_controller()
+    vm = blueprint.get_controller_by_name("RigVMModel")
 
 
-def initial(k):
-    return hierarchy.get_global_transform(k, initial=True)
+    def initial(k):
+        return hierarchy.get_global_transform(k, initial=True)
 
 
-def bone_location(name):
-    return initial(bone_key(name)).translation
+    def bone_location(name):
+        return initial(bone_key(name)).translation
 
 
-# ----------------------------------------------------------------------- hive -> Unreal space
-# The importer converts axes and units; recover that mapping from four imported
-# bones instead of assuming it, so pivot placement holds for any import settings.
-# A flat rig (every bone in one plane) sends three: the plane's normal maps to
-# the normal of the imported plane, scaled like the rest and flipped, because
-# importing from glTF's right-handed axes into Unreal's left-handed ones mirrors.
-def hive_head(name):
-    return next(b["head"] for b in BONES if b["name"] == name)
+    # ----------------------------------------------------------------------- hive -> Unreal space
+    # The importer converts axes and units; recover that mapping from four imported
+    # bones instead of assuming it, so pivot placement holds for any import settings.
+    # A flat rig (every bone in one plane) sends three: the plane's normal maps to
+    # the normal of the imported plane, scaled like the rest and flipped, because
+    # importing from glTF's right-handed axes into Unreal's left-handed ones mirrors.
+    def hive_head(name):
+        return next(b["head"] for b in BONES if b["name"] == name)
 
 
-def _cross(a, b):
+    def _cross(a, b):
+        return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+
+
+    def _length(a):
+        return sum(x * x for x in a) ** 0.5
+
+
+    def solve_basis():
+        names = BASIS_BONES
+        hp = [hive_head(n) for n in names]
+        up = [bone_location(n) for n in names]
+        u = [[hp[i][k] - hp[0][k] for k in range(3)] for i in range(1, len(names))]  # hive columns
+        v = [[up[i].x - up[0].x, up[i].y - up[0].y, up[i].z - up[0].z] for i in range(1, len(names))]
+        if len(u) == 2:
+            scale = _length(v[0]) / max(_length(u[0]), 1e-9)
+            u.append(_cross(u[0], u[1]))
+            v.append([-x / max(scale, 1e-9) for x in _cross(v[0], v[1])])
+        # M = V * U^-1, with U's columns u[0..2].
+        a, b, c = u
+        det = (a[0] * (b[1] * c[2] - b[2] * c[1]) - b[0] * (a[1] * c[2] - a[2] * c[1])
+               + c[0] * (a[1] * b[2] - a[2] * b[1]))
+        inv_rows = [
+            [(b[1] * c[2] - b[2] * c[1]) / det, (b[2] * c[0] - b[0] * c[2]) / det, (b[0] * c[1] - b[1] * c[0]) / det],
+            [(a[2] * c[1] - a[1] * c[2]) / det, (a[0] * c[2] - a[2] * c[0]) / det, (a[1] * c[0] - a[0] * c[1]) / det],
+            [(a[1] * b[2] - a[2] * b[1]) / det, (a[2] * b[0] - a[0] * b[2]) / det, (a[0] * b[1] - a[1] * b[0]) / det],
+        ]
+        m = [[sum(v[k][r] * inv_rows[k][col] for k in range(3)) for col in range(3)] for r in range(3)]
+        return m, hp[0], up[0]
+
+
+    BASIS, HIVE_ORIGIN, UE_ORIGIN = solve_basis()
+
+
+    def to_ue_dir(d):
+        return unreal.Vector(*[sum(BASIS[r][k] * d[k] for k in range(3)) for r in range(3)])
+
+
+    def to_ue(p):
+        return UE_ORIGIN + to_ue_dir([p[k] - HIVE_ORIGIN[k] for k in range(3)])
+
+
+    def rotate(vec, axis, angle):
+        """Rodrigues rotation, matching FQuat(axis, angle).RotateVector."""
+        cos, sin = _math.cos(angle), _math.sin(angle)
+        cross = unreal.Vector(axis.y * vec.z - axis.z * vec.y, axis.z * vec.x - axis.x * vec.z, axis.x * vec.y - axis.y * vec.x)
+        dot = axis.x * vec.x + axis.y * vec.y + axis.z * vec.z
+        return vec * cos + cross * sin + axis * (dot * (1 - cos))
+
+
+    # ----------------------------------------------------------------------- controls
+    chain_end_ik = {c["ik_control"]: c["end"] for c in CHAINS}
+    chain_of_pole = {c["pole_control"]: c for c in CHAINS}
+    chain_of_hock = {c["hock"]["control"]: c for c in CHAINS if c.get("hock")}
+    spline_of = {n: sp for sp in SPLINES for n in sp["controls"] + sp["fk_controls"]}
+
+
+    def nearest_bone(sp, position):
+        """The spline joint whose head is nearest a point (hive space)."""
+        def dist(b):
+            h = hive_head(b)
+            return sum((h[k] - position[k]) ** 2 for k in range(3))
+        return min(sp["bones"], key=dist)
+
+
+    def solve_end(chain):
+        """Where the two-bone solve ends: the hock on a three-segment leg, else the end bone."""
+        return chain["hock"]["bone"] if chain.get("hock") else chain["end"]
+
+
+    def target_transform(c):
+        """Control placement taken from the imported bones, so it is already in Unreal space."""
+        if c["kind"] in ("fk", "root") and c["bone"]:
+            return initial(bone_key(c["bone"]))
+        if c["kind"] == "ik_effector":
+            return initial(bone_key(chain_end_ik[c["name"]]))
+        if c["kind"] == "cog":
+            return initial(bone_key(BASIS_BONES[0]))
+        if c["kind"] == "aim":
+            return unreal.Transform(location=to_ue(c["position"]))
+        if c["name"] in spline_of:
+            # Curve and FK-layer controls turn like the joint they sit on, so the end
+            # control's rotation is the last joint's.
+            sp = spline_of[c["name"]]
+            bone = sp["bones"][-1] if c["name"] == sp["controls"][-1] else nearest_bone(sp, c["position"])
+            return unreal.Transform(location=to_ue(c["position"]), rotation=initial(bone_key(bone)).rotation.rotator())
+        if c["kind"] == "hock":
+            # At the ankle, turned like the hock bone.
+            chain = chain_of_hock[c["name"]]
+            return unreal.Transform(location=bone_location(chain["end"]),
+                                    rotation=initial(bone_key(chain["hock"]["bone"])).rotation.rotator())
+        if c["kind"] == "pin":
+            # At the elbow or knee, turned like the lower bone it follows.
+            return initial(bone_key(c["parent"]["name"]))
+        if c["kind"] == "bend":
+            # At the segment's middle, turned like the segment it follows.
+            return unreal.Transform(location=to_ue(c["position"]),
+                                    rotation=initial(bone_key(c["parent"]["name"])).rotation.rotator())
+        if c["kind"] == "pole":
+            chain = chain_of_pole[c["name"]]
+            a, m, e = (bone_location(b) for b in (chain["upper"], chain["lower"], solve_end(chain)))
+            bend = m - (a + e) * 0.5
+            bend = bend.normal() if bend.length() > 1e-3 else unreal.Vector(0, 1, 0)
+            return unreal.Transform(location=m + bend * (0.3 * HEIGHT_CM))
+        return unreal.Transform()
+
+
+    def parent_key(c):
+        parent = c["parent"]
+        if parent["type"] == "control":
+            return control_key(parent["name"])
+        if parent["type"] == "bone":
+            return bone_key(parent["name"])
+        return unreal.RigElementKey()
+
+
+    def add_control(name, parent, settings, value):
+        return hc.add_control(name, parent, settings, value, True, False)
+
+
+    def make_control(c, parent):
+        settings = unreal.RigControlSettings()
+        # Bend and pin controls only move: their value is an offset in the frame of
+        # the bone they follow.
+        moves_only = c["kind"] in ("bend", "pin")
+        settings.control_type = unreal.RigControlType.POSITION if moves_only else unreal.RigControlType.EULER_TRANSFORM
+        try:
+            settings.animation_type = unreal.RigControlAnimationType.ANIMATION_CONTROL
+        except AttributeError:
+            pass
+        settings.shape_name = shape_for(c["shape"])
+        settings.shape_color = unreal.LinearColor(c["color"][0], c["color"][1], c["color"][2], 1.0)
+        if moves_only:
+            value = unreal.RigHierarchy.make_control_value_from_vector(unreal.Vector(0.0, 0.0, 0.0))
+        else:
+            value = unreal.RigHierarchy.make_control_value_from_euler_transform(unreal.EulerTransform())
+        k = add_control(c["name"], parent, settings, value)
+        world = target_transform(c)
+        parent_world = initial(parent) if parent.name != "None" else unreal.Transform()
+        hierarchy.set_control_offset_transform(k, world.make_relative(parent_world), True, True)
+        scale = c["size"] * 100.0 / SHAPE_UNIT_CM
+        hierarchy.set_control_shape_transform(k, unreal.Transform(scale=unreal.Vector(scale, scale, scale)), True)
+        return k
+
+
+    for c in CONTROLS:
+        # Hock controls hang from the reverse-foot ankle null, made below.
+        if c["kind"] != "hock":
+            make_control(c, parent_key(c))
+
+    def add_float(name, parent, lo, hi, value):
+        settings = unreal.RigControlSettings()
+        settings.control_type = unreal.RigControlType.FLOAT
+        settings.minimum_value = unreal.RigHierarchy.make_control_value_from_float(lo)
+        settings.maximum_value = unreal.RigHierarchy.make_control_value_from_float(hi)
+        settings.shape_visible = False
+        add_control(name, parent, settings, unreal.RigHierarchy.make_control_value_from_float(float(value)))
+
+
+    for chain in CHAINS:
+        owner = control_key(chain["ik_control"])
+        add_float(chain["name"] + "_ik_fk", owner, 0.0, 1.0, chain["default_blend"])
+        add_float(chain["name"] + "_stretch", owner, 0.0, 1.0, chain["default_stretch"])
+        if chain.get("foot"):
+            add_float(chain["name"] + "_roll", owner, -90.0, 120.0, 0.0)
+        if not chain.get("hock"):
+            add_float(chain["name"] + "_soft", owner, 0.0, 1.0, chain["default_soft"])
+    for sp in SPLINES:
+        add_float(sp["name"] + "_stretch", control_key(sp["settings"]), 0.0, 1.0, sp["default_stretch"])
+        add_float(sp["name"] + "_volume", control_key(sp["settings"]), 0.0, 1.0, sp["default_volume"])
+
+    # Space switching uses Control Rig's own "available spaces" (UE 5.4+), which
+    # animators switch from the Sequencer with automatic compensation.
+    for c in CONTROLS:
+        for space in c.get("spaces", [])[1:]:
+            try:
+                hc.add_available_space(control_key(c["name"]), control_key(space))
+            except AttributeError:
+                unreal.log_warning("hive-rig: this engine version has no control spaces; skipped %s" % c["name"])
+                break
+
+
+    # Reverse-foot nulls: heel > toe tip > ball > ankle under each foot's IK control.
+    # Pivots copy the control's rotation so their local rotation starts at zero.
+    foot_rig = {}
+    for chain in CHAINS:
+        foot = chain.get("foot")
+        if not foot:
+            continue
+        n = chain["name"]
+        ctrl_key = control_key(chain["ik_control"])
+        ctrl_rot = initial(ctrl_key).rotation
+        pivots = []
+        parent = ctrl_key
+        for label in ("heel", "toe_tip", "ball"):
+            t = unreal.Transform(location=to_ue(foot[label]), rotation=ctrl_rot.rotator())
+            parent = hc.add_null("%s_%s_piv" % (n, label), parent, t, True, True, False)
+            pivots.append(parent)
+        ankle = hc.add_null(n + "_ankle", parent, initial(bone_key(chain["end"])), True, True, False)
+        flat = hc.add_null(n + "_toe_flat", pivots[1], initial(bone_key(foot["ball_bone"])), True, True, False)
+        # Pitch axis (hive +X) in the pivots' local frame, and the angle sign that lifts
+        # the toes for a negative roll whatever the handedness of the conversion.
+        lateral = to_ue_dir([1.0, 0.0, 0.0]).normal()
+        forward, up = to_ue_dir([0.0, 0.0, 1.0]).normal(), to_ue_dir([0.0, 1.0, 0.0]).normal()
+        lifted = rotate(forward, lateral, -0.3)
+        sign = 1.0 if (lifted.x * up.x + lifted.y * up.y + lifted.z * up.z) > 0 else -1.0
+        local_axis = ctrl_rot.unrotate_vector(lateral)
+        foot_rig[n] = dict(pivots=pivots, ankle=ankle, flat=flat, axis=local_axis, sign=sign,
+                           brk=float(foot["break_angle"]), ball_bone=foot["ball_bone"],
+                           ball_control=foot["ball_control"])
+
+    # Three-segment legs: the hock control rides on the ankle null (so it follows the
+    # roll) and carries a null at the hock bone, which the thigh and calf solve to.
+    hock_null = {}
+    for chain in CHAINS:
+        hock = chain.get("hock")
+        if not hock:
+            continue
+        n = chain["name"]
+        ankle = foot_rig[n]["ankle"] if n in foot_rig else control_key(chain["ik_control"])
+        hock_ctrl = make_control(next(c for c in CONTROLS if c["name"] == hock["control"]), ankle)
+        hock_null[n] = hc.add_null(n + "_hock", hock_ctrl, initial(bone_key(hock["bone"])), True, True, False)
+
+    # ----------------------------------------------------------------------- forward solve graph
+    def find_begin_node():
+        for node in vm.get_graph().get_nodes():
+            struct = node.get_script_struct() if hasattr(node, "get_script_struct") else None
+            if struct and "BeginExecution" in struct.get_name():
+                return node.get_node_path()
+        node = vm.add_unit_node_from_struct_path("/Script/ControlRig.RigUnit_BeginExecution", "Execute",
+                                                 unreal.Vector2D(-400, 0), "BeginExecution")
+        return node.get_node_path()
+
+
+    exec_tail = [find_begin_node()]
+    column = [0]
+
+
+    def unit(struct, name, pins):
+        column[0] += 1
+        path = struct if struct.startswith("/") else "/Script/ControlRig." + struct
+        node = vm.add_unit_node_from_struct_path(path, "Execute",
+                                                 unreal.Vector2D(column[0] * 320, 0), name)
+        path = node.get_node_path()
+        for pin, value in pins.items():
+            vm.set_pin_default_value(path + "." + pin, value, False)
+        return path
+
+
+    def chain_exec(node):
+        vm.add_link(exec_tail[0] + ".ExecuteContext", node + ".ExecuteContext")
+        exec_tail[0] = node
+
+
+    def get_control(name):
+        return unit("RigUnit_GetTransform", "Get_" + name,
+                    {"Item": item_pin("Control", name), "Space": "GlobalSpace"})
+
+
+    def get_null(key, space="GlobalSpace"):
+        return unit("RigUnit_GetTransform", "Get_" + str(key.name),
+                    {"Item": item_pin("Null", key.name), "Space": space})
+
+
+    def get_float(name):
+        return unit("RigUnit_GetControlFloat", "Get_" + name, {"Control": name})
+
+
+    math_pi = _math.pi
+
+
+    def math(op, name, pins):
+        return unit("/Script/RigVM.RigVMFunction_Math" + op, name, pins)
+
+
+    def feed(node, pin, value):
+        """Link a pin path into `pin`, or set it to a number."""
+        if isinstance(value, str):
+            vm.add_link(value, node + "." + pin)
+        else:
+            vm.set_pin_default_value(node + "." + pin, "%.9g" % value, False)
+
+
+    def op(kind, name, a, b):
+        """A two-input math node (FloatAdd, FloatMul, ...) on pins or numbers; its result pin."""
+        node = math(kind, name, {})
+        feed(node, "A", a)
+        feed(node, "B", b)
+        return node + ".Result"
+
+
+    TINY = 1e-4  # cm: keeps divisions finite
+
+
+    limb_ctrls = {}
+    for chain in CHAINS:
+        for ctrl in chain["fk_controls"]:
+            limb_ctrls[ctrl] = chain
+
+
+    def bezier_fit(params):
+        """How each point of the four-point Bezier closest to a curve is made from
+        the curve's points, as coefficients per point. It starts and ends on the
+        curve; its middle points are a least-squares fit, nudged toward thirds of
+        the chord so short chains still have one (UE's Fit Chain on Curve takes a
+        single cubic Bezier, which matches the curve exactly up to four controls)."""
+        m = len(params)
+        bern = [[(1 - u) ** 3, 3 * u * (1 - u) ** 2, 3 * u * u * (1 - u), u ** 3] for u in params]
+        soft = 1e-3
+        a11 = sum(b[1] * b[1] for b in bern) + soft
+        a12 = sum(b[1] * b[2] for b in bern)
+        a22 = sum(b[2] * b[2] for b in bern) + soft
+        det = a11 * a22 - a12 * a12
+        rhs = []
+        for j, third in ((1, 2.0 / 3.0), (2, 1.0 / 3.0)):
+            r = [b[j] for b in bern]
+            r[0] += soft * third - sum(b[j] * b[0] for b in bern)
+            r[-1] += soft * (1.0 - third) - sum(b[j] * b[3] for b in bern)
+            rhs.append(r)
+        first = [1.0 if i == 0 else 0.0 for i in range(m)]
+        last = [1.0 if i == m - 1 else 0.0 for i in range(m)]
+        p1 = [(a22 * x - a12 * y) / det for x, y in zip(*rhs)]
+        p2 = [(a11 * y - a12 * x) / det for x, y in zip(*rhs)]
+        return [first, p1, p2, last]
+
+
+    def solve_spline(sp):
+        """Fit the joints on the curve the controls bend: each Bezier point is its
+        rest place plus the weighted moves of the controls. The joints keep their
+        lengths, then stretch along the whole curve by the stretch control; the last
+        joint turns with the end control."""
+        n, bones, weights = sp["name"], sp["bones"], sp["weights"]
+        rest_ctrl = [initial(control_key(c)).translation for c in sp["controls"]]
+        rest_pts = [bone_location(b) for b in bones]
+        gets = [get_control(c) for c in sp["controls"]]
+        points = []
+        for j, coef in enumerate(bezier_fit(sp["params"])):
+            row = [sum(ci * w[c] for ci, w in zip(coef, weights)) for c in range(len(rest_ctrl))]
+            # The rest Bezier point, less where the weighted rest controls put it.
+            offset = unreal.Vector(0, 0, 0)
+            for ci, p in zip(coef, rest_pts):
+                offset = offset + p * ci
+            for wc, p in zip(row, rest_ctrl):
+                offset = offset - p * wc
+            acc = None
+            for c, wc in enumerate(row):
+                if abs(wc) < 1e-6:
+                    continue
+                scaled = math("VectorScale", "%s_bez%d_scale%d" % (n, j, c), {"Factor": "%f" % wc})
+                vm.add_link(gets[c] + ".Transform.Translation", scaled + ".Value")
+                add = math("VectorAdd", "%s_bez%d_add%d" % (n, j, c), {} if acc else {"A": vector_text(offset)})
+                if acc:
+                    vm.add_link(acc + ".Result", add + ".A")
+                vm.add_link(scaled + ".Result", add + ".B")
+                acc = add
+            points.append(acc)
+        chain = unit("RigUnit_CollectionChainItem", "Chain_" + n,
+                     {"FirstItem": item_pin("Bone", bones[0]), "LastItem": item_pin("Bone", bones[-1])})
+        first = initial(bone_key(bones[0]))
+        primary = first.inverse_transform_direction((rest_pts[1] - rest_pts[0]).normal())
+        stretch = get_float(n + "_stretch")
+        for alignment in ("Front", "Stretched"):
+            fit = unit("RigUnit_FitChainToCurvePerItem", "Spline_%s_%s" % (n, alignment), {
+                "Alignment": alignment,
+                "PrimaryAxis": vector_text(primary),
+                "SecondaryAxis": "(X=0.000000,Y=0.000000,Z=0.000000)",
+                "bPropagateToChildren": "True",
+            })
+            vm.add_link(chain + ".Collection", fit + ".Items")
+            for label, point in zip("ABCD", points):
+                vm.add_link(point + ".Result", fit + ".Bezier." + label)
+            if alignment == "Stretched":
+                vm.add_link(stretch + ".FloatValue", fit + ".Weight")
+            chain_exec(fit)
+        turn = unit("RigUnit_SetRotation", "SplineEnd_" + bones[-1],
+                    {"Item": item_pin("Bone", bones[-1]), "Space": "GlobalSpace", "bPropagateToChildren": "True"})
+        vm.add_link(gets[-1] + ".Transform.Rotation", turn + ".Value")
+        chain_exec(turn)
+
+        # Volume: each joint on the curve thins as it stretches (and thickens as it
+        # squashes) across its length, by 1 / sqrt(stretch) at volume 1, keeping
+        # its length axis. Its children keep their place.
+        volume = get_float(n + "_volume")
+        for i, b in enumerate(bones[:-1]):
+            rest_len = (rest_pts[i + 1] - rest_pts[i]).length()
+            ends = [unit("RigUnit_GetTransform", "Get_%s_volume_%d" % (n, i + k),
+                         {"Item": item_pin("Bone", bones[i + k]), "Space": "GlobalSpace"}) for k in (0, 1)]
+            now = math("VectorDistance", "%s_length" % b, {})
+            vm.add_link(ends[0] + ".Transform.Translation", now + ".A")
+            vm.add_link(ends[1] + ".Transform.Translation", now + ".B")
+            ratio = op("FloatDiv", "%s_squash" % b, rest_len, op("FloatMax", "%s_length_min" % b, now + ".Result", TINY))
+            thin = op("FloatPow", "%s_thin" % b, ratio, 0.5)
+            amount = math("FloatLerp", "%s_volume" % b, {"A": "1.0"})
+            feed(amount, "B", thin)
+            feed(amount, "T", volume + ".FloatValue")
+            # The joint's length axis in its own frame stays at 1.
+            along = initial(bone_key(b)).inverse_transform_direction(rest_pts[i + 1] - rest_pts[i])
+            comps = [abs(along.x), abs(along.y), abs(along.z)]
+            length_axis = comps.index(max(comps))
+            scale = math("VectorMake", "%s_volume_scale" % b, {})
+            for k, axis in enumerate("XYZ"):
+                feed(scale, axis, 1.0 if k == length_axis else amount + ".Result")
+            squash = unit("RigUnit_SetScale", "Volume_" + b,
+                          {"Item": item_pin("Bone", b), "Space": "GlobalSpace", "bPropagateToChildren": "False"})
+            vm.add_link(scale + ".Result", squash + ".Scale")
+            chain_exec(squash)
+
+
+    # FK in hierarchy order: controls are listed parents-first. Each spline is
+    # solved as soon as all its controls have been passed, before the parts that
+    # hang from its joints (a spline spine before the neck and arms).
+    pending_splines = list(SPLINES)
+    passed = set()
+
+
+    def solve_ready_splines():
+        for sp in list(pending_splines):
+            if all(c in passed for c in sp["controls"]):
+                pending_splines.remove(sp)
+                solve_spline(sp)
+
+
+    for c in CONTROLS:
+        solve_ready_splines()
+        passed.add(c["name"])
+        if c["kind"] not in ("fk", "root") or not c["bone"]:
+            continue
+        get = get_control(c["name"])
+        if copy_rule(c["bone"]) == "transform":
+            node = unit("RigUnit_SetTransform", "Set_" + c["bone"],
+                        {"Item": item_pin("Bone", c["bone"]), "Space": "GlobalSpace", "bPropagateToChildren": "True"})
+            vm.add_link(get + ".Transform", node + ".Value")
+        else:
+            node = unit("RigUnit_SetRotation", "Set_" + c["bone"],
+                        {"Item": item_pin("Bone", c["bone"]), "Space": "GlobalSpace", "bPropagateToChildren": "True"})
+            vm.add_link(get + ".Transform.Rotation", node + ".Value")
+        chain_exec(node)
+    solve_ready_splines()
+
+    # Eyes: aim each eye bone's rest direction at its control.
+    for c in CONTROLS:
+        if c["kind"] != "aim" or not c["bone"]:
+            continue
+        eye = initial(bone_key(c["bone"]))
+        axis = eye.inverse_transform_direction((to_ue(c["position"]) - eye.translation).normal())
+        aim = unit("RigUnit_AimItem", "Aim_" + c["bone"], {
+            "Item": item_pin("Bone", c["bone"]),
+            "Primary.Axis": vector_text(axis),
+            "Primary.Kind": "Location",
+            "Secondary.Weight": "0.0",
+        })
+        vm.add_link(get_control(c["name"]) + ".Transform.Translation", aim + ".Primary.Target")
+        chain_exec(aim)
+
+    # IK on top of FK, weighted by the blend control.
+    for chain in CHAINS:
+        upper = initial(bone_key(chain["upper"]))
+        ik_end = solve_end(chain)
+        a, m, e = (bone_location(b) for b in (chain["upper"], chain["lower"], ik_end))
+        primary = upper.inverse_transform_direction((m - a).normal())
+        bend = m - (a + e) * 0.5
+        secondary = upper.inverse_transform_direction(bend.normal() if bend.length() > 1e-3 else unreal.Vector(0, 1, 0))
+
+        blend = get_float(chain["name"] + "_ik_fk")
+        rig_foot = foot_rig.get(chain["name"])
+        if rig_foot:
+            # Roll: heel takes min(roll, 0), ball clamp(roll, 0, break), toe max(roll - break, 0).
+            roll = get_float(chain["name"] + "_roll")
+            n, brk = chain["name"], rig_foot["brk"]
+            heel_a = math("FloatMin", n + "_heel_angle", {"B": "0.0"})
+            ball_a = math("FloatClamp", n + "_ball_angle", {"Minimum": "0.0", "Maximum": str(brk)})
+            toe_sub = math("FloatSub", n + "_toe_sub", {"B": str(brk)})
+            toe_a = math("FloatMax", n + "_toe_angle", {"B": "0.0"})
+            vm.add_link(roll + ".FloatValue", heel_a + ".A")
+            vm.add_link(roll + ".FloatValue", ball_a + ".Value")
+            vm.add_link(roll + ".FloatValue", toe_sub + ".A")
+            vm.add_link(toe_sub + ".Result", toe_a + ".A")
+            angles = {"heel": heel_a + ".Result", "toe_tip": toe_a + ".Result", "ball": ball_a + ".Result"}
+            for label, piv in zip(("heel", "toe_tip", "ball"), rig_foot["pivots"]):
+                rad = math("FloatMul", "%s_%s_rad" % (n, label), {"B": str(rig_foot["sign"] * math_pi / 180.0)})
+                vm.add_link(angles[label], rad + ".A")
+                quat = math("QuaternionFromAxisAndAngle", "%s_%s_quat" % (n, label),
+                            {"Axis": vector_text(rig_foot["axis"])})
+                vm.add_link(rad + ".Result", quat + ".Angle")
+                spin = unit("RigUnit_SetRotation", "Roll_%s_%s" % (n, label),
+                            {"Item": item_pin("Null", piv.name), "Space": "LocalSpace", "bPropagateToChildren": "True"})
+                vm.add_link(quat + ".Result", spin + ".Value")
+                chain_exec(spin)
+            effector = get_null(rig_foot["ankle"])
+        else:
+            effector = get_control(chain["ik_control"])
+        # The two-bone solve aims at the hock null on a three-segment leg.
+        solve_to = get_null(hock_null[chain["name"]]) if chain["name"] in hock_null else effector
+        pole = get_control(chain["pole_control"])
+        stretch = get_float(chain["name"] + "_stretch")
+
+        # Soft IK and stretch, the way hive-rig's soft_reach describes them: `d` is
+        # the distance from the shoulder or hip to the goal and `length` the chain's;
+        # the reach eases toward full extension over the last soft * zone * length,
+        # stretch blends the aim from that reach to the goal, and the bones' lengths
+        # scale by aim / reach so the solve lands there with the softened bend. A
+        # three-segment leg has no soft control and eases over a vanishing zone, so
+        # it reaches min(d, length) and stretches past it.
+        n = chain["name"]
+        length = (m - a).length() + (e - m).length()
+        root = unit("RigUnit_GetTransform", "Get_%s_soft_root" % n,
+                    {"Item": item_pin("Bone", chain["upper"]), "Space": "GlobalSpace"}) + ".Transform.Translation"
+        goal = solve_to + ".Transform.Translation"
+        dist = math("VectorDistance", n + "_soft_d", {})
+        vm.add_link(root, dist + ".A")
+        vm.add_link(goal, dist + ".B")
+        d = dist + ".Result"
+        if chain.get("hock"):
+            ease = TINY
+        else:
+            soft = get_float(n + "_soft") + ".FloatValue"
+            ease = op("FloatMax", n + "_soft_ease", op("FloatMul", n + "_soft_zone", soft,
+                                                       float(chain["soft_zone"]) * length), TINY)
+        start = op("FloatSub", n + "_soft_start", length, ease)
+        below = op("FloatMin", n + "_soft_below", d, start)
+        over = op("FloatMax", n + "_soft_over", op("FloatSub", n + "_soft_past", d, start), 0.0)
+        fall = op("FloatMul", n + "_soft_fall", op("FloatDiv", n + "_soft_rate", over, ease), -1.0)
+        rise = op("FloatSub", n + "_soft_rise", 1.0, op("FloatPow", n + "_soft_decay", _math.e, fall))
+        reach = op("FloatAdd", n + "_soft_reach", below, op("FloatMul", n + "_soft_eased", ease, rise))
+        aim = op("FloatAdd", n + "_aim", reach,
+                 op("FloatMul", n + "_aim_stretch", stretch + ".FloatValue", op("FloatSub", n + "_aim_gap", d, reach)))
+        toward = math("VectorLerp", "SoftAim_" + n, {})
+        vm.add_link(root, toward + ".A")
+        vm.add_link(goal, toward + ".B")
+        feed(toward, "T", op("FloatDiv", n + "_aim_t", aim, op("FloatMax", n + "_d_min", d, TINY)))
+        grow = op("FloatDiv", n + "_scale", aim, op("FloatMax", n + "_reach_min", reach, TINY))
+        # The lower bone and the solved end move out along their parents by the
+        # scale, weighted like the IK, before the solve measures them.
+        for bone in (chain["lower"], ik_end):
+            parent = BONES[next(b["parent"] for b in BONES if b["name"] == bone)]["name"]
+            offset = initial(bone_key(bone)).make_relative(initial(bone_key(parent))).translation
+            longer = math("VectorScale", "%s_%s_stretched" % (n, bone), {"Value": vector_text(offset)})
+            feed(longer, "Factor", grow)
+            place = unit("RigUnit_SetTranslation", "Stretch_" + bone,
+                         {"Item": item_pin("Bone", bone), "Space": "LocalSpace", "bPropagateToChildren": "True"})
+            vm.add_link(longer + ".Result", place + ".Value")
+            vm.add_link(blend + ".FloatValue", place + ".Weight")
+            chain_exec(place)
+
+        ik = unit("RigUnit_TwoBoneIKSimplePerItem", "IK_" + chain["name"], {
+            "ItemA": item_pin("Bone", chain["upper"]),
+            "ItemB": item_pin("Bone", chain["lower"]),
+            "EffectorItem": item_pin("Bone", ik_end),
+            "PrimaryAxis": vector_text(primary),
+            "SecondaryAxis": vector_text(secondary),
+            "PoleVectorKind": "Location",
+            "bEnableStretch": "False",
+            "bPropagateToChildren": "True",
+        })
+        vm.add_link(toward + ".Result", ik + ".Effector.Translation")
+        vm.add_link(solve_to + ".Transform.Rotation", ik + ".Effector.Rotation")
+        vm.add_link(pole + ".Transform.Translation", ik + ".PoleVector")
+        vm.add_link(blend + ".FloatValue", ik + ".Weight")
+        chain_exec(ik)
+
+        if ik_end != chain["end"]:
+            seg = unit("RigUnit_SetRotation", "IKRot_" + ik_end,
+                       {"Item": item_pin("Bone", ik_end), "Space": "GlobalSpace", "bPropagateToChildren": "True"})
+            vm.add_link(solve_to + ".Transform.Rotation", seg + ".Value")
+            vm.add_link(blend + ".FloatValue", seg + ".Weight")
+            chain_exec(seg)
+
+        hand = unit("RigUnit_SetRotation", "IKRot_" + chain["end"],
+                    {"Item": item_pin("Bone", chain["end"]), "Space": "GlobalSpace", "bPropagateToChildren": "True"})
+        vm.add_link(effector + ".Transform.Rotation", hand + ".Value")
+        vm.add_link(blend + ".FloatValue", hand + ".Weight")
+        chain_exec(hand)
+
+        if rig_foot:
+            # In IK the toes stay planted on the toe pivot, keeping the toe control's tweak.
+            flat = get_null(rig_foot["flat"])
+            tweak = unit("RigUnit_GetTransform", "Get_" + rig_foot["ball_control"] + "_local",
+                         {"Item": item_pin("Control", rig_foot["ball_control"]), "Space": "LocalSpace"})
+            combined = math("QuaternionMul", chain["name"] + "_toe_rot", {})
+            vm.add_link(flat + ".Transform.Rotation", combined + ".A")
+            vm.add_link(tweak + ".Transform.Rotation", combined + ".B")
+            toe = unit("RigUnit_SetRotation", "IKRot_" + rig_foot["ball_bone"],
+                       {"Item": item_pin("Bone", rig_foot["ball_bone"]), "Space": "GlobalSpace",
+                        "bPropagateToChildren": "True"})
+            vm.add_link(combined + ".Result", toe + ".Value")
+            vm.add_link(blend + ".FloatValue", toe + ".Weight")
+            chain_exec(toe)
+
+    # Bendy limbs (an approximation): after the limb is solved, each bend joint moves
+    # by its share of the pin's and bend control's offsets. A point t along a segment
+    # takes 4t(1 - t) of the bend offset and, toward the pin end, t of the pin offset.
+    def bone_rotation(bone):
+        return unit("RigUnit_GetTransform", "Get_%s_rot" % bone,
+                    {"Item": item_pin("Bone", bone), "Space": "GlobalSpace"}) + ".Transform.Rotation"
+
+
+    def control_offset(name, bone):
+        """The control's offset from rest, in global space (its value is in the frame of `bone`)."""
+        value = unit("RigUnit_GetControlVector", "Get_" + name, {"Control": name})
+        turned = math("QuaternionRotateVector", name + "_offset", {})
+        vm.add_link(bone_rotation(bone), turned + ".Transform")
+        vm.add_link(value + ".Vector", turned + ".Vector")
+        return turned + ".Result"
+
+
+    def scaled(vector, factor, name):
+        node = math("VectorScale", name, {"Factor": str(factor)})
+        vm.add_link(vector, node + ".Value")
+        return node + ".Result"
+
+
+    for chain in CHAINS:
+        bendy = chain.get("bendy")
+        if not bendy:
+            continue
+        pin = control_offset(bendy["pin"], chain["lower"])
+        for seg, pin_at_end in ((bendy["upper"], True), (bendy["lower"], False)):
+            bend = control_offset(seg["control"], seg["bone"])
+            k = len(seg["joints"])
+            for i, joint in enumerate(seg["joints"]):
+                t = i / float(k)
+                pin_share = t if pin_at_end else 1.0 - t
+                total = math("VectorAdd", joint + "_bend_offset", {})
+                vm.add_link(scaled(pin, pin_share, joint + "_pin_share"), total + ".A")
+                vm.add_link(scaled(bend, 4.0 * t * (1.0 - t), joint + "_bend_share"), total + ".B")
+                here = unit("RigUnit_GetTransform", "Get_" + joint,
+                            {"Item": item_pin("Bone", joint), "Space": "GlobalSpace"})
+                moved = math("VectorAdd", joint + "_bent", {})
+                vm.add_link(here + ".Transform.Translation", moved + ".A")
+                vm.add_link(total + ".Result", moved + ".B")
+                place = unit("RigUnit_SetTranslation", "Bend_" + joint,
+                             {"Item": item_pin("Bone", joint), "Space": "GlobalSpace", "bPropagateToChildren": "False"})
+                vm.add_link(moved + ".Result", place + ".Value")
+                chain_exec(place)
+
+    # Corrective shapes: a curve per driven morph target, set from a pose reader.
+    # The reader turns a vector across the reader's axis by the bone's own turn
+    # since rest (its global turn with its parent's turn taken off, in the rest
+    # frame), measures how far it swung about the axis, and maps start..end
+    # degrees onto 0..1. A curve with a morph target's name drives that morph
+    # target when this Control Rig runs in the mesh's Anim Blueprint.
+    BLEND_SHAPES = RIG.get("shapes", [])
+
+
+    def _sub(a, b):
+        return [a[k] - b[k] for k in range(3)]
+
+
+    def _unit(a):
+        n = _length(a) or 1.0
+        return [x / n for x in a]
+
+
+    def bone_turn(bone):
+        """The bone's own turn since rest, in the rest frame (quaternion pin)."""
+        def get(name, initial_pose):
+            node = unit("RigUnit_GetTransform", "Reader_%s_%s" % (name, "rest" if initial_pose else "now"),
+                        {"Item": item_pin("Bone", name), "Space": "GlobalSpace",
+                         "bInitial": "True" if initial_pose else "False"})
+            return node + ".Transform.Rotation"
+
+        def turn(name):
+            inverse = math("QuaternionInverse", "Reader_%s_rest_inv" % name, {})
+            vm.add_link(get(name, True), inverse + ".Value")
+            delta = math("QuaternionMul", "Reader_%s_delta" % name, {})
+            vm.add_link(get(name, False), delta + ".A")
+            vm.add_link(inverse + ".Result", delta + ".B")
+            return delta + ".Result"
+
+        own = turn(bone)
+        parent = next(b["parent"] for b in BONES if b["name"] == bone)
+        if parent is None:
+            return own
+        parent_name = BONES[parent]["name"]
+        undo = math("QuaternionInverse", "Reader_%s_parent_inv" % bone, {})
+        vm.add_link(turn(parent_name), undo + ".Value")
+        result = math("QuaternionMul", "Reader_%s_own" % bone, {})
+        vm.add_link(undo + ".Result", result + ".A")
+        vm.add_link(own, result + ".B")
+        return result + ".Result"
+
+
+    def build_reader(shape):
+        d = shape["driver"]
+        if not any(b["name"] == d["bone"] for b in BONES):
+            unreal.log_warning("hive-rig: shape %s reads bone %s, which the rig doesn't have" % (shape["name"], d["bone"]))
+            return
+        name = shape["name"]
+        axis = _unit(d["axis"])
+        bone = next(b for b in BONES if b["name"] == d["bone"])
+        along = _sub(bone.get("tail", [0, 1, 0]), bone["head"]) if bone.get("tail") else [0.0, 1.0, 0.0]
+        # A reference across the axis, and the way it swings for a positive turn.
+        p = _sub(along, [axis[k] * sum(along[j] * axis[j] for j in range(3)) for k in range(3)])
+        if _length(p) < 1e-6:
+            p = _cross(axis, [1.0, 0.0, 0.0] if abs(axis[0]) < 0.9 else [0.0, 1.0, 0.0])
+        p = _unit(p)
+        q = _cross(axis, p)
+        p_ue, q_ue = to_ue_dir(p), to_ue_dir(q)
+        n_ue = p_ue ^ q_ue
+        n_ue = n_ue.normal() if hasattr(n_ue, "normal") else n_ue
+        hc.add_curve(name, float(shape.get("weight", 0.0)))
+        swung = math("QuaternionRotateVector", "Reader_%s_swing" % name, {"Vector": vector_text(p_ue)})
+        vm.add_link(bone_turn(d["bone"]), swung + ".Transform")
+        off_plane = math("VectorDot", "Reader_%s_off" % name, {"B": vector_text(n_ue)})
+        vm.add_link(swung + ".Result", off_plane + ".A")
+        lift = math("VectorScale", "Reader_%s_lift" % name, {"Value": vector_text(n_ue)})
+        vm.add_link(off_plane + ".Result", lift + ".Factor")
+        flat = math("VectorSub", "Reader_%s_flat" % name, {})
+        vm.add_link(swung + ".Result", flat + ".A")
+        vm.add_link(lift + ".Result", flat + ".B")
+        angle = math("VectorAngle", "Reader_%s_angle" % name, {"A": vector_text(p_ue)})
+        vm.add_link(flat + ".Result", angle + ".B")
+        side = math("VectorDot", "Reader_%s_side" % name, {"B": vector_text(q_ue)})
+        vm.add_link(flat + ".Result", side + ".A")
+        sign = math("FloatSign", "Reader_%s_sign" % name, {})
+        vm.add_link(side + ".Result", sign + ".Value")
+        signed = math("FloatMul", "Reader_%s_turn" % name, {})
+        vm.add_link(angle + ".Result", signed + ".A")
+        vm.add_link(sign + ".Result", signed + ".B")
+        remap = math("FloatRemap", "Reader_%s_weight" % name, {
+            "SourceMinimum": str(_math.radians(d["start"])), "SourceMaximum": str(_math.radians(d["end"])),
+            "TargetMinimum": "0.0", "TargetMaximum": "1.0", "bClamp": "True"})
+        vm.add_link(signed + ".Result", remap + ".Value")
+        set_curve = unit("RigUnit_SetCurveValue", "Curve_" + name, {"Curve": name})
+        vm.add_link(remap + ".Result", set_curve + ".Value")
+        chain_exec(set_curve)
+
+
+    for shape in BLEND_SHAPES:
+        if shape.get("driver"):
+            build_reader(shape)
+
+    unreal.ControlRigBlueprintLibrary.recompile_vm(blueprint)
+    unreal.EditorAssetLibrary.save_loaded_asset(blueprint)
+    unreal.log("hive-rig: built Control Rig %s with %d controls" % (blueprint.get_path_name(), len(CONTROLS)))
+    return blueprint
+
+
+# ----------------------------------------------------------------------- animator tools (Sequencer)
+# IK/FK matching on the Control Rig a Level Sequence animates. Each frame is
+# loaded from the Sequencer's channels into the rig, solved, matched with the
+# rig's own hierarchy and keyed back, so a frame range reads the keys the frames
+# before it were given. The limbs' controls, bones and helper nulls are the ones
+# build() made, found by the same names.
+def null_key(name):
+    return key(unreal.RigElementType.NULL, name)
+
+
+def animator_data():
+    limbs = []
+    for c in CHAINS:
+        hock = c.get("hock")
+        n = c["name"]
+        limbs.append({
+            "name": n, "ik": c["ik_control"], "pole": c["pole_control"],
+            # The chain's bones and FK controls from the top down, with the hock
+            # segment of a three-segment leg between the lower bone and the end.
+            "bones": [c["upper"], c["lower"]] + ([hock["bone"]] if hock else []) + [c["end"]],
+            "fk": c["fk_controls"][:2] + ([hock["fk_control"]] if hock else []) + c["fk_controls"][2:],
+            # The IK goal: the ankle null under the foot pivots, or the control itself.
+            "goal": null_key(n + "_ankle") if c.get("foot") else control_key(c["ik_control"]),
+            "hock": {"control": hock["control"], "target": n + "_hock"} if hock else None,
+            "soft": None if hock else {"zone": float(c["soft_zone"])},
+            "floats": [n + "_ik_fk", n + "_stretch"] + ([n + "_roll"] if c.get("foot") else [])
+            + ([] if hock else [n + "_soft"]),
+        })
+    floats = [f for l in limbs for f in l["floats"]]
+    for sp in SPLINES:
+        floats += [sp["name"] + "_stretch", sp["name"] + "_volume"]
+    moves_only = [c["name"] for c in CONTROLS if c["kind"] in ("bend", "pin")]
+    euler = [c["name"] for c in CONTROLS if c["name"] not in moves_only]
+    return {"limbs": limbs, "floats": floats, "positions": moves_only, "transforms": euler}
+
+
+ANIM = animator_data()
+SEQ_LIB = unreal.ControlRigSequencerLibrary
+VALUE = unreal.RigHierarchy
+
+
+def limb_of(name):
+    for limb in ANIM["limbs"]:
+        if limb["name"] == name:
+            return limb
+    raise RuntimeError("hive-rig: %s has no limb %s (it has %s)" % (NAME, name, ", ".join(l["name"] for l in ANIM["limbs"])))
+
+
+def rig_in_sequencer():
+    """The open Level Sequence and the hive Control Rig it animates."""
+    seq = unreal.LevelSequenceEditorBlueprintLibrary.get_current_level_sequence()
+    if seq is None:
+        raise RuntimeError("hive-rig: open the Level Sequence that animates the %s Control Rig first" % NAME)
+    probe = [control_key(l["ik"]) for l in ANIM["limbs"][:1]] or [control_key(CONTROLS[0]["name"])]
+    for proxy in SEQ_LIB.get_control_rigs(seq):
+        rig = proxy.control_rig
+        if rig is not None and all(rig.get_hierarchy().contains(k) for k in probe):
+            return seq, rig
+    raise RuntimeError("hive-rig: the open Level Sequence has no %s Control Rig track" % NAME)
+
+
+def frame_number(f):
+    return unreal.FrameNumber(int(f))
+
+
+def current_frame():
+    return int(unreal.LevelSequenceEditorBlueprintLibrary.get_current_time())
+
+
+def playback_frames(seq):
+    """Every frame of the sequence's playback range (its end is exclusive)."""
+    return list(range(int(seq.get_playback_start()), int(seq.get_playback_end())))
+
+
+def solve(rig):
+    """Run the rig's forward solve so the bones follow the controls just set."""
+    try:
+        rig.execute("Forwards Solve")
+    except AttributeError:
+        rig.evaluate_any_thread()
+
+
+def load_frame(ctx, f):
+    """Put the rig in the pose the Sequencer's keys give frame `f`, solved."""
+    seq, rig = ctx
+    try:
+        unreal.LevelSequenceEditorBlueprintLibrary.set_current_time(int(f))  # the viewport follows
+    except Exception:
+        pass
+    h, at = rig.get_hierarchy(), frame_number(f)
+    current = unreal.RigControlValueType.CURRENT
+    for name in ANIM["transforms"]:
+        value = SEQ_LIB.get_local_control_rig_euler_transform(seq, rig, name, at)
+        h.set_control_value(control_key(name), VALUE.make_control_value_from_euler_transform(value), current)
+    for name in ANIM["positions"]:
+        value = SEQ_LIB.get_local_control_rig_position(seq, rig, name, at)
+        h.set_control_value(control_key(name), VALUE.make_control_value_from_vector(value), current)
+    for name in ANIM["floats"]:
+        value = SEQ_LIB.get_local_control_rig_float(seq, rig, name, at)
+        h.set_control_value(control_key(name), VALUE.make_control_value_from_float(value), current)
+    solve(rig)
+
+
+def get_float(ctx, name):
+    value = ctx[1].get_hierarchy().get_control_value(control_key(name), unreal.RigControlValueType.CURRENT)
+    return float(VALUE.get_float_from_control_value(value))
+
+
+def set_float(ctx, name, value):
+    h = ctx[1].get_hierarchy()
+    h.set_control_value(control_key(name), VALUE.make_control_value_from_float(float(value)),
+                        unreal.RigControlValueType.CURRENT)
+    solve(ctx[1])
+
+
+def key_controls(ctx, names, f):
+    """Key the controls' current values on frame `f`."""
+    seq, rig = ctx
+    h, at = rig.get_hierarchy(), frame_number(f)
+    current = unreal.RigControlValueType.CURRENT
+    for name in names:
+        value = h.get_control_value(control_key(name), current)
+        if name in ANIM["floats"]:
+            SEQ_LIB.set_local_control_rig_float(seq, rig, name, at, VALUE.get_float_from_control_value(value), True)
+        elif name in ANIM["positions"]:
+            SEQ_LIB.set_local_control_rig_position(seq, rig, name, at, VALUE.get_vector_from_control_value(value), True)
+        else:
+            SEQ_LIB.set_local_control_rig_euler_transform(
+                seq, rig, name, at, VALUE.get_euler_transform_from_control_value(value), True)
+
+
+# Plain vector maths on [x, y, z] lists, so the matching reads like the Blender
+# and Maya tools whatever the engine's vector bindings.
+def vec(v):
+    return [v.x, v.y, v.z]
+
+
+def v_sub(a, b):
+    return [a[i] - b[i] for i in range(3)]
+
+
+def v_add(a, b):
+    return [a[i] + b[i] for i in range(3)]
+
+
+def v_scale(a, k):
+    return [x * k for x in a]
+
+
+def v_dot(a, b):
+    return sum(a[i] * b[i] for i in range(3))
+
+
+def v_cross(a, b):
     return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
 
 
-def _length(a):
-    return sum(x * x for x in a) ** 0.5
+def v_len(a):
+    return v_dot(a, a) ** 0.5
 
 
-def solve_basis():
-    names = BASIS_BONES
-    hp = [hive_head(n) for n in names]
-    up = [bone_location(n) for n in names]
-    u = [[hp[i][k] - hp[0][k] for k in range(3)] for i in range(1, len(names))]  # hive columns
-    v = [[up[i].x - up[0].x, up[i].y - up[0].y, up[i].z - up[0].z] for i in range(1, len(names))]
-    if len(u) == 2:
-        scale = _length(v[0]) / max(_length(u[0]), 1e-9)
-        u.append(_cross(u[0], u[1]))
-        v.append([-x / max(scale, 1e-9) for x in _cross(v[0], v[1])])
-    # M = V * U^-1, with U's columns u[0..2].
-    a, b, c = u
-    det = (a[0] * (b[1] * c[2] - b[2] * c[1]) - b[0] * (a[1] * c[2] - a[2] * c[1])
-           + c[0] * (a[1] * b[2] - a[2] * b[1]))
-    inv_rows = [
-        [(b[1] * c[2] - b[2] * c[1]) / det, (b[2] * c[0] - b[0] * c[2]) / det, (b[0] * c[1] - b[1] * c[0]) / det],
-        [(a[2] * c[1] - a[1] * c[2]) / det, (a[0] * c[2] - a[2] * c[0]) / det, (a[1] * c[0] - a[0] * c[1]) / det],
-        [(a[1] * b[2] - a[2] * b[1]) / det, (a[2] * b[0] - a[0] * b[2]) / det, (a[0] * b[1] - a[1] * b[0]) / det],
-    ]
-    m = [[sum(v[k][r] * inv_rows[k][col] for k in range(3)) for col in range(3)] for r in range(3)]
-    return m, hp[0], up[0]
-
-
-BASIS, HIVE_ORIGIN, UE_ORIGIN = solve_basis()
-
-
-def to_ue_dir(d):
-    return unreal.Vector(*[sum(BASIS[r][k] * d[k] for k in range(3)) for r in range(3)])
-
-
-def to_ue(p):
-    return UE_ORIGIN + to_ue_dir([p[k] - HIVE_ORIGIN[k] for k in range(3)])
-
-
-def rotate(vec, axis, angle):
-    """Rodrigues rotation, matching FQuat(axis, angle).RotateVector."""
-    cos, sin = _math.cos(angle), _math.sin(angle)
-    cross = unreal.Vector(axis.y * vec.z - axis.z * vec.y, axis.z * vec.x - axis.x * vec.z, axis.x * vec.y - axis.y * vec.x)
-    dot = axis.x * vec.x + axis.y * vec.y + axis.z * vec.z
-    return vec * cos + cross * sin + axis * (dot * (1 - cos))
-
-
-# ----------------------------------------------------------------------- controls
-chain_end_ik = {c["ik_control"]: c["end"] for c in CHAINS}
-chain_of_pole = {c["pole_control"]: c for c in CHAINS}
-chain_of_hock = {c["hock"]["control"]: c for c in CHAINS if c.get("hock")}
-spline_of = {n: sp for sp in SPLINES for n in sp["controls"] + sp["fk_controls"]}
-
-
-def nearest_bone(sp, position):
-    """The spline joint whose head is nearest a point (hive space)."""
-    def dist(b):
-        h = hive_head(b)
-        return sum((h[k] - position[k]) ** 2 for k in range(3))
-    return min(sp["bones"], key=dist)
-
-
-def solve_end(chain):
-    """Where the two-bone solve ends: the hock on a three-segment leg, else the end bone."""
-    return chain["hock"]["bone"] if chain.get("hock") else chain["end"]
-
-
-def target_transform(c):
-    """Control placement taken from the imported bones, so it is already in Unreal space."""
-    if c["kind"] in ("fk", "root") and c["bone"]:
-        return initial(bone_key(c["bone"]))
-    if c["kind"] == "ik_effector":
-        return initial(bone_key(chain_end_ik[c["name"]]))
-    if c["kind"] == "cog":
-        return initial(bone_key(BASIS_BONES[0]))
-    if c["kind"] == "aim":
-        return unreal.Transform(location=to_ue(c["position"]))
-    if c["name"] in spline_of:
-        # Curve and FK-layer controls turn like the joint they sit on, so the end
-        # control's rotation is the last joint's.
-        sp = spline_of[c["name"]]
-        bone = sp["bones"][-1] if c["name"] == sp["controls"][-1] else nearest_bone(sp, c["position"])
-        return unreal.Transform(location=to_ue(c["position"]), rotation=initial(bone_key(bone)).rotation.rotator())
-    if c["kind"] == "hock":
-        # At the ankle, turned like the hock bone.
-        chain = chain_of_hock[c["name"]]
-        return unreal.Transform(location=bone_location(chain["end"]),
-                                rotation=initial(bone_key(chain["hock"]["bone"])).rotation.rotator())
-    if c["kind"] == "pin":
-        # At the elbow or knee, turned like the lower bone it follows.
-        return initial(bone_key(c["parent"]["name"]))
-    if c["kind"] == "bend":
-        # At the segment's middle, turned like the segment it follows.
-        return unreal.Transform(location=to_ue(c["position"]),
-                                rotation=initial(bone_key(c["parent"]["name"])).rotation.rotator())
-    if c["kind"] == "pole":
-        chain = chain_of_pole[c["name"]]
-        a, m, e = (bone_location(b) for b in (chain["upper"], chain["lower"], solve_end(chain)))
-        bend = m - (a + e) * 0.5
-        bend = bend.normal() if bend.length() > 1e-3 else unreal.Vector(0, 1, 0)
-        return unreal.Transform(location=m + bend * (0.3 * HEIGHT_CM))
-    return unreal.Transform()
-
-
-def parent_key(c):
-    parent = c["parent"]
-    if parent["type"] == "control":
-        return control_key(parent["name"])
-    if parent["type"] == "bone":
-        return bone_key(parent["name"])
-    return unreal.RigElementKey()
-
-
-def add_control(name, parent, settings, value):
-    return hc.add_control(name, parent, settings, value, True, False)
-
-
-def make_control(c, parent):
-    settings = unreal.RigControlSettings()
-    # Bend and pin controls only move: their value is an offset in the frame of
-    # the bone they follow.
-    moves_only = c["kind"] in ("bend", "pin")
-    settings.control_type = unreal.RigControlType.POSITION if moves_only else unreal.RigControlType.EULER_TRANSFORM
-    try:
-        settings.animation_type = unreal.RigControlAnimationType.ANIMATION_CONTROL
-    except AttributeError:
-        pass
-    settings.shape_name = shape_for(c["shape"])
-    settings.shape_color = unreal.LinearColor(c["color"][0], c["color"][1], c["color"][2], 1.0)
-    if moves_only:
-        value = unreal.RigHierarchy.make_control_value_from_vector(unreal.Vector(0.0, 0.0, 0.0))
-    else:
-        value = unreal.RigHierarchy.make_control_value_from_euler_transform(unreal.EulerTransform())
-    k = add_control(c["name"], parent, settings, value)
-    world = target_transform(c)
-    parent_world = initial(parent) if parent.name != "None" else unreal.Transform()
-    hierarchy.set_control_offset_transform(k, world.make_relative(parent_world), True, True)
-    scale = c["size"] * 100.0 / SHAPE_UNIT_CM
-    hierarchy.set_control_shape_transform(k, unreal.Transform(scale=unreal.Vector(scale, scale, scale)), True)
-    return k
-
-
-for c in CONTROLS:
-    # Hock controls hang from the reverse-foot ankle null, made below.
-    if c["kind"] != "hock":
-        make_control(c, parent_key(c))
-
-def add_float(name, parent, lo, hi, value):
-    settings = unreal.RigControlSettings()
-    settings.control_type = unreal.RigControlType.FLOAT
-    settings.minimum_value = unreal.RigHierarchy.make_control_value_from_float(lo)
-    settings.maximum_value = unreal.RigHierarchy.make_control_value_from_float(hi)
-    settings.shape_visible = False
-    add_control(name, parent, settings, unreal.RigHierarchy.make_control_value_from_float(float(value)))
-
-
-for chain in CHAINS:
-    owner = control_key(chain["ik_control"])
-    add_float(chain["name"] + "_ik_fk", owner, 0.0, 1.0, chain["default_blend"])
-    add_float(chain["name"] + "_stretch", owner, 0.0, 1.0, chain["default_stretch"])
-    if chain.get("foot"):
-        add_float(chain["name"] + "_roll", owner, -90.0, 120.0, 0.0)
-for sp in SPLINES:
-    # Volume (squash) is built in Blender and Maya only.
-    add_float(sp["name"] + "_stretch", control_key(sp["settings"]), 0.0, 1.0, sp["default_stretch"])
-
-# Space switching uses Control Rig's own "available spaces" (UE 5.4+), which
-# animators switch from the Sequencer with automatic compensation.
-for c in CONTROLS:
-    for space in c.get("spaces", [])[1:]:
-        try:
-            hc.add_available_space(control_key(c["name"]), control_key(space))
-        except AttributeError:
-            unreal.log_warning("hive-rig: this engine version has no control spaces; skipped %s" % c["name"])
-            break
-
-
-# Reverse-foot nulls: heel > toe tip > ball > ankle under each foot's IK control.
-# Pivots copy the control's rotation so their local rotation starts at zero.
-foot_rig = {}
-for chain in CHAINS:
-    foot = chain.get("foot")
-    if not foot:
-        continue
-    n = chain["name"]
-    ctrl_key = control_key(chain["ik_control"])
-    ctrl_rot = initial(ctrl_key).rotation
-    pivots = []
-    parent = ctrl_key
-    for label in ("heel", "toe_tip", "ball"):
-        t = unreal.Transform(location=to_ue(foot[label]), rotation=ctrl_rot.rotator())
-        parent = hc.add_null("%s_%s_piv" % (n, label), parent, t, True, True, False)
-        pivots.append(parent)
-    ankle = hc.add_null(n + "_ankle", parent, initial(bone_key(chain["end"])), True, True, False)
-    flat = hc.add_null(n + "_toe_flat", pivots[1], initial(bone_key(foot["ball_bone"])), True, True, False)
-    # Pitch axis (hive +X) in the pivots' local frame, and the angle sign that lifts
-    # the toes for a negative roll whatever the handedness of the conversion.
-    lateral = to_ue_dir([1.0, 0.0, 0.0]).normal()
-    forward, up = to_ue_dir([0.0, 0.0, 1.0]).normal(), to_ue_dir([0.0, 1.0, 0.0]).normal()
-    lifted = rotate(forward, lateral, -0.3)
-    sign = 1.0 if (lifted.x * up.x + lifted.y * up.y + lifted.z * up.z) > 0 else -1.0
-    local_axis = ctrl_rot.unrotate_vector(lateral)
-    foot_rig[n] = dict(pivots=pivots, ankle=ankle, flat=flat, axis=local_axis, sign=sign,
-                       brk=float(foot["break_angle"]), ball_bone=foot["ball_bone"],
-                       ball_control=foot["ball_control"])
-
-# Three-segment legs: the hock control rides on the ankle null (so it follows the
-# roll) and carries a null at the hock bone, which the thigh and calf solve to.
-hock_null = {}
-for chain in CHAINS:
-    hock = chain.get("hock")
-    if not hock:
-        continue
-    n = chain["name"]
-    ankle = foot_rig[n]["ankle"] if n in foot_rig else control_key(chain["ik_control"])
-    hock_ctrl = make_control(next(c for c in CONTROLS if c["name"] == hock["control"]), ankle)
-    hock_null[n] = hc.add_null(n + "_hock", hock_ctrl, initial(bone_key(hock["bone"])), True, True, False)
-
-# ----------------------------------------------------------------------- forward solve graph
-def find_begin_node():
-    for node in vm.get_graph().get_nodes():
-        struct = node.get_script_struct() if hasattr(node, "get_script_struct") else None
-        if struct and "BeginExecution" in struct.get_name():
-            return node.get_node_path()
-    node = vm.add_unit_node_from_struct_path("/Script/ControlRig.RigUnit_BeginExecution", "Execute",
-                                             unreal.Vector2D(-400, 0), "BeginExecution")
-    return node.get_node_path()
-
-
-exec_tail = [find_begin_node()]
-column = [0]
-
-
-def unit(struct, name, pins):
-    column[0] += 1
-    path = struct if struct.startswith("/") else "/Script/ControlRig." + struct
-    node = vm.add_unit_node_from_struct_path(path, "Execute",
-                                             unreal.Vector2D(column[0] * 320, 0), name)
-    path = node.get_node_path()
-    for pin, value in pins.items():
-        vm.set_pin_default_value(path + "." + pin, value, False)
-    return path
-
-
-def chain_exec(node):
-    vm.add_link(exec_tail[0] + ".ExecuteContext", node + ".ExecuteContext")
-    exec_tail[0] = node
-
-
-def get_control(name):
-    return unit("RigUnit_GetTransform", "Get_" + name,
-                {"Item": item_pin("Control", name), "Space": "GlobalSpace"})
-
-
-def get_null(key, space="GlobalSpace"):
-    return unit("RigUnit_GetTransform", "Get_" + str(key.name),
-                {"Item": item_pin("Null", key.name), "Space": space})
-
-
-def get_float(name):
-    return unit("RigUnit_GetControlFloat", "Get_" + name, {"Control": name})
-
-
-math_pi = _math.pi
-
-
-def math(op, name, pins):
-    return unit("/Script/RigVM.RigVMFunction_Math" + op, name, pins)
-
-
-limb_ctrls = {}
-for chain in CHAINS:
-    for ctrl in chain["fk_controls"]:
-        limb_ctrls[ctrl] = chain
-
-
-def bezier_fit(params):
-    """How each point of the four-point Bezier closest to a curve is made from
-    the curve's points, as coefficients per point. It starts and ends on the
-    curve; its middle points are a least-squares fit, nudged toward thirds of
-    the chord so short chains still have one (UE's Fit Chain on Curve takes a
-    single cubic Bezier, which matches the curve exactly up to four controls)."""
-    m = len(params)
-    bern = [[(1 - u) ** 3, 3 * u * (1 - u) ** 2, 3 * u * u * (1 - u), u ** 3] for u in params]
-    soft = 1e-3
-    a11 = sum(b[1] * b[1] for b in bern) + soft
-    a12 = sum(b[1] * b[2] for b in bern)
-    a22 = sum(b[2] * b[2] for b in bern) + soft
-    det = a11 * a22 - a12 * a12
-    rhs = []
-    for j, third in ((1, 2.0 / 3.0), (2, 1.0 / 3.0)):
-        r = [b[j] for b in bern]
-        r[0] += soft * third - sum(b[j] * b[0] for b in bern)
-        r[-1] += soft * (1.0 - third) - sum(b[j] * b[3] for b in bern)
-        rhs.append(r)
-    first = [1.0 if i == 0 else 0.0 for i in range(m)]
-    last = [1.0 if i == m - 1 else 0.0 for i in range(m)]
-    p1 = [(a22 * x - a12 * y) / det for x, y in zip(*rhs)]
-    p2 = [(a11 * y - a12 * x) / det for x, y in zip(*rhs)]
-    return [first, p1, p2, last]
-
-
-def solve_spline(sp):
-    """Fit the joints on the curve the controls bend: each Bezier point is its
-    rest place plus the weighted moves of the controls. The joints keep their
-    lengths, then stretch along the whole curve by the stretch control; the last
-    joint turns with the end control."""
-    n, bones, weights = sp["name"], sp["bones"], sp["weights"]
-    rest_ctrl = [initial(control_key(c)).translation for c in sp["controls"]]
-    rest_pts = [bone_location(b) for b in bones]
-    gets = [get_control(c) for c in sp["controls"]]
-    points = []
-    for j, coef in enumerate(bezier_fit(sp["params"])):
-        row = [sum(ci * w[c] for ci, w in zip(coef, weights)) for c in range(len(rest_ctrl))]
-        # The rest Bezier point, less where the weighted rest controls put it.
-        offset = unreal.Vector(0, 0, 0)
-        for ci, p in zip(coef, rest_pts):
-            offset = offset + p * ci
-        for wc, p in zip(row, rest_ctrl):
-            offset = offset - p * wc
-        acc = None
-        for c, wc in enumerate(row):
-            if abs(wc) < 1e-6:
-                continue
-            scaled = math("VectorScale", "%s_bez%d_scale%d" % (n, j, c), {"Factor": "%f" % wc})
-            vm.add_link(gets[c] + ".Transform.Translation", scaled + ".Value")
-            add = math("VectorAdd", "%s_bez%d_add%d" % (n, j, c), {} if acc else {"A": vector_text(offset)})
-            if acc:
-                vm.add_link(acc + ".Result", add + ".A")
-            vm.add_link(scaled + ".Result", add + ".B")
-            acc = add
-        points.append(acc)
-    chain = unit("RigUnit_CollectionChainItem", "Chain_" + n,
-                 {"FirstItem": item_pin("Bone", bones[0]), "LastItem": item_pin("Bone", bones[-1])})
-    first = initial(bone_key(bones[0]))
-    primary = first.inverse_transform_direction((rest_pts[1] - rest_pts[0]).normal())
-    stretch = get_float(n + "_stretch")
-    for alignment in ("Front", "Stretched"):
-        fit = unit("RigUnit_FitChainToCurvePerItem", "Spline_%s_%s" % (n, alignment), {
-            "Alignment": alignment,
-            "PrimaryAxis": vector_text(primary),
-            "SecondaryAxis": "(X=0.000000,Y=0.000000,Z=0.000000)",
-            "bPropagateToChildren": "True",
-        })
-        vm.add_link(chain + ".Collection", fit + ".Items")
-        for label, point in zip("ABCD", points):
-            vm.add_link(point + ".Result", fit + ".Bezier." + label)
-        if alignment == "Stretched":
-            vm.add_link(stretch + ".FloatValue", fit + ".Weight")
-        chain_exec(fit)
-    turn = unit("RigUnit_SetRotation", "SplineEnd_" + bones[-1],
-                {"Item": item_pin("Bone", bones[-1]), "Space": "GlobalSpace", "bPropagateToChildren": "True"})
-    vm.add_link(gets[-1] + ".Transform.Rotation", turn + ".Value")
-    chain_exec(turn)
-
-
-# FK in hierarchy order: controls are listed parents-first. Each spline is
-# solved as soon as all its controls have been passed, before the parts that
-# hang from its joints (a spline spine before the neck and arms).
-pending_splines = list(SPLINES)
-passed = set()
-
-
-def solve_ready_splines():
-    for sp in list(pending_splines):
-        if all(c in passed for c in sp["controls"]):
-            pending_splines.remove(sp)
-            solve_spline(sp)
-
-
-for c in CONTROLS:
-    solve_ready_splines()
-    passed.add(c["name"])
-    if c["kind"] not in ("fk", "root") or not c["bone"]:
-        continue
-    get = get_control(c["name"])
-    if copy_rule(c["bone"]) == "transform":
-        node = unit("RigUnit_SetTransform", "Set_" + c["bone"],
-                    {"Item": item_pin("Bone", c["bone"]), "Space": "GlobalSpace", "bPropagateToChildren": "True"})
-        vm.add_link(get + ".Transform", node + ".Value")
-    else:
-        node = unit("RigUnit_SetRotation", "Set_" + c["bone"],
-                    {"Item": item_pin("Bone", c["bone"]), "Space": "GlobalSpace", "bPropagateToChildren": "True"})
-        vm.add_link(get + ".Transform.Rotation", node + ".Value")
-    chain_exec(node)
-solve_ready_splines()
-
-# Eyes: aim each eye bone's rest direction at its control.
-for c in CONTROLS:
-    if c["kind"] != "aim" or not c["bone"]:
-        continue
-    eye = initial(bone_key(c["bone"]))
-    axis = eye.inverse_transform_direction((to_ue(c["position"]) - eye.translation).normal())
-    aim = unit("RigUnit_AimItem", "Aim_" + c["bone"], {
-        "Item": item_pin("Bone", c["bone"]),
-        "Primary.Axis": vector_text(axis),
-        "Primary.Kind": "Location",
-        "Secondary.Weight": "0.0",
-    })
-    vm.add_link(get_control(c["name"]) + ".Transform.Translation", aim + ".Primary.Target")
-    chain_exec(aim)
-
-# IK on top of FK, weighted by the blend control.
-for chain in CHAINS:
-    upper = initial(bone_key(chain["upper"]))
-    ik_end = solve_end(chain)
-    a, m, e = (bone_location(b) for b in (chain["upper"], chain["lower"], ik_end))
-    primary = upper.inverse_transform_direction((m - a).normal())
-    bend = m - (a + e) * 0.5
-    secondary = upper.inverse_transform_direction(bend.normal() if bend.length() > 1e-3 else unreal.Vector(0, 1, 0))
-
-    blend = get_float(chain["name"] + "_ik_fk")
-    rig_foot = foot_rig.get(chain["name"])
-    if rig_foot:
-        # Roll: heel takes min(roll, 0), ball clamp(roll, 0, break), toe max(roll - break, 0).
-        roll = get_float(chain["name"] + "_roll")
-        n, brk = chain["name"], rig_foot["brk"]
-        heel_a = math("FloatMin", n + "_heel_angle", {"B": "0.0"})
-        ball_a = math("FloatClamp", n + "_ball_angle", {"Minimum": "0.0", "Maximum": str(brk)})
-        toe_sub = math("FloatSub", n + "_toe_sub", {"B": str(brk)})
-        toe_a = math("FloatMax", n + "_toe_angle", {"B": "0.0"})
-        vm.add_link(roll + ".FloatValue", heel_a + ".A")
-        vm.add_link(roll + ".FloatValue", ball_a + ".Value")
-        vm.add_link(roll + ".FloatValue", toe_sub + ".A")
-        vm.add_link(toe_sub + ".Result", toe_a + ".A")
-        angles = {"heel": heel_a + ".Result", "toe_tip": toe_a + ".Result", "ball": ball_a + ".Result"}
-        for label, piv in zip(("heel", "toe_tip", "ball"), rig_foot["pivots"]):
-            rad = math("FloatMul", "%s_%s_rad" % (n, label), {"B": str(rig_foot["sign"] * math_pi / 180.0)})
-            vm.add_link(angles[label], rad + ".A")
-            quat = math("QuaternionFromAxisAndAngle", "%s_%s_quat" % (n, label),
-                        {"Axis": vector_text(rig_foot["axis"])})
-            vm.add_link(rad + ".Result", quat + ".Angle")
-            spin = unit("RigUnit_SetRotation", "Roll_%s_%s" % (n, label),
-                        {"Item": item_pin("Null", piv.name), "Space": "LocalSpace", "bPropagateToChildren": "True"})
-            vm.add_link(quat + ".Result", spin + ".Value")
-            chain_exec(spin)
-        effector = get_null(rig_foot["ankle"])
-    else:
-        effector = get_control(chain["ik_control"])
-    # The two-bone solve aims at the hock null on a three-segment leg.
-    solve_to = get_null(hock_null[chain["name"]]) if chain["name"] in hock_null else effector
-    pole = get_control(chain["pole_control"])
-    stretch = get_float(chain["name"] + "_stretch")
-    max_ratio = math("FloatAdd", chain["name"] + "_stretch_ratio", {"A": "1.0"})
-    vm.add_link(stretch + ".FloatValue", max_ratio + ".B")
-    ik = unit("RigUnit_TwoBoneIKSimplePerItem", "IK_" + chain["name"], {
-        "ItemA": item_pin("Bone", chain["upper"]),
-        "ItemB": item_pin("Bone", chain["lower"]),
-        "EffectorItem": item_pin("Bone", ik_end),
-        "PrimaryAxis": vector_text(primary),
-        "SecondaryAxis": vector_text(secondary),
-        "PoleVectorKind": "Location",
-        "bEnableStretch": "True",
-        "StretchStartRatio": "1.0",
-        "bPropagateToChildren": "True",
-    })
-    vm.add_link(max_ratio + ".Result", ik + ".StretchMaximumRatio")
-    vm.add_link(solve_to + ".Transform", ik + ".Effector")
-    vm.add_link(pole + ".Transform.Translation", ik + ".PoleVector")
-    vm.add_link(blend + ".FloatValue", ik + ".Weight")
-    chain_exec(ik)
-
-    if ik_end != chain["end"]:
-        seg = unit("RigUnit_SetRotation", "IKRot_" + ik_end,
-                   {"Item": item_pin("Bone", ik_end), "Space": "GlobalSpace", "bPropagateToChildren": "True"})
-        vm.add_link(solve_to + ".Transform.Rotation", seg + ".Value")
-        vm.add_link(blend + ".FloatValue", seg + ".Weight")
-        chain_exec(seg)
-
-    hand = unit("RigUnit_SetRotation", "IKRot_" + chain["end"],
-                {"Item": item_pin("Bone", chain["end"]), "Space": "GlobalSpace", "bPropagateToChildren": "True"})
-    vm.add_link(effector + ".Transform.Rotation", hand + ".Value")
-    vm.add_link(blend + ".FloatValue", hand + ".Weight")
-    chain_exec(hand)
-
-    if rig_foot:
-        # In IK the toes stay planted on the toe pivot, keeping the toe control's tweak.
-        flat = get_null(rig_foot["flat"])
-        tweak = unit("RigUnit_GetTransform", "Get_" + rig_foot["ball_control"] + "_local",
-                     {"Item": item_pin("Control", rig_foot["ball_control"]), "Space": "LocalSpace"})
-        combined = math("QuaternionMul", chain["name"] + "_toe_rot", {})
-        vm.add_link(flat + ".Transform.Rotation", combined + ".A")
-        vm.add_link(tweak + ".Transform.Rotation", combined + ".B")
-        toe = unit("RigUnit_SetRotation", "IKRot_" + rig_foot["ball_bone"],
-                   {"Item": item_pin("Bone", rig_foot["ball_bone"]), "Space": "GlobalSpace",
-                    "bPropagateToChildren": "True"})
-        vm.add_link(combined + ".Result", toe + ".Value")
-        vm.add_link(blend + ".FloatValue", toe + ".Weight")
-        chain_exec(toe)
-
-# Bendy limbs (an approximation): after the limb is solved, each bend joint moves
-# by its share of the pin's and bend control's offsets. A point t along a segment
-# takes 4t(1 - t) of the bend offset and, toward the pin end, t of the pin offset.
-def bone_rotation(bone):
-    return unit("RigUnit_GetTransform", "Get_%s_rot" % bone,
-                {"Item": item_pin("Bone", bone), "Space": "GlobalSpace"}) + ".Transform.Rotation"
-
-
-def control_offset(name, bone):
-    """The control's offset from rest, in global space (its value is in the frame of `bone`)."""
-    value = unit("RigUnit_GetControlVector", "Get_" + name, {"Control": name})
-    turned = math("QuaternionRotateVector", name + "_offset", {})
-    vm.add_link(bone_rotation(bone), turned + ".Transform")
-    vm.add_link(value + ".Vector", turned + ".Vector")
-    return turned + ".Result"
-
-
-def scaled(vector, factor, name):
-    node = math("VectorScale", name, {"Factor": str(factor)})
-    vm.add_link(vector, node + ".Value")
-    return node + ".Result"
-
-
-for chain in CHAINS:
-    bendy = chain.get("bendy")
-    if not bendy:
-        continue
-    pin = control_offset(bendy["pin"], chain["lower"])
-    for seg, pin_at_end in ((bendy["upper"], True), (bendy["lower"], False)):
-        bend = control_offset(seg["control"], seg["bone"])
-        k = len(seg["joints"])
-        for i, joint in enumerate(seg["joints"]):
-            t = i / float(k)
-            pin_share = t if pin_at_end else 1.0 - t
-            total = math("VectorAdd", joint + "_bend_offset", {})
-            vm.add_link(scaled(pin, pin_share, joint + "_pin_share"), total + ".A")
-            vm.add_link(scaled(bend, 4.0 * t * (1.0 - t), joint + "_bend_share"), total + ".B")
-            here = unit("RigUnit_GetTransform", "Get_" + joint,
-                        {"Item": item_pin("Bone", joint), "Space": "GlobalSpace"})
-            moved = math("VectorAdd", joint + "_bent", {})
-            vm.add_link(here + ".Transform.Translation", moved + ".A")
-            vm.add_link(total + ".Result", moved + ".B")
-            place = unit("RigUnit_SetTranslation", "Bend_" + joint,
-                         {"Item": item_pin("Bone", joint), "Space": "GlobalSpace", "bPropagateToChildren": "False"})
-            vm.add_link(moved + ".Result", place + ".Value")
-            chain_exec(place)
-
-# Corrective shapes: a curve per driven morph target, set from a pose reader.
-# The reader turns a vector across the reader's axis by the bone's own turn
-# since rest (its global turn with its parent's turn taken off, in the rest
-# frame), measures how far it swung about the axis, and maps start..end
-# degrees onto 0..1. A curve with a morph target's name drives that morph
-# target when this Control Rig runs in the mesh's Anim Blueprint.
-BLEND_SHAPES = RIG.get("shapes", [])
-
-
-def _sub(a, b):
-    return [a[k] - b[k] for k in range(3)]
-
-
-def _unit(a):
-    n = _length(a) or 1.0
+def v_norm(a):
+    n = v_len(a) or 1.0
     return [x / n for x in a]
 
 
-def bone_turn(bone):
-    """The bone's own turn since rest, in the rest frame (quaternion pin)."""
-    def get(name, initial_pose):
-        node = unit("RigUnit_GetTransform", "Reader_%s_%s" % (name, "rest" if initial_pose else "now"),
-                    {"Item": item_pin("Bone", name), "Space": "GlobalSpace",
-                     "bInitial": "True" if initial_pose else "False"})
-        return node + ".Transform.Rotation"
-
-    def turn(name):
-        inverse = math("QuaternionInverse", "Reader_%s_rest_inv" % name, {})
-        vm.add_link(get(name, True), inverse + ".Value")
-        delta = math("QuaternionMul", "Reader_%s_delta" % name, {})
-        vm.add_link(get(name, False), delta + ".A")
-        vm.add_link(inverse + ".Result", delta + ".B")
-        return delta + ".Result"
-
-    own = turn(bone)
-    parent = next(b["parent"] for b in BONES if b["name"] == bone)
-    if parent is None:
-        return own
-    parent_name = BONES[parent]["name"]
-    undo = math("QuaternionInverse", "Reader_%s_parent_inv" % bone, {})
-    vm.add_link(turn(parent_name), undo + ".Value")
-    result = math("QuaternionMul", "Reader_%s_own" % bone, {})
-    vm.add_link(undo + ".Result", result + ".A")
-    vm.add_link(own, result + ".B")
-    return result + ".Result"
+def global_of(ctx, k, rest=False):
+    return ctx[1].get_hierarchy().get_global_transform(k, rest)
 
 
-def build_reader(shape):
-    d = shape["driver"]
-    if not any(b["name"] == d["bone"] for b in BONES):
-        unreal.log_warning("hive-rig: shape %s reads bone %s, which the rig doesn't have" % (shape["name"], d["bone"]))
-        return
-    name = shape["name"]
-    axis = _unit(d["axis"])
-    bone = next(b for b in BONES if b["name"] == d["bone"])
-    along = _sub(bone.get("tail", [0, 1, 0]), bone["head"]) if bone.get("tail") else [0.0, 1.0, 0.0]
-    # A reference across the axis, and the way it swings for a positive turn.
-    p = _sub(along, [axis[k] * sum(along[j] * axis[j] for j in range(3)) for k in range(3)])
-    if _length(p) < 1e-6:
-        p = _cross(axis, [1.0, 0.0, 0.0] if abs(axis[0]) < 0.9 else [0.0, 1.0, 0.0])
-    p = _unit(p)
-    q = _cross(axis, p)
-    p_ue, q_ue = to_ue_dir(p), to_ue_dir(q)
-    n_ue = p_ue ^ q_ue
-    n_ue = n_ue.normal() if hasattr(n_ue, "normal") else n_ue
-    hc.add_curve(name, float(shape.get("weight", 0.0)))
-    swung = math("QuaternionRotateVector", "Reader_%s_swing" % name, {"Vector": vector_text(p_ue)})
-    vm.add_link(bone_turn(d["bone"]), swung + ".Transform")
-    off_plane = math("VectorDot", "Reader_%s_off" % name, {"B": vector_text(n_ue)})
-    vm.add_link(swung + ".Result", off_plane + ".A")
-    lift = math("VectorScale", "Reader_%s_lift" % name, {"Value": vector_text(n_ue)})
-    vm.add_link(off_plane + ".Result", lift + ".Factor")
-    flat = math("VectorSub", "Reader_%s_flat" % name, {})
-    vm.add_link(swung + ".Result", flat + ".A")
-    vm.add_link(lift + ".Result", flat + ".B")
-    angle = math("VectorAngle", "Reader_%s_angle" % name, {"A": vector_text(p_ue)})
-    vm.add_link(flat + ".Result", angle + ".B")
-    side = math("VectorDot", "Reader_%s_side" % name, {"B": vector_text(q_ue)})
-    vm.add_link(flat + ".Result", side + ".A")
-    sign = math("FloatSign", "Reader_%s_sign" % name, {})
-    vm.add_link(side + ".Result", sign + ".Value")
-    signed = math("FloatMul", "Reader_%s_turn" % name, {})
-    vm.add_link(angle + ".Result", signed + ".A")
-    vm.add_link(sign + ".Result", signed + ".B")
-    remap = math("FloatRemap", "Reader_%s_weight" % name, {
-        "SourceMinimum": str(_math.radians(d["start"])), "SourceMaximum": str(_math.radians(d["end"])),
-        "TargetMinimum": "0.0", "TargetMaximum": "1.0", "bClamp": "True"})
-    vm.add_link(signed + ".Result", remap + ".Value")
-    set_curve = unit("RigUnit_SetCurveValue", "Curve_" + name, {"Curve": name})
-    vm.add_link(remap + ".Result", set_curve + ".Value")
-    chain_exec(set_curve)
+def place(ctx, k, transform):
+    """Move a control so its global transform is `transform` (its children follow)."""
+    ctx[1].get_hierarchy().set_global_transform(k, transform, False, True)
+    solve(ctx[1])
 
 
-for shape in BLEND_SHAPES:
-    if shape.get("driver"):
-        build_reader(shape)
+def turned_like(location, t):
+    """A transform at `location` turned like `t`, without its scale."""
+    return unreal.Transform(location=location, rotation=t.rotation.rotator())
 
-unreal.ControlRigBlueprintLibrary.recompile_vm(blueprint)
-unreal.EditorAssetLibrary.save_loaded_asset(blueprint)
-unreal.log("hive-rig: built Control Rig %s with %d controls" % (blueprint.get_path_name(), len(CONTROLS)))
+
+def limb_frame(a, b, c, fallback):
+    """Axes along the reach, toward the middle joint's bend, and their normal."""
+    along = v_norm(v_sub(c, a))
+    bend = v_sub(v_sub(b, a), v_scale(along, v_dot(v_sub(b, a), along)))
+    if v_len(bend) < 1e-3 * v_len(v_sub(b, a)):
+        bend = v_sub(fallback, v_scale(along, v_dot(fallback, along)))
+    bend = v_norm(bend)
+    return along, bend, v_cross(along, bend)
+
+
+def pole_position(ctx, limb, a, b, c, upper_now):
+    """Where the pole sat at rest relative to the limb's frame, in today's frame;
+    a straight limb carries the rest bend along with the upper bone."""
+    # The third joint is the reach: the end, or a three-segment leg's hock joint.
+    ra, rb, rc = (vec(global_of(ctx, bone_key(b), True).translation) for b in limb["bones"][:3])
+    rest_pole = vec(global_of(ctx, control_key(limb["pole"]), True).translation)
+    rest = limb_frame(ra, rb, rc, v_sub(rest_pole, rb))
+    coords = [v_dot(axis, v_sub(rest_pole, rb)) for axis in rest]
+    rest_upper = global_of(ctx, bone_key(limb["bones"][0]), True)
+    carried = vec(upper_now.rotation.rotate_vector(rest_upper.rotation.unrotate_vector(unreal.Vector(*rest[1]))))
+    now = limb_frame(a, b, c, carried)
+    return v_add(b, [sum(now[k][i] * coords[k] for k in range(3)) for i in range(3)])
+
+
+def rotate_about(p, origin, axis, angle):
+    v = v_sub(p, origin)
+    cos, sin = _math.cos(angle), _math.sin(angle)
+    r = v_add(v_add(v_scale(v, cos), v_scale(v_cross(axis, v), sin)), v_scale(axis, v_dot(axis, v) * (1 - cos)))
+    return v_add(origin, r)
+
+
+def unsoft_reach(reach, length, soft, zone):
+    """The goal distance at which a softened chain reaches `reach` (the inverse of
+    hive-rig's soft_reach), so matching to IK lands on the FK pose."""
+    ease = soft * zone * length
+    start = length - ease
+    if ease <= 0.0 or reach <= start:
+        return reach
+    return start - ease * _math.log(max(1.0 - (reach - start) / ease, 1e-9))
+
+
+def match_ik_to_fk(ctx, limb):
+    """Turn the FK controls onto the IK pose, then switch the limb to FK."""
+    blend = limb["name"] + "_ik_fk"
+    set_float(ctx, blend, 1.0)
+    targets = [global_of(ctx, bone_key(b)) for b in limb["bones"]]
+    for ctrl, target in zip(limb["fk"], targets):
+        k = control_key(ctrl)
+        place(ctx, k, turned_like(global_of(ctx, k).translation, target))
+    set_float(ctx, blend, 0.0)
+    return limb["fk"] + [blend]
+
+
+def match_fk_to_ik(ctx, limb):
+    """Move the IK control (and hock control) and pole onto the FK pose, then
+    switch the limb to IK."""
+    blend = limb["name"] + "_ik_fk"
+    set_float(ctx, blend, 0.0)
+    fk = [global_of(ctx, bone_key(b)) for b in limb["bones"]]
+    ik = control_key(limb["ik"])
+    # The goal can sit below the control (a rolled foot); keep that offset.
+    offset = global_of(ctx, limb["goal"]).make_relative(global_of(ctx, ik))
+    place(ctx, ik, offset.inverse() * turned_like(fk[-1].translation, fk[-1]))
+    soft = limb.get("soft")
+    if soft and get_float(ctx, limb["name"] + "_soft") > 0.0:
+        # Soft IK falls short near full reach: push the control out until the eased
+        # reach lands on the FK end.
+        rest = [vec(global_of(ctx, bone_key(b), True).translation) for b in limb["bones"][:3]]
+        length = v_len(v_sub(rest[1], rest[0])) + v_len(v_sub(rest[2], rest[1]))
+        root = vec(global_of(ctx, bone_key(limb["bones"][0])).translation)
+        have = v_sub(vec(global_of(ctx, limb["goal"]).translation), root)
+        want = unsoft_reach(v_len(have), length, get_float(ctx, limb["name"] + "_soft"), soft["zone"])
+        if want > v_len(have):
+            now = global_of(ctx, ik)
+            moved = v_add(vec(now.translation), v_scale(v_norm(have), want - v_len(have)))
+            place(ctx, ik, turned_like(unreal.Vector(*moved), now))
+    hock = limb.get("hock")
+    if hock:
+        # Turn the hock control (it pivots on the ankle) until the null it carries
+        # at the hock point lines up with the FK hock joint.
+        ctrl = control_key(hock["control"])
+        carry = global_of(ctx, null_key(hock["target"])).make_relative(global_of(ctx, ctrl))
+        target = carry.inverse() * turned_like(fk[2].translation, fk[2])
+        place(ctx, ctrl, turned_like(global_of(ctx, ctrl).translation, target))
+    # The two-bone solve reaches the third joint: the end, or the hock joint.
+    a, b, c = (vec(t.translation) for t in fk[:3])
+    pole = control_key(limb["pole"])
+    place(ctx, pole, turned_like(unreal.Vector(*pole_position(ctx, limb, a, b, c, fk[0])), global_of(ctx, pole)))
+    set_float(ctx, blend, 1.0)
+    # Turn the pole about the reach until the middle joint lands on the FK one.
+    along = v_norm(v_sub(c, a))
+    want = v_sub(v_sub(b, a), v_scale(along, v_dot(v_sub(b, a), along)))
+    for _ in range(8):
+        got = v_sub(vec(global_of(ctx, bone_key(limb["bones"][1])).translation), a)
+        got = v_sub(got, v_scale(along, v_dot(got, along)))
+        if v_dot(got, got) < 1e-8 or v_dot(want, want) < 1e-8:
+            break
+        angle = _math.atan2(v_dot(v_cross(got, want), along), v_dot(got, want))
+        if abs(angle) < 1e-5:
+            break
+        now = global_of(ctx, pole)
+        moved = rotate_about(vec(now.translation), a, along, angle)
+        place(ctx, pole, turned_like(unreal.Vector(*moved), now))
+    return [limb["ik"], limb["pole"], blend] + ([hock["control"]] if hock else [])
+
+
+def match_limb(name, to, frames=None):
+    """Match limb `name` to "fk" or "ik" on `frames` (the current frame when
+    None), keying what changed on each, in order. Returns the frames matched."""
+    limb = limb_of(name)
+    ctx = rig_in_sequencer()
+    here = current_frame()
+    frames = [here] if frames is None else list(frames)
+    match = match_ik_to_fk if to == "fk" else match_fk_to_ik
+    for f in frames:
+        load_frame(ctx, f)
+        key_controls(ctx, match(ctx, limb), f)
+    try:
+        unreal.LevelSequenceEditorBlueprintLibrary.set_current_time(here)
+    except Exception:
+        pass
+    unreal.log("hive-rig: matched %s to %s on %d frame(s)" % (name, to.upper(), len(frames)))
+    return len(frames)
+
+
+def ik_to_fk(name, frames=None):
+    return match_limb(name, "fk", frames)
+
+
+def fk_to_ik(name, frames=None):
+    return match_limb(name, "ik", frames)
+
+
+def tool_args(fn):
+    """A tool taking a limb, with `--range` for the sequence's playback range."""
+    def run(args):
+        name = args[0]
+        frames = playback_frames(rig_in_sequencer()[0]) if "--range" in args else None
+        return fn(name, frames)
+    return run
+
+
+# Command-line tools: py "<this file>" <tool> <args...>. Each tool also gets a
+# menu entry per limb (labels below), on the current frame and over the range.
+TOOLS = {
+    "ik_to_fk": tool_args(ik_to_fk),
+    "fk_to_ik": tool_args(fk_to_ik),
+}
+TOOL_LABELS = {"ik_to_fk": "IK to FK", "fk_to_ik": "FK to IK"}
+
+
+def script_path():
+    try:
+        return os.path.abspath(__file__)
+    except NameError:
+        return os.path.join(os.path.dirname(GLB_PATH), NAME + "_unreal.py")
+
+
+def register_menu():
+    """A "Hive Rig" menu in the editor's main menu bar with the animator tools."""
+    menus = unreal.ToolMenus.get()
+    bar = menus.find_menu("LevelEditor.MainMenu")
+    if bar is None:
+        unreal.log_warning("hive-rig: no main menu to add the Hive Rig tools to")
+        return None
+    menu = bar.add_sub_menu("HiveRig", "", "HiveRig_" + NAME, "Hive Rig: " + NAME,
+                            "Animator tools for the %s Control Rig" % NAME)
+    path = script_path().replace("\\", "/")
+    count = 0
+    for limb in ANIM["limbs"]:
+        for tool, label in TOOL_LABELS.items():
+            for suffix, scope in (("", "this frame"), (" --range", "playback range")):
+                entry = unreal.ToolMenuEntry(name="HiveRig_%s_%s_%s%s" % (NAME, tool, limb["name"], suffix.strip()),
+                                             type=unreal.MultiBlockType.MENU_ENTRY)
+                entry.set_label("%s: %s (%s)" % (limb["name"], label, scope))
+                entry.set_string_command(unreal.ToolMenuStringCommandType.COMMAND, "",
+                                         'py "%s" %s %s%s' % (path, tool, limb["name"], suffix))
+                menu.add_menu_entry("Match", entry)
+                count += 1
+    menus.refresh_all_widgets()
+    return count
+
+
+def main(argv=None):
+    import sys
+
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] in TOOLS:
+        return TOOLS[args[0]](args[1:])
+    if args and args[0] == "menu":
+        return register_menu()
+    blueprint = build()
+    register_menu()
+    return blueprint
+
+
+if __name__ == "__main__":
+    main()
