@@ -38,7 +38,7 @@ struct Launch {
     bend: Option<f32>,
     /// About this world axis (0..2) instead of the one across the bone.
     bend_axis: Option<usize>,
-    /// Scroll Properties down to the weight tools.
+    /// Scroll Properties down to the weight tools (or a picked control's look).
     tools: bool,
     /// Turn the select tool on and select the vertices around the brush spot.
     vertices: bool,

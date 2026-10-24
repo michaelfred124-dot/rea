@@ -129,7 +129,7 @@ jobs:
           grep -q "No problems found" "$c/log.txt"
           # The app with a restyled control picked in the controls stage.
           xvfb-run -a -s "-screen 0 1400x900x24" cargo run --locked -q --bin HiveRig -- \
-            "$c/hive_demo.hive.json" --pick hand_l_ik_ctrl --screenshot "$RUNNER_TEMP/hive-rig-control-styles.ppm"
+            "$c/hive_demo.hive.json" --pick hand_l_ik_ctrl --tools --screenshot "$RUNNER_TEMP/hive-rig-control-styles.ppm"
           test "$(head -c 2 "$RUNNER_TEMP/hive-rig-control-styles.ppm")" = P6
       - name: Generate demo rigs (T-pose and A-pose)
         run: |

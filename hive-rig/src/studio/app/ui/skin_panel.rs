@@ -52,8 +52,8 @@ pub(super) fn brush_glyph(mode: BrushMode) -> (&'static str, Color32) {
 
 impl Studio {
     /// Scroll Properties to put this point at the top, while a screenshot
-    /// asks for the weight tools (`--tools`).
-    fn scroll_here(&mut self, ui: &mut Ui) {
+    /// asks for the weight tools, or a picked control's look (`--tools`).
+    pub(in crate::app) fn scroll_here(&mut self, ui: &mut Ui) {
         if self.skin_tools.scroll_to_tools > 0 {
             self.skin_tools.scroll_to_tools -= 1;
             ui.scroll_to_cursor(Some(egui::Align::Min));

@@ -1133,6 +1133,7 @@ impl Studio {
                 }
                 let before = self.style_of(&name);
                 let mut change = components::StyleChange::default();
+                self.scroll_here(ui);
                 theme::label_caps(ui, "Shape");
                 if let Some(shape) = shape_grid(ui, c.shape, 5) {
                     change.shape = Some(shape);
