@@ -101,6 +101,77 @@ pub fn fix_spikes(
     (out, changed)
 }
 
+/// Vertices whose weights add up to less than [`super::NO_WEIGHT`]: they don't
+/// follow any bone and stay behind when the rig moves.
+pub fn unweighted(skin: &SkinWeights) -> Vec<usize> {
+    (0..skin.vertex_count())
+        .filter(|&v| skin.influences(v).map(|(_, w)| w).sum::<f32>() < super::NO_WEIGHT)
+        .collect()
+}
+
+/// Deforming bones of `sk` with no weight above [`super::NO_WEIGHT`] on any
+/// vertex: they move nothing.
+pub fn unskinned_bones(skin: &SkinWeights, sk: &Skeleton) -> Vec<usize> {
+    let mut most = vec![0.0f32; sk.bones.len()];
+    for v in 0..skin.vertex_count() {
+        for (j, w) in skin.influences(v) {
+            if let Some(m) = most.get_mut(j) {
+                *m = m.max(w);
+            }
+        }
+    }
+    (0..sk.bones.len())
+        .filter(|&b| sk.bones[b].deform && most[b] < super::NO_WEIGHT)
+        .collect()
+}
+
+/// Give every unweighted vertex the average weights of its weighted
+/// neighbours over the surface, working in from the weighted skin one ring at
+/// a time, so a bare patch takes the weights round its edge. Vertices with no
+/// weighted vertex anywhere on their piece keep none. Returns the weights and
+/// how many vertices got weights.
+pub fn fill_unweighted(
+    skin: &SkinWeights,
+    adjacency: &[Vec<u32>],
+    limits: SkinLimits,
+) -> (SkinWeights, usize) {
+    let mut out = skin.clone();
+    let mut bare: Vec<bool> = vec![false; skin.vertex_count()];
+    for v in unweighted(skin) {
+        bare[v] = true;
+    }
+    let mut filled = 0;
+    loop {
+        // Each ring takes its weights from the skin before the ring, so the
+        // result doesn't depend on the vertex order.
+        let ring: Vec<(usize, Vec<(u16, f32)>)> = (0..bare.len())
+            .filter(|&v| bare[v])
+            .filter_map(|v| {
+                let from = adjacency
+                    .get(v)?
+                    .iter()
+                    .map(|&n| n as usize)
+                    .filter(|&n| !bare[n]);
+                let mut pairs = out.average(from);
+                if pairs.is_empty() {
+                    return None;
+                }
+                limit_pairs(&mut pairs, limits, None, &[]);
+                Some((v, pairs))
+            })
+            .collect();
+        if ring.is_empty() {
+            break;
+        }
+        for (v, pairs) in ring {
+            out.set(v, pairs);
+            bare[v] = false;
+            filled += 1;
+        }
+    }
+    (out, filled)
+}
+
 /// Set `bone`'s weight to `value` on each of `vertices` (flood fill, or one
 /// cell of the weight table). The vertex's other unlocked bones scale to fill
 /// the rest; a vertex held by `bone` alone hands the rest to its nearest
@@ -266,6 +337,67 @@ mod tests {
             skin,
             adj,
         }
+    }
+
+    #[test]
+    fn bare_vertices_and_bones_are_found_and_filled_from_around() {
+        let d = demo_rig();
+        assert!(unweighted(&d.skin).is_empty());
+        assert!(unskinned_bones(&d.skin, &d.sk).is_empty());
+        // Strip a patch on the upper arm, and every weight of the left hand.
+        let (_, patch) = around(&d, "upperarm_l", 0.04);
+        assert!(patch.len() > 5);
+        let hand = d.sk.index_of("hand_l").unwrap();
+        let mut skin = d.skin.clone();
+        for &v in &patch {
+            skin.set(v, Vec::new());
+        }
+        let held: Vec<usize> = (0..skin.vertex_count())
+            .filter(|&v| skin.weight(v, hand) > 0.0)
+            .collect();
+        for &v in &held {
+            let rest: Vec<(u16, f32)> = skin
+                .influences(v)
+                .filter(|(j, _)| *j != hand)
+                .map(|(j, w)| (j as u16, w))
+                .collect();
+            let total: f32 = rest.iter().map(|p| p.1).sum();
+            skin.set(
+                v,
+                rest.into_iter()
+                    .map(|(j, w)| (j, w / total.max(1e-9)))
+                    .collect(),
+            );
+        }
+        let bare = unweighted(&skin);
+        assert!(patch.iter().all(|v| bare.contains(v)));
+        assert!(unskinned_bones(&skin, &d.sk).contains(&hand));
+        // Filling gives the patch the arm's weights from round its edge.
+        let (filled, n) = fill_unweighted(&skin, &d.adj, SkinLimits::default());
+        assert_eq!(n, bare.len());
+        assert!(unweighted(&filled).is_empty());
+        assert_normalised(&filled);
+        let up = d.sk.index_of("upperarm_l").unwrap();
+        let mean = |s: &SkinWeights| {
+            patch.iter().map(|&v| s.weight(v, up)).sum::<f32>() / patch.len() as f32
+        };
+        assert!(
+            (mean(&filled) - mean(&d.skin)).abs() < 0.25,
+            "{} vs {}",
+            mean(&filled),
+            mean(&d.skin)
+        );
+        // A piece with no weight anywhere stays bare.
+        let empty = SkinWeights {
+            joints: vec![Vec::new(); 3],
+            weights: vec![Vec::new(); 3],
+        };
+        let (still, n) = fill_unweighted(
+            &empty,
+            &[vec![1], vec![0, 2], vec![1]],
+            SkinLimits::default(),
+        );
+        assert_eq!((n, unweighted(&still).len()), (0, 3));
     }
 
     fn assert_normalised(skin: &SkinWeights) {

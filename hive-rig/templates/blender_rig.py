@@ -1015,9 +1015,10 @@ def build(RIG, geos=None):
 
 
 # --------------------------------------------------------------------------- animator tools
-# IK/FK matching, pose mirroring, reset and space switching. Which controls make
-# up each limb and which controls are left/right twins come from hive-rig (the
-# rig's ik_chains and mirror_pairs), kept on the armature as `hive_anim`.
+# IK/FK matching, pose mirroring and flipping, a pose library, reset and space
+# switching. Which controls make up each limb and which controls are left/right
+# twins come from hive-rig (the rig's ik_chains and mirror_pairs), kept on the
+# armature as `hive_anim`.
 ANIM_PROPS = ("ik_fk", "stretch", "soft", "roll", "space", "volume", "spring")
 
 
@@ -1239,15 +1240,52 @@ def match_range(rig, name, to, frames=None):
     return len(frames)
 
 
+def twins(rig):
+    """Each left/right control mapped to its twin on the other side."""
+    twin = {}
+    for left, right in anim_data(rig)["mirror"]:
+        twin[left], twin[right] = right, left
+    return twin
+
+
+def mirrored_basis(rig, src, dst, basis):
+    """`src`'s local pose `basis` as the matching pose of `dst` on the other side
+    (`dst` may be `src` itself for a centre control). Twins' rest frames are
+    mirror images up to an axis flip `f`, so conjugating by it mirrors the pose
+    relative to the control's parent."""
+    bones = rig.data.bones
+    flip = Matrix.Scale(-1.0, 3, (1.0, 0.0, 0.0))
+    rs = bones[src].matrix_local.to_3x3().normalized()
+    rd = bones[dst].matrix_local.to_3x3().normalized()
+    f = (rs.inverted() @ flip @ rd).to_4x4()
+    return f.inverted() @ basis @ f
+
+
+def control_settings(pb):
+    return {p: pb[p] for p in ANIM_PROPS if p in pb.keys()}
+
+
+def put_pose(rig, moves):
+    """Apply `(src, dst, basis, settings)` moves, each mirrored from `src` onto
+    `dst` (a plain copy when `src` is None)."""
+    pose = rig.pose.bones
+    for src, dst, basis, settings in moves:
+        pose[dst].matrix_basis = basis if src is None else mirrored_basis(rig, src, dst, basis)
+        for p, v in settings.items():
+            if p in pose[dst].keys():
+                pose[dst][p] = v
+    refresh(rig)
+    key_controls(rig, [m[1] for m in moves])
+    return len(moves)
+
+
 def mirror_pose(rig, names=None, source="left"):
     """Copy controls' poses onto their twins on the other side. `names` are the
     controls to copy from (their twins receive the pose); without names every
     `source`-side control is copied. Each pose is mirrored relative to the
     control's parent, so the result is symmetric when the centre is."""
     data = anim_data(rig)
-    twin = {}
-    for left, right in data["mirror"]:
-        twin[left], twin[right] = right, left
+    twin = twins(rig)
     lefts = {left for left, _ in data["mirror"]}
     if names:
         picked = [n for n in names if n in twin]
@@ -1255,24 +1293,70 @@ def mirror_pose(rig, names=None, source="left"):
         copies = [(n, twin[n]) for n in picked if twin[n] not in picked or (n in lefts) == (source == "left")]
     else:
         copies = [(l, r) if source == "left" else (r, l) for l, r in data["mirror"]]
-    pose, bones = rig.pose.bones, rig.data.bones
-    flip = Matrix.Scale(-1.0, 3, (1.0, 0.0, 0.0))
+    pose = rig.pose.bones
     # Read every source first, so swapping both sides at once is consistent.
-    poses = [(src, dst, pose[src].matrix_basis.copy(), {p: pose[src][p] for p in ANIM_PROPS if p in pose[src].keys()})
-             for src, dst in copies]
-    for src, dst, basis, props in poses:
-        # The rest frames of twins are mirror images up to an axis flip `f`;
-        # conjugating the source's local pose by it gives the twin's.
-        rs = bones[src].matrix_local.to_3x3().normalized()
-        rd = bones[dst].matrix_local.to_3x3().normalized()
-        f = (rs.inverted() @ flip @ rd).to_4x4()
-        pose[dst].matrix_basis = f.inverted() @ basis @ f
-        for p, v in props.items():
-            if p in pose[dst].keys():
-                pose[dst][p] = v
-    refresh(rig)
-    key_controls(rig, [dst for _, dst in copies])
-    return len(copies)
+    return put_pose(rig, [(src, dst, pose[src].matrix_basis.copy(), control_settings(pose[src]))
+                          for src, dst in copies])
+
+
+def flip_pose(rig, names=None):
+    """Turn the pose into its mirror image: every left/right pair swaps poses
+    (mirrored) and every centre control is mirrored onto itself, so a character
+    leaning left leans right. With `names`, only those controls and their twins."""
+    data = anim_data(rig)
+    twin = twins(rig)
+    picked = [n for n in (names or data["controls"]) if n in data["controls"]]
+    picked = list(dict.fromkeys(picked + [twin[n] for n in picked if n in twin]))
+    pose = rig.pose.bones
+    # Every pose is read before any is written, so twins swap cleanly.
+    return put_pose(rig, [(n, twin.get(n, n), pose[n].matrix_basis.copy(), control_settings(pose[n]))
+                          for n in picked])
+
+
+# Pose library: named poses kept on the armature (`hive_poses`), each the
+# controls' local poses and settings, so they are saved with the .blend file.
+def pose_library(rig):
+    return json.loads(rig.get("hive_poses", "{}"))
+
+
+def save_pose(rig, name, names=None):
+    """Store the current pose of every control (or only `names`) as `name`,
+    replacing a pose of that name. Returns how many controls it holds."""
+    name = name.strip()
+    if not name:
+        raise RuntimeError("Give the pose a name")
+    data = anim_data(rig)
+    pose = rig.pose.bones
+    picked = [n for n in (names or data["controls"]) if n in data["controls"]]
+    library = pose_library(rig)
+    library[name] = {n: {"basis": [list(row) for row in pose[n].matrix_basis],
+                         "settings": control_settings(pose[n])} for n in picked}
+    rig["hive_poses"] = json.dumps(library)
+    return len(picked)
+
+
+def apply_pose(rig, name, names=None, mirrored=False):
+    """Put the controls (all the pose holds, or only `names`) into pose `name`.
+    Mirrored, each control's stored pose lands mirrored on its twin (centre
+    controls on themselves), giving the pose's mirror image."""
+    library = pose_library(rig)
+    if name not in library:
+        raise RuntimeError("No pose named %s" % name)
+    twin = twins(rig)
+    present = set(anim_data(rig)["controls"])
+    moves = []
+    for src, stored in library[name].items():
+        dst = twin.get(src, src) if mirrored else src
+        if dst not in present or (names and dst not in names):
+            continue
+        moves.append((src if mirrored else None, dst, Matrix(stored["basis"]), stored["settings"]))
+    return put_pose(rig, moves)
+
+
+def delete_pose(rig, name):
+    library = pose_library(rig)
+    library.pop(name, None)
+    rig["hive_poses"] = json.dumps(library)
 
 
 def reset_pose(rig, names=None):
@@ -1613,6 +1697,71 @@ class HIVE_OT_mirror_pose(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class HIVE_OT_flip_pose(bpy.types.Operator):
+    bl_idname = "hive.flip_pose"
+    bl_label = "Flip Pose"
+    bl_description = ("Turn the pose into its mirror image: left and right swap and the centre controls "
+                      "mirror (the selected controls and their twins, or every control if none is selected)")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        rig = find_rig(context)
+        n = flip_pose(rig, selected_controls(rig))
+        self.report({"INFO"}, "Flipped %d controls" % n)
+        return {"FINISHED"}
+
+
+class HIVE_OT_save_pose(bpy.types.Operator):
+    bl_idname = "hive.save_pose"
+    bl_label = "Save Pose"
+    bl_description = "Keep the current pose in the rig's pose library (the selected controls, or every control)"
+    bl_options = {"REGISTER", "UNDO"}
+    name: bpy.props.StringProperty(name="Name", default="Pose")
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        rig = find_rig(context)
+        try:
+            n = save_pose(rig, self.name, selected_controls(rig))
+        except RuntimeError as e:
+            self.report({"ERROR"}, str(e))
+            return {"CANCELLED"}
+        self.report({"INFO"}, "Saved %s (%d controls)" % (self.name, n))
+        return {"FINISHED"}
+
+
+class HIVE_OT_apply_pose(bpy.types.Operator):
+    bl_idname = "hive.apply_pose"
+    bl_label = "Apply Pose"
+    bl_description = "Put the controls into this pose (only the selected ones, if any are selected)"
+    bl_options = {"REGISTER", "UNDO"}
+    name: bpy.props.StringProperty()
+    mirrored: bpy.props.BoolProperty(name="Mirrored", default=False)
+
+    def execute(self, context):
+        rig = find_rig(context)
+        try:
+            apply_pose(rig, self.name, selected_controls(rig), self.mirrored)
+        except RuntimeError as e:
+            self.report({"ERROR"}, str(e))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class HIVE_OT_delete_pose(bpy.types.Operator):
+    bl_idname = "hive.delete_pose"
+    bl_label = "Delete Pose"
+    bl_description = "Take this pose out of the pose library"
+    bl_options = {"REGISTER", "UNDO"}
+    name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        delete_pose(find_rig(context), self.name)
+        return {"FINISHED"}
+
+
 class HIVE_OT_reset_pose(bpy.types.Operator):
     bl_idname = "hive.reset_pose"
     bl_label = "Reset Pose"
@@ -1704,6 +1853,7 @@ class HIVE_PT_panel(bpy.types.Panel):
         row = box.row(align=True)
         row.operator("hive.mirror_pose", text="Mirror L to R", icon="MOD_MIRROR").source = "left"
         row.operator("hive.mirror_pose", text="Mirror R to L").source = "right"
+        box.operator("hive.flip_pose", icon="ARROW_LEFTRIGHT")
         row = box.row(align=True)
         row.operator("hive.reset_pose", text="Reset All", icon="LOOP_BACK").selected = False
         row.operator("hive.reset_pose", text="Reset Selected").selected = True
@@ -1715,6 +1865,16 @@ class HIVE_PT_panel(bpy.types.Panel):
             for i, space in enumerate(data["spaces"][active.name]):
                 op = col.operator("hive.switch_space", text=space, depress=int(active.get("space", 0)) == i)
                 op.control, op.index = active.name, i
+        box = layout.box()
+        box.label(text="Pose Library")
+        for name in sorted(pose_library(rig)):
+            row = box.row(align=True)
+            op = row.operator("hive.apply_pose", text=name)
+            op.name, op.mirrored = name, False
+            op = row.operator("hive.apply_pose", text="", icon="MOD_MIRROR")
+            op.name, op.mirrored = name, True
+            row.operator("hive.delete_pose", text="", icon="X").name = name
+        box.operator("hive.save_pose", icon="ADD")
 
 
 CLASSES = (
@@ -1725,6 +1885,10 @@ CLASSES = (
     HIVE_OT_rebuild,
     HIVE_OT_match_limb,
     HIVE_OT_mirror_pose,
+    HIVE_OT_flip_pose,
+    HIVE_OT_save_pose,
+    HIVE_OT_apply_pose,
+    HIVE_OT_delete_pose,
     HIVE_OT_reset_pose,
     HIVE_OT_select_controls,
     HIVE_OT_switch_space,

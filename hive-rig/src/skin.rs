@@ -698,6 +698,11 @@ pub enum BrushMode {
 /// another bone than everything around it scores near 1.
 pub const SPIKE: f32 = 0.5;
 
+/// Weight below this counts as none: a vertex whose weights add up to less
+/// follows no bone, and a deforming bone that never reaches it on any vertex
+/// moves no skin.
+pub const NO_WEIGHT: f32 = 1e-3;
+
 /// One touch of the weight brush.
 #[derive(Debug, Clone, Copy)]
 pub struct Dab {

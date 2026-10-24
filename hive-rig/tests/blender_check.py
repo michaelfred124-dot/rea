@@ -114,6 +114,12 @@ check(all(w is not None and w < 1e-3 for w in worst),
       "every control shape sits on its outline (%d controls, %d shapes)"
       % (len(RIG_CONTROLS), len({c["shape"] for c in RIG_CONTROLS})))
 
+if hasattr(rig.pose.bones[RIG_CONTROLS[0]["name"]], "color"):
+    off = max(max(abs(a - b) for a, b in zip(rig.pose.bones[c["name"]].color.custom.normal, c["color"]))
+              for c in RIG_CONTROLS)
+    # Blender keeps bone colours at 8 bits a channel.
+    check(off < 1.0 / 255 + 1e-4, "every control is drawn in its colour (%d colours)" % len({tuple(c["color"]) for c in RIG_CONTROLS}))
+
 rest = [v.co.copy() for v in geo.data.vertices]
 
 _bones = [b["name"] for b in DATA["skeleton"]["bones"]]

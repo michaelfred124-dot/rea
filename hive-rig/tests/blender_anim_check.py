@@ -247,6 +247,90 @@ if picked:
     check(pose[twin[picked]].matrix_basis != Matrix.Identity(4), "mirror selected copies the picked control")
     check(pose[other_twin].matrix_basis == Matrix.Identity(4), "mirror selected leaves other controls alone")
 
+# Flip: pose both sides and the centre differently, flip, and every deforming
+# bone lands where its twin was, mirrored (a centre bone on its own mirror).
+def bone_twin_map():
+    """Deforming bones paired by mirrored rest positions; centre bones pair with themselves."""
+    deform = [b for b in bones if b.use_deform]
+    out = {}
+    for b in deform:
+        want_h, want_t = mirrored(b.head_local), mirrored(b.tail_local)
+        best = min(deform, key=lambda o: (o.head_local - want_h).length + (o.tail_local - want_t).length)
+        if (best.head_local - want_h).length + (best.tail_local - want_t).length < 1e-3:
+            out[b.name] = best.name
+    return out
+
+
+def pose_some_of_everything():
+    ns["reset_pose"](rig)
+    names = data["controls"]
+    for k, n in enumerate(names):
+        pb = pose[n]
+        if k % 3 == 0:
+            continue
+        pb.rotation_mode = "XYZ"
+        pb.rotation_euler = (0.05 * (k % 5) - 0.1, 0.07 * (k % 4) - 0.1, 0.06 * (k % 3) + 0.02)
+        if not all(pb.lock_location) and k % 2 == 0:
+            pb.location = (0.01 * (k % 3), -0.008 * (k % 2 + 1), 0.006)
+    if has_limbs:
+        pose[limbs["leg_l"]["ik"]]["roll"] = 20.0
+        pose[limbs["arm_r"]["ik"]]["ik_fk"] = 1.0
+    update()
+
+
+bone_twin = bone_twin_map()
+centre_bones = [b for b, t in bone_twin.items() if b == t]
+check(len(centre_bones) > 0 and (len(bone_twin) > len(centre_bones) or not data["mirror"]), "flip: %d deforming bones paired, %d in the centre"
+      % (len(bone_twin), len(centre_bones)))
+pose_some_of_everything()
+before_pose = {n: pose[n].matrix_basis.copy() for n in data["controls"]}
+before = {b: (pose[b].head.copy(), pose[b].tail.copy(), pose[b].x_axis.copy()) for b in bone_twin}
+settings_before = {n: ns["control_settings"](pose[n]) for n in data["controls"]}
+n = ns["flip_pose"](rig)
+check(n == len(data["controls"]), "flip with nothing selected flips all %d controls" % n)
+update()
+worst = 0.0
+for b, t in bone_twin.items():
+    h, tl, _ = before[t]
+    worst = max(worst, (pose[b].head - mirrored(h)).length, (pose[b].tail - mirrored(tl)).length)
+check(worst < POS_TOL, "flip: every deforming bone is its twin's mirror image (%.5f m)" % worst)
+moved = max((before[b][0] - pose[b].head).length for b in centre_bones)
+check(moved > 1e-3 or not any(before_pose[n] != Matrix.Identity(4) for n in data["controls"]),
+      "flip moves the centre (%.4f m)" % moved)
+twin = {l: r for l, r in data["mirror"]}
+twin.update({r: l for l, r in data["mirror"]})
+check(all(ns["control_settings"](pose[twin.get(n, n)]) == settings_before[n] for n in data["controls"]),
+      "flip swaps ik_fk, roll and the other settings between twins")
+flipped_pose = {n: pose[n].matrix_basis.copy() for n in data["controls"]}
+ns["flip_pose"](rig)
+err = max(max(abs(a - b) for ra, rb in zip(pose[n].matrix_basis, before_pose[n]) for a, b in zip(ra, rb))
+          for n in data["controls"])
+check(err < 1e-4, "flipping twice gives the pose back (%.6f)" % err)
+
+# Pose library: save, reset, apply; apply mirrored is the flip; selected only; delete.
+ns["save_pose"](rig, "test pose")
+check(sorted(ns["pose_library"](rig)) == ["test pose"], "the pose is in the library")
+ns["reset_pose"](rig)
+ns["apply_pose"](rig, "test pose")
+err = max(max(abs(a - b) for ra, rb in zip(pose[n].matrix_basis, before_pose[n]) for a, b in zip(ra, rb))
+          for n in data["controls"])
+check(err < 1e-5 and all(ns["control_settings"](pose[n]) == settings_before[n] for n in data["controls"]),
+      "applying the saved pose puts every control back (%.6f)" % err)
+ns["reset_pose"](rig)
+ns["apply_pose"](rig, "test pose", None, True)
+err = max(max(abs(a - b) for ra, rb in zip(pose[n].matrix_basis, flipped_pose[n]) for a, b in zip(ra, rb))
+          for n in data["controls"])
+check(err < 1e-4, "applying it mirrored gives the flipped pose (%.6f)" % err)
+ns["reset_pose"](rig)
+one = next(n for n in data["controls"] if before_pose[n] != Matrix.Identity(4))
+check(ns["apply_pose"](rig, "test pose", [one]) == 1, "applying to the selected controls only")
+check(all(pose[n].matrix_basis == Matrix.Identity(4) for n in data["controls"] if n != one),
+      "the other controls stay put")
+ns["save_pose"](rig, "second", [one])
+check(len(json.loads(rig["hive_poses"])["second"]) == 1, "a pose of the selected controls holds only them")
+ns["delete_pose"](rig, "second")
+check(sorted(ns["pose_library"](rig)) == ["test pose"], "delete takes a pose out")
+
 # Select all controls.
 count = ns["select_controls"](rig)
 check(sorted(ns["selected_controls"](rig)) == sorted(data["controls"]) and count == len(data["controls"]),
@@ -286,6 +370,14 @@ ns["HIVE_PT_panel"].draw(SimpleNamespace(layout=layout),
 drawn = [c.args[0] for c in layout.mock_calls if c.args and isinstance(c.args[0], str) and c.args[0].startswith("hive.")]
 check(drawn.count("hive.match_limb") == 2 * len(limbs) and "hive.switch_space" in drawn and "hive.mirror_pose" in drawn,
       "the Hive tab shows match buttons for %d limbs, mirror, reset and the space buttons" % len(limbs))
+check("hive.flip_pose" in drawn and "hive.save_pose" in drawn and drawn.count("hive.apply_pose") == 2
+      and "hive.delete_pose" in drawn, "the Hive tab shows Flip Pose and the pose library with its pose")
+for p in pose:
+    ns["set_bone_selected"](p, False)
+check(bpy.ops.hive.flip_pose() == {"FINISHED"} and bpy.ops.hive.apply_pose(name="test pose", mirrored=True) == {"FINISHED"},
+      "Flip Pose and Apply Pose run from the Hive tab")
+check(bpy.ops.hive.save_pose(name="from the tab") == {"FINISHED"} and "from the tab" in ns["pose_library"](rig),
+      "Save Pose runs from the Hive tab")
 
 # Reset everything through the panel's operator.
 if has_limbs:

@@ -72,6 +72,15 @@ SHAPES = {
     "half_circle": "HalfCircle_Thick",
     "pyramid": "Pyramid_Thick",
     "star": "Star4_Thick",
+    "rounded_square": "RoundedSquare_Thick",
+    "rounded_triangle": "RoundedTriangle_Thick",
+    "quarter_circle": "QuarterCircle_Thick",
+    # No library match: the nearest look-alike.
+    "gear": "Octagon_Thick",
+    "curved_arrow": "HalfCircle_Thick",
+    "lollipop": "Circle_Thick",
+    "cylinder": "Circle_Thick",
+    "plus": "Arrow4_Thick",
 }
 FALLBACK_SHAPE = "Circle_Thick"
 

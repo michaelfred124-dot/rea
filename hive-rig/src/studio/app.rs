@@ -604,6 +604,24 @@ impl Studio {
         });
     }
 
+    /// Change the look of a control, its twin or its component's controls
+    /// (see [`components::restyle`]), as one undo step.
+    pub fn restyle_controls(
+        &mut self,
+        control: &str,
+        change: components::StyleChange,
+        scope: components::StyleScope,
+    ) {
+        let name = control.to_string();
+        self.edit("restyle the control", |g| {
+            let changed = components::restyle(g, &name, change, scope)?;
+            Ok(match changed.len() {
+                1 => format!("Restyled {name}."),
+                n => format!("Restyled {name} and {} more.", n - 1),
+            })
+        });
+    }
+
     /// Hang a component from a bone, as one undo step.
     pub fn attach_component(&mut self, comp: usize, bone: &str) {
         let Some(id) = self
@@ -2388,6 +2406,106 @@ mod tests {
             back.controls.control(&name).unwrap().shape,
             hive_rig::controls::Shape::Cross
         );
+    }
+
+    #[test]
+    fn restyling_with_symmetry_reaches_the_twin_in_one_undo_step() {
+        use hive_rig::components::{StyleChange, StyleScope};
+        use hive_rig::controls::Shape;
+        let mut s = demo_studio();
+        let style = |s: &Studio, n: &str| {
+            s.doc
+                .as_ref()
+                .unwrap()
+                .guides
+                .control_styles
+                .get(n)
+                .copied()
+        };
+        let change = StyleChange {
+            shape: Some(Shape::CurvedArrow),
+            color: Some([0.1, 0.45, 1.0]),
+            ..Default::default()
+        };
+        s.restyle_controls("hand_l_ik_ctrl", change, StyleScope::WithTwin);
+        assert!(!s.error, "{}", s.status);
+        let (l, r) = (
+            style(&s, "hand_l_ik_ctrl").unwrap(),
+            style(&s, "hand_r_ik_ctrl").unwrap(),
+        );
+        assert_eq!(
+            (l.shape, r.shape),
+            (Some(Shape::CurvedArrow), Some(Shape::CurvedArrow))
+        );
+        assert_eq!(r.color, Some([1.0, 0.15, 0.15]), "the side colour swaps");
+        let preview = s.doc.as_ref().unwrap().preview.as_ref().unwrap();
+        assert_eq!(
+            preview.controls.control("hand_r_ik_ctrl").unwrap().shape,
+            Shape::CurvedArrow
+        );
+        // The whole component, without its twin.
+        s.restyle_controls(
+            "upperarm_l_fk_ctrl",
+            StyleChange {
+                shape: Some(Shape::Plus),
+                ..Default::default()
+            },
+            StyleScope::Component { twins: false },
+        );
+        assert_eq!(
+            style(&s, "lowerarm_l_fk_ctrl").unwrap().shape,
+            Some(Shape::Plus)
+        );
+        assert_ne!(
+            style(&s, "lowerarm_r_fk_ctrl").and_then(|x| x.shape),
+            Some(Shape::Plus)
+        );
+        s.undo();
+        s.undo();
+        assert!(s.doc.as_ref().unwrap().guides.control_styles.is_empty());
+    }
+
+    #[test]
+    fn skin_checks_find_and_fill_bare_vertices_and_bones() {
+        let mut s = demo_studio();
+        assert!(s.skin_report().is_none(), "no skin checks before Build");
+        assert!(s.build(), "{}", s.status);
+        assert!(s.skin_report().unwrap().issues.is_empty());
+        // Strip a few vertices and the left hand's weights by hand.
+        let doc = s.doc.as_mut().unwrap();
+        let rig = doc.rig.as_mut().unwrap();
+        let hand = rig.skeleton.index_of("hand_l").unwrap();
+        let mut bare = vec![3, 4, 5];
+        for v in 0..rig.skin.vertex_count() {
+            if rig.skin.weight(v, hand) > 0.0 {
+                bare.push(v);
+            }
+        }
+        for &v in &bare {
+            rig.skin.set(v, Vec::new());
+        }
+        let report = s.skin_report().unwrap();
+        assert_eq!(report.unweighted.len(), {
+            let mut b = bare.clone();
+            b.sort();
+            b.dedup();
+            b.len()
+        });
+        assert_eq!(report.unskinned, vec![hand]);
+        s.select_unweighted();
+        assert_eq!(s.skin_tools.selected_count(), report.unweighted.len());
+        s.fill_unweighted();
+        assert!(!s.error, "{}", s.status);
+        let after = s.skin_report().unwrap();
+        assert!(after.unweighted.is_empty() && after.unskinned == vec![hand]);
+        // Auto on the bone gives it skin again; each fix is one undo step.
+        s.reauto_named_bone("hand_l");
+        assert!(s.skin_report().unwrap().issues.is_empty(), "{}", s.status);
+        assert_eq!(s.weights_bone.as_deref(), Some("hand_l"));
+        s.undo();
+        assert_eq!(s.skin_report().unwrap().unskinned, vec![hand]);
+        s.undo();
+        assert!(!s.skin_report().unwrap().unweighted.is_empty());
     }
 
     #[test]

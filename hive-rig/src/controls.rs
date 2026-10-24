@@ -36,6 +36,22 @@ pub enum Shape {
     Pyramid,
     /// A four-pointed star.
     Star,
+    /// A square with rounded corners.
+    RoundedSquare,
+    /// A triangle with rounded corners, pointing along the shape's up direction.
+    RoundedTriangle,
+    /// A quarter of a disc, opening toward the shape's up and across directions.
+    QuarterCircle,
+    /// A toothed ring.
+    Gear,
+    /// A three-quarter ring with an arrowhead: turn this way.
+    CurvedArrow,
+    /// A ring on a stick, standing up from the control.
+    Lollipop,
+    /// Two rings along the axis, joined by four lines.
+    Cylinder,
+    /// A plus sign outline with wide arms.
+    Plus,
 }
 
 /// Line strips in a shape's own frame: `x` across, `y` along the control's axis
@@ -47,7 +63,7 @@ pub type Strokes = Vec<Vec<Vec3>>;
 const RING_SEGMENTS: usize = 32;
 
 impl Shape {
-    pub const ALL: [Shape; 15] = [
+    pub const ALL: [Shape; 23] = [
         Shape::Circle,
         Shape::Square,
         Shape::Cube,
@@ -63,6 +79,14 @@ impl Shape {
         Shape::HalfCircle,
         Shape::Pyramid,
         Shape::Star,
+        Shape::RoundedSquare,
+        Shape::RoundedTriangle,
+        Shape::QuarterCircle,
+        Shape::Gear,
+        Shape::CurvedArrow,
+        Shape::Lollipop,
+        Shape::Cylinder,
+        Shape::Plus,
     ];
 
     pub fn label(self) -> &'static str {
@@ -82,6 +106,14 @@ impl Shape {
             Shape::HalfCircle => "Half circle",
             Shape::Pyramid => "Pyramid",
             Shape::Star => "Star",
+            Shape::RoundedSquare => "Rounded square",
+            Shape::RoundedTriangle => "Rounded triangle",
+            Shape::QuarterCircle => "Quarter circle",
+            Shape::Gear => "Gear",
+            Shape::CurvedArrow => "Curved arrow",
+            Shape::Lollipop => "Lollipop",
+            Shape::Cylinder => "Cylinder",
+            Shape::Plus => "Plus",
         }
     }
 
@@ -210,8 +242,137 @@ impl Shape {
                     .collect();
                 vec![flat(&pts)]
             }
+            Shape::RoundedSquare => vec![rounded(
+                &[(1.0, 1.0), (-1.0, 1.0), (-1.0, -1.0), (1.0, -1.0)],
+                0.35,
+            )],
+            Shape::RoundedTriangle => {
+                let corners: Vec<(f32, f32)> = (0..3)
+                    .map(|i| {
+                        let a = (90.0 + i as f32 * 120.0f32).to_radians();
+                        (a.cos(), a.sin())
+                    })
+                    .collect();
+                // Rounding pulls the tips in; grow it back to full size.
+                let mut tri = rounded(&corners, 0.3);
+                let reach = tri.iter().map(|p| p.length()).fold(0.0, f32::max);
+                tri.iter_mut().for_each(|p| *p /= reach);
+                vec![tri]
+            }
+            Shape::QuarterCircle => {
+                // From the centre out along across, round to up, and back.
+                let mut out = vec![Vec3::ZERO];
+                out.extend(arc(Vec3::X, Vec3::Z, FRAC_PI_2, RING_SEGMENTS / 4));
+                out.push(Vec3::ZERO);
+                vec![out]
+            }
+            Shape::Gear => {
+                // Eight teeth: each a flat top at full radius and a gap at 0.78.
+                const TEETH: usize = 8;
+                let step = TAU / TEETH as f32;
+                let pts: Vec<(f32, f32)> = (0..TEETH)
+                    .flat_map(|t| {
+                        let a = t as f32 * step;
+                        [(0.78, 0.0), (1.0, 0.12), (1.0, 0.38), (0.78, 0.5)]
+                            .into_iter()
+                            .map(move |(r, f)| {
+                                let (s, c) = (a + f * step).sin_cos();
+                                (r * c, r * s)
+                            })
+                    })
+                    .collect();
+                vec![flat(&pts)]
+            }
+            Shape::CurvedArrow => {
+                // Three quarters of a ring from the bottom round through across,
+                // up and the far side, ending in an arrowhead pointing on round.
+                let r = 0.8;
+                let (start, sweep) = (-FRAC_PI_2, 1.5 * PI);
+                let round = |a: f32| Vec3::new(a.cos(), 0.0, a.sin());
+                let body = (0..=24)
+                    .map(|i| round(start + sweep * i as f32 / 24.0) * r)
+                    .collect();
+                let end = start + sweep;
+                let tip = round(end) * r + round(end + FRAC_PI_2) * 0.45;
+                let head = vec![round(end) * (r + 0.2), tip, round(end) * (r - 0.2)];
+                vec![body, head]
+            }
+            Shape::Lollipop => {
+                // A stick up to a ring that starts where the stick meets it.
+                let centre = Vec3::Z * 0.75;
+                let mut head = arc(-Vec3::Z * 0.25, Vec3::X * 0.25, TAU, RING_SEGMENTS);
+                head[RING_SEGMENTS] = head[0];
+                let head = head.into_iter().map(|p| p + centre).collect();
+                vec![vec![Vec3::ZERO, Vec3::Z * 0.5], head]
+            }
+            Shape::Cylinder => {
+                let r = 0.8;
+                let ring_at = |y: f32| -> Vec<Vec3> {
+                    ring(Vec3::X * r, Vec3::Z * r)
+                        .into_iter()
+                        .map(|p| p.with_y(y))
+                        .collect()
+                };
+                let mut out = vec![ring_at(-0.6), ring_at(0.6)];
+                out.extend(
+                    [(r, 0.0), (0.0, r), (-r, 0.0), (0.0, -r)]
+                        .iter()
+                        .map(|&(x, z)| vec![Vec3::new(x, -0.6, z), Vec3::new(x, 0.6, z)]),
+                );
+                out
+            }
+            Shape::Plus => {
+                const W: f32 = 0.3;
+                vec![flat(&[
+                    (W, W),
+                    (W, 1.0),
+                    (-W, 1.0),
+                    (-W, W),
+                    (-1.0, W),
+                    (-1.0, -W),
+                    (-W, -W),
+                    (-W, -1.0),
+                    (W, -1.0),
+                    (W, -W),
+                    (1.0, -W),
+                    (1.0, W),
+                ])]
+            }
         }
     }
+}
+
+/// A closed loop round `corners` (in the plane, counter-clockwise) with each
+/// corner rounded off by an arc of `radius`, keeping the loop inside the
+/// corners' outline.
+fn rounded(corners: &[(f32, f32)], radius: f32) -> Vec<Vec3> {
+    const STEPS: usize = 6;
+    let n = corners.len();
+    let at = |i: usize| {
+        let (x, z) = corners[i % n];
+        Vec3::new(x, 0.0, z)
+    };
+    let mut out = Vec::new();
+    for i in 0..n {
+        let (prev, here, next) = (at(i + n - 1), at(i), at(i + 1));
+        let a = (prev - here).normalize();
+        let b = (next - here).normalize();
+        // The arc touches both edges `cut` from the corner; its centre is on
+        // the bisector.
+        let half = a.angle_between(b) * 0.5;
+        let cut = radius / half.tan();
+        let centre = here + (a + b).normalize() * (radius / half.sin());
+        let (from, to) = (here + a * cut, here + b * cut);
+        let (u, v) = ((from - centre).normalize(), (to - centre).normalize());
+        let sweep = u.angle_between(v);
+        let w = (v - u * u.dot(v)).normalize();
+        for k in 0..=STEPS {
+            let t = sweep * k as f32 / STEPS as f32;
+            out.push(centre + (u * t.cos() + w * t.sin()) * radius);
+        }
+    }
+    out.push(out[0]);
+    out
 }
 
 /// The frame a control's shape is drawn in: across, along `axis`, and up. Up is
@@ -771,6 +932,60 @@ mod tests {
                 assert_eq!(line.first(), line.last(), "{s:?}");
             }
         }
+    }
+
+    #[test]
+    fn the_newer_shapes_read_as_themselves() {
+        let points = |s: Shape| s.strokes().concat();
+        for s in [
+            Shape::RoundedSquare,
+            Shape::RoundedTriangle,
+            Shape::QuarterCircle,
+            Shape::Gear,
+            Shape::CurvedArrow,
+            Shape::Lollipop,
+            Shape::Plus,
+        ] {
+            assert!(points(s).iter().all(|p| p.y == 0.0), "{s:?} is flat");
+        }
+        // Rounded shapes have no sharp corner: no point reaches the corner of
+        // the square, and the outline still touches every side.
+        let rs = points(Shape::RoundedSquare);
+        assert!(rs.iter().all(|p| p.x.abs() + p.z.abs() < 1.9));
+        for dir in [Vec3::X, -Vec3::X, Vec3::Z, -Vec3::Z] {
+            assert!(rs.iter().any(|p| (p.dot(dir) - 1.0).abs() < 1e-4), "{dir}");
+        }
+        let rt = points(Shape::RoundedTriangle);
+        let top = rt.iter().map(|p| p.z).fold(f32::MIN, f32::max);
+        assert!((top - 1.0).abs() < 1e-4, "the rounded triangle points up");
+        // The quarter circle stays in one quadrant and starts at its centre.
+        let q = points(Shape::QuarterCircle);
+        assert!(q.iter().all(|p| p.x >= -1e-6 && p.z >= -1e-6));
+        assert_eq!(q[0], Vec3::ZERO);
+        // Gear teeth: the outline goes in and out eight times.
+        let gear = &Shape::Gear.strokes()[0];
+        let outer = gear
+            .windows(2)
+            .filter(|w| w[0].length() < 0.9 && w[1].length() > 0.9);
+        assert_eq!(outer.count(), 8);
+        // The curved arrow is an open arc plus a head at its end.
+        let ca = Shape::CurvedArrow.strokes();
+        assert_eq!(ca.len(), 2);
+        assert_ne!(ca[0].first(), ca[0].last());
+        let end = *ca[0].last().unwrap();
+        assert!(
+            ca[1].iter().any(|p| (*p - end).length() > 0.3),
+            "the head points on"
+        );
+        // The lollipop's stick meets its ring.
+        let lp = Shape::Lollipop.strokes();
+        assert!(lp[1].iter().any(|p| (*p - lp[0][1]).length() < 1e-5));
+        // The cylinder has two rings across the axis and four lines along it.
+        let cy = Shape::Cylinder.strokes();
+        assert_eq!(cy.len(), 6);
+        assert!(cy[0].iter().all(|p| p.y == cy[0][0].y) && cy[0][0].y == -cy[1][0].y);
+        // The plus is one closed outline of twelve corners.
+        assert_eq!(Shape::Plus.strokes()[0].len(), 13);
     }
 
     #[test]

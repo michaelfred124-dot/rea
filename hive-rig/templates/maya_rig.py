@@ -908,7 +908,9 @@ def build(RIG, geos=None):
         "offsets": {ctrl_of[c["name"]]: offset_of[c["name"]] for c in CONTROLS},
         "limbs": limbs,
         "mirror": [[ctrl_of[l], ctrl_of[r]] for l, r in RIG["controls"].get("mirror_pairs", [])],
-        "bind": {ctrl_of[n]: world_matrix(offset_of[n]) for pair in RIG["controls"].get("mirror_pairs", []) for n in pair},
+        # Every control's offset at bind: twins mirror against each other, centre
+        # controls (flipping a pose) against themselves.
+        "bind": {ctrl_of[c["name"]]: world_matrix(offset_of[c["name"]]) for c in CONTROLS},
         "spaces": spaces,
         "defaults": defaults,
     }
@@ -924,9 +926,9 @@ def build(RIG, geos=None):
 
 
 # --------------------------------------------------------------------------- animator tools
-# IK/FK matching, pose mirroring, reset and space switching. The limbs and the
-# left/right twins come from hive-rig (ik_chains and mirror_pairs), kept on the rig
-# as `hiveAnim` with the bind frames. Matrices here are 4x4 lists of rows acting on
+# IK/FK matching, pose mirroring and flipping, a pose library, reset and space
+# switching. The limbs and the left/right twins come from hive-rig (ik_chains and
+# mirror_pairs), kept on the rig as `hiveAnim` with the bind frames. Matrices here are 4x4 lists of rows acting on
 # column vectors; Maya's flat worldMatrix is the transpose.
 ANIM_ATTRS = ("ikFk", "stretch", "soft", "roll", "space", "volume")
 CHANNELS = ("tx", "ty", "tz", "rx", "ry", "rz")
@@ -1167,40 +1169,131 @@ def match_range(name, to, frames=None):
     return len(frames)
 
 
+def twins():
+    """Each left/right control mapped to its twin on the other side."""
+    twin = {}
+    for left, right in anim_data()["mirror"]:
+        twin[left], twin[right] = right, left
+    return twin
+
+
+def local_pose(ctrl):
+    """A control's channels as a local transform (relative to its offset) and its settings."""
+    rotation = euler_matrix(*(cmds.getAttr(ctrl + "." + c) for c in ("rx", "ry", "rz")))
+    local = with_translation(rotation, [cmds.getAttr(ctrl + "." + c) for c in ("tx", "ty", "tz")])
+    attrs = {a: cmds.getAttr(ctrl + "." + a) for a in ANIM_ATTRS if cmds.attributeQuery(a, node=ctrl, exists=True)}
+    return local, attrs
+
+
+def mirrored_local(data, src, dst, local):
+    """`src`'s local pose as the matching pose of `dst` on the other side (`dst`
+    may be `src` itself for a centre control). The bind frames of twins are
+    mirror images up to an axis flip `f`; conjugating by it mirrors the pose
+    relative to the control's offset."""
+    flip = [[-1.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 0, 1.0, 0], [0, 0, 0, 1.0]]
+    rs = with_translation(from_maya(data["bind"][src]), [0, 0, 0])
+    rd = with_translation(from_maya(data["bind"][dst]), [0, 0, 0])
+    f = mat_mul(mat_mul(mat_inv(rs), flip), rd)
+    return mat_mul(mat_mul(mat_inv(f), local), f)
+
+
+def put_pose(moves):
+    """Apply `(src, dst, local, attrs)` moves, each mirrored from `src` onto
+    `dst` (a plain copy when `src` is None)."""
+    data = anim_data()
+    for src, dst, local, attrs in moves:
+        set_local(dst, local if src is None else mirrored_local(data, src, dst, local))
+        for a, v in attrs.items():
+            if cmds.attributeQuery(a, node=dst, exists=True) and settable(dst + "." + a):
+                cmds.setAttr(dst + "." + a, v)
+    key_controls([m[1] for m in moves])
+    return len(moves)
+
+
 def mirror_pose(names=None, source="left"):
     """Copy controls' poses onto their twins on the other side: the selected
     controls, or every `source`-side control when none is given. Each pose is
     mirrored relative to the control's own offset, so the result is symmetric
     when the centre is."""
     data = anim_data()
-    twin = {}
-    for left, right in data["mirror"]:
-        twin[left], twin[right] = right, left
+    twin = twins()
     lefts = {left for left, _ in data["mirror"]}
     if names:
         picked = [n for n in names if n in twin]
         copies = [(n, twin[n]) for n in picked if twin[n] not in picked or (n in lefts) == (source == "left")]
     else:
         copies = [(l, r) if source == "left" else (r, l) for l, r in data["mirror"]]
-    flip = [[-1.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 0, 1.0, 0], [0, 0, 0, 1.0]]
-    poses = []
-    for src, dst in copies:
-        rotation = euler_matrix(*(cmds.getAttr(src + "." + c) for c in ("rx", "ry", "rz")))
-        local = with_translation(rotation, [cmds.getAttr(src + "." + c) for c in ("tx", "ty", "tz")])
-        attrs = {a: cmds.getAttr(src + "." + a) for a in ANIM_ATTRS if cmds.attributeQuery(a, node=src, exists=True)}
-        poses.append((src, dst, local, attrs))
-    for src, dst, local, attrs in poses:
-        # The bind frames of twins are mirror images up to an axis flip `f`;
-        # conjugating the source's local pose by it gives the twin's.
-        rs = with_translation(from_maya(data["bind"][src]), [0, 0, 0])
-        rd = with_translation(from_maya(data["bind"][dst]), [0, 0, 0])
-        f = mat_mul(mat_mul(mat_inv(rs), flip), rd)
-        set_local(dst, mat_mul(mat_mul(mat_inv(f), local), f))
-        for a, v in attrs.items():
-            if cmds.attributeQuery(a, node=dst, exists=True):
-                cmds.setAttr(dst + "." + a, v)
-    key_controls([dst for _, dst in copies])
-    return len(copies)
+    # Read every source first, so swapping both sides at once is consistent.
+    return put_pose([(src, dst) + local_pose(src) for src, dst in copies])
+
+
+def flip_pose(names=None):
+    """Turn the pose into its mirror image: every left/right pair swaps poses
+    (mirrored) and every centre control is mirrored onto itself. With `names`,
+    only those controls and their twins."""
+    data = anim_data()
+    twin = twins()
+    picked = [n for n in (names or data["controls"]) if n in data["controls"]]
+    picked = list(dict.fromkeys(picked + [twin[n] for n in picked if n in twin]))
+    return put_pose([(n, twin.get(n, n)) + local_pose(n) for n in picked])
+
+
+# Pose library: named poses kept on the rig (`hivePoses`), each the controls'
+# local transforms and settings, so they are saved with the scene.
+POSES_ATTR = "hivePoses"
+
+
+def pose_library():
+    if not cmds.attributeQuery(POSES_ATTR, node=TOP, exists=True):
+        return {}
+    return json.loads(cmds.getAttr(TOP + "." + POSES_ATTR) or "{}")
+
+
+def write_library(library):
+    if not cmds.attributeQuery(POSES_ATTR, node=TOP, exists=True):
+        cmds.addAttr(TOP, longName=POSES_ATTR, dataType="string")
+    cmds.setAttr(TOP + "." + POSES_ATTR, json.dumps(library), type="string")
+
+
+def save_pose(name, names=None):
+    """Store the current pose of every control (or only `names`) as `name`,
+    replacing a pose of that name. Returns how many controls it holds."""
+    name = (name or "").strip()
+    if not name:
+        raise RuntimeError("Give the pose a name")
+    data = anim_data()
+    picked = [n for n in (names or data["controls"]) if n in data["controls"]]
+    library = pose_library()
+    library[name] = {}
+    for n in picked:
+        local, attrs = local_pose(n)
+        library[name][n] = {"local": local, "settings": attrs}
+    write_library(library)
+    return len(picked)
+
+
+def apply_pose(name, names=None, mirrored=False):
+    """Put the controls (all the pose holds, or only `names`) into pose `name`.
+    Mirrored, each control's stored pose lands mirrored on its twin (centre
+    controls on themselves), giving the pose's mirror image."""
+    library = pose_library()
+    if name not in library:
+        raise RuntimeError("No pose named %s" % name)
+    twin = twins()
+    present = set(anim_data()["controls"])
+    moves = []
+    for src, stored in library[name].items():
+        dst = twin.get(src, src) if mirrored else src
+        if dst not in present or (names and dst not in names):
+            continue
+        moves.append((src if mirrored else None, dst, stored["local"], stored["settings"]))
+    return put_pose(moves)
+
+
+def delete_pose(name):
+    library = pose_library()
+    library.pop(name, None)
+    write_library(library)
 
 
 def reset_pose(names=None):
@@ -1456,7 +1549,7 @@ def _safe(fn, *args):
 def show_window():
     if cmds.window(WINDOW, exists=True):
         cmds.deleteUI(WINDOW)
-    cmds.window(WINDOW, title="Hive Rig: " + NAME, widthHeight=(240, 560))
+    cmds.window(WINDOW, title="Hive Rig: " + NAME, widthHeight=(240, 760))
     cmds.columnLayout(adjustableColumn=True, rowSpacing=4)
     cmds.button(label="Edit Guides", command=_safe(show_guides))
     cmds.button(label="Mirror Left to Right", command=_safe(mirror_guides))
@@ -1526,10 +1619,62 @@ def animation_section():
 
     cmds.button(label="Mirror Pose Left to Right", command=mirror("left"))
     cmds.button(label="Mirror Pose Right to Left", command=mirror("right"))
+    cmds.button(label="Flip Pose", command=lambda *_: _safe(flip_pose, selected_controls())())
     cmds.button(label="Reset All Controls", command=reset(False))
     cmds.button(label="Reset Selected Controls", command=reset(True))
     cmds.button(label="Select All Controls", command=_safe(select_controls))
     cmds.button(label="Switch Space Without Pop...", command=space)
+    pose_library_section()
+
+
+POSE_LIST = "hivePoseList"
+
+
+def pose_library_section():
+    """The pose library: a list of saved poses with Apply, Apply Mirrored,
+    Save (the selected controls, or all) and Delete."""
+    cmds.separator()
+    cmds.text(label="Pose Library")
+    cmds.textScrollList(POSE_LIST, numberOfRows=6, allowMultiSelection=False, append=sorted(pose_library()))
+
+    def picked():
+        sel = cmds.textScrollList(POSE_LIST, q=True, selectItem=True) or []
+        if not sel:
+            cmds.warning("Pick a pose in the list")
+        return sel[0] if sel else None
+
+    def refresh_list():
+        cmds.textScrollList(POSE_LIST, e=True, removeAll=True)
+        cmds.textScrollList(POSE_LIST, e=True, append=sorted(pose_library()))
+
+    def save(*_):
+        if cmds.promptDialog(title="Save Pose", message="Pose name:", button=["Save", "Cancel"],
+                             defaultButton="Save", cancelButton="Cancel", dismissString="Cancel") != "Save":
+            return
+        _safe(save_pose, cmds.promptDialog(q=True, text=True), selected_controls())()
+        refresh_list()
+
+    def apply(mirrored):
+        def call(*_):
+            name = picked()
+            if name:
+                _safe(apply_pose, name, selected_controls(), mirrored)()
+        return call
+
+    def delete(*_):
+        name = picked()
+        if name:
+            _safe(delete_pose, name)()
+            refresh_list()
+
+    cmds.rowLayout(numberOfColumns=2, adjustableColumn=1)
+    cmds.button(label="Apply Pose", command=apply(False))
+    cmds.button(label="Apply Mirrored", command=apply(True))
+    cmds.setParent("..")
+    cmds.rowLayout(numberOfColumns=2, adjustableColumn=1)
+    cmds.button(label="Save Pose...", command=save)
+    cmds.button(label="Delete", command=delete)
+    cmds.setParent("..")
 
 
 def main():

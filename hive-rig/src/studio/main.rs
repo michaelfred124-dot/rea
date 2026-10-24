@@ -245,6 +245,8 @@ fn main() -> eframe::Result {
     }
     if let Some(name) = &launch.pick {
         studio.rig_pick = Some(if name.starts_with("ctrl") || name.ends_with("_ctrl") {
+            // Controls are picked in the controls stage.
+            studio.mode = app::Mode::Rig;
             app::RigPick::Control(name.clone())
         } else {
             app::RigPick::Bone(name.clone())

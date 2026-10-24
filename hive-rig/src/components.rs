@@ -1434,6 +1434,155 @@ pub fn set_control_style(g: &mut Guides, control: &str, style: ControlStyle) -> 
     Ok(())
 }
 
+/// Which controls a change of look goes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StyleScope {
+    /// The control alone.
+    One,
+    /// The control and its left/right twin (what symmetry does in the app).
+    WithTwin,
+    /// Every control its component built (and their twins, with `twins`).
+    Component { twins: bool },
+}
+
+/// A change to some controls' look: the fields that are set replace what the
+/// controls have, `scale` multiplies their current size, and the rest is kept.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct StyleChange {
+    pub shape: Option<Shape>,
+    pub size: Option<f32>,
+    pub scale: Option<f32>,
+    pub color: Option<[f32; 3]>,
+}
+
+/// The colour a twin on the other side gets: the left and right side colours
+/// swap, any other colour is kept.
+pub fn twin_color(color: [f32; 3]) -> [f32; 3] {
+    let near = |a: [f32; 3], b: [f32; 3]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-3);
+    if near(color, LEFT) {
+        RIGHT
+    } else if near(color, RIGHT) {
+        LEFT
+    } else {
+        color
+    }
+}
+
+/// The default colours: the centre, the left and right sides, and the root.
+pub const SIDE_COLORS: [(&str, [f32; 3]); 4] = [
+    ("Centre", CENTER),
+    ("Left", LEFT),
+    ("Right", RIGHT),
+    ("Root", ROOT),
+];
+
+/// More colours offered for controls, by name.
+pub const MORE_COLORS: [(&str, [f32; 3]); 4] = [
+    ("Green", [0.2, 0.85, 0.35]),
+    ("Cyan", [0.1, 0.85, 0.9]),
+    ("Orange", [1.0, 0.55, 0.1]),
+    ("White", [0.95, 0.95, 0.95]),
+];
+
+/// The controls a change of look on `control` reaches under `scope`, the
+/// control itself first. Each comes with whether it is a twin (on the other
+/// side) of the control it follows.
+pub fn style_targets(
+    built: &Built,
+    control: &str,
+    scope: StyleScope,
+) -> Result<Vec<(String, bool)>> {
+    let rig = &built.controls;
+    let c = rig
+        .control(control)
+        .ok_or_else(|| anyhow::anyhow!("no control named '{control}'"))?;
+    let twin_of = |name: &str| -> Option<String> {
+        rig.mirror_pairs.iter().find_map(|pair| {
+            let [l, r] = pair;
+            if l == name {
+                Some(r.clone())
+            } else if r == name {
+                Some(l.clone())
+            } else {
+                None
+            }
+        })
+    };
+    let mut out = vec![(c.name.clone(), false)];
+    let (own, twins) = match scope {
+        StyleScope::One => (vec![], false),
+        StyleScope::WithTwin => (vec![], true),
+        StyleScope::Component { twins } => (
+            rig.controls
+                .iter()
+                .filter(|o| o.component == c.component && o.name != c.name)
+                .map(|o| o.name.clone())
+                .collect(),
+            twins,
+        ),
+    };
+    out.extend(own.into_iter().map(|n| (n, false)));
+    if twins {
+        let sided: Vec<String> = out.iter().map(|(n, _)| n.clone()).collect();
+        for n in sided {
+            if let Some(t) = twin_of(&n)
+                && !out.iter().any(|(o, _)| *o == t)
+            {
+                out.push((t, true));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Change the look of `control` (and, by `scope`, its twin or its component's
+/// controls) as written in the guides. A twin gets the same shape and size and
+/// the other side's colour when the colour is a side colour. Returns the
+/// controls changed.
+pub fn restyle(
+    g: &mut Guides,
+    control: &str,
+    change: StyleChange,
+    scope: StyleScope,
+) -> Result<Vec<String>> {
+    if let Some(size) = change.size {
+        ensure!(size > 0.0, "control size must be positive");
+    }
+    if let Some(scale) = change.scale {
+        ensure!(scale > 0.0, "control scale must be positive");
+    }
+    let built = build(g)?;
+    let targets = style_targets(&built, control, scope)?;
+    for (name, twin) in &targets {
+        let Some(c) = built.controls.control(name) else {
+            continue;
+        };
+        let mut style = g.control_styles.get(name).copied().unwrap_or_default();
+        if let Some(shape) = change.shape {
+            style.shape = Some(shape);
+        }
+        if let Some(size) = change.size {
+            style.size = Some(size);
+        }
+        if let Some(scale) = change.scale {
+            style.size = Some((c.size * scale).max(0.001));
+        }
+        if let Some(color) = change.color {
+            style.color = Some(if *twin { twin_color(color) } else { color });
+        }
+        set_control_style(g, name, style)?;
+    }
+    Ok(targets.into_iter().map(|(n, _)| n).collect())
+}
+
+/// Give the controls `names` their component's default look again.
+pub fn reset_styles<'a>(g: &mut Guides, names: impl IntoIterator<Item = &'a str>) -> usize {
+    names
+        .into_iter()
+        .filter(|n| g.control_styles.remove(*n).is_some())
+        .count()
+}
+
 /// Bring the components of another layout in, hung from `bone`. Only premade
 /// parts (chains, eyes, jaw, face) can be imported: the body's own components
 /// are fixed to the mannequin's bones. Components keep their ids, so an id
@@ -3731,6 +3880,122 @@ mod tests {
             assert_eq!(c.shape, shape);
             assert_eq!(c.outline().len(), shape.strokes().len(), "{name}");
         }
+    }
+
+    #[test]
+    fn restyling_reaches_the_twin_and_the_component() {
+        let mut g = demo_guides();
+        let built = build(&g).unwrap();
+        let ik = built
+            .controls
+            .ik_chains
+            .iter()
+            .find(|c| c.name == "arm_l")
+            .unwrap();
+        let (hand, hand_r) = (ik.ik_control.clone(), ik.ik_control.replace("_l_", "_r_"));
+        assert!(built.controls.control(&hand_r).is_some(), "{hand_r}");
+        // One control: only it changes.
+        let changed = restyle(
+            &mut g,
+            &hand,
+            StyleChange {
+                shape: Some(Shape::Gear),
+                ..Default::default()
+            },
+            StyleScope::One,
+        )
+        .unwrap();
+        assert_eq!(changed, vec![hand.clone()]);
+        assert!(!g.control_styles.contains_key(&hand_r));
+        // With its twin: same shape and size; a side colour swaps sides,
+        // any other colour is the same on both.
+        restyle(
+            &mut g,
+            &hand,
+            StyleChange {
+                size: Some(0.09),
+                color: Some(LEFT),
+                ..Default::default()
+            },
+            StyleScope::WithTwin,
+        )
+        .unwrap();
+        let (l, r) = (g.control_styles[&hand], g.control_styles[&hand_r]);
+        assert_eq!(
+            (l.shape, l.size, l.color),
+            (Some(Shape::Gear), Some(0.09), Some(LEFT))
+        );
+        assert_eq!((r.shape, r.size, r.color), (None, Some(0.09), Some(RIGHT)));
+        let green = [0.2, 0.9, 0.3];
+        restyle(
+            &mut g,
+            &hand_r,
+            StyleChange {
+                color: Some(green),
+                ..Default::default()
+            },
+            StyleScope::WithTwin,
+        )
+        .unwrap();
+        assert_eq!(g.control_styles[&hand].color, Some(green));
+        assert_eq!(g.control_styles[&hand_r].color, Some(green));
+        // A whole component, twins too, scaled from each control's own size.
+        let before = build(&g).unwrap();
+        let comp = before
+            .controls
+            .control(&ik.fk_controls[0])
+            .unwrap()
+            .component
+            .clone();
+        let changed = restyle(
+            &mut g,
+            &ik.fk_controls[0],
+            StyleChange {
+                scale: Some(2.0),
+                ..Default::default()
+            },
+            StyleScope::Component { twins: true },
+        )
+        .unwrap();
+        let own: Vec<_> = before
+            .controls
+            .controls
+            .iter()
+            .filter(|c| c.component == comp)
+            .collect();
+        assert!(
+            own.len() > 3 && changed.len() == 2 * own.len(),
+            "{changed:?}"
+        );
+        let after = build(&g).unwrap();
+        for name in &changed {
+            let (a, b) = (
+                after.controls.control(name).unwrap(),
+                before.controls.control(name).unwrap(),
+            );
+            assert!((a.size - 2.0 * b.size).abs() < 1e-6, "{name}");
+        }
+        // Reset takes the looks off again, and a bad size is refused.
+        assert_eq!(
+            reset_styles(&mut g, changed.iter().map(String::as_str)),
+            changed.len()
+        );
+        assert!(!g.control_styles.contains_key(&hand));
+        let bad = StyleChange {
+            size: Some(-1.0),
+            ..Default::default()
+        };
+        assert!(restyle(&mut g, &hand, bad, StyleScope::One).is_err());
+        assert!(
+            restyle(
+                &mut g,
+                "no_such_ctrl",
+                StyleChange::default(),
+                StyleScope::One
+            )
+            .is_err()
+        );
+        assert_eq!(twin_color(CENTER), CENTER);
     }
 
     #[test]

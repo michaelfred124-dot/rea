@@ -171,16 +171,18 @@ enum Command {
     Components { guides: PathBuf },
     /// Look for likely mistakes before building: guides on the wrong side,
     /// limbs bending the wrong way or not at all, joints outside the body or on
-    /// top of each other, lopsided twins and odd parents. Exits non-zero only
-    /// when the guides can't build.
+    /// top of each other, lopsided twins and odd parents. On a built rig, also
+    /// vertices with no weight and deforming bones with no skin. Exits non-zero
+    /// only when the guides can't build.
     Check {
         /// A `.guides.json`, or a `.hive.json` (its mesh is checked against,
-        /// and the guides next to it, which a rebuild would use).
+        /// and the guides next to it, which a rebuild would use; and its skin).
         file: PathBuf,
         /// A character mesh (.obj, .gltf, .glb, .fbx) to check the guides against.
         #[arg(long)]
         mesh: Option<PathBuf>,
-        /// Apply the fixes that are mechanical and save the guides file.
+        /// Apply the fixes that are mechanical and save the guides file (on a
+        /// rig, also fill vertices with no weight and write the rig again).
         #[arg(long)]
         fix: bool,
         #[command(flatten)]
@@ -190,6 +192,37 @@ enum Command {
     Template {
         #[command(subcommand)]
         action: TemplateCommand,
+    },
+    /// List the controls with their look, or change the look (shape, size,
+    /// colour) of some of them. The look is kept in the guides file, so every
+    /// rebuild and every exporter (Blender, Maya, Unreal) gets it.
+    Control {
+        guides: PathBuf,
+        /// Controls to change, by internal (`hand_l_ik_ctrl`) or exported name.
+        /// None lists every control.
+        controls: Vec<String>,
+        /// The shape, by its guides.json name (circle, gear, curved_arrow...).
+        #[arg(long)]
+        shape: Option<String>,
+        /// Radius or half-extent in metres.
+        #[arg(long)]
+        size: Option<f32>,
+        /// Multiply the current size by this.
+        #[arg(long)]
+        scale: Option<f32>,
+        /// `r,g,b` from 0 to 1, `#rrggbb`, or left, right, centre, root, green,
+        /// cyan, orange or white.
+        #[arg(long)]
+        color: Option<String>,
+        /// Also change each control's left/right twin (a side colour swaps sides).
+        #[arg(long)]
+        twin: bool,
+        /// Change every control of each named control's component.
+        #[arg(long)]
+        component: bool,
+        /// Put the default look back instead.
+        #[arg(long)]
+        reset: bool,
     },
     /// Show or set how a guides file names joints and controls on export.
     Naming {
@@ -392,6 +425,14 @@ enum WeightsCommand {
         #[command(flatten)]
         edit: WeightEdit,
     },
+    /// Give every vertex with no weight the weights around it on the surface
+    /// (what `hive-rig check` flags as "no weight").
+    Fill {
+        /// The `<name>.hive.json` of the rig.
+        rig: PathBuf,
+        #[command(flatten)]
+        edit: WeightEdit,
+    },
     /// Re-run the automatic weights on the skin of some bones (wherever they
     /// have weight now or would get it), keeping the hand edits elsewhere.
     Auto {
@@ -578,7 +619,21 @@ fn write(rig: &Rig, out: &Path, output: &Outputs) -> Result<()> {
     for f in files {
         println!("  {}", f.display());
     }
+    print_skin_warnings(rig);
     Ok(())
+}
+
+/// Warn about vertices with no weight and deforming bones with no skin.
+fn print_skin_warnings(rig: &Rig) {
+    for i in checks::check_skin(&rig.skeleton, &rig.skin).issues {
+        eprintln!("{}", i.line());
+    }
+}
+
+/// The rig's weights with every bare vertex filled from around it.
+fn fill_bare(rig: &Rig) -> (hive_rig::skin::SkinWeights, usize) {
+    let adjacency = hive_rig::skin::edit::surface_neighbours(&rig.mesh);
+    hive_rig::skin::edit::fill_unweighted(&rig.skin, &adjacency, rig.guides.skin)
 }
 
 fn detect(mesh: &Mesh) -> Guides {
@@ -689,8 +744,10 @@ fn check_command(file: &Path, mesh: Option<&Path>, fix: bool, orient: OrientFlag
         .to_lowercase()
         .ends_with(".hive.json");
     let mut orientation_line = None;
+    let mut built_rig = None;
     let (guides_path, mut guides, rig_mesh) = if is_rig {
         let rig = load_rig(file)?;
+        built_rig = Some(rig.clone());
         orientation_line = Some(format!("{} (from the rig)", rig.orientation));
         let dir = file.parent().unwrap_or(Path::new("."));
         let next_to = dir.join(format!("{}.guides.json", rig.name));
@@ -742,6 +799,24 @@ fn check_command(file: &Path, mesh: Option<&Path>, fix: bool, orient: OrientFlag
         println!("Applied {n} fix(es) and saved {}", path.display());
         issues = checks::check(&guides, surface.as_mut());
     }
+    // A built rig: its skin too.
+    if let Some(mut r) = built_rig {
+        let report = checks::check_skin(&r.skeleton, &r.skin);
+        if fix && !report.unweighted.is_empty() {
+            let (skin, n) = fill_bare(&r);
+            r.skin = skin;
+            let dir = file.parent().unwrap_or(Path::new("."));
+            let targets = existing_targets(dir, &r.name);
+            export::write_all(&r, dir, &targets)?;
+            println!(
+                "Filled {n} vertices with no weight from around them and wrote {} again",
+                file.display()
+            );
+            issues.extend(checks::check_skin(&r.skeleton, &r.skin).issues);
+        } else {
+            issues.extend(report.issues);
+        }
+    }
     for i in &issues {
         println!("{}", i.line());
     }
@@ -752,6 +827,130 @@ fn check_command(file: &Path, mesh: Option<&Path>, fix: bool, orient: OrientFlag
         println!("{e} error(s), {w} warning(s)");
     }
     anyhow::ensure!(e == 0, "the guides can't build");
+    Ok(())
+}
+
+fn parse_shape(name: &str) -> Result<hive_rig::controls::Shape> {
+    serde_json::from_value(serde_json::Value::String(name.to_lowercase())).map_err(|_| {
+        let names: Vec<String> = hive_rig::controls::Shape::ALL
+            .iter()
+            .map(|s| {
+                serde_json::to_string(s)
+                    .unwrap()
+                    .trim_matches('"')
+                    .to_string()
+            })
+            .collect();
+        anyhow::anyhow!("unknown shape '{name}' (one of {})", names.join(", "))
+    })
+}
+
+fn parse_color(text: &str) -> Result<[f32; 3]> {
+    let t = text.trim().to_lowercase();
+    let named = components::SIDE_COLORS
+        .iter()
+        .chain(components::MORE_COLORS.iter())
+        .find(|(n, _)| n.to_lowercase() == t || (t == "center" && *n == "Centre"));
+    if let Some((_, c)) = named {
+        return Ok(*c);
+    }
+    if let Some(hex) = t.strip_prefix('#') {
+        anyhow::ensure!(
+            hex.len() == 6 && hex.is_ascii(),
+            "a hex colour is #rrggbb, not '{text}'"
+        );
+        let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).map(|b| b as f32 / 255.0);
+        return Ok([byte(0)?, byte(2)?, byte(4)?]);
+    }
+    let parts: Vec<f32> = t
+        .split(',')
+        .map(|p| p.trim().parse::<f32>())
+        .collect::<Result<_, _>>()
+        .map_err(|_| {
+            anyhow::anyhow!("a colour is r,g,b from 0 to 1, #rrggbb or a side name, not '{text}'")
+        })?;
+    anyhow::ensure!(
+        parts.len() == 3 && parts.iter().all(|x| (0.0..=1.0).contains(x)),
+        "a colour is three numbers from 0 to 1, not '{text}'"
+    );
+    Ok([parts[0], parts[1], parts[2]])
+}
+
+fn control_command(
+    path: &Path,
+    names: &[String],
+    change: components::StyleChange,
+    scope: components::StyleScope,
+    reset: bool,
+) -> Result<()> {
+    let mut guides = load_guides(path)?;
+    let built = components::build(&guides)?;
+    let naming = guides.naming.clone();
+    // Accept the internal or the exported name.
+    let internal = |name: &str| -> Result<String> {
+        built
+            .controls
+            .controls
+            .iter()
+            .find(|c| c.name == name || naming.control(&c.name) == name)
+            .map(|c| c.name.clone())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "'{name}' is not a control of this rig (see `hive-rig control {}`)",
+                    path.display()
+                )
+            })
+    };
+    if names.is_empty() {
+        anyhow::ensure!(
+            change == components::StyleChange::default() && !reset,
+            "name the controls to change"
+        );
+        for c in &built.controls.controls {
+            let [r, gr, b] = c.color;
+            println!(
+                "{:<28} {:<16} {:>6.3} m  {:.2},{:.2},{:.2}{}",
+                naming.control(&c.name),
+                serde_json::to_string(&c.shape)?.trim_matches('"'),
+                c.size,
+                r,
+                gr,
+                b,
+                if guides.control_styles.contains_key(&c.name) {
+                    "  (restyled)"
+                } else {
+                    ""
+                }
+            );
+        }
+        return Ok(());
+    }
+    anyhow::ensure!(
+        reset || change != components::StyleChange::default(),
+        "give --shape, --size, --scale, --color or --reset"
+    );
+    let mut changed = Vec::new();
+    for name in names {
+        let name = internal(name)?;
+        if reset {
+            let targets = components::style_targets(&built, &name, scope)?;
+            components::reset_styles(&mut guides, targets.iter().map(|(n, _)| n.as_str()));
+            changed.extend(targets.into_iter().map(|(n, _)| n));
+        } else {
+            changed.extend(components::restyle(&mut guides, &name, change, scope)?);
+        }
+    }
+    changed.sort();
+    changed.dedup();
+    guides.save(path)?;
+    let shown: Vec<String> = changed.iter().map(|n| naming.control(n)).collect();
+    println!(
+        "{} {} control(s): {}. Saved {}; rebuild to see it in the exports.",
+        if reset { "Reset" } else { "Restyled" },
+        changed.len(),
+        shown.join(", "),
+        path.display()
+    );
     Ok(())
 }
 
@@ -1212,6 +1411,16 @@ fn weights_command(action: WeightsCommand) -> Result<()> {
             );
             edit.write(&r, &path)
         }
+        WeightsCommand::Fill { rig: path, edit } => {
+            let mut r = load_rig(&path)?;
+            let (skin, n) = fill_bare(&r);
+            r.skin = skin;
+            println!(
+                "Filled {n} vertices of '{}' with no weight from the weights around them.",
+                r.name
+            );
+            edit.write(&r, &path)
+        }
         WeightsCommand::Auto {
             rig: path,
             bone,
@@ -1480,6 +1689,30 @@ fn main() -> Result<()> {
             orient,
         } => check_command(&file, mesh.as_deref(), fix, orient),
         Command::Template { action } => template_command(action),
+        Command::Control {
+            guides,
+            controls,
+            shape,
+            size,
+            scale,
+            color,
+            twin,
+            component,
+            reset,
+        } => {
+            let change = components::StyleChange {
+                shape: shape.as_deref().map(parse_shape).transpose()?,
+                size,
+                scale,
+                color: color.as_deref().map(parse_color).transpose()?,
+            };
+            let scope = match (component, twin) {
+                (true, twins) => components::StyleScope::Component { twins },
+                (false, true) => components::StyleScope::WithTwin,
+                (false, false) => components::StyleScope::One,
+            };
+            control_command(&guides, &controls, change, scope, reset)
+        }
         Command::Naming {
             guides,
             preset,

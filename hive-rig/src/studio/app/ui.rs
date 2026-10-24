@@ -1131,13 +1131,11 @@ impl Studio {
                     self.channel_box(ui, &name);
                     ui.add_space(8.0);
                 }
-                let mut style = self.style_of(&name);
-                let before = style;
-                let mut changed = false;
+                let before = self.style_of(&name);
+                let mut change = components::StyleChange::default();
                 theme::label_caps(ui, "Shape");
                 if let Some(shape) = shape_grid(ui, c.shape, 5) {
-                    style.shape = Some(shape);
-                    changed = true;
+                    change.shape = Some(shape);
                 }
                 ui.label(RichText::new(c.shape.label()).size(12.0).color(TEXT_FAINT));
                 ui.add_space(6.0);
@@ -1152,18 +1150,64 @@ impl Studio {
                     )
                     .changed()
                 {
-                    style.size = Some(size);
-                    changed = true;
+                    change.size = Some(size);
                 }
                 ui.add_space(6.0);
                 theme::label_caps(ui, "Colour");
-                let mut rgb = c.color;
-                if ui.color_edit_button_rgb(&mut rgb).changed() {
-                    style.color = Some(rgb);
-                    changed = true;
+                ui.horizontal(|ui| {
+                    let mut rgb = c.color;
+                    if ui.color_edit_button_rgb(&mut rgb).changed() {
+                        change.color = Some(rgb);
+                    }
+                    for (label, color) in components::SIDE_COLORS
+                        .iter()
+                        .chain(components::MORE_COLORS.iter())
+                    {
+                        if color_swatch(ui, *color, c.color == *color)
+                            .on_hover_text(*label)
+                            .clicked()
+                        {
+                            change.color = Some(*color);
+                        }
+                    }
+                });
+                let scope = if self.symmetry {
+                    components::StyleScope::WithTwin
+                } else {
+                    components::StyleScope::One
+                };
+                if change != components::StyleChange::default() {
+                    self.restyle_controls(&name, change, scope);
                 }
-                if changed {
-                    self.restyle_control(&name, style);
+                ui.label(
+                    RichText::new(if self.symmetry {
+                        "Symmetry is on: its twin on the other side changes too."
+                    } else {
+                        "Symmetry is off: only this control changes."
+                    })
+                    .size(11.5)
+                    .color(TEXT_FAINT),
+                );
+                if ui
+                    .button("Same shape and colour for its component")
+                    .on_hover_text(
+                        "Give every control of this component (and, with symmetry, its twin) \
+                         this control's shape and colour",
+                    )
+                    .clicked()
+                {
+                    let whole = components::StyleChange {
+                        shape: Some(c.shape),
+                        color: Some(c.color),
+                        ..Default::default()
+                    };
+                    self.restyle_controls(
+                        &name,
+                        whole,
+                        components::StyleScope::Component {
+                            twins: self.symmetry,
+                        },
+                    );
                 }
                 if before != ControlStyle::default()
                     && ui.button("Reset this control's look").clicked()
@@ -1490,19 +1534,22 @@ impl Studio {
     }
 
     /// The pre-build checks: every warning, a click to select its guide, and a
-    /// Fix button where the fix is mechanical.
+    /// Fix button where the fix is mechanical. After Build, the built skin's
+    /// checks follow (vertices with no weight, bones with no skin).
     fn checks_card(&mut self, ui: &mut Ui) {
         let Some(doc) = &self.doc else { return };
         let issues = doc.checks.clone();
         let origin = doc.guides.origin();
         let fixable = issues.iter().filter(|i| i.fix.is_some()).count();
+        let skin = self.skin_report();
+        let skin_issues = skin.as_ref().map(|r| r.issues.len()).unwrap_or(0);
         ui.horizontal(|ui| {
             theme::label_caps(ui, "Checks");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if issues.is_empty() {
+                if issues.is_empty() && skin_issues == 0 {
                     theme::badge(ui, "All clear", OK);
                 } else {
-                    let w = checks::warnings(&issues);
+                    let w = checks::warnings(&issues) + skin_issues;
                     let e = checks::errors(&issues);
                     if w > 0 {
                         theme::badge(ui, &count(w, "warning"), WARN);
@@ -1542,8 +1589,88 @@ impl Studio {
                         self.fix_all_issues();
                     }
                 }
+                if let Some(report) = &skin {
+                    self.skin_check_rows(ui, report);
+                }
                 ui.label(RichText::new(origin).size(11.0).color(TEXT_FAINT));
             });
+    }
+
+    /// The built skin's checks: vertices with no weight (Select, Fill) and
+    /// deforming bones with no skin (Show, Auto).
+    fn skin_check_rows(&mut self, ui: &mut Ui, report: &checks::SkinReport) {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("Built skin")
+                .size(11.5)
+                .strong()
+                .color(TEXT_DIM),
+        );
+        if report.issues.is_empty() {
+            ui.label(
+                RichText::new("Every vertex has weight and every deforming bone has skin.")
+                    .size(12.0)
+                    .color(TEXT_DIM),
+            );
+            ui.add_space(4.0);
+            return;
+        }
+        enum Act {
+            Select,
+            Fill,
+            Show(String),
+            Auto(String),
+        }
+        let mut act = None;
+        for issue in &report.issues {
+            ui.horizontal(|ui| {
+                theme::dot(ui, WARN);
+                ui.label(RichText::new(issue.place()).strong().color(TEXT))
+                    .on_hover_text(issue.check.label());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let button = |ui: &mut Ui, text: &str, tip: &str| {
+                        ui.add(egui::Button::new(RichText::new(text).size(11.5)).corner_radius(7))
+                            .on_hover_text(tip)
+                            .clicked()
+                    };
+                    match (&issue.check, &issue.guide) {
+                        (checks::Check::Unweighted, _) => {
+                            if button(
+                                ui,
+                                "Fill",
+                                "Give them the weights around them (one undo step)",
+                            ) {
+                                act = Some(Act::Fill);
+                            }
+                            if button(ui, "Select", "Select them, to look at or paint them") {
+                                act = Some(Act::Select);
+                            }
+                        }
+                        (checks::Check::Unskinned, Some(bone)) => {
+                            if button(ui, "Auto", "Re-run the automatic weights for this bone") {
+                                act = Some(Act::Auto(bone.clone()));
+                            }
+                            if button(ui, "Show", "Show its weights, to paint them") {
+                                act = Some(Act::Show(bone.clone()));
+                            }
+                        }
+                        _ => {}
+                    }
+                });
+            });
+            ui.add(
+                egui::Label::new(RichText::new(&issue.message).size(12.0).color(TEXT_DIM)).wrap(),
+            )
+            .on_hover_text(&issue.suggestion);
+            ui.add_space(3.0);
+        }
+        match act {
+            Some(Act::Select) => self.select_unweighted(),
+            Some(Act::Fill) => self.fill_unweighted(),
+            Some(Act::Show(b)) => self.show_bone_weights(&b),
+            Some(Act::Auto(b)) => self.reauto_named_bone(&b),
+            None => {}
+        }
     }
 
     /// How the character stands in its file and the layout its guides are, with
@@ -4940,6 +5067,28 @@ fn shape_grid(ui: &mut Ui, current: Shape, columns: usize) -> Option<Shape> {
             }
         });
     chosen
+}
+
+/// A small round colour button, ringed when it's the control's colour.
+fn color_swatch(ui: &mut Ui, color: [f32; 3], on: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
+    let fill = Color32::from_rgb(
+        (color[0] * 255.0) as u8,
+        (color[1] * 255.0) as u8,
+        (color[2] * 255.0) as u8,
+    );
+    let ring = if on || response.hovered() {
+        TEXT
+    } else {
+        BORDER
+    };
+    ui.painter().circle(
+        rect.center(),
+        7.0,
+        fill,
+        Stroke::new(if on { 2.0 } else { 1.0 }, ring),
+    );
+    response
 }
 
 /// A shape's lines seen from slightly above and to the side, so the solid shapes

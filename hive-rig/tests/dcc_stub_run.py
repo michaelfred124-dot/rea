@@ -165,7 +165,7 @@ def stub_maya():
               "window", "deleteUI", "columnLayout", "rowLayout", "setParent", "button", "text", "separator",
               "checkBox", "showWindow", "confirmDialog", "skinPercent", "pointConstraint",
               "shadingNode", "uvLink", "blendShape", "aliasAttr", "loadPlugin", "currentTime",
-              "playbackOptions"]:
+              "playbackOptions", "textScrollList", "promptDialog"]:
         setattr(cmds, n, generic(n))
 
     om = types.ModuleType("maya.api.OpenMaya")
@@ -356,12 +356,27 @@ if __name__ == "__main__":
         assert ns["mirror_pose"](None, "left") == len(anim["mirror"])
         if anim["mirror"]:
             assert ns["mirror_pose"]([anim["mirror"][0][1]], "right") == 1
+        # Flip: every control, twins swapped and centre controls onto themselves,
+        # mirrored against bind frames every control has.
+        assert sorted(anim["bind"]) == sorted(anim["controls"])
+        assert ns["flip_pose"]() == len(anim["controls"])
+        if anim["mirror"]:
+            assert ns["flip_pose"]([anim["mirror"][0][0]]) == 2
+        # Pose library: save, apply, apply mirrored, selected only, delete.
+        assert ns["save_pose"]("stub pose") == len(anim["controls"])
+        assert sorted(ns["pose_library"]()) == ["stub pose"]
+        assert ns["apply_pose"]("stub pose") == len(anim["controls"])
+        assert ns["apply_pose"]("stub pose", None, True) == len(anim["controls"])
+        assert ns["apply_pose"]("stub pose", [anim["controls"][0]]) == 1
+        ns["delete_pose"]("stub pose")
+        assert ns["pose_library"]() == {}
         assert ns["reset_pose"]() == len(anim["controls"])
         assert ns["select_controls"]() == len(anim["controls"])
         ns["switch_space"](next(iter(anim["spaces"])), 1)
         ns["show_window"]()
         # A row of match buttons per limb.
         assert ("rowLayout" in calls or not anim["limbs"]) and "confirmDialog" not in calls
+        assert "textScrollList" in calls, "the window has the pose library"
         print("maya animator tools ran against stubs: ok")
         # Blend shapes: every shape lands on a blendShape target with its
         # offsets and vertices; every corrective gets a reader network.

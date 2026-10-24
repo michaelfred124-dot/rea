@@ -82,16 +82,19 @@ patterns) applied to every export, and now:
 | 7 | Joints to guides, next steps | Turn an existing skeleton into guides | Done for .glb and binary .fbx, with unknown chains (ears, tails, hair, side branches) read back as chain components hung from the bone they grow from. Next: ASCII FBX, reading a chain's spline (tentacle) or bendy setup back, and recognising helper joints by what they drive rather than by name | Small |
 | 8 | FBX and more targets | FBX export; Unity and Houdini use | Done: a hand-written binary FBX 7.4 writer (`--targets fbx`, Export FBX in the app) with mesh, skeleton, every skin influence and a bind pose, checked through Blender's FBX importer. Also done: objects, UV sets, vertex colours, materials with texture files and blend shapes, checked through Blender's FBX importer. Also done: FBX input (binary 7.x, 32- and 64-bit records, compressed arrays; meshes, materials, textures, shapes, skeleton and skin), checked on public models turned into FBX by Blender against their .glb and Blender's importer. Next: try it in Unreal, Unity and Houdini (not yet done), ASCII FBX input, Unity Humanoid bone names, animation takes, embedded textures on export | Small |
 | 9 | Pose-driven correctives | Corrective shapes and helper joints driven by joint angles (Brave Rabbit's weightDriver is the well-known Maya RBF/pose reader) | Done: angle pose readers (one bone's turn about an axis, start to end degrees) driving corrective shapes sculpted in the pose, in Blender, Maya and Unreal. Next: cone readers (a swing of any direction), RBF readers over several poses, readers driving helper joints, trying the Maya and Unreal setups in the real applications, and applying undriven shape weights in Unreal | Medium |
-| 10 | Control shapes | A library of control curve shapes, recolouring | More shapes and per-control colour/size in the app | Small |
+| 10 | Control shapes | A library of control curve shapes, recolouring | Done: 23 shapes defined once (`src/controls.rs`) and drawn as the same lines in the app, Blender and Maya, with Unreal library look-alikes; per-control shape, size and colour in the app (shape grid, size, colour picker and swatches; with symmetry the twin follows, a side colour swapping sides; one button for the whole component) and the CLI (`hive-rig control`, with `--twin`, `--component`, `--scale`, `--reset`), kept in the guides so every rebuild and exporter gets them. Checked in real Blender; Maya and Unreal only against stubs. Next: check the Unreal look-alikes in Unreal, custom shapes drawn or imported by the user, line thickness | Small |
 | 11 | Skin tools, next steps | Auto skin plus weight tools | Done: mirror, smooth, paint brush (add, subtract, smooth, symmetry, undo; edits kept on rebuild), prune, max influences per engine (glTF writes a second joints/weights set past four), and copy weights between characters by closest surface point with naming-aware bone matching, and extra chains left unmatched by name (tails, ears with other names or joint counts) matched by position. Next: a flood/set-value tool, locking bones while painting, painting in Blender/Maya round-tripping into the guides | Small |
 | 12 | Proximity controls | Controls appear as the mouse comes near (lesterbanks) | Blender-only overlay; Maya has no clean equivalent | Small |
 | 13 | Developer API | Scriptable rig building | Already partly there: the CLI and the guides JSON; document it | Small |
 
 ## Things we haven't been thinking about
 
-- Validation before build: done (see Already covered). Next: checks on the
-  built skin (vertices with no weight, a bone with no skin), and per-studio
-  tolerances.
+- Validation before build: done (see Already covered), and checks on the
+  built skin: vertices with no weight (filled from the weights around them)
+  and deforming bones with no skin (automatic weights again), in the app's
+  Checks card and the CLI (`check`, `weights fill`). Next: per-studio
+  tolerances, and skin checks for weights that pull a vertex the wrong way
+  (a bone far from the vertex it moves).
 - Rig presets per engine: Unreal mannequin is done; Unity Humanoid and Mixamo
   bone names would let one rig retarget everywhere.
 - Saving the rigging window's setups as user templates: done (rig templates).

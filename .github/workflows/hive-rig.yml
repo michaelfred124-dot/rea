@@ -88,6 +88,49 @@ jobs:
           if cargo run --locked -q -- check "$c/demo/hive_demo.guides.json"; then exit 1; fi
           cargo run --locked -q -- check "$c/demo/hive_demo.guides.json" --mesh "$c/demo/hive_demo.glb" --fix
           cargo run --locked -q -- rebuild "$c/demo/hive_demo.hive.json"
+      - name: Control looks from the CLI, built-skin checks, Maya and Unreal builders
+        run: |
+          c="$RUNNER_TEMP/looks"
+          cargo run --locked -q -- demo -o "$c"
+          g="$c/hive_demo.guides.json"
+          cargo run --locked -q -- control "$g" hand_l_ik_ctrl --shape gear --scale 1.3 --twin
+          cargo run --locked -q -- control "$g" foot_l_ik_ctrl --shape rounded_square --color green --twin
+          cargo run --locked -q -- control "$g" upperarm_l_fk_ctrl --component --twin --color '#ff8c1a'
+          cargo run --locked -q -- control "$g" cog_ctrl --shape curved_arrow
+          cargo run --locked -q -- control "$g" | tee "$c/log.txt"
+          grep -Eq "^hand_r_ik_ctrl +gear .*restyled" "$c/log.txt"
+          grep -Eq "^foot_r_ik_ctrl +rounded_square .*0.20,0.85,0.35" "$c/log.txt"
+          test "$(grep -c restyled "$c/log.txt")" -ge 14
+          cargo run --locked -q -- rebuild "$c/hive_demo.hive.json"
+          python3 -I tests/dcc_stub_run.py maya "$c/hive_demo_maya.py"
+          python3 -I tests/dcc_stub_run.py unreal "$c/hive_demo_unreal.py"
+          # Strip some weights: check reports them, --fix fills the bare vertices,
+          # and the automatic weights give the hand its skin back.
+          python3 -I - "$c/hive_demo.hive.json" <<'EOF'
+          import json, sys
+          r = json.load(open(sys.argv[1]))
+          names = [b["name"] for b in r["skeleton"]["bones"]]
+          hand = names.index("hand_l")
+          skin = r["skin"]
+          for v in range(len(skin["joints"])):
+              if v in (5, 6, 7) or hand in skin["joints"][v]:
+                  skin["joints"][v], skin["weights"][v] = [], []
+          json.dump(r, open(sys.argv[1], "w"))
+          EOF
+          cargo run --locked -q -- check "$c/hive_demo.hive.json" | tee "$c/log.txt"
+          grep -q "warning: skin: .* vertices have no weight" "$c/log.txt"
+          grep -q "hand_l deforms but has no skin" "$c/log.txt"
+          cargo run --locked -q -- check "$c/hive_demo.hive.json" --fix | tee "$c/log.txt"
+          grep -q "Filled .* vertices with no weight" "$c/log.txt"
+          ! grep -q "no weight, so" "$c/log.txt" || exit 1
+          cargo run --locked -q -- weights auto "$c/hive_demo.hive.json" --bone hand_l 2>&1 | tee "$c/log.txt"
+          ! grep -q "has no skin" "$c/log.txt" || exit 1
+          cargo run --locked -q -- check "$c/hive_demo.hive.json" | tee "$c/log.txt"
+          grep -q "No problems found" "$c/log.txt"
+          # The app with a restyled control picked in the controls stage.
+          xvfb-run -a -s "-screen 0 1400x900x24" cargo run --locked -q --bin HiveRig -- \
+            "$c/hive_demo.hive.json" --pick hand_l_ik_ctrl --screenshot "$RUNNER_TEMP/hive-rig-control-styles.ppm"
+          test "$(head -c 2 "$RUNNER_TEMP/hive-rig-control-styles.ppm")" = P6
       - name: Generate demo rigs (T-pose and A-pose)
         run: |
           cargo run --locked -q -- demo -o "$RUNNER_TEMP/t_pose"
@@ -289,11 +332,17 @@ jobs:
           shapes = {"root_ctrl": "four_arrows", "cog_ctrl": "octagon", "head_ctrl": "sphere",
                     "pelvis_ctrl": "star", "spine_02_ctrl": "hexagon", "hand_l_ik_ctrl": "pyramid",
                     "lowerarm_l_pole_ctrl": "arrow", "lowerarm_r_pole_ctrl": "triangle",
-                    "foot_l_ik_ctrl": "double_arrow", "foot_r_ik_ctrl": "half_circle"}
+                    "foot_l_ik_ctrl": "double_arrow", "foot_r_ik_ctrl": "half_circle",
+                    "spine_01_ctrl": "rounded_square", "spine_03_ctrl": "rounded_triangle",
+                    "neck_01_ctrl": "quarter_circle", "hand_r_ik_ctrl": "gear",
+                    "upperarm_l_fk_ctrl": "curved_arrow", "upperarm_r_fk_ctrl": "lollipop",
+                    "thigh_l_fk_ctrl": "cylinder", "thigh_r_fk_ctrl": "plus"}
           g = json.load(open(sys.argv[1]))
           g["control_styles"] = {name: {"shape": shape} for name, shape in shapes.items()}
           json.dump(g, open(sys.argv[1], "w"))
           EOF
+          # Colours and sizes from the CLI too (the check compares every colour).
+          cargo run -q -- control "$rig/hive_demo.guides.json" calf_l_fk_ctrl --color cyan --size 0.09 --twin
           cargo run -q -- rebuild "$rig/hive_demo.hive.json"
           python tests/blender_check.py "$rig/hive_demo_blender.py" "$rig/hive_demo.glb"
       - name: Skin weights in Blender - 8 influences (JOINTS_1), 4 with pruning, copied weights

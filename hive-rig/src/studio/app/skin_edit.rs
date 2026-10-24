@@ -14,6 +14,7 @@ use std::sync::Arc;
 use eframe::egui::{Pos2, Rect};
 use glam::Vec3;
 
+use hive_rig::checks;
 use hive_rig::skin::{self, SkinWeights, edit};
 use hive_rig::voxel::weld_positions;
 
@@ -428,6 +429,57 @@ impl Studio {
         let name = rig.skeleton.bones[bone].name.clone();
         let region = edit::bone_region(&rig.skin, &auto, bone);
         self.reauto(&region, format!("{name}'s {} vertices", region.len()));
+    }
+
+    /// The built-skin checks on the current weights (vertices with no weight,
+    /// deforming bones with no skin), or `None` before Build.
+    pub fn skin_report(&self) -> Option<checks::SkinReport> {
+        let rig = self.doc.as_ref()?.rig.as_ref()?;
+        Some(checks::check_skin(&rig.skeleton, &rig.skin))
+    }
+
+    /// Select the vertices with no weight, to look at or paint them.
+    pub fn select_unweighted(&mut self) {
+        let Some(report) = self.skin_report() else {
+            return self.fail("Build the rig first, then check its skin.");
+        };
+        if report.unweighted.is_empty() {
+            return self.info("Every vertex has weight.");
+        }
+        self.select_vertices(&report.unweighted, SelectOp::Replace);
+        self.skin_tools.selecting = true;
+        self.info(format!(
+            "Selected the {} vertices with no weight.",
+            report.unweighted.len()
+        ));
+    }
+
+    /// Give every vertex with no weight the weights around it, as one undo step.
+    pub fn fill_unweighted(&mut self) {
+        if !self.need_rig("fill the vertices with no weight") {
+            return;
+        }
+        let adjacency = self.neighbours();
+        let rig = self.doc.as_ref().unwrap().rig.as_ref().unwrap();
+        let (skin, n) = edit::fill_unweighted(&rig.skin, &adjacency, rig.guides.skin);
+        self.commit_skin(
+            skin,
+            true,
+            format!("Filled {n} vertices with no weight from the weights around them."),
+        );
+    }
+
+    /// Show a bone with no skin under Weights, ready to paint or re-run.
+    pub fn show_bone_weights(&mut self, bone: &str) {
+        self.weights_bone = Some(bone.to_string());
+        self.weight_colors = None;
+    }
+
+    /// Re-run the automatic weights for one bone (a bone the checks found
+    /// without skin), as one undo step.
+    pub fn reauto_named_bone(&mut self, bone: &str) {
+        self.show_bone_weights(bone);
+        self.reauto_bone();
     }
 
     /// The automatic weights of the built rig: the ones it was built with, or

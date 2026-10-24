@@ -175,6 +175,8 @@ pub fn script(rig: &Rig, target: Target, glb_path: &Path) -> Result<String> {
                 "controls": rig.controls.controls,
                 "ik_chains": rig.controls.ik_chains,
                 "splines": rig.controls.splines,
+                // Left/right control twins, for the pose tools' flip.
+                "mirror_pairs": rig.controls.mirror_pairs,
                 "basis": basis,
                 "shapes": shapes,
             });

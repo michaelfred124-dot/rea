@@ -527,7 +527,14 @@ Properties shows the name and lets you:
 * **Control shape, size and colour** change how one control looks. The look is
   saved in the guides file and survives a rebuild. Shapes are picked from a
   grid of drawn tiles (hover one for its name); the right-click menu on a
-  control has the same grid.
+  control has the same grid. Next to the colour picker are swatches for the
+  centre, left, right and root colours and a few more. With **Symmetry** on, a
+  change reaches the control's twin on the other side too: the same shape and
+  size, and the other side's colour when you pick a side colour (left blue on
+  one hand is right red on the other); any other colour is the same on both.
+  **Same shape and colour for its component** gives every control of the
+  component (and, with symmetry, its twin component) this control's shape and
+  colour.
 
 ### Control shapes
 
@@ -548,9 +555,33 @@ Properties shows the name and lets you:
 | Half circle | `half_circle` | `HalfCircle_Thick` |
 | Pyramid | `pyramid` | `Pyramid_Thick` |
 | Four-pointed star | `star` | `Star4_Thick` |
+| Rounded square | `rounded_square` | `RoundedSquare_Thick` |
+| Rounded triangle | `rounded_triangle` | `RoundedTriangle_Thick` |
+| Quarter circle | `quarter_circle` | `QuarterCircle_Thick` |
+| Gear (eight teeth) | `gear` | `Octagon_Thick` (look-alike) |
+| Curved arrow (three-quarter ring) | `curved_arrow` | `HalfCircle_Thick` (look-alike) |
+| Lollipop (ring on a stick) | `lollipop` | `Circle_Thick` (look-alike) |
+| Cylinder | `cylinder` | `Circle_Thick` (look-alike) |
+| Plus (wide arms) | `plus` | `Arrow4_Thick` (look-alike) |
 
 Set one by hand in `guides.json` with
-`"control_styles": { "head_ctrl": { "shape": "sphere", "size": 0.12 } }`.
+`"control_styles": { "head_ctrl": { "shape": "sphere", "size": 0.12 } }`,
+or from the command line with `hive-rig control`:
+
+```bash
+hive-rig control out/hero.guides.json                       # every control: shape, size, colour
+hive-rig control out/hero.guides.json hand_l_ik_ctrl --shape gear --scale 1.3 --twin
+hive-rig control out/hero.guides.json upperarm_l_fk_ctrl --component --twin --color '#ff8c1a'
+hive-rig control out/hero.guides.json head_ctrl --shape lollipop --size 0.16 --color cyan
+hive-rig control out/hero.guides.json hand_l_ik_ctrl --twin --reset
+hive-rig rebuild out/hero.hive.json                         # the exports get the new looks
+```
+
+Controls are named by their internal or exported name. `--size` is in metres,
+`--scale` multiplies the current size, and `--color` takes `r,g,b` (0 to 1),
+`#rrggbb` or a name (left, right, centre, root, green, cyan, orange, white).
+`--twin` and `--component` reach the twin and the component's controls the
+way symmetry and the component button do in the app.
 The shapes are defined once, in `src/controls.rs`. Flat shapes lie in the
 plane facing the control's axis, and arrows and triangles point up, or forward
 for a control that faces up or down. Each control's lines are written into the
@@ -650,6 +681,30 @@ The Checks card shows the same two lines, with the orientation control (see
 [Input requirements](#input-requirements)). Given a `.hive.json` it uses the rig's mesh and the guides
 next to it (the ones `rebuild` reads). `rig`, `rebuild` and `demo` print the
 same warnings before building.
+
+**The built skin.** After Build (and after painting, copying or pruning
+weights) two more checks look at the weights themselves:
+
+| Check | Warns when | Fix offered |
+| --- | --- | --- |
+| No weight | a vertex's weights add up to less than 0.001, so it stays behind when the rig moves | fill it from the weights around it on the surface |
+| Bone without skin | a deforming bone has no weight above 0.001 on any vertex, so turning it moves nothing | re-run that bone's automatic weights, or paint it |
+
+In the app they're listed under **Built skin** in the Checks card, with
+**Select** (select the bare vertices) and **Fill** for the first, **Show** (pick
+the bone under Weights to paint it) and **Auto** for the second, each one undo
+step. On the command line `check` reports them for a `.hive.json`, `rig`,
+`rebuild` and the `weights` commands print them after writing, and:
+
+```bash
+hive-rig check out/hero.hive.json --fix          # also fills bare vertices and writes the rig again
+hive-rig weights fill out/hero.hive.json         # only the fill
+hive-rig weights auto out/hero.hive.json --bone hand_l   # skin for a bone that has none
+```
+
+Filling works in from the weighted skin one ring of vertices at a time, each
+taking the average of its weighted neighbours, so a bare patch takes the
+weights round its edge. A loose piece with no weight anywhere stays bare.
 
 ### Versions and compatibility
 
@@ -793,7 +848,7 @@ again in a file that already has the rig only brings back the tab or window.
 ### Animator tools in Blender, Maya and Unreal
 
 Below the guide tools, the Hive tab (Blender) and the Hive Rig window (Maya)
-have an **Animation** section:
+have an **Animation** section and a **Pose Library**:
 
 * **IK to FK / FK to IK** for each arm and leg. IK to FK turns the FK controls
   to the pose the IK limb has now; FK to IK moves the IK control onto the FK
@@ -808,6 +863,18 @@ have an **Animation** section:
   other side, or every left (right) control's pose when nothing is selected.
   Poses are mirrored relative to each control's parent, along with `ik_fk`,
   `stretch`, `soft`, `roll` and `space`. Centre controls are left alone.
+* **Flip Pose** turns the pose into its mirror image: left and right twins swap
+  poses (each mirrored) and every centre control is mirrored onto itself, so a
+  character leaning and looking left leans and looks right. With controls
+  selected, only those and their twins flip. Flipping twice gives the pose back.
+* **Pose Library**: **Save Pose** keeps the current pose of the selected
+  controls (or every control) under a name, in the scene file (on the armature
+  in Blender, on the rig's top node in Maya). Each saved pose has **Apply**
+  (only the selected controls, if any are selected) and **Apply Mirrored**,
+  which puts each control's saved pose mirrored onto its twin and centre
+  controls mirrored onto themselves. **Delete** takes a pose out. Poses hold
+  the controls' local transforms and their settings (`ik_fk`, `roll` and so on),
+  so they work at any place in the scene.
 * **Reset** puts every control, or only the selected ones, back to the bind
   pose and default settings. **Select All Controls** selects the controls only.
 * **Switch space without a pop**: Blender shows a button per space for the
@@ -1051,6 +1118,22 @@ rerun, each one Undo step; click and box selection seeing only the front; the
 paint bend). The app screenshots them with `--weights BONE --lock BONE --bend 70
 --bend-axis z --dab replace --vertices --hover --tools`; the
 `.glb`'s second joints/weights set is read back in `src/export/glb.rs`.
+The built-skin checks have tests in `src/checks.rs` (the demo is clean; bare
+vertices and a bone stripped of its skin are each reported), `src/skin/edit.rs`
+(filling a bare patch from round its edge, a loose piece left bare) and
+`src/studio/app.rs` (Select, Fill and Auto from the Checks card, each one undo
+step). Control looks have tests in `src/controls.rs` (every shape fits its
+size and reads as itself), `src/components.rs` (one control, its twin with the
+side colour swapped, a whole component scaled, reset) and the app's (symmetry
+reaching the twin in one undo step). `blender_check.py` compares every
+control's drawn lines and colour with the rig; CI styles controls with
+`hive-rig control`, breaks and repairs a rig's skin with `check --fix` and
+`weights auto`, and screenshots the app with a restyled control picked.
+`blender_anim_check.py` also flips the pose of the demo, the dog and every
+creature (every deforming bone lands on its twin's mirror image, the centre
+moves, flipping twice gives the pose back) and runs the pose library (save,
+apply, apply mirrored equals the flip, selected only, delete, and the Hive
+tab's buttons); the Maya stubs run the same calls.
 CI runs all of this (`.github/workflows/hive-rig.yml`), and builds both Windows
 executables as a downloadable artifact.
 

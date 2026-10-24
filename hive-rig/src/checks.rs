@@ -1,4 +1,5 @@
-//! Checks run on a layout before it is built.
+//! Checks run on a layout before it is built, and on a built rig's skin
+//! ([`check_skin`]).
 //!
 //! Most are warnings: the rig still builds, but probably not the way the rigger
 //! meant (a guide on the wrong side of the body, an elbow that IK would flip, a
@@ -17,7 +18,8 @@ use glam::Vec3;
 
 use crate::components::{self, Built, Component, Guides, Kind, mirror_guide, spine_name, twin_id};
 use crate::mesh::Mesh;
-use crate::skeleton::Side;
+use crate::skeleton::{Side, Skeleton};
+use crate::skin::{SkinWeights, edit};
 
 /// A sided guide may lean this far across the mid-line before it's on the wrong side.
 pub const MIDLINE_TOLERANCE: f32 = 0.005;
@@ -61,6 +63,10 @@ pub enum Check {
     OffCentre,
     /// A component hanging from a bone that makes an odd hierarchy.
     OddParent,
+    /// Built skin: vertices that no bone moves.
+    Unweighted,
+    /// Built skin: a deforming bone that moves no vertex.
+    Unskinned,
 }
 
 impl Check {
@@ -75,6 +81,8 @@ impl Check {
             Check::Asymmetric => "not symmetric",
             Check::OffCentre => "off centre",
             Check::OddParent => "odd parent",
+            Check::Unweighted => "no weight",
+            Check::Unskinned => "bone without skin",
         }
     }
 }
@@ -115,6 +123,9 @@ pub struct Issue {
 impl Issue {
     /// "arm_l · elbow", or the component alone.
     pub fn place(&self) -> String {
+        if self.check == Check::Unweighted {
+            return "skin".into();
+        }
         match (&self.guide, self.component.is_empty()) {
             (_, true) => "layout".into(),
             (Some(g), false) => format!("{} · {g}", self.component),
@@ -343,6 +354,73 @@ pub fn check_built(
         hierarchy(g, b, &mut out);
     }
     out
+}
+
+// --------------------------------------------------------------------------- the built skin
+
+/// What the built skin's checks found: the vertices no bone moves and the
+/// deforming bones (by index) that move no vertex, with an issue for each.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SkinReport {
+    pub unweighted: Vec<usize>,
+    pub unskinned: Vec<usize>,
+    pub issues: Vec<Issue>,
+}
+
+/// Check a built rig's skin weights (after painting, copying or pruning them):
+/// every vertex should follow some bone and every deforming bone should move
+/// some skin. Both are warnings; the rig still exports.
+pub fn check_skin(sk: &Skeleton, skin: &SkinWeights) -> SkinReport {
+    let unweighted = edit::unweighted(skin);
+    let unskinned = edit::unskinned_bones(skin, sk);
+    let mut issues = Vec::new();
+    if !unweighted.is_empty() {
+        let n = unweighted.len();
+        let shown: Vec<String> = unweighted.iter().take(5).map(|v| v.to_string()).collect();
+        issues.push(Issue {
+            severity: Severity::Warning,
+            check: Check::Unweighted,
+            component: String::new(),
+            guide: None,
+            message: format!(
+                "{n} {} no weight, so {} behind when the rig moves (vertex {}{})",
+                if n == 1 {
+                    "vertex has"
+                } else {
+                    "vertices have"
+                },
+                if n == 1 { "it stays" } else { "they stay" },
+                shown.join(", "),
+                if n > shown.len() { ", ..." } else { "" }
+            ),
+            suggestion: "fill them from the weights around them (`hive-rig weights fill`), \
+                         or paint them"
+                .into(),
+            fix: None,
+        });
+    }
+    for &b in &unskinned {
+        let bone = &sk.bones[b];
+        issues.push(Issue {
+            severity: Severity::Warning,
+            check: Check::Unskinned,
+            component: bone.component.clone(),
+            guide: Some(bone.name.clone()),
+            message: format!(
+                "{} deforms but has no skin, so turning it moves nothing",
+                bone.name
+            ),
+            suggestion: "re-run its automatic weights (`hive-rig weights auto --bone`) or \
+                         paint it, or move its guides inside the mesh and rebuild"
+                .into(),
+            fix: None,
+        });
+    }
+    SkinReport {
+        unweighted,
+        unskinned,
+        issues,
+    }
 }
 
 fn cm(metres: f32) -> String {
@@ -887,6 +965,58 @@ mod tests {
             quadruped(demo::DOG_HEIGHT),
             Surface::new(&demo::demo_quadruped()),
         )
+    }
+
+    #[test]
+    fn built_skin_checks_find_bare_vertices_and_bones() {
+        let rig = crate::rig::auto_rig(demo_humanoid(), "demo", Default::default()).unwrap();
+        let clean = check_skin(&rig.skeleton, &rig.skin);
+        assert_eq!(clean, SkinReport::default(), "the demo's skin is complete");
+        let mut skin = rig.skin.clone();
+        // Two bare vertices, and the left hand's weight given to its forearm.
+        skin.set(10, Vec::new());
+        skin.set(20, Vec::new());
+        let hand = rig.skeleton.index_of("hand_l").unwrap();
+        let fore = rig.skeleton.index_of("lowerarm_l").unwrap() as u16;
+        for v in 0..skin.vertex_count() {
+            let w = skin.weight(v, hand);
+            if w > 0.0 {
+                let mut pairs: Vec<(u16, f32)> = skin
+                    .influences(v)
+                    .filter(|(j, _)| *j != hand)
+                    .map(|(j, w)| (j as u16, w))
+                    .collect();
+                pairs.push((fore, w));
+                skin.set(v, pairs);
+            }
+        }
+        let report = check_skin(&rig.skeleton, &skin);
+        assert_eq!(report.unweighted, vec![10, 20]);
+        assert_eq!(report.unskinned, vec![hand]);
+        assert_eq!(report.issues.len(), 2);
+        let bare = &report.issues[0];
+        assert_eq!(
+            (bare.check, bare.place()),
+            (Check::Unweighted, "skin".to_string())
+        );
+        assert!(
+            bare.message.starts_with("2 vertices have no weight"),
+            "{}",
+            bare.message
+        );
+        let bone = &report.issues[1];
+        assert_eq!(bone.check, Check::Unskinned);
+        assert_eq!(
+            bone.place(),
+            format!("arm_l · {}", rig.skeleton.bones[hand].name)
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .all(|i| i.severity == Severity::Warning && i.fix.is_none())
+        );
+        assert_eq!((warnings(&report.issues), errors(&report.issues)), (2, 0));
     }
 
     fn comp<'a>(g: &'a mut Guides, id: &str) -> &'a mut Component {
