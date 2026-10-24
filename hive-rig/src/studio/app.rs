@@ -577,7 +577,7 @@ impl Studio {
         self.info("Demo character loaded. Drag the guides to adjust, then Build Rig.");
     }
 
-    /// Open a built-in creature (dog, bird, spider or snake) with its layout.
+    /// Open a built-in creature (dog, bird, spider, snake, horse or dinosaur) with its layout.
     pub fn load_creature(&mut self, c: demo::Creature) {
         self.set_doc(Doc::new(c.rig_name(), c.mesh(), c.guides(), demo_out_dir()));
         self.info(format!(

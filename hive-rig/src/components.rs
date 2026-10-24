@@ -221,7 +221,8 @@ pub struct Options {
     /// Curve controls of a spline chain or spline spine, ends included.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub controls: Option<usize>,
-    /// Bendy arms and legs: bend controls arc each segment's joints, and a pin
+    /// Bendy arms, legs and quad legs (whose thigh and calf bend; the hock stays
+    /// one bone): bend controls arc each segment's joints, and a pin
     /// control moves the elbow or knee. Replaces the twist helpers with
     /// [`BEND_JOINTS`] bend joints per segment (which still take the twist shares
     /// when `twist` is on).
@@ -231,6 +232,11 @@ pub struct Options {
     /// near full extension so the knee or elbow doesn't pop.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub soft: f32,
+    /// Quad legs: default of the IK control's `spring` attribute (0 to 1). At 1
+    /// the hock swings with the thigh as the paw moves (a spring hock, see
+    /// [`crate::controls::spring_hock`]); at 0 it keeps the hock control's angle.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub spring: f32,
 }
 
 fn is_zero(v: &f32) -> bool {
@@ -254,6 +260,7 @@ impl Default for Options {
             controls: None,
             bendy: false,
             soft: 0.0,
+            spring: 0.0,
         }
     }
 }
@@ -791,6 +798,152 @@ pub fn snake(height: f32) -> Guides {
     ];
     // Lying on the floor: no leg or arm regions, the skin follows the bones.
     creature(h, components, -h, 10.0 * h)
+}
+
+/// The built-in horse layout for a horse `height` metres tall (floor to the top
+/// of the raised head), facing +Z: a long level back, a long neck rising to the
+/// head with the muzzle along the head bone, a hanging tail, two front legs and
+/// two three-segment hind legs on long cannons.
+///
+/// The front legs are arm components whose elbows sit back against the belly:
+/// the scapula, the upper arm from the point of the shoulder to the elbow, the
+/// forearm and cannon as one bone down to the fetlock, and the pastern and hoof
+/// as the hand. The hind legs are [`Kind::QuadLeg`] with the stifle forward, the
+/// hock high and behind, and the pastern and hoof as the paw. A horse's stifle
+/// and hock flex together, so the hind legs start with a full spring hock
+/// (`spring` = 1): lifting a hoof folds the whole leg.
+pub fn horse(height: f32) -> Guides {
+    let h = height;
+    let v = |x: f32, y: f32, z: f32| Vec3::new(x, y, z) * h;
+    let chest_bone = spine_name(SPINE_JOINTS - 1);
+    let mut components = vec![
+        Component::new("root", Kind::Root, Side::Center, None).guide("root", Vec3::ZERO),
+        Component::new("spine", Kind::Spine, Side::Center, Some("root"))
+            .guide("pelvis", v(0.0, 0.7, -0.36))
+            .guide("chest", v(0.0, 0.72, 0.2)),
+        Component::new("head", Kind::Head, Side::Center, Some(&chest_bone))
+            .guide("neck", v(0.0, 0.76, 0.27))
+            .guide("head", v(0.0, 0.95, 0.47))
+            .guide("head_top", v(0.0, 0.8, 0.66)),
+    ];
+    for side in [Side::Left, Side::Right] {
+        let sx = side.sign();
+        components.push(
+            Component::new(
+                format!("front_leg{}", side.suffix()),
+                Kind::Arm,
+                side,
+                Some(&chest_bone),
+            )
+            .guide("clavicle", v(0.04 * sx, 0.78, 0.17))
+            .guide("shoulder", v(0.09 * sx, 0.6, 0.29))
+            .guide("elbow", v(0.09 * sx, 0.46, 0.19))
+            .guide("wrist", v(0.09 * sx, 0.065, 0.22))
+            .guide("hand_tip", v(0.09 * sx, 0.01, 0.27)),
+        );
+    }
+    for side in [Side::Left, Side::Right] {
+        let sx = side.sign();
+        let mut leg = Component::new(
+            format!("hind_leg{}", side.suffix()),
+            Kind::QuadLeg,
+            side,
+            Some("pelvis"),
+        );
+        let points = [
+            v(0.09 * sx, 0.66, -0.36),  // hip
+            v(0.09 * sx, 0.48, -0.23),  // stifle, forward
+            v(0.09 * sx, 0.3, -0.45),   // hock, high and behind
+            v(0.09 * sx, 0.065, -0.41), // fetlock: the pastern starts here
+            v(0.09 * sx, 0.03, -0.37),  // coronet: the top of the hoof
+            v(0.09 * sx, 0.005, -0.33), // toe of the hoof
+            v(0.09 * sx, 0.0, -0.42),   // heel of the hoof
+        ];
+        for (name, p) in QUAD_LEG_GUIDES.iter().zip(points) {
+            leg = leg.guide(*name, p);
+        }
+        leg.options.spring = 1.0;
+        components.push(leg);
+    }
+    components.push(chain(
+        "tail".into(),
+        Side::Center,
+        "pelvis",
+        (0..=4).map(|k| {
+            let t = k as f32 / 4.0;
+            v(0.0, 0.7 - 0.3 * t, -0.48 - 0.16 * t + 0.04 * t * t)
+        }),
+    ));
+    // The belly line is above the elbows and stifles, so the front legs are
+    // planted; the body is wide enough that nothing above it counts as a leg.
+    creature(h, components, 0.52 * h, 0.5 * h)
+}
+
+/// Joints of the built-in dinosaur's spline tail.
+pub const DINOSAUR_TAIL_JOINTS: usize = 8;
+
+/// The built-in dinosaur (a biped theropod) layout for one `height` metres tall
+/// (floor to the top of the head), facing +Z: a level spine balanced over the
+/// hips, a curved neck and a big head with the snout along the head bone, two
+/// short arms held under the chest, two three-segment legs that stand on their
+/// toes, and a long spline tail behind. The arms are arm components (FK, as
+/// arms start); the legs are [`Kind::QuadLeg`]: thigh, shin, the long
+/// metatarsus as the hock and the toes as the paw.
+pub fn dinosaur(height: f32) -> Guides {
+    let h = height;
+    let v = |x: f32, y: f32, z: f32| Vec3::new(x, y, z) * h;
+    let chest_bone = spine_name(SPINE_JOINTS - 1);
+    let mut tail = Component::new("tail", Kind::Spline, Side::Center, Some("pelvis"));
+    for k in 0..=DINOSAUR_TAIL_JOINTS {
+        let t = k as f32 / DINOSAUR_TAIL_JOINTS as f32;
+        tail = tail.guide(
+            format!("j{}", k + 1),
+            v(0.0, 0.66 - 0.16 * t, -0.16 - 1.0 * t),
+        );
+    }
+    tail.options.controls = Some(4);
+    let mut components = vec![
+        Component::new("root", Kind::Root, Side::Center, None).guide("root", Vec3::ZERO),
+        Component::new("spine", Kind::Spine, Side::Center, Some("root"))
+            .guide("pelvis", v(0.0, 0.66, -0.08))
+            .guide("chest", v(0.0, 0.7, 0.3)),
+        Component::new("head", Kind::Head, Side::Center, Some(&chest_bone))
+            .guide("neck", v(0.0, 0.73, 0.36))
+            .guide("head", v(0.0, 0.9, 0.52))
+            .guide("head_top", v(0.0, 0.86, 0.8)),
+    ];
+    for side in [Side::Left, Side::Right] {
+        let sx = side.sign();
+        components.push(
+            Component::new(
+                format!("arm{}", side.suffix()),
+                Kind::Arm,
+                side,
+                Some(&chest_bone),
+            )
+            .guide("clavicle", v(0.03 * sx, 0.66, 0.32))
+            .guide("shoulder", v(0.09 * sx, 0.62, 0.36))
+            .guide("elbow", v(0.11 * sx, 0.54, 0.33))
+            .guide("wrist", v(0.11 * sx, 0.52, 0.42))
+            .guide("hand_tip", v(0.11 * sx, 0.48, 0.48)),
+        );
+    }
+    for side in [Side::Left, Side::Right] {
+        let mut leg = Component::new(
+            format!("leg{}", side.suffix()),
+            Kind::QuadLeg,
+            side,
+            Some("pelvis"),
+        );
+        let points = quad_leg_points(v(0.11 * side.sign(), 0.6, -0.06), 0.0);
+        for (name, p) in QUAD_LEG_GUIDES.iter().zip(points) {
+            leg = leg.guide(*name, p);
+        }
+        components.push(leg);
+    }
+    components.push(tail);
+    // The arms hang above the belly line, so they aren't planted front legs.
+    creature(h, components, 0.4 * h, 0.16 * h)
 }
 
 /// Premade components that can be added to an existing layout.
@@ -1406,14 +1559,20 @@ pub fn mirror_side(g: &mut Guides, source: Side) -> usize {
     updates.len() + paired
 }
 
-/// Set `bendy` and the default `soft` on every arm and leg.
+/// Set `bendy` and the default `soft` on every arm, leg and quad leg.
 pub fn set_limb_options(g: &mut Guides, bendy: bool, soft: f32) {
     for c in &mut g.components {
-        if matches!(c.kind, Kind::Arm | Kind::Leg) {
+        if matches!(c.kind, Kind::Arm | Kind::Leg | Kind::QuadLeg) {
             c.options.bendy = bendy;
             c.options.soft = soft;
         }
     }
+}
+
+/// Set the default hock `spring` on every quad leg; returns how many there are.
+pub fn set_hock_spring(g: &mut Guides, spring: f32) -> usize {
+    let legs = g.components.iter_mut().filter(|c| c.kind == Kind::QuadLeg);
+    legs.map(|c| c.options.spring = spring).count()
 }
 
 /// Change the spine component's joint count, re-attaching components that hung
@@ -1741,13 +1900,14 @@ fn validate(g: &Guides) -> Result<()> {
                 c.id
             );
         }
+        let limb = matches!(c.kind, Kind::Arm | Kind::Leg | Kind::QuadLeg);
         ensure!(
-            !c.options.bendy || matches!(c.kind, Kind::Arm | Kind::Leg),
+            !c.options.bendy || limb,
             "component {}: only arms and legs can be bendy",
             c.id
         );
         ensure!(
-            c.options.soft == 0.0 || matches!(c.kind, Kind::Arm | Kind::Leg),
+            c.options.soft == 0.0 || limb,
             "component {}: only arms and legs have soft IK",
             c.id
         );
@@ -1756,6 +1916,17 @@ fn validate(g: &Guides) -> Result<()> {
             "component {}: soft must be 0 to 1 (got {})",
             c.id,
             c.options.soft
+        );
+        ensure!(
+            c.options.spring == 0.0 || c.kind == Kind::QuadLeg,
+            "component {}: only quad legs have a spring hock",
+            c.id
+        );
+        ensure!(
+            (0.0..=1.0).contains(&c.options.spring),
+            "component {}: spring must be 0 to 1 (got {})",
+            c.id,
+            c.options.spring
         );
         if c.kind == Kind::Spine {
             let n = g.spine_joints(c);
@@ -2044,9 +2215,9 @@ fn build_leg(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
             blend: 1.0,
             upright_ik: true,
             foot: Some(foot),
-            hock: None,
             soft: c.options.soft,
             bend,
+            ..Limb::default()
         },
     );
     toe_control(b, side, &names[2], ball);
@@ -2073,7 +2244,9 @@ fn toe_control(b: &mut Builder, side: Side, foot: &str, ball: String) {
 /// A three-segment hind leg: thigh, calf and hock (twist helpers on the thigh
 /// and calf), then the paw (`foot`) and toes (`ball`). The thigh and calf solve
 /// as a two-bone IK aimed at the hock, which a hock control at the ankle swings;
-/// the paw keeps the biped leg's reverse-foot roll.
+/// the paw keeps the biped leg's reverse-foot roll. Bendy, the thigh and calf
+/// get bend joints and the knee a pin, as a leg's do; `soft` eases the reach to
+/// the hock and `spring` lets the hock swing with the thigh.
 fn build_quad_leg(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
     let side = c.side;
     let s = side.suffix();
@@ -2082,7 +2255,7 @@ fn build_quad_leg(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
     b.link(parent, region);
     let segments = [format!("thigh{s}"), format!("calf{s}"), format!("hock{s}")];
     let points = [p("hip"), p("knee"), p("hock"), p("ankle")];
-    limb_bones(b, &segments, parent, &points, side, region, &c.options)?;
+    let bend = limb_bones(b, &segments, parent, &points, side, region, &c.options)?;
     let foot = format!("foot{s}");
     b.bone(&foot, &segments[2], p("ankle"), p("ball"), side, region)?;
     let ball = format!("ball{s}");
@@ -2109,7 +2282,9 @@ fn build_quad_leg(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
             upright_ik: true,
             foot: Some(roll),
             hock: Some(segments[2].clone()),
-            ..Limb::default()
+            soft: c.options.soft,
+            spring: c.options.spring,
+            bend,
         },
     );
     toe_control(b, side, &foot, ball);
@@ -2210,6 +2385,8 @@ struct Limb {
     hock: Option<String>,
     /// Default of the `soft` attribute.
     soft: f32,
+    /// Default of the hock's `spring` attribute (three-segment legs).
+    spring: f32,
     /// Bend joints of the upper and lower segments, for a bendy limb.
     bend: Option<[Vec<String>; 2]>,
 }
@@ -2318,6 +2495,7 @@ fn limb_controls(
             fk_control: fk_name(&k.name),
             bone: k.name,
             control,
+            default_spring: limb.spring,
         }
     });
 
@@ -3280,22 +3458,32 @@ mod tests {
     #[test]
     fn bendy_and_soft_are_checked() {
         let mut g = quadruped(1.0);
-        let hind = g
-            .components
-            .iter_mut()
-            .find(|c| c.kind == Kind::QuadLeg)
-            .unwrap();
-        hind.options.bendy = true;
+        let tail = g.components.iter_mut().find(|c| c.id == "tail").unwrap();
+        tail.options.bendy = true;
         let e = build(&g).err().unwrap().to_string();
         assert!(e.contains("only arms and legs can be bendy"), "{e}");
         let mut g = quadruped(1.0);
         g.components
             .iter_mut()
-            .find(|c| c.kind == Kind::QuadLeg)
+            .find(|c| c.id == "tail")
             .unwrap()
             .options
             .soft = 0.2;
         assert!(build(&g).is_err());
+        // The hock spring belongs to quad legs only, from 0 to 1.
+        let mut g = demo_guides();
+        g.components
+            .iter_mut()
+            .find(|c| c.kind == Kind::Leg)
+            .unwrap()
+            .options
+            .spring = 0.5;
+        let e = build(&g).err().unwrap().to_string();
+        assert!(e.contains("only quad legs have a spring hock"), "{e}");
+        let mut g = quadruped(1.0);
+        assert_eq!(set_hock_spring(&mut g, 1.5), 2);
+        let e = build(&g).err().unwrap().to_string();
+        assert!(e.contains("spring must be 0 to 1"), "{e}");
         let mut g = demo_guides();
         set_limb_options(&mut g, false, 1.5);
         let e = build(&g).err().unwrap().to_string();
@@ -3315,6 +3503,108 @@ mod tests {
                 .iter()
                 .all(|c| c.default_soft == 0.25 && c.bendy.is_none())
         );
+    }
+
+    /// Quad legs take the bendy and soft options the arms and legs have: bend
+    /// joints on the thigh and calf (the hock stays one bone), a knee pin, the
+    /// soft default, and the hock spring's default on the hock segment.
+    #[test]
+    fn quad_legs_are_bendy_soft_and_sprung() {
+        let mut g = quadruped(0.8);
+        set_limb_options(&mut g, true, 0.3);
+        assert_eq!(set_hock_spring(&mut g, 0.75), 2);
+        let built = build(&g).unwrap();
+        let sk = &built.skeleton;
+        for s in ["_l", "_r"] {
+            let leg = built
+                .controls
+                .ik_chains
+                .iter()
+                .find(|c| c.name == format!("leg{s}"))
+                .unwrap();
+            assert_eq!(leg.default_soft, 0.3);
+            let hock = leg.hock.as_ref().unwrap();
+            assert_eq!(hock.default_spring, 0.75);
+            let bendy = leg.bendy.as_ref().expect("bendy hind leg");
+            assert_eq!(bendy.upper.bone, format!("thigh{s}"));
+            assert_eq!(bendy.lower.bone, format!("calf{s}"));
+            assert_eq!(bendy.pin, format!("calf{s}_pin_ctrl"));
+            for seg in [&bendy.upper, &bendy.lower] {
+                assert_eq!(seg.joints.len(), BEND_JOINTS);
+                let bone = sk.bone(&seg.bone).unwrap();
+                assert!(
+                    !bone.deform,
+                    "{} hands its skin to its bend joints",
+                    seg.bone
+                );
+                // The bend joints run end to end along their segment.
+                let first = sk.bone(&seg.joints[0]).unwrap();
+                let last = sk.bone(seg.joints.last().unwrap()).unwrap();
+                assert!(first.head.distance(bone.head) < 1e-5);
+                assert!(last.tail.distance(bone.tail) < 1e-5);
+                assert!(seg.joints.iter().all(|j| sk.bone(j).unwrap().deform));
+            }
+            // The lower curve ends at the hock joint, where the calf ends.
+            assert!(
+                sk.bone(&format!("calf{s}"))
+                    .unwrap()
+                    .tail
+                    .distance(sk.bone(&hock.bone).unwrap().head)
+                    < 1e-5
+            );
+            // The hock keeps one deforming bone and its FK control.
+            assert!(sk.bone(&hock.bone).unwrap().deform);
+            assert!(built.controls.control(&hock.fk_control).is_some());
+            assert!(built.controls.control(&bendy.upper.control).is_some());
+        }
+        // The front legs (arms) are bendy too; the guides round-trip the options.
+        assert!(built.controls.ik_chains.iter().all(|c| c.bendy.is_some()));
+        let text = serde_json::to_string(&g).unwrap();
+        let back: Guides = serde_json::from_str(&text).unwrap();
+        let hind = back.component("hind_leg_l").unwrap();
+        assert!(hind.options.bendy && hind.options.soft == 0.3 && hind.options.spring == 0.75);
+        // Unset, the spring isn't written and reads back as 0.
+        let plain = serde_json::to_string(&quadruped(0.8)).unwrap();
+        assert!(!plain.contains("spring"));
+    }
+
+    /// The horse's hind legs start with a full spring hock; the dog's, bird's
+    /// and dinosaur's with none.
+    #[test]
+    fn horse_hocks_spring_and_dinosaur_stands_on_quad_legs() {
+        let spring = |g: &Guides| -> Vec<f32> {
+            build(g)
+                .unwrap()
+                .controls
+                .ik_chains
+                .iter()
+                .filter_map(|c| c.hock.as_ref().map(|h| h.default_spring))
+                .collect()
+        };
+        assert_eq!(spring(&horse(1.8)), [1.0, 1.0]);
+        assert_eq!(spring(&quadruped(0.8)), [0.0, 0.0]);
+        assert_eq!(spring(&bird(0.5)), [0.0, 0.0]);
+        let dino = dinosaur(1.6);
+        assert_eq!(spring(&dino), [0.0, 0.0]);
+        let built = build(&dino).unwrap();
+        // Short arms start in FK (they hang above the belly); the legs in IK.
+        for c in &built.controls.ik_chains {
+            let want = if c.name.starts_with("arm") { 0.0 } else { 1.0 };
+            assert_eq!(c.default_blend, want, "{}", c.name);
+        }
+        assert_eq!(built.controls.splines.len(), 1, "the spline tail");
+        assert_eq!(built.controls.splines[0].bones.len(), DINOSAUR_TAIL_JOINTS);
+        // The horse's front legs are planted and its layout reads as four-legged.
+        let horse = build(&horse(1.8)).unwrap();
+        let front = horse
+            .controls
+            .ik_chains
+            .iter()
+            .find(|c| c.name == "arm_l")
+            .unwrap();
+        assert_eq!(front.default_blend, 1.0);
+        assert_eq!(crate::orient::layout_name(&super::horse(1.8)), "dog");
+        assert_eq!(crate::orient::layout_name(&dino), "creature");
     }
 
     /// Bones and controls as comparable values.

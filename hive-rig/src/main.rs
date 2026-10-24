@@ -62,16 +62,22 @@ enum Command {
         quadruped: bool,
         /// Rig a built-in creature instead, written as `hive_<creature>`: a dog
         /// (four legs with three-segment hind legs), a bird (wings, two legs
-        /// with hocks, tail), a spider (eight FK legs) or a snake (spline spine
-        /// and tail with a head).
+        /// with hocks, tail), a spider (eight FK legs), a snake (spline spine
+        /// and tail with a head), a horse (long legs, spring hocks) or a
+        /// dinosaur (a theropod: three-segment legs, short arms, spline tail).
         #[arg(long, value_enum)]
         creature: Option<demo::Creature>,
-        /// Make the arms and legs bendy (bend controls and an elbow/knee pin).
-        #[arg(long, conflicts_with_all = ["quadruped", "creature"])]
+        /// Make the arms and legs (and quad legs) bendy: bend controls and an
+        /// elbow or knee pin.
+        #[arg(long)]
         bendy: bool,
-        /// Default soft IK (0 to 1) on the arms and legs.
-        #[arg(long, default_value_t = 0.0, conflicts_with_all = ["quadruped", "creature"])]
+        /// Default soft IK (0 to 1) on the arms and legs (and quad legs).
+        #[arg(long, default_value_t = 0.0)]
         soft: f32,
+        /// Default hock spring (0 to 1) on the quad legs: at 1 the hock swings
+        /// with the thigh as the paw moves. The horse starts at 1, the others at 0.
+        #[arg(long)]
+        spring: Option<f32>,
         #[command(flatten)]
         common: Common,
     },
@@ -1269,14 +1275,24 @@ fn main() -> Result<()> {
             out,
             quadruped,
             creature,
+            bendy,
+            soft,
+            spring,
             common,
             ..
         } if quadruped || creature.is_some() => {
             let c = creature.unwrap_or(demo::Creature::Dog);
+            let mut guides = c.guides();
+            components::set_limb_options(&mut guides, bendy, soft);
+            if let Some(spring) = spring
+                && components::set_hock_spring(&mut guides, spring) == 0
+            {
+                anyhow::bail!("the {} has no quad legs for --spring", c.name());
+            }
             run(
                 c.mesh(),
                 &c.rig_name(),
-                c.guides(),
+                guides,
                 &out,
                 &common,
                 Orientation::STANDARD,
@@ -1287,9 +1303,14 @@ fn main() -> Result<()> {
             arm_drop,
             bendy,
             soft,
+            spring,
             common,
             ..
         } => {
+            anyhow::ensure!(
+                spring.is_none(),
+                "the humanoid demo has no quad legs for --spring (try --creature horse)"
+            );
             let mesh = demo::humanoid(arm_drop);
             let mut guides = detect(&mesh);
             components::set_limb_options(&mut guides, bendy, soft);

@@ -485,15 +485,41 @@ def build(RIG, geos=None):
         edit[hock["bone"]].inherit_scale = "NONE"
         hock_target[chain["name"]] = mch("MCH_%s_hock" % chain["name"], like=hock["bone"], parent=hock["control"])
 
-    # Soft IK (two-bone limbs): the IK aims at a helper on the line from the
-    # shoulder or hip to the goal, pulled in as the goal nears full reach.
-    soft_rig = {}
+    # Spring hocks (hive-rig's spring_hock): a helper two-bone chain from the hip
+    # to the ankle whose upper bone is the thigh plus the hock and whose lower
+    # bone is the calf. Solved to the foot goal with the limb's pole, its upper
+    # bone turns the way the thigh and hock turn together. The hock control
+    # hangs under a helper on the goal that takes that turn, blended by `spring`,
+    # so at 1 the hock swings with the thigh and the control turns it further.
+    spring_rig = {}
     for chain in CHAINS:
-        if chain.get("hock"):
+        hock = chain.get("hock")
+        if not hock:
             continue
         n = chain["name"]
-        parent = edit[chain["upper"]].parent
         goal = foot_ik_target.get(n, chain["ik_control"])
+        knee, top, ankle = edit[chain["lower"]].head, edit[hock["bone"]].head, edit[hock["bone"]].tail
+        mid = knee + (ankle - top)
+        parent = edit[chain["upper"]].parent
+        upper = mch("MCH_%s_spring_upper" % n, head=edit[chain["upper"]].head.copy(),
+                    parent=parent.name if parent else None)
+        edit[upper].tail = mid
+        lower = mch("MCH_%s_spring_lower" % n, head=mid.copy(), parent=upper)
+        edit[lower].tail = ankle.copy()
+        edit[lower].use_connect = True
+        carry = mch("MCH_%s_spring_hock" % n, like=hock["control"], parent=upper)
+        follow = mch("MCH_%s_spring" % n, like=hock["control"], parent=goal)
+        edit[hock["control"]].parent = edit[follow]
+        spring_rig[n] = {"upper": upper, "lower": lower, "carry": carry, "follow": follow, "goal": goal}
+
+    # Soft IK: the IK aims at a helper on the line from the shoulder or hip to
+    # the goal (the hock point on a three-segment leg), pulled in as the goal
+    # nears full reach.
+    soft_rig = {}
+    for chain in CHAINS:
+        n = chain["name"]
+        parent = edit[chain["upper"]].parent
+        goal = hock_target.get(n) or foot_ik_target.get(n, chain["ik_control"])
         soft_rig[n] = {
             "root": mch("MCH_%s_soft_root" % n, like=chain["upper"], parent=parent.name if parent else None),
             "target": mch("MCH_%s_soft" % n, like=goal),
@@ -593,6 +619,10 @@ def build(RIG, geos=None):
         c["name"]: pole_angle(edit[c["upper"]], edit[c["lower"]], edit[c["pole_control"]].head)
         for c in CHAINS
     }
+    for c in CHAINS:
+        if c["name"] in spring_rig:
+            s = spring_rig[c["name"]]
+            s["pole_angle"] = pole_angle(edit[s["upper"]], edit[s["lower"]], edit[c["pole_control"]].head)
 
     bpy.ops.object.mode_set(mode="POSE")
 
@@ -762,6 +792,24 @@ def build(RIG, geos=None):
             seg.target = rig
             seg.subtarget = hock_target[chain["name"]]
             add_blend_driver(seg, chain["ik_control"])
+
+        spring = spring_rig.get(chain["name"])
+        if spring:
+            add_property(ik_pb, "spring", float(hock.get("default_spring", 0.0)), 0.0, 1.0,
+                         "1 = the hock swings with the thigh as the paw moves, 0 = it keeps the hock control's angle")
+            solve = pose[spring["lower"]].constraints.new("IK")
+            solve.name = "Spring IK"
+            solve.target, solve.subtarget = rig, spring["goal"]
+            solve.pole_target, solve.pole_subtarget = rig, chain["pole_control"]
+            solve.pole_angle = spring["pole_angle"]
+            solve.chain_count = 2
+            solve.use_stretch = True
+            for bone in (spring["upper"], spring["lower"]):
+                add_driver(pose[bone], "ik_stretch", chain["ik_control"], "stretch", "stretch * 0.1")
+            turn = pose[spring["follow"]].constraints.new("COPY_ROTATION")
+            turn.name = "Spring"
+            turn.target, turn.subtarget = rig, spring["carry"]
+            add_driver(turn, "influence", chain["ik_control"], "spring", "spring")
 
         rot = pose[chain["end"]].constraints.new("COPY_ROTATION")
         rot.name = "IK Rotation"
@@ -970,7 +1018,7 @@ def build(RIG, geos=None):
 # IK/FK matching, pose mirroring, reset and space switching. Which controls make
 # up each limb and which controls are left/right twins come from hive-rig (the
 # rig's ik_chains and mirror_pairs), kept on the armature as `hive_anim`.
-ANIM_PROPS = ("ik_fk", "stretch", "soft", "roll", "space", "volume")
+ANIM_PROPS = ("ik_fk", "stretch", "soft", "roll", "space", "volume", "spring")
 
 
 def animator_data(RIG, goals, hock_targets, soft_rig):
@@ -998,6 +1046,8 @@ def animator_data(RIG, goals, hock_targets, soft_rig):
         d.update(ik_fk=float(c["default_blend"]), stretch=float(c["default_stretch"]))
         if c["name"] in soft_rig:
             d["soft"] = float(c["default_soft"])
+        if hock:
+            d["spring"] = float(hock.get("default_spring", 0.0))
         if c.get("foot"):
             d["roll"] = 0.0
     for sp in controls.get("splines", []):
@@ -1115,12 +1165,13 @@ def fk_to_ik(rig, name, force_key=False):
     offset = ik.matrix.inverted() @ goal.matrix
     ik.matrix = fk[-1] @ offset.inverted()
     refresh(rig)
+    # The two-bone IK reaches the third FK joint: the end, or the hock joint.
+    a, b, c = fk[0].translation, fk[1].translation, fk[2].translation
     soft = limb.get("soft")
     if soft and ik.get("soft", 0.0) > 0.0:
         # Soft IK falls short near full reach: push the control out until the eased
-        # reach lands on the FK end.
-        root = pose[soft["root"]].head
-        have = goal.head - root
+        # reach lands on the FK joint.
+        have = c - pose[soft["root"]].head
         want = unsoft_reach(have.length, soft["length"], ik["soft"], soft["zone"])
         if want > have.length:
             m = ik.matrix.copy()
@@ -1128,39 +1179,42 @@ def fk_to_ik(rig, name, force_key=False):
             ik.matrix = m
             refresh(rig)
     hock = limb.get("hock")
-    if hock:
-        # Turn the hock control (it pivots on the ankle) until its copy of the hock
-        # bone lines up with the FK hock; the IK then reaches the FK hock joint.
-        ctrl, target = pose[hock["control"]], pose[hock["target"]]
-        carry = ctrl.matrix.inverted() @ target.matrix
-        ctrl.matrix = fk[2] @ carry.inverted()
-        ctrl.location = (0.0, 0.0, 0.0)
-        refresh(rig)
     pole = pose[limb["pole"]]
-    a, b, c = fk[0].translation, fk[1].translation, fk[2].translation
-    m = pole.matrix.copy()
-    m.translation = pole_position(rig, limb, a, b, c, fk[0])
-    pole.matrix = m
-    ik["ik_fk"] = 1.0
-    refresh(rig)
-    # How the solver turns the limb's plane toward the pole is its own business;
-    # turn the pole about the reach until the middle joint lands on the FK one.
-    along = (c - a).normalized()
-    for _ in range(8):
-        want = b - a - along * (b - a).dot(along)
-        got = pose[limb["lower"]].head - a
-        got -= along * got.dot(along)
-        if want.length < 1e-6 or got.length < 1e-6:
-            break
-        angle = got.angle(want)
-        if angle < 1e-5:
-            break
-        if got.cross(want).dot(along) < 0:
-            angle = -angle
+    # A spring hock turns with the solve the pole aims, so the hock and the pole
+    # are matched in turn until both settle.
+    rounds = 6 if hock and ik.get("spring", 0.0) > 0.0 else 1
+    for _ in range(rounds):
+        if hock:
+            # Turn the hock control (it pivots on the ankle) until its copy of the hock
+            # bone lines up with the FK hock; the IK then reaches the FK hock joint.
+            ctrl, target = pose[hock["control"]], pose[hock["target"]]
+            carry = ctrl.matrix.inverted() @ target.matrix
+            ctrl.matrix = fk[2] @ carry.inverted()
+            ctrl.location = (0.0, 0.0, 0.0)
+            refresh(rig)
         m = pole.matrix.copy()
-        m.translation = a + Matrix.Rotation(angle, 3, along) @ (m.translation - a)
+        m.translation = pole_position(rig, limb, a, b, c, fk[0])
         pole.matrix = m
+        ik["ik_fk"] = 1.0
         refresh(rig)
+        # How the solver turns the limb's plane toward the pole is its own business;
+        # turn the pole about the reach until the middle joint lands on the FK one.
+        along = (c - a).normalized()
+        for _ in range(8):
+            want = b - a - along * (b - a).dot(along)
+            got = pose[limb["lower"]].head - a
+            got -= along * got.dot(along)
+            if want.length < 1e-6 or got.length < 1e-6:
+                break
+            angle = got.angle(want)
+            if angle < 1e-5:
+                break
+            if got.cross(want).dot(along) < 0:
+                angle = -angle
+            m = pole.matrix.copy()
+            m.translation = a + Matrix.Rotation(angle, 3, along) @ (m.translation - a)
+            pole.matrix = m
+            refresh(rig)
     key_controls(rig, [limb["ik"], limb["pole"]] + ([hock["control"]] if hock else []), force_key)
 
 

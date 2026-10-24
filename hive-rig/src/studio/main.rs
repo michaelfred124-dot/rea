@@ -1,7 +1,7 @@
 //! Hive Rig: the desktop rigging app. Double-click it, open a character, adjust
 //! the guides, build and export.
 //!
-//! `HiveRig [character, rig or guides file] [--demo [dog|bird|spider|snake]] [--build] [--weights BONE] [--paint] [--dab add|subtract|replace|scale|smooth|mend]
+//! `HiveRig [character, rig or guides file] [--demo [dog|bird|spider|snake|horse|dinosaur]] [--build] [--weights BONE] [--paint] [--dab add|subtract|replace|scale|smooth|mend]
 //! [--lock BONE] [--bend DEGREES] [--bend-axis x|y|z] [--tools] [--vertices] [--hover] [--library] [--templates] [--export]
 //! [--select COMPONENT[,COMPONENT...]] [--pick NAME] [--pose BONE[=DEGREES[@x|y|z]]] [--shape NAME=WEIGHT]...
 //! [--screenshot OUT.ppm]`
@@ -24,7 +24,7 @@ use eframe::egui;
 struct Launch {
     file: Option<PathBuf>,
     demo: bool,
-    /// `--demo dog|bird|spider|snake`: open that creature as the demo.
+    /// `--demo dog|bird|spider|snake|horse|dinosaur`: open that creature as the demo.
     creature: Option<hive_rig::demo::Creature>,
     build: bool,
     weights: Option<String>,

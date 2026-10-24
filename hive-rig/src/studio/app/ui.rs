@@ -1864,9 +1864,7 @@ impl Studio {
                         });
                     }
                 });
-                if comp.kind != Kind::QuadLeg {
-                    self.limb_options(ui, &comp);
-                }
+                self.limb_options(ui, &comp);
             }
             _ => {}
         }
@@ -1950,13 +1948,16 @@ impl Studio {
     }
 
     /// Record an undo step for a guide move unless one is already in progress.
-    /// Arm and leg options: bendy segments and the IK's soft reach.
+    /// Arm and leg options: bendy segments and the IK's soft reach, and a quad
+    /// leg's hock spring.
     fn limb_options(&mut self, ui: &mut Ui, comp: &components::Component) {
         let id = comp.id.clone();
         let mut bendy = comp.options.bendy;
         let mut soft = comp.options.soft;
+        let mut spring = comp.options.spring;
         let mut toggled = false;
         let mut softened = false;
+        let mut sprung = false;
         ui.horizontal(|ui| {
             toggled = theme::pill(ui, &mut bendy, "Bendy")
                 .on_hover_text("Bend controls arc each segment, and a pin moves the elbow or knee")
@@ -1974,6 +1975,22 @@ impl Studio {
                 )
                 .changed();
         });
+        if comp.kind == Kind::QuadLeg {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Hock spring").color(TEXT_DIM));
+                sprung = ui
+                    .add(
+                        egui::DragValue::new(&mut spring)
+                            .range(0.0..=1.0)
+                            .speed(0.01)
+                            .max_decimals(2),
+                    )
+                    .on_hover_text(
+                        "1 = the hock swings with the thigh as the paw moves; 0 = it keeps the hock control's angle",
+                    )
+                    .changed();
+            });
+        }
         if toggled {
             self.edit("change bendy", |g| {
                 component_mut(g, &id).options.bendy = bendy;
@@ -1987,6 +2004,12 @@ impl Studio {
             self.edit("change soft IK", |g| {
                 component_mut(g, &id).options.soft = soft;
                 Ok(format!("Soft IK on {id} is now {soft:.2}."))
+            });
+        }
+        if sprung {
+            self.edit("change hock spring", |g| {
+                component_mut(g, &id).options.spring = spring;
+                Ok(format!("Hock spring on {id} is now {spring:.2}."))
             });
         }
     }

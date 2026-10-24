@@ -203,9 +203,14 @@ pub const BIRD_HEIGHT: f32 = 0.5;
 pub const SPIDER_HEIGHT: f32 = 0.4;
 /// Size unit of the demo snake, which is about four of them long.
 pub const SNAKE_HEIGHT: f32 = 0.5;
+/// Height of the demo horse, floor to the top of its raised head.
+pub const HORSE_HEIGHT: f32 = 1.8;
+/// Height of the demo dinosaur, floor to the top of its head.
+pub const DINOSAUR_HEIGHT: f32 = 1.6;
 
-/// The built-in creatures: a layout (`components::quadruped`, `bird`, `spider`
-/// or `snake`) and a procedural demo body built around its guides.
+/// The built-in creatures: a layout (`components::quadruped`, `bird`, `spider`,
+/// `snake`, `horse` or `dinosaur`) and a procedural demo body built around its
+/// guides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Creature {
     /// Spine, neck and head, tail, two front legs and two three-segment hind legs.
@@ -216,14 +221,22 @@ pub enum Creature {
     Spider,
     /// A spline spine with a raised head and a spline tail.
     Snake,
+    /// Long legs: front legs and three-segment hind legs with spring hocks, a
+    /// long neck, head and tail.
+    Horse,
+    /// A biped theropod: three-segment legs, short arms, a neck, a big head and
+    /// a long spline tail.
+    Dinosaur,
 }
 
 impl Creature {
-    pub const ALL: [Creature; 4] = [
+    pub const ALL: [Creature; 6] = [
         Creature::Dog,
         Creature::Bird,
         Creature::Spider,
         Creature::Snake,
+        Creature::Horse,
+        Creature::Dinosaur,
     ];
 
     pub fn name(self) -> &'static str {
@@ -232,6 +245,8 @@ impl Creature {
             Creature::Bird => "bird",
             Creature::Spider => "spider",
             Creature::Snake => "snake",
+            Creature::Horse => "horse",
+            Creature::Dinosaur => "dinosaur",
         }
     }
 
@@ -248,6 +263,12 @@ impl Creature {
             }
             Creature::Spider => "Eight four-bone FK legs, a head and an abdomen.",
             Creature::Snake => "A spline spine and spline tail with a raised neck and head.",
+            Creature::Horse => {
+                "Long front legs and three-segment hind legs with spring hocks, a neck, head and tail."
+            }
+            Creature::Dinosaur => {
+                "Two three-segment legs, short arms, a neck, a big head and a long spline tail."
+            }
         }
     }
 
@@ -259,6 +280,8 @@ impl Creature {
             Creature::Bird => BIRD_HEIGHT,
             Creature::Spider => SPIDER_HEIGHT,
             Creature::Snake => SNAKE_HEIGHT,
+            Creature::Horse => HORSE_HEIGHT,
+            Creature::Dinosaur => DINOSAUR_HEIGHT,
         }
     }
 
@@ -270,6 +293,8 @@ impl Creature {
             Creature::Bird => crate::components::bird(h),
             Creature::Spider => crate::components::spider(h),
             Creature::Snake => crate::components::snake(h),
+            Creature::Horse => crate::components::horse(h),
+            Creature::Dinosaur => crate::components::dinosaur(h),
         }
     }
 
@@ -280,6 +305,8 @@ impl Creature {
             Creature::Bird => demo_bird(),
             Creature::Spider => demo_spider(),
             Creature::Snake => demo_snake(),
+            Creature::Horse => demo_horse(),
+            Creature::Dinosaur => demo_dinosaur(),
         }
     }
 
@@ -452,6 +479,135 @@ pub fn demo_snake() -> Mesh {
         Vec3::new(0.09, 0.055, 0.14) * h,
     ));
     m.append(&cylinder(head, snout, (0.05 * h, 0.035 * h), 12, step));
+    m
+}
+
+/// A procedural horse standing square, facing +Z, built around
+/// `components::horse(HORSE_HEIGHT)`: a deep barrel, a
+/// long neck and head with the muzzle, a hanging tail and four long legs
+/// tapering to the hooves.
+pub fn demo_horse() -> Mesh {
+    let h = HORSE_HEIGHT;
+    let g = crate::components::horse(h);
+    let mut m = Mesh::default();
+    let step = 0.03;
+    let [pelvis, chest] = points(&g, "spine", &[]).try_into().unwrap();
+    m.append(&cylinder(
+        pelvis - Vec3::Z * 0.14 * h,
+        chest + Vec3::Z * 0.12 * h,
+        (0.13 * h, 0.15 * h),
+        24,
+        step,
+    ));
+    let [neck, head, muzzle] = points(&g, "head", &[]).try_into().unwrap();
+    tube(
+        &mut m,
+        &[chest, neck, head],
+        &[0.1 * h, 0.07 * h, 0.055 * h],
+        step,
+    );
+    m.append(&cylinder(head, muzzle, (0.045 * h, 0.06 * h), 14, step));
+    m.append(&sphere(muzzle, 0.045 * h, 12, 8));
+    let tail = points(&g, "tail", &[]);
+    let n = tail.len();
+    let radii: Vec<f32> = (0..n)
+        .map(|i| (0.035 - 0.02 * i as f32 / (n - 1) as f32) * h)
+        .collect();
+    tube(&mut m, &tail, &radii, step);
+    for s in ["_l", "_r"] {
+        tube(
+            &mut m,
+            &points(
+                &g,
+                &format!("front_leg{s}"),
+                &["clavicle", "shoulder", "elbow", "wrist", "hand_tip"],
+            ),
+            &[0.05 * h, 0.055 * h, 0.04 * h, 0.022 * h, 0.02 * h],
+            step,
+        );
+        let leg = format!("hind_leg{s}");
+        tube(
+            &mut m,
+            &points(&g, &leg, &["hip", "knee", "hock", "ankle", "ball", "toe"]),
+            &[
+                0.07 * h,
+                0.055 * h,
+                0.03 * h,
+                0.022 * h,
+                0.022 * h,
+                0.018 * h,
+            ],
+            step,
+        );
+        let [ankle, heel] = points(&g, &leg, &["ankle", "heel"]).try_into().unwrap();
+        m.append(&cylinder(ankle, heel, (0.015 * h, 0.015 * h), 8, step));
+    }
+    m
+}
+
+/// A procedural theropod standing on two legs, facing +Z, built around
+/// `components::dinosaur(DINOSAUR_HEIGHT)`: a deep body over the hips, a curved
+/// neck, a big head with a snout, two short arms, strong legs on their toes and
+/// a long tail tapering to its tip.
+pub fn demo_dinosaur() -> Mesh {
+    let h = DINOSAUR_HEIGHT;
+    let g = crate::components::dinosaur(h);
+    let mut m = Mesh::default();
+    let step = 0.025;
+    let [pelvis, chest] = points(&g, "spine", &[]).try_into().unwrap();
+    m.append(&cylinder(
+        pelvis - Vec3::Z * 0.12 * h,
+        chest + Vec3::Z * 0.08 * h,
+        (0.14 * h, 0.15 * h),
+        24,
+        step,
+    ));
+    let [neck, head, snout] = points(&g, "head", &[]).try_into().unwrap();
+    tube(
+        &mut m,
+        &[chest, neck, head],
+        &[0.1 * h, 0.075 * h, 0.07 * h],
+        step,
+    );
+    m.append(&ellipsoid(
+        head.lerp(snout, 0.4),
+        Vec3::new(0.08, 0.09, 0.17) * h,
+    ));
+    m.append(&cylinder(head, snout, (0.05 * h, 0.05 * h), 14, step));
+    let tail = points(&g, "tail", &[]);
+    let n = tail.len();
+    let radii: Vec<f32> = (0..n)
+        .map(|i| (0.12 - 0.105 * i as f32 / (n - 1) as f32) * h)
+        .collect();
+    tube(&mut m, &tail, &radii, step);
+    for s in ["_l", "_r"] {
+        tube(
+            &mut m,
+            &points(
+                &g,
+                &format!("arm{s}"),
+                &["clavicle", "shoulder", "elbow", "wrist", "hand_tip"],
+            ),
+            &[0.03 * h, 0.03 * h, 0.022 * h, 0.018 * h, 0.012 * h],
+            step,
+        );
+        let leg = format!("leg{s}");
+        tube(
+            &mut m,
+            &points(&g, &leg, &["hip", "knee", "hock", "ankle", "ball", "toe"]),
+            &[
+                0.08 * h,
+                0.06 * h,
+                0.035 * h,
+                0.028 * h,
+                0.02 * h,
+                0.012 * h,
+            ],
+            step,
+        );
+        let [ankle, heel] = points(&g, &leg, &["ankle", "heel"]).try_into().unwrap();
+        m.append(&cylinder(ankle, heel, (0.015 * h, 0.015 * h), 8, step));
+    }
     m
 }
 

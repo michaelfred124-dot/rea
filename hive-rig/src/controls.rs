@@ -463,6 +463,67 @@ pub struct HockSegment {
     /// parent in the data is the IK control; builders hang it under the
     /// reverse-foot goal so it follows the foot roll.
     pub control: String,
+    /// Initial value of the `spring` attribute on the IK control (0 to 1). At 0
+    /// the hock keeps the angle the hock control gives it as the paw moves; at 1
+    /// it swings with the thigh (a spring hock, see [`spring_hock`]), so moving
+    /// the paw alone folds the whole leg. The hock control turns it further.
+    #[serde(default)]
+    pub default_spring: f32,
+}
+
+/// The pose a spring hock gives a three-segment leg: the motion every builder
+/// implements at `spring` = 1.
+///
+/// The thigh and the hock turn together, by one rotation `Q`, so the angle
+/// between them stays as it is at rest (the way a horse's stifle and hock flex
+/// together). Then `hip + Q(thigh) + calf + Q(hock) = ankle`: the leg folds like
+/// a two-bone chain from the hip to the ankle whose upper bone is the thigh plus
+/// the hock (from the hip to `knee + ankle - hock` at rest) and whose lower bone
+/// is the calf. The builders solve that chain with the limb's pole, give the hock
+/// the upper bone's turn, and the leg's own two-bone IK then reaches the hock
+/// joint exactly, with no loop between the two solves.
+///
+/// `rest` is the hip, knee, hock and ankle at rest and `rest_pole` the pole
+/// control there; `hip`, `goal` and `pole` are posed. The middle joint keeps its
+/// rest angle about the reach line from the plane through the pole, as the IK
+/// solvers do. Returns the posed hip, knee, hock and ankle (the ankle stops
+/// short of a goal out of reach), or `None` for a degenerate leg.
+pub fn spring_hock(
+    rest: [Vec3; 4],
+    rest_pole: Vec3,
+    hip: Vec3,
+    goal: Vec3,
+    pole: Vec3,
+) -> Option<[Vec3; 4]> {
+    let [hip0, knee0, hock0, ankle0] = rest;
+    let thigh = knee0 - hip0;
+    let shin = ankle0 - hock0;
+    let mid0 = thigh + shin;
+    let (upper, lower) = (mid0.length(), (ankle0 - hip0 - mid0).length());
+    // The reach line and the plane through the pole: (along, toward the pole, normal).
+    let frame = |root: Vec3, end: Vec3, pole: Vec3| -> Option<[Vec3; 3]> {
+        let along = (end - root).try_normalize()?;
+        let normal = along.cross(pole - root).try_normalize()?;
+        Some([along, normal.cross(along), normal])
+    };
+    let [_, b0, n0] = frame(hip0, ankle0, rest_pole)?;
+    let angle = mid0.dot(n0).atan2(mid0.dot(b0));
+    let [a, b, n] = frame(hip, goal, pole)?;
+    let reach = (goal - hip)
+        .length()
+        .clamp((upper - lower).abs() + 1e-6, upper + lower);
+    let x = (reach * reach + upper * upper - lower * lower) / (2.0 * reach);
+    let r = (upper * upper - x * x).max(0.0).sqrt();
+    let mid = a * x + (b * angle.cos() + n * angle.sin()) * r;
+    // Q turns the upper bone's frame (its direction and its side) from rest to now.
+    let basis = |u: Vec3, side: Vec3| -> Option<glam::Mat3> {
+        let u = u.try_normalize()?;
+        let v = (side - u * u.dot(side)).try_normalize()?;
+        Some(glam::Mat3::from_cols(u, v, u.cross(v)))
+    };
+    let q = basis(mid, n)? * basis(mid0, n0)?.transpose();
+    let ankle = hip + a * reach;
+    Some([hip, hip + q * thigh, ankle - q * shin, ankle])
 }
 
 impl IkChain {
@@ -586,6 +647,46 @@ pub fn fk_name(bone: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The spring hock keeps every segment's length and the thigh-to-hock angle,
+    /// lands the ankle on a goal in reach and rests where the leg rests.
+    #[test]
+    fn spring_hock_folds_thigh_and_hock_together() {
+        let g = crate::components::quadruped(0.8);
+        let leg = g.component("hind_leg_l").unwrap();
+        let p = |n: &str| leg.position(n).unwrap();
+        let rest = [p("hip"), p("knee"), p("hock"), p("ankle")];
+        let pole = p("knee") + Vec3::Z * 0.3;
+        let lengths = |q: &[Vec3; 4]| [0, 1, 2].map(|i| q[i].distance(q[i + 1]));
+        let angle = |q: &[Vec3; 4]| (q[1] - q[0]).angle_between(q[3] - q[2]);
+        let at_rest = spring_hock(rest, pole, rest[0], rest[3], pole).unwrap();
+        for (a, b) in at_rest.iter().zip(&rest) {
+            assert!(a.distance(*b) < 1e-5, "{a} {b}");
+        }
+        for lift in [
+            Vec3::new(0.0, 0.1, 0.0),
+            Vec3::new(0.0, 0.15, 0.1),
+            Vec3::new(0.02, 0.05, -0.08),
+        ] {
+            let goal = rest[3] + lift;
+            let q = spring_hock(rest, pole, rest[0], goal, pole + lift * 0.5).unwrap();
+            assert!(q[3].distance(goal) < 1e-5, "the ankle reaches {goal}");
+            for (got, want) in lengths(&q).iter().zip(lengths(&rest)) {
+                assert!((got - want).abs() < 1e-5, "{got} vs {want}");
+            }
+            assert!((angle(&q) - angle(&rest)).abs() < 1e-4);
+            // Lifting the paw straight up folds the knee forward, toward the pole.
+            if lift.z >= 0.0 {
+                assert!(q[1].z > rest[1].z + 0.01, "{}", q[1]);
+            }
+        }
+        // Out of reach the leg straightens toward the goal and stops short,
+        // still keeping the thigh-to-hock angle.
+        let far = rest[3] + (rest[3] - rest[0]) * 2.0;
+        let q = spring_hock(rest, pole, rest[0], far, pole).unwrap();
+        assert!(q[3].distance(rest[0]) < far.distance(rest[0]));
+        assert!((angle(&q) - angle(&rest)).abs() < 1e-4);
+    }
 
     fn control(shape: Shape, axis: Vec3) -> Control {
         Control {
