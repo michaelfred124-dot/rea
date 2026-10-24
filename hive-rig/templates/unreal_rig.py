@@ -21,8 +21,10 @@ The mesh's pieces, materials, textures and blendshapes (as morph targets) come
 in with the .glb import. Each corrective shape gets a curve of its name, set by
 a pose reader in the Control Rig (the driving bone's turn about the reader's
 axis, mapped from start to end degrees onto 0..1); the curve drives the morph
-target when the Control Rig runs in the mesh's Anim Blueprint. Shapes without
-a driver are left at zero here (a weight set in hive-rig is not applied).
+target when the Control Rig runs in the mesh's Anim Blueprint. A shape without
+a driver gets a float control `<shape>_shape` (at its hive-rig weight) setting
+its curve instead. In-betweens come in as morph targets of their own
+(`<shape>_ib50`); the shape's curves blend through them in order.
 
 The script also adds a "Hive Poses" menu: flip the pose into its mirror image
 and a pose library (save, apply, apply mirrored), on the Level Sequence that
@@ -902,7 +904,6 @@ def build():
         p_ue, q_ue = to_ue_dir(p), to_ue_dir(q)
         n_ue = p_ue ^ q_ue
         n_ue = n_ue.normal() if hasattr(n_ue, "normal") else n_ue
-        hc.add_curve(name, float(shape.get("weight", 0.0)))
         swung = math("QuaternionRotateVector", "Reader_%s_swing" % name, {"Vector": vector_text(p_ue)})
         vm.add_link(bone_turn(d["bone"]), swung + ".Transform")
         off_plane = math("VectorDot", "Reader_%s_off" % name, {"B": vector_text(n_ue)})
@@ -925,14 +926,60 @@ def build():
             "SourceMinimum": str(_math.radians(d["start"])), "SourceMaximum": str(_math.radians(d["end"])),
             "TargetMinimum": "0.0", "TargetMaximum": "1.0", "bClamp": "True"})
         vm.add_link(signed + ".Result", remap + ".Value")
-        set_curve = unit("RigUnit_SetCurveValue", "Curve_" + name, {"Curve": name})
-        vm.add_link(remap + ".Result", set_curve + ".Value")
-        chain_exec(set_curve)
+        return remap + ".Result"
 
 
+    def inbetween_name(name, weight):
+        """An in-between's morph target, as hive-rig names it: `<shape>_ib<percent>`."""
+        return "%s_ib%d" % (name, int(round(weight * 100.0)))
+
+
+    def set_shape_curves(shape, weight_pin):
+        """A curve per morph target of the shape, set from its weight. A shape with
+        in-betweens has a morph target per target (`<shape>_ib50`, then
+        `<shape>`); each curve rises from the target before (or rest) to 1 at its
+        own weight and falls to the next, so the mesh blends through them in order."""
+        name = shape["name"]
+        points = [b for b in shape.get("inbetweens", [])] + [1.0]
+        targets = [inbetween_name(name, w) for w in points[:-1]] + [name]
+        start_weight = float(shape.get("weight", 0.0))
+        for k, target in enumerate(targets):
+            hc.add_curve(target, 0.0 if len(targets) > 1 else start_weight)
+            value = weight_pin
+            if len(targets) > 1:
+                lo = points[k - 1] if k > 0 else 0.0
+                rise = math("FloatRemap", "Blend_%s_rise" % target, {
+                    "SourceMinimum": str(lo), "SourceMaximum": str(points[k]),
+                    "TargetMinimum": "0.0", "TargetMaximum": "1.0", "bClamp": "True"})
+                vm.add_link(weight_pin, rise + ".Value")
+                value = rise + ".Result"
+                if k < len(targets) - 1:
+                    fall = math("FloatRemap", "Blend_%s_fall" % target, {
+                        "SourceMinimum": str(points[k]), "SourceMaximum": str(points[k + 1]),
+                        "TargetMinimum": "1.0", "TargetMaximum": "0.0", "bClamp": "True"})
+                    vm.add_link(weight_pin, fall + ".Value")
+                    both = math("FloatMin", "Blend_%s" % target, {})
+                    vm.add_link(rise + ".Result", both + ".A")
+                    vm.add_link(fall + ".Result", both + ".B")
+                    value = both + ".Result"
+            set_curve = unit("RigUnit_SetCurveValue", "Curve_" + target, {"Curve": target})
+            vm.add_link(value, set_curve + ".Value")
+            chain_exec(set_curve)
+
+
+    # Shapes nothing drives get a float control (`<shape>_shape`, at the weight
+    # hive-rig gave them) that sets their curves, so they can be keyed here too.
+    shape_owner = control_key(CONTROLS[0]["name"]) if CONTROLS else None
     for shape in BLEND_SHAPES:
         if shape.get("driver"):
-            build_reader(shape)
+            pin = build_reader(shape)
+        elif shape_owner is not None:
+            add_float(shape["name"] + "_shape", shape_owner, 0.0, 1.0, shape.get("weight", 0.0))
+            pin = get_float(shape["name"] + "_shape") + ".FloatValue"
+        else:
+            pin = None
+        if pin is not None:
+            set_shape_curves(shape, pin)
 
     unreal.ControlRigBlueprintLibrary.recompile_vm(blueprint)
     unreal.EditorAssetLibrary.save_loaded_asset(blueprint)

@@ -123,6 +123,27 @@ impl Projector {
 }
 
 /// Weight 0..1 as a blue-green-yellow-red ramp.
+/// A bone's own colour in the all-bones weights view: hues spread by the
+/// golden angle, so neighbouring bones (which come one after another in the
+/// skeleton) differ clearly.
+pub fn bone_color(index: usize) -> Color32 {
+    let h = (index as f32 * 0.618_034).fract() * 6.0;
+    let (s, v) = (0.62, 0.92);
+    let c = v * s;
+    let x = c * (1.0 - (h % 2.0 - 1.0).abs());
+    let (r, g, b) = match h as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = v - c;
+    let to = |t: f32| ((t + m) * 255.0).round() as u8;
+    Color32::from_rgb(to(r), to(g), to(b))
+}
+
 pub fn weight_color(w: f32) -> Color32 {
     const STOPS: [(f32, [f32; 3]); 5] = [
         (0.0, [0.10, 0.12, 0.35]),

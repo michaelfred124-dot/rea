@@ -355,8 +355,10 @@ if corrective:
     shape, control = corrective
     geo = next(o for o in built if o.data.shape_keys and shape in o.data.shape_keys.key_blocks)
     kb = geo.data.shape_keys.key_blocks[shape]
-    reader = next(s for s in json.loads(open(script).read().split('r"""', 1)[1].split('"""', 1)[0])["mesh"]["shapes"]
-                  if s["name"] == shape)["driver"]
+    hive_shape = next(s for s in json.loads(open(script).read().split('r"""', 1)[1].split('"""', 1)[0])["mesh"]["shapes"]
+                      if s["name"] == shape)
+    reader = hive_shape["driver"]
+    has_inbetweens = bool(hive_shape.get("inbetweens"))
     bone = reader["bone"]
     pb = rig.pose.bones[control]
     pb.rotation_mode = "XYZ"
@@ -407,7 +409,13 @@ if corrective:
         pb.rotation_euler = e
         half = evaluate()
         expected = (turned_by() - reader["start"]) / (reader["end"] - reader["start"])
-        if abs(half - expected) > 0.1:
+        if has_inbetweens:
+            # The in-betweens take the middle of the bend (blender_roundtrip_check.py
+            # checks them); the full shape is checked at the full bend.
+            ok("half bend: %s has in-betweens, which the round-trip check covers" % shape)
+            e[axis] = sign * math.radians(reader["end"])
+            pb.rotation_euler = e
+        elif abs(half - expected) > 0.1:
             fail("half bend: %s is %.3f, the bone turned for %.3f" % (shape, half, expected))
         else:
             ok("half bend: %s is %.3f (the bone's turn gives %.3f)" % (shape, half, expected))

@@ -81,7 +81,14 @@ fn reads_back_the_fbx_writer() {
 
 #[test]
 fn reads_back_objects_uvs_colours_materials_textures_and_shapes() {
-    let r = rig::auto_rig(demo::dressed_humanoid(), "dressed", Default::default()).unwrap();
+    let mut r = rig::auto_rig(demo::dressed_humanoid(), "dressed", Default::default()).unwrap();
+    // An in-between goes out as a channel of its own and folds back.
+    let name = r.mesh.shapes[0].name.clone();
+    crate::shapes::add_inbetween(&mut r, &name, 0.4).unwrap();
+    for o in &mut r.mesh.shapes[0].inbetweens[0].offsets {
+        *o *= 2.0;
+    }
+    r.mesh.shapes[0].weight = 0.2;
     let back = round_trip(&r);
     let m = &back.mesh;
     assert_eq!(m.objects.len(), 2);
@@ -91,6 +98,17 @@ fn reads_back_objects_uvs_colours_materials_textures_and_shapes() {
         assert!(a.distance(*b) < 1e-6);
     }
     assert_eq!(m.shapes.len(), 1);
+    let (got, want) = (&m.shapes[0], &r.mesh.shapes[0]);
+    assert_eq!(got.inbetweens.len(), 1);
+    assert!((got.inbetweens[0].weight - 0.4).abs() < 1e-4);
+    assert!((got.weight - 0.2).abs() < 1e-4, "{}", got.weight);
+    for (x, y) in got.inbetweens[0]
+        .offsets
+        .iter()
+        .zip(&want.inbetweens[0].offsets)
+    {
+        assert!(x.distance(*y) < 1e-6);
+    }
     let textured = m
         .materials
         .iter()

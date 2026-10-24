@@ -240,14 +240,20 @@ def build_shapes(RIG, geos):
             continue
         bs = cmds.blendShape(geo, name=geo.split("|")[-1] + "_shapes", frontOfChain=True)[0]
         for i, s in enumerate(mine):
-            points, comps = [], []
-            for v, d in zip(s["vertices"], s["offsets"]):
-                if start <= v < start + count:
-                    points.append((d[0] * SCALE, d[1] * SCALE, d[2] * SCALE, 1.0))
-                    comps.append("vtx[%d]" % (v - start))
-            item = "%s.inputTarget[0].inputTargetGroup[%d].inputTargetItem[6000]" % (bs, i)
-            cmds.setAttr(item + ".inputPointsTarget", len(points), *points, type="pointArray")
-            cmds.setAttr(item + ".inputComponentsTarget", len(comps), *comps, type="componentList")
+            # The full shape is target item 6000; each in-between is item
+            # 5000 + 1000 * its weight, so Maya blends through them natively.
+            targets = [(b["weight"], b["vertices"], b["offsets"]) for b in s.get("inbetweens", [])]
+            targets.append((1.0, s["vertices"], s["offsets"]))
+            for weight, vertices, offsets in targets:
+                points, comps = [], []
+                for v, d in zip(vertices, offsets):
+                    if start <= v < start + count:
+                        points.append((d[0] * SCALE, d[1] * SCALE, d[2] * SCALE, 1.0))
+                        comps.append("vtx[%d]" % (v - start))
+                item = "%s.inputTarget[0].inputTargetGroup[%d].inputTargetItem[%d]" % (
+                    bs, i, 5000 + int(round(weight * 1000)))
+                cmds.setAttr(item + ".inputPointsTarget", len(points), *points, type="pointArray")
+                cmds.setAttr(item + ".inputComponentsTarget", len(comps), *comps, type="componentList")
             cmds.setAttr("%s.weight[%d]" % (bs, i), s.get("weight", 0.0))
             cmds.aliasAttr(safe_node_name(s["name"]), "%s.weight[%d]" % (bs, i))
             out.setdefault(s["name"], []).append((bs, i))
@@ -369,7 +375,8 @@ def build(RIG, geos=None):
         # Each mesh takes the weights of its run of hive-rig's vertices.
         start, n_verts = vertex_run(geo, len(positions) if len(geos) == 1 else None)
         skin = cmds.skinCluster(
-            deform_joints, geo, toSelectedBones=True, bindMethod=0, maximumInfluences=4,
+            deform_joints, geo, toSelectedBones=True, bindMethod=0,
+            maximumInfluences=int(RIG["guides"].get("skin", {}).get("max_influences", 4)),
             normalizeWeights=1, obeyMaxInfluences=True, name=geo.split("|")[-1] + "_skinCluster",
         )[0]
         geo_shape = cmds.listRelatives(geo, shapes=True, fullPath=True)[0]
@@ -1483,12 +1490,104 @@ def write_weights(geo, per_vertex):
     fn.setWeights(path, all_vertices(len(per_vertex)), om.MIntArray(list(range(n))), weights, False)
 
 
+def expand_components(comps):
+    """Vertex indices of a componentList such as ['vtx[0:3]', 'vtx[7]']."""
+    out = []
+    for c in comps or []:
+        inside = c[c.index("[") + 1 : c.rindex("]")] if "[" in c else ""
+        if ":" in inside:
+            a, b = inside.split(":")
+            out += list(range(int(a), int(b) + 1))
+        elif inside.isdigit():
+            out.append(int(inside))
+    return out
+
+
+def gather_edits(weights=True, shapes=True):
+    """The skinCluster weights painted and the blendShape targets sculpted
+    here, in hive-rig's vertex order and frame (metres, Y up): the edits file
+    `hive-rig weights import` and `hive-rig shape <rig> import` read. Targets
+    are read from the blendShape's stored deltas (sculpt with the target's
+    own tools, or delete a target mesh once it is edited)."""
+    geos = rig_meshes()
+    runs = [(geo,) + tuple(vertex_run(geo)) for geo in geos]
+    total = len(RIG_DATA["mesh"]["positions"])
+    out = {"hive_rig_edits": 1, "rig": NAME, "source": "maya", "vertex_count": total}
+    if weights:
+        per_vertex = [{} for _ in range(total)]
+        for geo, start, _ in runs:
+            for v, w in enumerate(read_weights(geo) or []):
+                if start + v < total:
+                    per_vertex[start + v] = w
+        out["weights"] = per_vertex
+    if shapes:
+        by_alias = {safe_node_name(s["name"]): s["name"] for s in RIG_DATA["mesh"].get("shapes", [])}
+        found = {}
+        for geo, start, _ in runs:
+            for bs in cmds.ls(cmds.listHistory(geo) or [], type="blendShape") or []:
+                aliases = cmds.aliasAttr(bs, query=True) or []
+                for alias, plug in zip(aliases[::2], aliases[1::2]):
+                    if not plug.startswith("weight["):
+                        continue
+                    i = int(plug[len("weight[") : -1])
+                    name = by_alias.get(alias, alias)
+                    s = found.setdefault(name, {"name": name, "targets": {}})
+                    if not cmds.listConnections("%s.weight[%d]" % (bs, i), source=True, destination=False):
+                        s["weight"] = float(cmds.getAttr("%s.weight[%d]" % (bs, i)))
+                    group = "%s.inputTarget[0].inputTargetGroup[%d]" % (bs, i)
+                    for item in cmds.getAttr(group + ".inputTargetItem", multiIndices=True) or []:
+                        plug_item = "%s.inputTargetItem[%d]" % (group, item)
+                        points = cmds.getAttr(plug_item + ".inputPointsTarget") or []
+                        comps = expand_components(cmds.getAttr(plug_item + ".inputComponentsTarget"))
+                        t = s["targets"].setdefault(item, {"vertices": [], "offsets": []})
+                        for v, p in zip(comps, points):
+                            t["vertices"].append(start + v)
+                            t["offsets"].append([p[0] / SCALE, p[1] / SCALE, p[2] / SCALE])
+        shape_list = []
+        for s in found.values():
+            full = s["targets"].pop(6000, {"vertices": [], "offsets": []})
+            entry = {"name": s["name"], "vertices": full["vertices"], "offsets": full["offsets"],
+                     "inbetweens": [{"weight": (item - 5000) / 1000.0, "vertices": t["vertices"], "offsets": t["offsets"]}
+                                    for item, t in sorted(s["targets"].items()) if 5000 < item < 6000]}
+            if "weight" in s:
+                entry["weight"] = s["weight"]
+            shape_list.append(entry)
+        out["shapes"] = shape_list
+    return out
+
+
+def send_edits(weights=True, shapes=True):
+    """Write the edits file next to the rig and have hive-rig take the painted
+    weights and sculpted shapes into the .hive.json, so the next rebuild (and
+    the other programs' builders) keep them."""
+    hive_path = files()[1]
+    data = gather_edits(weights, shapes)
+    path = os.path.join(os.path.dirname(hive_path), NAME + ".edits.json")
+    with open(path, "w") as f:
+        json.dump(data, f)
+    said = []
+    if weights:
+        said.append(run_hive("weights", "import", hive_path, path).strip().splitlines()[0])
+    if shapes and data["shapes"]:
+        said.append(run_hive("shape", hive_path, "import", path).strip().splitlines()[-1])
+    return " ".join(said) or "Nothing to send"
+
+
 def rebuild(keep_weights=True):
     """Rebuild the rig from its guides. With keep_weights, vertices keep their
-    current weights unless the new rig weights them to a joint that didn't exist."""
+    current weights unless the new rig weights them to a joint that didn't exist.
+    The painted weights and sculpted targets go to hive-rig first, so its
+    .hive.json keeps them too."""
     guides_path, hive_path = files()
     write_guides(guides_of())
-    run_hive("rebuild", hive_path, "--guides", guides_path)
+    try:
+        send_edits(weights=keep_weights, shapes=True)
+    except RuntimeError as e:
+        cmds.warning("hive-rig: couldn't send the weights and shapes before rebuilding: %s" % e)
+    if keep_weights:
+        run_hive("rebuild", hive_path, "--guides", guides_path, "--keep-weights")
+    else:
+        run_hive("rebuild", hive_path, "--guides", guides_path)
     with open(hive_path) as f:
         data = json.load(f)
 
@@ -1569,6 +1668,11 @@ def show_window():
     cmds.separator()
     keep = cmds.checkBox(label="Keep Weights", value=True)
     cmds.button(label="Rebuild Rig", command=lambda *_: _safe(rebuild, cmds.checkBox(keep, q=True, value=True))())
+    cmds.separator()
+    cmds.text(label="Skin and Shapes")
+    cmds.button(label="Send Weights and Shapes to Hive", command=_safe(send_edits, True, True))
+    cmds.button(label="Send Weights Only", command=_safe(send_edits, True, False))
+    cmds.button(label="Send Shapes Only", command=_safe(send_edits, False, True))
     if cmds.attributeQuery("hiveAnim", node=TOP, exists=True):
         animation_section()
     cmds.showWindow(WINDOW)

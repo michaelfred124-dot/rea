@@ -298,6 +298,9 @@ pub fn turn_mesh(mesh: &mut Mesh, m: Mat3) {
         for o in &mut s.normal_offsets {
             *o = m * *o;
         }
+        for o in s.inbetweens.iter_mut().flat_map(|b| &mut b.offsets) {
+            *o = m * *o;
+        }
         if let Some(d) = &mut s.driver {
             d.axis = m * d.axis;
         }

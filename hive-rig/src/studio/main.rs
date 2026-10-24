@@ -4,7 +4,8 @@
 //! `HiveRig [character, rig or guides file] [--demo [dog|bird|spider|snake|horse|dinosaur]] [--build] [--weights BONE] [--paint] [--dab add|subtract|replace|scale|smooth|mend]
 //! [--lock BONE] [--bend DEGREES] [--bend-axis x|y|z] [--tools] [--vertices] [--hover] [--library] [--templates] [--export]
 //! [--select COMPONENT[,COMPONENT...]] [--pick NAME] [--pose BONE[=DEGREES[@x|y|z]]] [--shape NAME=WEIGHT]...
-//! [--screenshot OUT.ppm]`
+//! [--corrective] [--inbetween WEIGHT] [--sculpt grab|smooth|relax|inflate|erase] [--all-bones]
+//! [--bone-filter TEXT] [--screenshot OUT.ppm]`
 //! (the flags exist so the window can be checked automatically).
 
 // No console window behind the app on Windows.
@@ -56,6 +57,16 @@ struct Launch {
     tool: Option<String>,
     /// `--shape NAME=WEIGHT`: set a shape's weight and pick it (repeatable).
     shapes: Vec<String>,
+    /// Make a corrective for the `--pose` and push its skin out a little.
+    corrective: bool,
+    /// Give the picked shape an in-between at this weight and sculpt it.
+    inbetween: Option<f32>,
+    /// Turn the sculpt tool on with this brush, shown on the picked shape.
+    sculpt: Option<String>,
+    /// Colour the mesh by every bone at once.
+    all_bones: bool,
+    /// Search the bone list for this.
+    bone_filter: Option<String>,
     screenshot: Option<PathBuf>,
 }
 
@@ -113,6 +124,17 @@ fn parse_args() -> Launch {
                 .extend(args.next().map(|s| s.to_string_lossy().into_owned())),
             Some("--tool") => launch.tool = args.next().map(|s| s.to_string_lossy().into_owned()),
             Some("--screenshot") => launch.screenshot = args.next().map(PathBuf::from),
+            Some("--corrective") => launch.corrective = true,
+            Some("--inbetween") => {
+                launch.inbetween = args.next().and_then(|s| s.to_str()?.parse().ok())
+            }
+            Some("--sculpt") => {
+                launch.sculpt = args.next().map(|s| s.to_string_lossy().into_owned())
+            }
+            Some("--all-bones") => launch.all_bones = true,
+            Some("--bone-filter") => {
+                launch.bone_filter = args.next().map(|s| s.to_string_lossy().into_owned())
+            }
             Some("--shape") => launch
                 .shapes
                 .extend(args.next().map(|s| s.to_string_lossy().into_owned())),
@@ -223,6 +245,7 @@ fn main() -> eframe::Result {
     if launch.hover {
         studio.painting = launch.paint;
         studio.skin_tools.hover = spot;
+        studio.skin_tools.inspect = spot;
     }
     if launch.tools {
         studio.skin_tools.scroll_to_tools = 4;
@@ -250,6 +273,36 @@ fn main() -> eframe::Result {
         let (name, weight) = text.split_once('=').unwrap_or((text, "1"));
         studio.set_shape_weight(name, weight.trim().parse().unwrap_or(1.0));
         studio.shape_pick = Some(name.to_string());
+    }
+    if launch.corrective && studio.new_corrective() {
+        // Push the skin around the posed joint out, so the shape shows.
+        let joint = studio.pose.as_ref().and_then(|p| {
+            let rig = studio.doc.as_ref()?.rig.as_ref()?;
+            let b = rig.skeleton.bone(&p.bone)?;
+            Some((b.head, rig.guides.body.height))
+        });
+        if let Some((at, height)) = joint
+            && studio.begin_sculpt()
+        {
+            studio.sculpt_at(at, glam::Vec3::new(0.0, 0.0, 0.012 * height));
+        }
+    }
+    if let Some(w) = launch.inbetween {
+        studio.add_inbetween_here_at(w);
+    }
+    if let Some(brush) = &launch.sculpt {
+        use hive_rig::shapes::SculptBrush;
+        studio.shape_tools.brush = SculptBrush::ALL
+            .into_iter()
+            .find(|b| b.label().eq_ignore_ascii_case(brush))
+            .unwrap_or(SculptBrush::Grab);
+        studio.set_mesh_tool(app::MeshTool::Sculpt);
+        studio.show_sculpt_brush();
+        studio.shape_tools.scroll_to = 4;
+    }
+    studio.skin_tools.color_all = launch.all_bones;
+    if let Some(text) = launch.bone_filter {
+        studio.skin_tools.bone_filter = text;
     }
     if let Some(name) = &launch.pick {
         studio.rig_pick = Some(if name.starts_with("ctrl") || name.ends_with("_ctrl") {

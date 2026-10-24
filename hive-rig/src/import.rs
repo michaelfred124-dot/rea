@@ -704,9 +704,12 @@ pub fn load_gltf(path: &Path) -> Result<Mesh> {
                 vertices: keys,
                 weight,
                 driver: None,
+                inbetweens: Vec::new(),
             }
         })
         .collect();
+    // hive-rig writes in-betweens as targets of their own (`<shape>_ib50`).
+    mesh.shapes = crate::shapes::fold_inbetweens(std::mem::take(&mut mesh.shapes));
     // Unused images and materials stay: they're cheap and keep indices stable.
     Ok(mesh)
 }

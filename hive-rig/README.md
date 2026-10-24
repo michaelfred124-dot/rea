@@ -32,7 +32,7 @@ a joint; with Symmetry on, its twin on the other side follows.
 * **The outliner** (left) lists the components as their attachment tree: each
   component sits under the one owning the bone it hangs from (a leg hung from
   the head is listed under the head). **Properties** (right)
-  shows the rig summary, the pre-build [checks](#checks-before-building), [blendshapes](#blendshapes-and-corrective-shapes) (a weight slider per shape, correctives, the sculpt brush), skin weights (influence limits, the paint brush, Mirror and Smooth, locks, fixes and the vertex selection) and naming, or, with a component
+  shows the rig summary, the pre-build [checks](#checks-before-building), [blendshapes](#blendshapes-and-corrective-shapes) (a searchable shape list with a slider each, correctives, in-betweens and the sculpt brushes), [skin weights](#skin-weights-in-the-app) (the mesh tool, a searchable bone list, the paint brush, mirror and copy, the vertex inspector, locks, fixes and the vertex selection) and naming, or, with a component
   selected, its attachment, options (the spine's joint count and **Spline (curve)**
   toggle, a tentacle's joint and curve-control counts), exact guide positions and the names its
   bones will export as. Click a panel's title to fold it away.
@@ -175,17 +175,40 @@ reader: the turn of one bone about an axis, from `start` degrees (off) to
 `end` degrees (fully on). A **corrective** is a shape sculpted in a pose and
 driven by it, such as an elbow that keeps its volume as it bends.
 
+A shape can have **in-betweens**: extra targets at weights between 0 and 1
+(say 0.5) that the shape passes through on its way to the full target, so an
+elbow corrective can bulge one way half bent and another way fully bent. Each
+target is fully on at its own weight and blends linearly with its neighbours.
+
 In the app, after Build, the Properties panel's **Blendshapes** card lists the
-shapes with a weight slider each (a driven shape shows the weight its bone
-gives it in the test pose). **Corrective from pose** makes a shape for the
+shapes (with a search box once there are many) with a weight slider each (a
+driven shape shows the weight its bone gives it in the test pose, and a dot
+count of its in-betweens). **Corrective from pose** makes a shape for the
 test-posed bone, driven by it, off at rest and on at the pose's angle; **New
-shape** makes one to sculpt at rest. With a shape picked, turn on **Sculpt** and
-drag on the mesh: the vertices under the brush follow the pointer in the
-current pose, and the change is worked back through the skin so that, in that
-pose, the shape puts them where you dragged them. Each shape's `...` menu
-mirrors it onto the other side (its driver moves to the twin bone), splits it
-into left and right halves, or removes it; **Combine shown** adds the shapes
-with a weight above zero into a new one. Shape edits have their own **Undo shape**.
+shape** makes one to sculpt at rest. Click a shape to sculpt it: under **Sculpt
+<shape>** pick the **Target** (an in-between or **Full 1.00**), add one with
+**+ In-between** (at the shape's weight now, or half way; right-click one to
+remove it) and pick a brush:
+
+| Brush | What a drag does |
+| --- | --- |
+| Grab | The vertices under the brush follow the pointer |
+| Smooth | Each vertex moves toward its neighbours' average, evening out bumps |
+| Relax | Evens the vertices out along the surface, keeping its shape |
+| Inflate | Pushes the surface out along its normals (Ctrl: in) |
+| Erase | Takes the target's change back off under the brush |
+
+Sculpting works in the current pose with the picked target fully on, and the
+change is worked back through the skin so that, in that pose, the target puts
+the vertices where the brush left them. When the test pose doesn't show the
+target fully on, the card says so and **Pose there** turns the reader's bone to
+the target's angle. The brush shows its radius, its falloff (dots on the
+vertices it will move, brighter where it moves them more) and its strength (an
+arc round the ring) before you press; `[` and `]` resize it. Each shape's `...`
+menu mirrors it onto the other side (its driver moves to the twin bone), splits
+it into left and right halves, or removes it; **Combine shown** adds the shapes
+with a weight above zero into a new one (in-betweens are dropped). Shape edits
+have their own **Undo shape**.
 
 On the command line (each command writes the rig and its outputs again):
 
@@ -194,6 +217,10 @@ hive-rig shape out/hero.hive.json list
 # Sculpt in a pose and drive the shape from it: the forearm bent 90 degrees
 hive-rig shape out/hero.hive.json sculpt elbow_fix_l --pose lowerarm_l=90 \
   --at 0.33,1.43,-0.01 --radius 0.08 --offset 0,0.03,0 --drive
+hive-rig shape out/hero.hive.json inbetween elbow_fix_l 0.5               # a target half way
+hive-rig shape out/hero.hive.json sculpt elbow_fix_l --inbetween 0.5 --pose lowerarm_l=45 \
+  --at 0.33,1.43,-0.01 --radius 0.06 --offset 0,0.02,0.01
+hive-rig shape out/hero.hive.json inbetween elbow_fix_l 0.5 --remove
 hive-rig shape out/hero.hive.json sculpt smile --from sculpted_smile.glb   # from a sculpted copy
 hive-rig shape out/hero.hive.json mirror elbow_fix_l                       # elbow_fix_r, driven by lowerarm_r
 hive-rig shape out/hero.hive.json split smile --width 0.02                 # smile_l and smile_r
@@ -211,15 +238,36 @@ bone (forearm, shin) bends the way its IK bends without one. `--from` takes a
 mesh with the same vertices, sculpted in that pose (or at rest). A rebuild keeps
 the shapes and moves their drivers onto the renamed bones.
 
-How each target drives a corrective:
+How each target carries shapes, in-betweens and drivers:
 
-| Target | Shapes | Driver |
+| Target | Shapes and in-betweens | Driver |
 | --- | --- | --- |
-| `.glb` | Morph targets with names and default weights | None (glTF has no drivers) |
-| `.fbx` | Blend shape channels with default weights | None (FBX has no drivers) |
-| Blender | Shape keys | A driver on the key's value: the bone's local rotation (quaternion) read with a simple expression, so it works without Python auto-run. Checked in real Blender |
-| Maya | A blendShape in front of the skinCluster | A node network (multMatrix, decomposeMatrix, vectorProduct) and an expression on the target weight. Only against stubs |
-| Unreal | Morph targets from the `.glb` import | A curve per corrective, set by a pose reader in the Control Rig. The curve drives the morph target only when the Control Rig runs in the mesh's Anim Blueprint; shapes without a driver stay at zero (their weight isn't applied). Only against stubs |
+| `.glb` | Morph targets with names and default weights; an in-between is a morph target of its own, `<shape>_ib50`, at its share of the weight. hive-rig folds them back into one shape when it reads the file | None (glTF has no drivers) |
+| `.fbx` | A blend shape channel per target (`<shape>_ib50` too, since Blender's FBX importer refuses FBX in-betweens) | None (FBX has no drivers) |
+| Blender | A shape key per target. A shape with in-betweens gets a `hive_shape_<name>` slider on the armature (in its custom properties and the hive-rig panel's **Skin and Shapes** box) and each key follows it through a hat-shaped simple expression | A driver on the key's value (or on the slider, with in-betweens): the bone's local rotation (quaternion) read with a simple expression, so it works without Python auto-run. Checked in real Blender |
+| Maya | A blendShape in front of the skinCluster, with in-betweens as native in-between targets (inputTargetItem 5000 + 1000 x weight) | A node network (multMatrix, decomposeMatrix, vectorProduct) and an expression on the target weight. Only against stubs |
+| Unreal | Morph targets from the `.glb` import (in-betweens as `<shape>_ib50`) | A curve per morph target in the Control Rig, set by the shape's pose reader or, for a shape nothing drives, by a `<shape>_shape` float control (at its hive-rig weight) so it can be keyed; with in-betweens the curves blend through the targets in order. The curves drive the morph targets when the Control Rig runs in the mesh's Anim Blueprint. Only against stubs |
+
+#### Send edits back to hive-rig
+
+Weights painted and shapes sculpted in Blender or Maya come back into the
+`.hive.json`, so they survive the next rebuild. The Blender panel's **Skin and
+Shapes** box and the Maya window's **Skin and Shapes** section have **Send to
+Hive** buttons (all, weights only, shapes only): they write
+`<name>.edits.json` next to the rig (each vertex's weights by bone name, and
+each shape key or blendShape target with its in-betweens, in hive-rig's units
+and frame) and run:
+
+```bash
+hive-rig weights import out/hero.hive.json out/hero.edits.json   # only vertices that changed move
+hive-rig shape out/hero.hive.json import out/hero.edits.json     # --only NAME for one shape
+```
+
+Imported weights follow the rig's influence limits; a shape keeps its driver
+(only an undriven shape takes the slider's weight) and a new shape key comes in
+as a new shape. **Rebuild** in either tool sends the edits first and keeps the
+edited weights. The mesh must keep hive-rig's vertices and their order.
+Blender's round trip is checked in real Blender; Maya's only against stubs.
 
 Pose readers measure a bone's turn about one axis since rest (the twist part of
 its rotation about that axis, so turns about other axes change it little). Cone and RBF readers, and helper joints driven
@@ -727,15 +775,26 @@ opens: settings this one doesn't know are ignored, an unknown guides version
 builds with the newest rules this one has, and the app, the command line and
 `check` warn about it. Files from before the stamp (no `hive_rig`) are version 1.
 
-### Weight tools
+### Skin weights in the app
 
-After Build, the Properties panel's skin weights section has **Mirror L to R**
-(right-click for R to L), which copies one side's weights onto the other by
-mirrored vertex position, and **Smooth**, which blurs the shown bone's weights
-(or every bone's) with their neighbours.
+After Build, the Properties panel's skin weights section starts with the
+**mesh tool**: **View** (drags orbit), **Paint**, **Select** or **Sculpt** (the
+picked shape). One is on at a time, and a line over the viewport says which
+and what a drag does. Below it, the **bone list** shows every deform bone with
+a search box: click a bone to show its weights as a heat map (click again to
+hide them), or switch **Bone** to **All** to colour the mesh by every bone at
+once, each in the colour of its swatch in the list. Each row has a lock, and a
+bar with the weight of the vertex being inspected. **Mirror L to R** and
+**Mirror R to L** copy one side's weights onto the other by mirrored vertex
+position, **Smooth** blurs the shown bone's weights (or every bone's) with
+their neighbours, and **Copy from rig...** takes the weights of another
+`.hive.json` (this character built before, or another with a similar skeleton)
+by bone name, as `hive-rig weights copy` does.
 
-* **Paint**: pick a bone in the weights list, turn on **Paint** and drag on the
-  mesh. **Add** raises the bone's weight (the vertex's other bones give way),
+* **Paint**: pick a bone in the list, choose the **Paint** tool and drag on the
+  mesh. Before you press, the brush shows its radius, the vertices it would
+  change (dots, brighter where the falloff and strength change them more) and
+  its strength as an arc round the ring. **Add** raises the bone's weight (the vertex's other bones give way),
   **Subtract** lowers it (the other bones take it up; a vertex held by that bone
   alone passes to its parent), **Replace** moves it towards the brush's
   **Value**, **Scale** multiplies it by the **Factor** (0.5 halves it at full
@@ -750,7 +809,7 @@ mirrored vertex position, and **Smooth**, which blurs the shown bone's weights
   degrees about X, Y or Z (the axis across the bone by default), through the
   test pose, so you watch the skin deform while you paint. Painting lands on the
   bent skin. Nothing is saved; 0 straightens it.
-* **Lock** the shown bone (the weights list marks locked bones): no brush mode,
+* **Lock** a bone (its padlock in the list, or **Lock** for the shown bone): no brush mode,
   smooth, flood, paste, fix or automatic-weights rerun changes its weights on
   any vertex; the vertex's unlocked bones share whatever the locked ones leave.
   A locked bone can't be painted itself. Mirror and weight copy still copy every
@@ -775,7 +834,10 @@ mirrored vertex position, and **Smooth**, which blurs the shown bone's weights
   vertex's other unlocked bones share the rest. A whole drag or a typed value is
   one Undo step.
 * **Hover** over the mesh with a bone shown (or Select on) to see the vertex
-  under the pointer and each influence on it.
+  under the pointer and each influence on it. The **Vertex** inspector in
+  Properties keeps the last vertex hovered (or the first selected): its
+  influences, how many of the limit it uses and their sum, each weight
+  editable as in the weight table.
 * **Max influences and prune**: the most bones per vertex, 1 to 12, with the
   engines named: Unreal 8 (12 with its extra-influences setting), Unity and
   glTF 4. Past four, the `.glb` writes a second `JOINTS_1`/`WEIGHTS_1` set (a
@@ -994,6 +1056,8 @@ hive-rig rig /tmp/models/CesiumMan/CesiumMan.glb -o /tmp/cm
 python -I tests/blender_skin_eval.py /tmp/cm/CesiumMan.hive.json --source /tmp/models/CesiumMan/CesiumMan.glb
 python -I tests/blender_mesh_check.py out/hero_blender.py --source hero.glb --fbx out/hero.fbx   # after rig hero.glb -o out --targets blender,fbx
 python -I tests/blender_mesh_check.py out/hive_demo_blender.py --corrective elbow_fix_l lowerarm_l_fk_ctrl
+python -I tests/blender_roundtrip_check.py out/hive_demo_blender.py --corrective elbow_fix_r lowerarm_r_fk_ctrl --slider brow_up
+python3 tests/dcc_stub_run.py maya out/hive_demo_maya.py --send         # Maya Send to Hive
 python tests/blender_guides_check.py out/hive_demo_blender.py           # guides and rebuild
 python tests/blender_quad_check.py dog/hive_dog_blender.py dog/hive_dog.glb   # after demo --quadruped -o dog
 python tests/blender_spline_check.py out/hive_demo_blender.py out/hive_demo.glb   # after add tentacle, spine --spline true, rebuild
@@ -1158,7 +1222,16 @@ key with the same offsets. With `--fbx` it repeats the UV, material, texture and
 shape checks on the `.fbx` through Blender's FBX importer. With `--corrective`
 it checks the shape's driver: off at rest, on when the control bends the joint
 90 degrees, half on at half the bend, the mesh moves, and bending the other way
-leaves it off. CI downloads two public models from the Khronos glTF sample
+leaves it off (for a shape with in-betweens, the half-bend check gives way to
+the round-trip check below). `blender_roundtrip_check.py` takes a rig with a
+driven corrective and an undriven slider shape, both with in-betweens, and in
+real Blender checks that every target is a shape key with hive-rig's offsets,
+that the drivers are simple expressions, that the corrective peaks at its
+in-between's angle and the slider shows each target at its weight; then it
+repaints one vertex, resculpts a key, adds a shape key, moves the slider, runs
+**Send to Hive** and checks the `.hive.json`: exactly that vertex changed, the
+sculpt and the new shape came in, drivers and in-betweens were kept, and
+**Rebuild** keeps all of it. CI downloads two public models from the Khronos glTF sample
 assets at a pinned commit (CesiumMan, textured and skinned; MorphPrimitivesTest,
 two materials and a morph target), rigs them and runs it; the downloads are
 never committed. Locally it also passed on Fox, AnimatedMorphCube, MultiUVTest

@@ -164,9 +164,40 @@ Weights alone can't fix every pose: an elbow bent past 90 degrees still loses
 volume and a shoulder raised overhead still folds. Production rigs add
 *corrective shapes* (blendshapes sculpted for a pose, faded in by the joint
 angle through a pose reader such as an RBF or cone reader) or *helper joints*
-that push skin out as the joint bends. hive-rig doesn't build correctives yet
-(see `docs/hive-gaps.md`, item 9); its bent-joint thickness below is pure
-linear blend skinning.
+that push skin out as the joint bends. hive-rig builds angle-driven
+correctives (see the README's blendshapes section and `docs/hive-gaps.md`,
+item 9); the bent-joint thickness measured below is pure linear blend skinning,
+without them.
+
+**Sculpting through the skin.** A shape's offsets are stored at rest, but a
+corrective is sculpted in its pose. Each sculpt step takes the moves made on
+the posed mesh and works them back through linear blend skinning: a vertex's
+rest-space offset is its posed move turned by the inverse of its blended bone
+rotation, so in that pose the shape puts the vertex where the brush left it.
+The brushes all work on the picked target *fully on*, in the current pose:
+
+* **Grab** moves the vertices under the brush by the pointer's drag, faded by
+  the falloff `(1 - (d/r)^2)^2` (the weight brush's).
+* **Smooth** moves each vertex toward the average of its surface neighbours
+  (seam copies welded) by `strength x falloff`.
+* **Relax** does the same with the move's component along the vertex normal
+  taken off, so vertices even out along the surface without the surface
+  shrinking.
+* **Inflate** moves each vertex along its normal (averaged over the welded
+  seam copies, so a seam doesn't split) by a tenth of the radius at full
+  strength; inverted, it deflates.
+* **Erase** scales the target's offsets under the brush toward zero (no
+  change from rest) by `strength x falloff`.
+
+**In-betweens.** A shape with targets at weights `p_1 < ... < p_k < 1` mixes
+them piecewise linearly: at weight `w` between `p_i` and `p_(i+1)` it is
+`(1 - t) T_i + t T_(i+1)` with `t = (w - p_i) / (p_(i+1) - p_i)`, and below
+`p_1` it fades the first target in from rest. Each target's contribution is a
+hat function of `w`, which is how the DCCs get it: Blender keys read the
+shape's slider through a hat expression, Unreal's Control Rig builds the hats
+from two clamped remaps and a min per target, and Maya's blendShape does the
+same blend natively. In flat formats (glTF, FBX) each target becomes its own
+morph target named `<shape>_ib<percent>`; hive-rig folds them back on import.
 
 ## Measured on real characters
 

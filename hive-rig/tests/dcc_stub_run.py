@@ -47,6 +47,7 @@ N_VERTS = [0]
 SCRIPT = [""]
 CV_POSITIONS = {}  # "curveShape.cv[i]" -> world position set by the Maya builder
 TIME = [7.0]  # Maya's current frame
+BLEND_SHAPES = []  # blendShape nodes the Maya builder made
 
 
 def stub_maya():
@@ -55,6 +56,8 @@ def stub_maya():
     attrs = {}  # "node.attr" -> value, for the string attributes the guide tools use
     positions = {}
     nodes = set()
+    aliases = {}  # node -> [(attr, alias)], from aliasAttr
+    blend_shapes = BLEND_SHAPES
 
     def node(*args, **kwargs):
         counter[0] += 1
@@ -92,10 +95,30 @@ def stub_maya():
                     CV_POSITIONS[args[0]] = list(kwargs["translation"])
                 return None
             if name == "getAttr":
+                if kwargs.get("multiIndices"):
+                    # The indices set under this multi attribute.
+                    prefix = args[0] + "["
+                    found = {int(k[len(prefix):].split("]", 1)[0]) for k in attrs if k.startswith(prefix)}
+                    return sorted(found)
                 return attrs.get(args[0], 10.0)
+            if name == "aliasAttr":
+                if kwargs.get("query"):
+                    out = []
+                    for plug, alias in aliases.get(args[0], []):
+                        out += [alias, plug]
+                    return out
+                alias, plug = args[0], args[1]
+                node_name, attr = plug.split(".", 1)
+                aliases.setdefault(node_name, []).append((attr, alias))
+                return None
+            if name == "listConnections":
+                return []
             if name == "setAttr":
                 if kwargs.get("type") in ("pointArray", "componentList"):
                     calls.append(("setAttr_" + kwargs["type"], args[0]))
+                    attrs[args[0]] = list(args[2:])
+                elif len(args) == 2 and isinstance(args[1], (int, float)) and ".weight[" in args[0]:
+                    attrs[args[0]] = args[1]
                 if kwargs.get("type") == "string":
                     attrs[args[0]] = args[1]
                 return None
@@ -120,6 +143,8 @@ def stub_maya():
                     return sorted(n for n in nodes if n.startswith(args[0][:-1]))
                 if kwargs.get("type") == "skinCluster":
                     return ["skinCluster1"]
+                if kwargs.get("type") == "blendShape":
+                    return list(blend_shapes)
                 return list(args[0]) if args and isinstance(args[0], list) else []
             if name == "spaceLocator":
                 return [node(**kwargs)]
@@ -138,7 +163,9 @@ def stub_maya():
                 return node(*args, **kwargs)
             if name == "blendShape":
                 calls.append((name, args))
-                return [node(*args, **kwargs)]
+                made = node(*args, **kwargs)
+                blend_shapes.append(made)
+                return [made]
             if name == "expression":
                 calls.append(("expression", kwargs.get("name", "")))
                 return None
@@ -165,7 +192,7 @@ def stub_maya():
               "window", "deleteUI", "columnLayout", "rowLayout", "setParent", "button", "text", "separator",
               "checkBox", "showWindow", "confirmDialog", "skinPercent", "pointConstraint",
               "shadingNode", "uvLink", "blendShape", "aliasAttr", "loadPlugin", "currentTime",
-              "playbackOptions", "textScrollList", "promptDialog"]:
+              "playbackOptions", "textScrollList", "promptDialog", "listConnections"]:
         setattr(cmds, n, generic(n))
 
     om = types.ModuleType("maya.api.OpenMaya")
@@ -397,6 +424,36 @@ if __name__ == "__main__":
         assert calls.count("setWeights") == objects, (calls.count("setWeights"), objects)
         if shapes:
             print("maya blend shapes ran against stubs: %d shapes, %d readers: ok" % (len(shapes), len(readers)))
+        # In-betweens are their own target items (5000 + 1000 * weight).
+        for s in shapes:
+            for b in s.get("inbetweens", []):
+                item = "inputTargetItem[%d]" % (5000 + int(round(b["weight"] * 1000)))
+                assert any(item in c[1] for c in targets), (s["name"], item)
+        # Send to Hive reads back what the builder put there: every shape with
+        # its in-betweens and offsets, and each vertex's weights.
+        if objects == 1:
+            edits = ns["gather_edits"]()
+            assert edits["vertex_count"] == N_VERTS[0] and len(edits["weights"]) == N_VERTS[0]
+            assert all(len(w) == 1 for w in edits["weights"]), edits["weights"][:3]
+            back = {s["name"]: s for s in edits["shapes"]}
+            assert sorted(back) == sorted(s["name"] for s in shapes), (sorted(back), [s["name"] for s in shapes])
+            for s in shapes:
+                got = back[s["name"]]
+                pairs = [(s["vertices"], s["offsets"], got["vertices"], got["offsets"])]
+                assert [b["weight"] for b in got["inbetweens"]] == [b["weight"] for b in s.get("inbetweens", [])], s["name"]
+                pairs += [(a["vertices"], a["offsets"], b["vertices"], b["offsets"])
+                          for a, b in zip(s.get("inbetweens", []), got["inbetweens"])]
+                for va, oa, vb, ob in pairs:
+                    assert va == vb, s["name"]
+                    assert all(abs(x - y) < 1e-6 for p, q in zip(oa, ob) for x, y in zip(p, q)), s["name"]
+                if not s.get("driver"):
+                    assert abs(got["weight"] - s.get("weight", 0.0)) < 1e-6, (s["name"], got.get("weight"))
+            print("maya send to hive read back %d shapes and %d vertices' weights against stubs: ok"
+                  % (len(shapes), len(edits["weights"])))
+            if os.path.isfile(ns["HIVE_EXE"]) and "--send" in sys_args:
+                said = ns["send_edits"](False, True)
+                assert "Imported shapes" in said or not shapes, said
+                print("maya send to hive ran hive-rig shape import: ok")
         if os.path.isfile(ns["HIVE_EXE"]) and "--guides" in sys_args:
             # Guide tools: edit, mirror, add a component, rebuild keeping weights.
             ns["show_guides"]()
@@ -431,13 +488,28 @@ if __name__ == "__main__":
                 for joint in chain["bendy"][seg]["joints"]:
                     assert "Bend_" + joint in made, joint
         # Corrective shapes: a curve per driven shape, set from its pose reader.
-        driven = [s["name"] for s in rig.get("shapes", []) if s.get("driver")]
+        all_shapes = rig.get("shapes", [])
+        driven = [s["name"] for s in all_shapes if s.get("driver")]
         for name in driven:
-            assert "Curve_" + name in made and "Reader_%s_weight" % name in made, name
+            assert "Reader_%s_weight" % name in made, name
+        # Every shape's curves: one per morph target (in-betweens first), set
+        # from its reader or, undriven, from its `<shape>_shape` float control.
+        expected = []
+        for s in all_shapes:
+            expected += ["%s_ib%d" % (s["name"], round(w * 100)) for w in s.get("inbetweens", [])] + [s["name"]]
+            if len(s.get("inbetweens", [])):
+                for w in s["inbetweens"]:
+                    assert "Blend_%s_ib%d" % (s["name"], round(w * 100)) in made, s["name"]
+        for target in expected:
+            assert "Curve_" + target in made, target
         curves = [c.args[0] for c in vm_curves.call_args_list]
-        assert sorted(curves) == sorted(driven), (curves, driven)
-        if driven:
-            print("unreal corrective curves ran against stubs: %d: ok" % len(driven))
+        assert sorted(curves) == sorted(expected), (curves, expected)
+        undriven = [s["name"] + "_shape" for s in all_shapes if not s.get("driver")]
+        shape_floats = {str(c.args[0]) for c in hc.add_control.call_args_list}
+        assert all(u in shape_floats for u in undriven), (undriven, sorted(shape_floats)[:5])
+        if all_shapes:
+            print("unreal shape curves ran against stubs: %d curves, %d readers, %d sliders: ok"
+                  % (len(expected), len(driven), len(undriven)))
         # Soft IK and stretch on every limb (a soft control on two-bone limbs);
         # volume on every spline joint on the curve.
         floats = {c.args[0] for c in hc.add_control.call_args_list}

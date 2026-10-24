@@ -308,6 +308,10 @@ enum ShapeCommand {
         /// pose's angle.
         #[arg(long, requires = "pose")]
         drive: bool,
+        /// Sculpt the shape's in-between at this weight instead of the full
+        /// shape (add it first with `inbetween`).
+        #[arg(long)]
+        inbetween: Option<f32>,
     },
     /// Drive a shape from a bone's rotation (a corrective shape): its weight
     /// goes from 0 at `--start` degrees to 1 at `--end` degrees of turn.
@@ -370,6 +374,25 @@ enum ShapeCommand {
     Rename {
         name: String,
         new: String,
+    },
+    /// Give a shape an in-between target at a weight between 0 and 1 (it
+    /// starts where the shape puts the vertices at that weight; sculpt it with
+    /// `sculpt --inbetween`), or take one off with --remove.
+    Inbetween {
+        name: String,
+        weight: f32,
+        #[arg(long)]
+        remove: bool,
+    },
+    /// Bring shapes sculpted in Blender or Maya back into the rig, with their
+    /// in-betweens: the edits file the builder scripts' Send to Hive writes.
+    /// A shape the rig has keeps its pose reader.
+    Import {
+        /// The edits file (`<name>.edits.json`).
+        edits: PathBuf,
+        /// Only this shape (repeatable).
+        #[arg(long)]
+        only: Vec<String>,
     },
 }
 
@@ -443,6 +466,19 @@ enum WeightsCommand {
         bone: Vec<String>,
         #[command(flatten)]
         edit: WeightEdit,
+    },
+    /// Bring weights painted in Blender or Maya back into the rig: the edits
+    /// file the builder scripts' Send to Hive writes. A rebuild with
+    /// --keep-weights keeps them. Writes the rig again (the outputs already
+    /// next to it).
+    Import {
+        /// The `<name>.hive.json` of the rig.
+        rig: PathBuf,
+        /// The edits file (`<name>.edits.json`).
+        edits: PathBuf,
+        /// Output directory (default: the rig's directory).
+        #[arg(short, long)]
+        out: Option<PathBuf>,
     },
 }
 
@@ -1175,7 +1211,21 @@ fn shape_command(path: &Path, action: ShapeCommand) -> Result<()> {
                     ),
                     None => format!("weight {:.2}", s.weight),
                 };
-                println!("{:<24} {:>6} vertices  {what}", s.name, s.vertices.len());
+                let ibs = if s.inbetweens.is_empty() {
+                    String::new()
+                } else {
+                    let at: Vec<String> = s
+                        .inbetweens
+                        .iter()
+                        .map(|b| format!("{:.2}", b.weight))
+                        .collect();
+                    format!("  in-betweens at {}", at.join(", "))
+                };
+                println!(
+                    "{:<24} {:>6} vertices  {what}{ibs}",
+                    s.name,
+                    s.vertices.len()
+                );
             }
             return Ok(());
         }
@@ -1187,6 +1237,7 @@ fn shape_command(path: &Path, action: ShapeCommand) -> Result<()> {
             offset,
             from,
             drive,
+            inbetween,
         } => {
             let pose = pose.map(|p| shapes::parse_pose(&rig, &p)).transpose()?;
             let locals = pose.as_ref().map_or_else(
@@ -1225,7 +1276,8 @@ fn shape_command(path: &Path, action: ShapeCommand) -> Result<()> {
                 }
                 _ => anyhow::bail!("say what to move: --at, --radius and --offset, or --from"),
             };
-            let moved = shapes::sculpt(&mut rig, &name, &locals, &moves)?;
+            let mats = shapes::skin_matrices(&rig.skeleton, &locals);
+            let moved = shapes::sculpt_target(&mut rig, &name, inbetween, &locals, &mats, &moves)?;
             if drive && let Some(p) = &pose {
                 let bone = rig.skeleton.bones[p.bone].name.clone();
                 shapes::set_driver(
@@ -1304,6 +1356,42 @@ fn shape_command(path: &Path, action: ShapeCommand) -> Result<()> {
         ShapeCommand::Rename { name, new } => {
             shapes::rename(&mut rig, &name, &new)?;
             format!("Renamed '{name}' to '{new}'.")
+        }
+        ShapeCommand::Inbetween {
+            name,
+            weight,
+            remove,
+        } => {
+            if remove {
+                shapes::remove_inbetween(&mut rig, &name, weight)?;
+                format!("Took the in-between at {weight:.2} off '{name}'.")
+            } else {
+                shapes::add_inbetween(&mut rig, &name, weight)?;
+                format!(
+                    "'{name}' has an in-between at {weight:.2}; sculpt it with `sculpt {name} --inbetween {weight}`."
+                )
+            }
+        }
+        ShapeCommand::Import { edits, only } => {
+            let edits = hive_rig::edits::Edits::read(&edits)?;
+            let r = hive_rig::edits::import_shapes(&mut rig, &edits, &only)?;
+            let list = |v: &[String]| {
+                if v.is_empty() {
+                    "none".to_string()
+                } else {
+                    v.join(", ")
+                }
+            };
+            format!(
+                "Imported shapes from {}: updated {}; added {}.",
+                if edits.source.is_empty() {
+                    "the edits file"
+                } else {
+                    &edits.source
+                },
+                list(&r.updated),
+                list(&r.added)
+            )
         }
     };
     rig.mesh.validate()?;
@@ -1448,6 +1536,46 @@ fn weights_command(action: WeightsCommand) -> Result<()> {
                 region.len()
             );
             edit.write(&r, &path)
+        }
+        WeightsCommand::Import {
+            rig: path,
+            edits,
+            out,
+        } => {
+            let mut r = load_rig(&path)?;
+            let edits = hive_rig::edits::Edits::read(&edits)?;
+            let report = hive_rig::edits::import_weights(&mut r, &edits)?;
+            println!(
+                "Imported the weights from {}: {} of {} vertices changed.",
+                if edits.source.is_empty() {
+                    "the edits file"
+                } else {
+                    &edits.source
+                },
+                report.changed,
+                r.mesh.vertex_count()
+            );
+            if !report.unknown.is_empty() {
+                println!(
+                    "  not bones of '{}' (their weight went to the other bones): {}",
+                    r.name,
+                    report.unknown.join(", ")
+                );
+            }
+            if report.empty > 0 {
+                println!(
+                    "  {} vertices had no weight on the rig's bones and kept theirs.",
+                    report.empty
+                );
+            }
+            let dir = out.unwrap_or_else(|| path.parent().unwrap_or(Path::new(".")).to_path_buf());
+            let targets = existing_targets(&dir, &r.name);
+            let targets = if targets.is_empty() {
+                existing_targets(path.parent().unwrap_or(Path::new(".")), &r.name)
+            } else {
+                targets
+            };
+            write(&r, &dir, &Outputs { targets })
         }
     }
 }

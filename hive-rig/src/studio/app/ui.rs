@@ -1361,54 +1361,7 @@ impl Studio {
                     .color(TEXT_FAINT),
             );
         } else {
-            egui::ComboBox::from_id_salt("weights")
-                .width(ui.available_width() - 8.0)
-                .selected_text(self.weights_bone.as_deref().unwrap_or("Off"))
-                .height(360.0)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.weights_bone, None, "Off");
-                    for b in &deform {
-                        let label = if self.skin_tools.locked.contains(b) {
-                            format!("{b}  (locked)")
-                        } else {
-                            b.clone()
-                        };
-                        ui.selectable_value(&mut self.weights_bone, Some(b.clone()), label);
-                    }
-                });
-            weight_legend(ui);
-            self.brush_controls(ui);
-            ui.horizontal(|ui| {
-                let mirror = ui
-                    .add(egui::Button::new(RichText::new("Mirror L to R").size(12.5)).corner_radius(8))
-                    .on_hover_text("Copy the left side's weights onto the right. Right-click to copy right to left.");
-                if mirror.clicked() {
-                    self.mirror_weights(Side::Left);
-                }
-                mirror.context_menu(|ui| {
-                    if ui.button("Mirror R to L").clicked() {
-                        self.mirror_weights(Side::Right);
-                        ui.close();
-                    }
-                });
-                let what = if self.weights_bone.is_some() { "the shown bone" } else { "every bone" };
-                if ui
-                    .add(egui::Button::new(RichText::new("Smooth").size(12.5)).corner_radius(8))
-                    .on_hover_text(format!("Blur the weights of {what} with their neighbours."))
-                    .clicked()
-                {
-                    self.smooth_weights();
-                }
-            });
-            self.weight_tools(ui);
-            ui.checkbox(
-                &mut self.keep_weights,
-                RichText::new("Keep edited weights on rebuild").size(12.5),
-            )
-            .on_hover_text(
-                "Painted, mirrored and smoothed weights stay when the rig is built again, \
-                 except where a new bone takes the vertex.",
-            );
+            self.skin_card(ui, &deform);
         }
 
         ui.add_space(8.0);
@@ -1487,51 +1440,6 @@ impl Studio {
         if limits != doc.guides.skin {
             self.set_skin_limits(limits);
         }
-    }
-
-    /// The weight brush: on/off, what it does, its size and strength.
-    fn brush_controls(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            let mut on = self.painting;
-            theme::pill(ui, &mut on, "Paint").on_hover_text(
-                "Drag on the mesh to paint the shown bone's weight ([ and ] resize)",
-            );
-            if on != self.painting {
-                self.painting = on;
-                if on {
-                    self.sculpting = false;
-                    self.skin_tools.selecting = false;
-                } else {
-                    self.brush_at = None;
-                }
-            }
-        });
-        self.brush_modes(ui);
-        let height = self
-            .doc
-            .as_ref()
-            .map_or(1.8, |d| d.guides.body.height)
-            .max(1e-3);
-        let mut cm = self.brush.radius * height * 100.0;
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Radius").size(12.0).color(TEXT_DIM));
-            let max = 0.25 * height * 100.0;
-            if ui
-                .add(
-                    egui::Slider::new(&mut cm, 0.5..=max)
-                        .suffix(" cm")
-                        .max_decimals(1),
-                )
-                .changed()
-            {
-                self.brush.radius = cm / 100.0 / height;
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Strength").size(12.0).color(TEXT_DIM));
-            ui.add(egui::Slider::new(&mut self.brush.strength, 0.01..=1.0).max_decimals(2));
-        });
-        self.brush_extras(ui);
     }
 
     /// The pre-build checks: every warning, a click to select its guide, and a
@@ -2923,36 +2831,19 @@ impl Studio {
                 self.paint_at(hit);
             }
         } else if sculpt_on {
-            // The sculpt brush: the vertices under it follow the pointer across
-            // the screen (in the plane facing the camera through the grab point).
-            if self.stroke.is_none()
-                && response.hovered()
-                && let Some(p) = pointer
-            {
-                self.brush_at = hit_at(self, p);
-            }
-            if response.drag_started_by(PointerButton::Primary)
-                && let Some(p) = press.or(pointer)
-                && let Some(hit) = hit_at(self, p)
-                && self.begin_sculpt()
-            {
-                self.stroke = Some(hit);
-            }
-            if let Some(last) = self.stroke
-                && response.dragged_by(PointerButton::Primary)
-                && let Some(p) = pointer
-            {
-                let (o, d) = pr.ray(p);
-                let across = d.dot(pr.forward);
-                if across.abs() > 1e-6 {
-                    let to = o + d * ((last - o).dot(pr.forward) / across);
-                    if to.distance(last) > 1e-5 {
-                        self.sculpt_at(last, to - last);
-                        self.stroke = Some(to);
-                        self.brush_at = Some(to);
+            if !blocked {
+                let resize = ui.input(|i| {
+                    if i.key_pressed(Key::OpenBracket) {
+                        0.8
+                    } else if i.key_pressed(Key::CloseBracket) {
+                        1.25
+                    } else {
+                        1.0
                     }
-                }
+                });
+                self.sculpt_radius = (self.sculpt_radius * resize).clamp(0.003, 0.2);
             }
+            self.sculpt_input(ui, &response, &pr, pointer, press);
         } else {
             self.stroke = None;
         }
@@ -3096,6 +2987,7 @@ impl Studio {
             self.paint_brush(&painter, &pr);
         }
         self.paint_skin_tools(&painter, &pr);
+        self.paint_mode_hint(&painter, rect);
         paint_axes(
             &painter,
             &pr,
@@ -3189,50 +3081,6 @@ impl Studio {
             .map(|(_, ci)| ci)
     }
 
-    /// The weight brush on the mesh: its reach, a centre dot and what it does.
-    fn paint_brush(&self, painter: &egui::Painter, pr: &Projector) {
-        let (Some(at), Some(doc)) = (self.brush_at, &self.doc) else {
-            return;
-        };
-        let sculpt = !self.painting && self.sculpting;
-        let reach = if sculpt {
-            self.sculpt_radius
-        } else {
-            self.brush.radius
-        };
-        let radius = reach * doc.guides.body.height;
-        let right = pr.forward.cross(Vec3::Y).normalize_or(Vec3::X);
-        let (Some(c), Some(edge)) = (pr.pos(at), pr.pos(at + right * radius)) else {
-            return;
-        };
-        let r = c.distance(edge).max(2.0);
-        let (glyph, color) = if sculpt {
-            ("\u{2194}", Color32::from_rgb(255, 190, 110))
-        } else {
-            skin_panel::brush_glyph(self.brush.mode)
-        };
-        painter.circle_filled(c, r, color.gamma_multiply(0.10));
-        // The inner ring shows where the brush is at full strength.
-        painter.circle_stroke(c, r * 0.45, Stroke::new(1.0, color.gamma_multiply(0.6)));
-        painter.circle_stroke(c, r, Stroke::new(2.0, color));
-        painter.circle_filled(c, 2.5, color);
-        painter.text(
-            c + Vec2::new(r * 0.72 + 6.0, -r * 0.72 - 6.0),
-            Align2::CENTER_CENTER,
-            glyph,
-            FontId::proportional(18.0),
-            color,
-        );
-        let chip = if sculpt {
-            self.shape_pick.as_ref()
-        } else {
-            self.weights_bone.as_ref()
-        };
-        if let Some(name) = chip {
-            label_chip(painter, c + Vec2::new(r + 10.0, 12.0), name);
-        }
-    }
-
     fn paint_handles(&self, painter: &egui::Painter, pr: &Projector, pointer: Option<Pos2>) {
         let Some(doc) = &self.doc else { return };
         if self.mode != Mode::Guides {
@@ -3266,7 +3114,11 @@ impl Studio {
     }
 
     fn paint(&mut self, painter: &egui::Painter, pr: &Projector, pointer: Option<Pos2>) {
-        let weights = self.weights_bone.clone();
+        let weights = if self.skin_tools.color_all {
+            Some(super::ALL_BONES.to_string())
+        } else {
+            self.weights_bone.clone()
+        };
         let colors = match &weights {
             Some(b) if self.show_mesh => self.weights_for(b).map(<[Color32]>::to_vec),
             _ => None,

@@ -267,54 +267,152 @@ def turn_expression(axis, start, end):
     return "clamp((%s-(%.6f))/(%.6f), 0, 1)" % (turn, start, span)
 
 
+def inbetween_name(name, weight):
+    """An in-between's shape key: `<shape>_ib<percent>`, as hive-rig names it."""
+    return "%s_ib%d" % (name, int(round(weight * 100.0)))
+
+
+def parse_inbetween_name(name):
+    """(shape, weight) for a key named `<shape>_ib<percent>`, else None."""
+    head, sep, pct = name.rpartition("_ib")
+    if not sep or not head or not pct.isdigit() or not 1 <= int(pct) <= 99:
+        return None
+    return head, int(pct) / 100.0
+
+
+def shape_targets(s):
+    """A shape's targets in order: (key name, weight reached at, vertices,
+    offsets): its in-betweens, then the full shape at 1."""
+    out = [(inbetween_name(s["name"], b["weight"]), b["weight"], b["vertices"], b["offsets"])
+           for b in s.get("inbetweens", [])]
+    out.append((s["name"], 1.0, s["vertices"], s["offsets"]))
+    return out
+
+
+def hat_expression(points, k, w):
+    """How much of target k a shape at weight `w` (an expression) takes: rising
+    from the target before (or rest) to 1 at points[k], falling to the next."""
+    lo = points[k - 1] if k > 0 else 0.0
+    rise = "(%s-%.6f)/%.6f" % (w, lo, (points[k] - lo) or 1e-6)
+    if k == len(points) - 1:
+        return "max(0, %s)" % rise
+    hi = points[k + 1]
+    fall = "(%.6f-%s)/%.6f" % (hi, w, (hi - points[k]) or 1e-6)
+    return "max(0, min(%s, %s))" % (rise, fall)
+
+
+def hat_value(points, k, w):
+    """hat_expression evaluated in Python, for a shape's starting weight."""
+    lo = points[k - 1] if k > 0 else 0.0
+    rise = (w - lo) / ((points[k] - lo) or 1e-6)
+    if k == len(points) - 1:
+        return max(0.0, rise)
+    hi = points[k + 1]
+    return max(0.0, min(rise, (hi - w) / ((hi - points[k]) or 1e-6)))
+
+
+def shape_property(name):
+    """The armature's custom property holding a shape's slider, for a shape
+    with in-betweens (its keys follow the slider through them)."""
+    return "hive_shape_" + name
+
+
+def add_reader_vars(drv, rig, bone_name):
+    for var_name, channel in (("w", "ROT_W"), ("x", "ROT_X"), ("y", "ROT_Y"), ("z", "ROT_Z")):
+        var = drv.variables.new()
+        var.name = var_name
+        var.type = "TRANSFORMS"
+        t = var.targets[0]
+        t.id = rig
+        t.bone_target = bone_name
+        t.transform_type = channel
+        t.rotation_mode = "QUATERNION"
+        t.transform_space = "LOCAL_SPACE"
+
+
 def build_shapes(RIG, geos, rig):
     """Shape keys for hive-rig's blendshapes on the objects they move, at their
-    weights; corrective shapes get a driver reading their bone's rotation."""
+    weights; corrective shapes get a driver reading their bone's rotation.
+
+    A shape with in-betweens becomes a key per target (`<shape>_ib50`, then
+    `<shape>`), each driven to blend through them in order: from its pose
+    reader, or from a slider on the armature (`hive_shape_<shape>`) when
+    nothing drives it."""
     shapes = RIG["mesh"].get("shapes", [])
     if not shapes:
         return
+    for s in shapes:
+        if not s.get("inbetweens"):
+            continue
+        prop = shape_property(s["name"])
+        rig[prop] = float(s.get("weight", 0.0))
+        ui = rig.id_properties_ui(prop)
+        ui.update(min=0.0, max=1.0, soft_min=0.0, soft_max=1.0, description="Weight of shape " + s["name"])
+        reader = s.get("driver")
+        if reader and reader["bone"] in rig.data.bones:
+            # A driven shape's weight is read once into the property; its keys
+            # blend from it (one expression each would pass Blender's length limit).
+            bone = rig.data.bones[reader["bone"]]
+            axis = (bone.matrix_local.to_3x3().inverted() @ to_blender(reader["axis"])).normalized()
+            rig.driver_remove('["%s"]' % prop)
+            drv = rig.driver_add('["%s"]' % prop).driver
+            drv.type = "SCRIPTED"
+            add_reader_vars(drv, rig, reader["bone"])
+            drv.expression = turn_expression(axis, reader["start"], reader["end"])
     for k, geo in enumerate(geos):
         start = geo.get("hive_first_vertex", 0)
         n = len(geo.data.vertices)
-        mine = [s for s in shapes
-                if any(start <= v < start + n for v in s["vertices"]) or (k == 0 and not s["vertices"])]
+
+        def touches(s):
+            return any(start <= v < start + n for _, _, vs, _ in shape_targets(s) for v in vs)
+
+        mine = [s for s in shapes if touches(s) or (k == 0 and not s["vertices"])]
         if not mine:
             continue
         if geo.data.shape_keys is None:
             geo.shape_key_add(name="Basis", from_mix=False)
         for s in mine:
-            kb = geo.data.shape_keys.key_blocks.get(s["name"]) or geo.shape_key_add(name=s["name"], from_mix=False)
-            co = [0.0] * (3 * n)
-            geo.data.shape_keys.key_blocks["Basis"].data.foreach_get("co", co)
-            for v, d in zip(s["vertices"], s["offsets"]):
-                i = v - start
-                if 0 <= i < n:
-                    bd = to_blender(d)
-                    co[3 * i] += bd[0]
-                    co[3 * i + 1] += bd[1]
-                    co[3 * i + 2] += bd[2]
-            kb.data.foreach_set("co", co)
-            kb.value = s.get("weight", 0.0)
+            targets = shape_targets(s)
+            points = [t[1] for t in targets]
             reader = s.get("driver")
-            if reader and reader["bone"] in rig.data.bones:
-                bone = rig.data.bones[reader["bone"]]
-                axis = (bone.matrix_local.to_3x3().inverted() @ to_blender(reader["axis"])).normalized()
+            if reader and reader["bone"] not in rig.data.bones:
+                print("hive-rig: shape %s reads bone %s, which the rig doesn't have" % (s["name"], reader["bone"]))
+                reader = None
+            for t, (key_name, _, vertices, offsets) in enumerate(targets):
+                kb = geo.data.shape_keys.key_blocks.get(key_name) or geo.shape_key_add(name=key_name, from_mix=False)
+                co = [0.0] * (3 * n)
+                geo.data.shape_keys.key_blocks["Basis"].data.foreach_get("co", co)
+                for v, d in zip(vertices, offsets):
+                    i = v - start
+                    if 0 <= i < n:
+                        bd = to_blender(d)
+                        co[3 * i] += bd[0]
+                        co[3 * i + 1] += bd[1]
+                        co[3 * i + 2] += bd[2]
+                kb.data.foreach_set("co", co)
                 kb.driver_remove("value")
+                if len(targets) == 1:
+                    kb.value = s.get("weight", 0.0)
+                else:
+                    kb.slider_min = 0.0
+                    kb.value = hat_value(points, t, s.get("weight", 0.0))
+                if reader is None and len(targets) == 1:
+                    continue
                 drv = kb.driver_add("value").driver
                 drv.type = "SCRIPTED"
-                for var_name, channel in (("w", "ROT_W"), ("x", "ROT_X"), ("y", "ROT_Y"), ("z", "ROT_Z")):
+                if reader is not None and len(targets) == 1:
+                    bone = rig.data.bones[reader["bone"]]
+                    axis = (bone.matrix_local.to_3x3().inverted() @ to_blender(reader["axis"])).normalized()
+                    add_reader_vars(drv, rig, reader["bone"])
+                    weight = turn_expression(axis, reader["start"], reader["end"])
+                else:
                     var = drv.variables.new()
-                    var.name = var_name
-                    var.type = "TRANSFORMS"
-                    t = var.targets[0]
-                    t.id = rig
-                    t.bone_target = reader["bone"]
-                    t.transform_type = channel
-                    t.rotation_mode = "QUATERNION"
-                    t.transform_space = "LOCAL_SPACE"
-                drv.expression = turn_expression(axis, reader["start"], reader["end"])
-            elif reader:
-                print("hive-rig: shape %s reads bone %s, which the rig doesn't have" % (s["name"], reader["bone"]))
+                    var.name = "weight"
+                    var.type = "SINGLE_PROP"
+                    var.targets[0].id = rig
+                    var.targets[0].data_path = '["%s"]' % shape_property(s["name"])
+                    weight = "weight"
+                drv.expression = weight if len(targets) == 1 else hat_expression(points, t, weight)
 
 
 def build(RIG, geos=None):
@@ -1543,12 +1641,99 @@ def read_weights(geo):
     return [{names[g.group]: g.weight for g in v.groups if g.weight > 0.0} for v in geo.data.vertices]
 
 
+def gather_edits(rig, weights=True, shapes=True):
+    """The weights painted and the shape keys sculpted here, in hive-rig's
+    vertex order and frame: the edits file `hive-rig weights import` and
+    `hive-rig shape <rig> import` read."""
+    geos = rig_meshes(rig)
+    total = sum(len(g.data.vertices) for g in geos)
+    out = {"hive_rig_edits": 1, "rig": rig["hive_name"], "source": "blender", "vertex_count": total}
+    if weights:
+        bones = {b.name for b in rig.data.bones}
+        per_vertex = [None] * total
+        for geo in geos:
+            start = geo.get("hive_first_vertex", 0)
+            for v, w in enumerate(read_weights(geo)):
+                if start + v < total:
+                    per_vertex[start + v] = {g: x for g, x in w.items() if g in bones}
+        out["weights"] = [w or {} for w in per_vertex]
+    if shapes:
+        found = {}  # key name -> {"vertices": [], "offsets": [], "weight": value or None}
+        for geo in geos:
+            keys = geo.data.shape_keys
+            if keys is None:
+                continue
+            start = geo.get("hive_first_vertex", 0)
+            n = len(geo.data.vertices)
+            basis = keys.reference_key
+            base = [0.0] * (3 * n)
+            basis.data.foreach_get("co", base)
+            driven = {fc.data_path for fc in (keys.animation_data.drivers if keys.animation_data else [])}
+            for kb in keys.key_blocks:
+                if kb == basis:
+                    continue
+                co = [0.0] * (3 * n)
+                kb.data.foreach_get("co", co)
+                entry = found.setdefault(kb.name, {"vertices": [], "offsets": [], "weight": None})
+                if 'key_blocks["%s"].value' % kb.name not in driven:
+                    entry["weight"] = kb.value
+                for i in range(n):
+                    d = (co[3 * i] - base[3 * i], co[3 * i + 1] - base[3 * i + 1], co[3 * i + 2] - base[3 * i + 2])
+                    if abs(d[0]) + abs(d[1]) + abs(d[2]) > 1e-7:
+                        entry["vertices"].append(start + i)
+                        entry["offsets"].append(from_blender(d))
+        shape_list = []
+        for name, e in found.items():
+            ib = parse_inbetween_name(name)
+            if ib is not None and ib[0] in found:
+                continue
+            s = {"name": name, "vertices": e["vertices"], "offsets": e["offsets"], "inbetweens": []}
+            if shape_property(name) in rig.keys():
+                s["weight"] = float(rig[shape_property(name)])
+            elif e["weight"] is not None:
+                s["weight"] = e["weight"]
+            for other, o in found.items():
+                parsed = parse_inbetween_name(other)
+                if parsed is not None and parsed[0] == name:
+                    s["inbetweens"].append({"weight": parsed[1], "vertices": o["vertices"], "offsets": o["offsets"]})
+            s["inbetweens"].sort(key=lambda b: b["weight"])
+            shape_list.append(s)
+        out["shapes"] = shape_list
+    return out
+
+
+def send_edits(rig, weights=True, shapes=True):
+    """Write the edits file next to the rig and have hive-rig take the painted
+    weights and sculpted shapes into the .hive.json, so the next rebuild (and
+    the other programs' builders) keep them."""
+    hive_path = files(rig)[1]
+    data = gather_edits(rig, weights, shapes)
+    path = os.path.join(rig["hive_dir"], rig["hive_name"] + ".edits.json")
+    with open(path, "w") as f:
+        json.dump(data, f)
+    said = []
+    if weights:
+        said.append(run_hive("weights", "import", hive_path, path).strip().splitlines()[0])
+    if shapes and data["shapes"]:
+        said.append(run_hive("shape", hive_path, "import", path).strip().splitlines()[-1])
+    return " ".join(said) or "Nothing to send"
+
+
 def rebuild(rig, keep_weights=True):
     """Rebuild the rig from its guides. With keep_weights, vertices keep their
-    current weights unless the new rig weights them to a bone that didn't exist."""
+    current weights unless the new rig weights them to a bone that didn't exist.
+    The painted weights and sculpted shape keys go to hive-rig first, so its
+    .hive.json keeps them too."""
     guides_path, hive_path = files(rig)
     write_guides(rig, guides_of(rig))
-    run_hive("rebuild", hive_path, "--guides", guides_path)
+    try:
+        send_edits(rig, weights=keep_weights, shapes=True)
+    except RuntimeError as e:
+        print("hive-rig: couldn't send the weights and shapes before rebuilding: %s" % e)
+    if keep_weights:
+        run_hive("rebuild", hive_path, "--guides", guides_path, "--keep-weights")
+    else:
+        run_hive("rebuild", hive_path, "--guides", guides_path)
     with open(hive_path) as f:
         data = json.load(f)
 
@@ -1657,6 +1842,23 @@ class HIVE_OT_rebuild(bpy.types.Operator):
     def execute(self, context):
         try:
             rebuild(find_rig(context), self.keep_weights)
+        except RuntimeError as e:
+            self.report({"ERROR"}, str(e))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class HIVE_OT_send_edits(bpy.types.Operator):
+    bl_idname = "hive.send_edits"
+    bl_label = "Send to Hive"
+    bl_description = ("Send the painted weights and sculpted shape keys back into the hive rig file, "
+                      "so rebuilds and the other programs' builders keep them")
+    weights: bpy.props.BoolProperty(name="Weights", default=True)
+    shapes: bpy.props.BoolProperty(name="Shapes", default=True)
+
+    def execute(self, context):
+        try:
+            self.report({"INFO"}, send_edits(find_rig(context), self.weights, self.shapes))
         except RuntimeError as e:
             self.report({"ERROR"}, str(e))
             return {"CANCELLED"}
@@ -1832,6 +2034,18 @@ class HIVE_PT_panel(bpy.types.Panel):
         col.operator("hive.add_component", text="Add Tail").preset = "tail"
         col.operator("hive.remove_component", icon="X")
         layout.operator("hive.rebuild", icon="FILE_REFRESH").keep_weights = True
+        box = layout.box()
+        box.label(text="Skin and Shapes")
+        row = box.row(align=True)
+        op = row.operator("hive.send_edits", text="Send All", icon="EXPORT")
+        op.weights, op.shapes = True, True
+        op = row.operator("hive.send_edits", text="Weights")
+        op.weights, op.shapes = True, False
+        op = row.operator("hive.send_edits", text="Shapes")
+        op.weights, op.shapes = False, True
+        sliders = [k for k in rig.keys() if k.startswith("hive_shape_")]
+        for k in sorted(sliders):
+            box.prop(rig, '["%s"]' % k, text=k[len("hive_shape_"):], slider=True)
         if editing or not rig.get("hive_anim"):
             return
 
@@ -1883,6 +2097,7 @@ CLASSES = (
     HIVE_OT_add_component,
     HIVE_OT_remove_component,
     HIVE_OT_rebuild,
+    HIVE_OT_send_edits,
     HIVE_OT_match_limb,
     HIVE_OT_mirror_pose,
     HIVE_OT_flip_pose,

@@ -166,7 +166,7 @@ pub fn script(rig: &Rig, target: Target, glb_path: &Path) -> Result<String> {
                 .mesh
                 .shapes
                 .iter()
-                .map(|s| json!({ "name": s.name, "weight": s.weight, "driver": s.driver }))
+                .map(|s| json!({ "name": s.name, "weight": s.weight, "driver": s.driver, "inbetweens": s.points()[..s.inbetweens.len()] }))
                 .collect();
             let data = json!({
                 "name": rig.name,

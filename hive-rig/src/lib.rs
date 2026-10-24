@@ -19,6 +19,7 @@ pub mod checks;
 pub mod components;
 pub mod controls;
 pub mod demo;
+pub mod edits;
 pub mod export;
 pub mod import;
 pub mod joints;

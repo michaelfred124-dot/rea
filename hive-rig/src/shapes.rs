@@ -39,6 +39,75 @@ pub struct Shape {
     /// A corrective shape: a joint's rotation sets the weight instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub driver: Option<PoseReader>,
+    /// In-between targets: where the vertices are at a weight between 0 and 1
+    /// (ascending by weight). The shape moves through them in order: from rest
+    /// to the first, from one to the next, and from the last to the full
+    /// offsets at 1, blending linearly between neighbours (as Maya's
+    /// blendShape in-betweens do).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inbetweens: Vec<Inbetween>,
+}
+
+/// One in-between target of a shape: the full offsets of its vertices at
+/// `weight` (not added to the shape's own offsets).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Inbetween {
+    /// The shape weight at which the vertices are exactly here (0 < weight < 1).
+    pub weight: f32,
+    /// The vertices it moves, ascending.
+    pub vertices: Vec<u32>,
+    /// Where each of `vertices` is at `weight`, as an offset from rest (metres).
+    pub offsets: Vec<Vec3>,
+}
+
+impl Inbetween {
+    /// The in-between from one offset per vertex, keeping the vertices that move.
+    pub fn from_dense(weight: f32, offsets: &[Vec3]) -> Inbetween {
+        let s = Shape::from_dense("", offsets);
+        Inbetween {
+            weight,
+            vertices: s.vertices,
+            offsets: s.offsets,
+        }
+    }
+
+    pub fn dense(&self, n: usize) -> Vec<Vec3> {
+        dense_of(&self.vertices, &self.offsets, n)
+    }
+}
+
+fn dense_of(vertices: &[u32], offsets: &[Vec3], n: usize) -> Vec<Vec3> {
+    let mut out = vec![Vec3::ZERO; n];
+    for (&v, d) in vertices.iter().zip(offsets) {
+        if let Some(o) = out.get_mut(v as usize) {
+            *o += *d;
+        }
+    }
+    out
+}
+
+/// How much of each target a weight `w` takes, for targets reached at
+/// `points` (ascending, the last being 1): linear between the two targets
+/// around `w`, rising from rest to the first, and carried on past either end
+/// along the nearest segment (so with one target at 1 this is just `w`).
+pub fn target_mix(points: &[f32], w: f32) -> Vec<f32> {
+    let mut out = vec![0.0; points.len()];
+    if points.is_empty() {
+        return out;
+    }
+    if points.len() == 1 || w <= points[0] {
+        out[0] = w / points[0].max(1e-6);
+        return out;
+    }
+    // The segment [points[k], points[k + 1]] holding w (the last one past the end).
+    let k = (0..points.len() - 1)
+        .find(|&k| w <= points[k + 1])
+        .unwrap_or(points.len() - 2);
+    let span = (points[k + 1] - points[k]).max(1e-6);
+    let t = (w - points[k]) / span;
+    out[k] = 1.0 - t;
+    out[k + 1] = t;
+    out
 }
 
 fn is_zero(v: &f32) -> bool {
@@ -107,18 +176,71 @@ impl Shape {
             normal_offsets: Vec::new(),
             weight: 0.0,
             driver: None,
+            inbetweens: Vec::new(),
         }
     }
 
-    /// One offset per vertex of an `n`-vertex mesh.
+    /// One offset per vertex of an `n`-vertex mesh (at full weight).
     pub fn dense(&self, n: usize) -> Vec<Vec3> {
-        let mut out = vec![Vec3::ZERO; n];
-        for (&v, d) in self.vertices.iter().zip(&self.offsets) {
-            if let Some(o) = out.get_mut(v as usize) {
-                *o += *d;
+        dense_of(&self.vertices, &self.offsets, n)
+    }
+
+    /// The weights its targets are reached at: each in-between's, then 1.
+    pub fn points(&self) -> Vec<f32> {
+        self.inbetweens
+            .iter()
+            .map(|b| b.weight)
+            .chain([1.0])
+            .collect()
+    }
+
+    /// How much of each target (the in-betweens, then the full shape) the
+    /// shape at weight `w` takes.
+    pub fn mix(&self, w: f32) -> Vec<f32> {
+        target_mix(&self.points(), w)
+    }
+
+    /// Add the shape at weight `w` to `out` (one position per vertex).
+    pub fn add_to(&self, out: &mut [Vec3], w: f32) {
+        if w == 0.0 {
+            return;
+        }
+        let mix = self.mix(w);
+        let targets = self
+            .inbetweens
+            .iter()
+            .map(|b| (&b.vertices, &b.offsets))
+            .chain([(&self.vertices, &self.offsets)]);
+        for ((vertices, offsets), c) in targets.zip(mix) {
+            if c == 0.0 {
+                continue;
+            }
+            for (&v, d) in vertices.iter().zip(offsets) {
+                if let Some(p) = out.get_mut(v as usize) {
+                    *p += *d * c;
+                }
             }
         }
+    }
+
+    /// One offset per vertex of an `n`-vertex mesh, at weight `w`.
+    pub fn dense_at(&self, n: usize, w: f32) -> Vec<Vec3> {
+        let mut out = vec![Vec3::ZERO; n];
+        self.add_to(&mut out, w);
         out
+    }
+
+    /// The name an in-between goes by as a target of its own (glTF and Unreal
+    /// morph targets, Blender shape keys): `<shape>_ib<percent>`.
+    pub fn inbetween_name(&self, k: usize) -> String {
+        inbetween_name(&self.name, self.inbetweens[k].weight)
+    }
+
+    /// The in-between reached at `weight` (to within half a percent).
+    pub fn inbetween_at(&self, weight: f32) -> Option<usize> {
+        self.inbetweens
+            .iter()
+            .position(|b| (b.weight - weight).abs() < 0.005)
     }
 
     pub fn dense_normals(&self, n: usize) -> Vec<Vec3> {
@@ -165,22 +287,138 @@ impl Shape {
                 self.name
             );
         }
+        let mut last = 0.0f32;
+        for b in &self.inbetweens {
+            anyhow::ensure!(
+                b.weight > 0.0 && b.weight < 1.0,
+                "shape '{}' has an in-between at {}; they sit between 0 and 1",
+                self.name,
+                b.weight
+            );
+            anyhow::ensure!(
+                b.weight - last >= 0.01 - 1e-5 && 1.0 - b.weight >= 0.01 - 1e-5,
+                "shape '{}' has in-betweens out of order or closer than 0.01",
+                self.name
+            );
+            last = b.weight;
+            anyhow::ensure!(
+                b.vertices.len() == b.offsets.len()
+                    && b.vertices.windows(2).all(|w| w[0] < w[1])
+                    && b.vertices.last().is_none_or(|&v| (v as usize) < n)
+                    && b.offsets.iter().all(|d| d.is_finite()),
+                "shape '{}' has a broken in-between at {}",
+                self.name,
+                b.weight
+            );
+        }
         Ok(())
     }
+}
+
+/// `<shape>_ib<percent>`: an in-between's name as a target of its own.
+pub fn inbetween_name(shape: &str, weight: f32) -> String {
+    format!("{shape}_ib{}", (weight * 100.0).round() as i32)
+}
+
+/// Read `<shape>_ib<percent>` back: the shape's name and the weight.
+pub fn parse_inbetween_name(name: &str) -> Option<(&str, f32)> {
+    let (shape, pct) = name.rsplit_once("_ib")?;
+    let pct: u32 = pct.parse().ok()?;
+    (!shape.is_empty() && (1..100).contains(&pct)).then_some((shape, pct as f32 / 100.0))
 }
 
 /// `rest` with each shape added at its weight in `weights` (one per shape).
 pub fn apply(rest: &[Vec3], shapes: &[Shape], weights: &[f32]) -> Vec<Vec3> {
     let mut out = rest.to_vec();
     for (s, &w) in shapes.iter().zip(weights) {
-        if w == 0.0 {
-            continue;
+        s.add_to(&mut out, w);
+    }
+    out
+}
+
+/// One target of a shape, as formats without in-betweens carry it: a morph
+/// target or shape key of its own.
+#[derive(Debug, Clone)]
+pub struct FlatTarget<'a> {
+    /// The shape's name, or `<shape>_ib<percent>` for an in-between.
+    pub name: String,
+    /// Which shape of the list it belongs to.
+    pub shape: usize,
+    pub vertices: &'a [u32],
+    pub offsets: &'a [Vec3],
+    /// Normal offsets (the full shape's only; empty when it has none).
+    pub normals: &'a [Vec3],
+    /// The target's weight for the shape's own weight.
+    pub weight: f32,
+}
+
+/// Every target of `shapes` as a target of its own, each shape's in-betweens
+/// before its full target, weighted so that together they give the shape at
+/// its weight.
+pub fn flat_targets(shapes: &[Shape]) -> Vec<FlatTarget<'_>> {
+    let mut out = Vec::new();
+    for (i, s) in shapes.iter().enumerate() {
+        let mix = s.mix(s.weight);
+        for (k, b) in s.inbetweens.iter().enumerate() {
+            out.push(FlatTarget {
+                name: s.inbetween_name(k),
+                shape: i,
+                vertices: &b.vertices,
+                offsets: &b.offsets,
+                normals: &[],
+                weight: mix[k],
+            });
         }
-        for (&v, d) in s.vertices.iter().zip(&s.offsets) {
-            if let Some(p) = out.get_mut(v as usize) {
-                *p += *d * w;
+        out.push(FlatTarget {
+            name: s.name.clone(),
+            shape: i,
+            vertices: &s.vertices,
+            offsets: &s.offsets,
+            normals: &s.normal_offsets,
+            weight: *mix.last().unwrap_or(&0.0),
+        });
+    }
+    out
+}
+
+/// Fold targets named `<shape>_ib<percent>` into `<shape>`'s in-betweens, the
+/// way hive-rig writes them to formats without in-betweens (glTF morph
+/// targets, Blender shape keys). The folded shape's weight is recovered from
+/// the targets' weights. Targets without a matching shape stay as they are.
+pub fn fold_inbetweens(shapes: Vec<Shape>) -> Vec<Shape> {
+    let names: std::collections::HashSet<String> = shapes.iter().map(|s| s.name.clone()).collect();
+    let mut out: Vec<Shape> = Vec::new();
+    let mut parts: HashMap<String, Vec<Shape>> = HashMap::new();
+    for s in shapes {
+        match parse_inbetween_name(&s.name) {
+            Some((base, _)) if names.contains(base) => {
+                parts.entry(base.to_string()).or_default().push(s);
             }
+            _ => out.push(s),
         }
+    }
+    for s in &mut out {
+        let Some(mut ibs) = parts.remove(&s.name) else {
+            continue;
+        };
+        ibs.sort_by(|a, b| {
+            let wa = parse_inbetween_name(&a.name).map_or(0.0, |x| x.1);
+            let wb = parse_inbetween_name(&b.name).map_or(0.0, |x| x.1);
+            wa.total_cmp(&wb)
+        });
+        // Each target's weight times the weight it is reached at adds up to
+        // the shape's weight (two neighbouring targets share it linearly).
+        let mut w = s.weight;
+        for ib in ibs {
+            let at = parse_inbetween_name(&ib.name).map_or(0.5, |x| x.1);
+            w += ib.weight * at;
+            s.inbetweens.push(Inbetween {
+                weight: at,
+                vertices: ib.vertices,
+                offsets: ib.offsets,
+            });
+        }
+        s.weight = w;
     }
     out
 }
@@ -211,6 +449,7 @@ pub fn combine(shapes: &[&Shape], name: &str) -> Shape {
         vertices: keys,
         weight: 0.0,
         driver: None,
+        inbetweens: Vec::new(),
     }
 }
 
@@ -284,6 +523,18 @@ pub fn mirror(
             .collect();
     }
     out.weight = shape.weight;
+    out.inbetweens = shape
+        .inbetweens
+        .iter()
+        .map(|b| {
+            let src = b.dense(n);
+            let dense: Vec<Vec3> = map
+                .iter()
+                .map(|m| m.map_or(Vec3::ZERO, |j| flip(src[j as usize])))
+                .collect();
+            Inbetween::from_dense(b.weight, &dense)
+        })
+        .collect();
     out
 }
 
@@ -317,10 +568,14 @@ pub fn split(
             normal_offsets: Vec::new(),
             weight: shape.weight,
             driver: None,
+            inbetweens: Vec::new(),
+        };
+        let share = |v: u32| {
+            let s = left_share(positions[v as usize].x);
+            if left { s } else { 1.0 - s }
         };
         for (k, (&v, d)) in shape.vertices.iter().zip(&shape.offsets).enumerate() {
-            let s = left_share(positions[v as usize].x);
-            let s = if left { s } else { 1.0 - s };
+            let s = share(v);
             if s <= 0.0 {
                 continue;
             }
@@ -329,6 +584,21 @@ pub fn split(
             if let Some(nd) = shape.normal_offsets.get(k) {
                 out.normal_offsets.push(*nd * s);
             }
+        }
+        for b in &shape.inbetweens {
+            let mut half = Inbetween {
+                weight: b.weight,
+                vertices: Vec::new(),
+                offsets: Vec::new(),
+            };
+            for (&v, d) in b.vertices.iter().zip(&b.offsets) {
+                let s = share(v);
+                if s > 0.0 {
+                    half.vertices.push(v);
+                    half.offsets.push(*d * s);
+                }
+            }
+            out.inbetweens.push(half);
         }
         out
     };
@@ -601,6 +871,26 @@ pub fn posed_mesh_with(rig: &Rig, locals: &[Quat], mats: &[Mat4]) -> Vec<Vec3> {
     deform(&base, &rig.skin, mats)
 }
 
+/// Where the skin puts each vertex in a pose with one target of the shape
+/// `name` fully on (the in-between reached at `inbetween`, or the full
+/// shape) and the other shapes at their weights in that pose: the mesh a
+/// sculpt of that target starts from.
+pub fn posed_target(
+    rig: &Rig,
+    name: &str,
+    inbetween: Option<f32>,
+    locals: &[Quat],
+    mats: &[Mat4],
+) -> Vec<Vec3> {
+    let shapes = &rig.mesh.shapes;
+    let mut weights = weights_in_pose(shapes, locals, |n| rig.skeleton.index_of(n));
+    if let Some(i) = shapes.iter().position(|s| s.name == name) {
+        weights[i] = inbetween.unwrap_or(1.0);
+    }
+    let base = apply(&rig.mesh.positions, shapes, &weights);
+    deform(&base, &rig.skin, mats)
+}
+
 /// Add `moves` (vertex, where it should be in the pose) to the shape `name`,
 /// making it if needed: the offsets are worked back through the skin, so at
 /// full weight in that pose each vertex lands where it was put. Other shapes
@@ -623,13 +913,35 @@ pub fn sculpt_with(
     mats: &[Mat4],
     moves: &[(usize, Vec3)],
 ) -> anyhow::Result<usize> {
+    sculpt_target(rig, name, None, locals, mats, moves)
+}
+
+/// [`sculpt_with`] into one of the shape's targets: the in-between reached at
+/// `inbetween` (which must exist), or the full shape with `None`.
+pub fn sculpt_target(
+    rig: &mut Rig,
+    name: &str,
+    inbetween: Option<f32>,
+    locals: &[Quat],
+    mats: &[Mat4],
+    moves: &[(usize, Vec3)],
+) -> anyhow::Result<usize> {
     anyhow::ensure!(!name.trim().is_empty(), "the shape needs a name");
     let shapes = &rig.mesh.shapes;
     let mine = shapes.iter().position(|s| s.name == name);
+    let target = match (inbetween, mine) {
+        (None, _) => None,
+        (Some(w), Some(i)) => Some(
+            shapes[i]
+                .inbetween_at(w)
+                .ok_or_else(|| anyhow::anyhow!("'{name}' has no in-between at {w:.2}"))?,
+        ),
+        (Some(_), None) => anyhow::bail!("the rig has no shape '{name}'"),
+    };
     let mut weights = weights_in_pose(shapes, locals, |n| rig.skeleton.index_of(n));
     if let Some(i) = mine {
-        // This shape counts fully: the new offsets go on top of its own.
-        weights[i] = 1.0;
+        // This target counts fully: the new offsets go on top of its own.
+        weights[i] = target.map_or(1.0, |k| shapes[i].inbetweens[k].weight);
     }
     let base = apply(&rig.mesh.positions, shapes, &weights);
     let offsets = corrective_offsets(&base, &rig.skin, mats, moves);
@@ -642,17 +954,61 @@ pub fn sculpt_with(
     }
     let added = Shape::from_dense(name, &dense);
     let moved = added.vertices.len();
-    match mine {
-        Some(i) => {
+    match (mine, target) {
+        (Some(i), Some(k)) => {
+            let b = &mut rig.mesh.shapes[i].inbetweens[k];
+            let mut sum = b.dense(n);
+            for (s, d) in sum.iter_mut().zip(&dense) {
+                *s += *d;
+            }
+            *b = Inbetween::from_dense(b.weight, &sum);
+        }
+        (Some(i), None) => {
             let old = rig.mesh.shapes[i].clone();
             let mut merged = combine(&[&old, &added], name);
             merged.weight = old.weight;
             merged.driver = old.driver;
+            merged.inbetweens = old.inbetweens;
             rig.mesh.shapes[i] = merged;
         }
-        None => rig.mesh.shapes.push(added),
+        (None, _) => rig.mesh.shapes.push(added),
     }
     Ok(moved)
+}
+
+/// Give `name` an in-between at `weight` (between 0 and 1), starting where the
+/// shape puts the vertices at that weight now, so nothing moves until it is
+/// sculpted. Returns its index among the shape's in-betweens.
+pub fn add_inbetween(rig: &mut Rig, name: &str, weight: f32) -> anyhow::Result<usize> {
+    anyhow::ensure!(
+        weight.is_finite() && (0.01..=0.99).contains(&weight),
+        "an in-between sits between 0.01 and 0.99, not {weight}"
+    );
+    let weight = (weight * 100.0).round() / 100.0;
+    let n = rig.mesh.vertex_count();
+    let i = index(rig, name)?;
+    let s = &rig.mesh.shapes[i];
+    anyhow::ensure!(
+        s.inbetweens
+            .iter()
+            .all(|b| (b.weight - weight).abs() >= 0.01 - 1e-5),
+        "'{name}' already has an in-between at {weight:.2}"
+    );
+    let b = Inbetween::from_dense(weight, &s.dense_at(n, weight));
+    let s = &mut rig.mesh.shapes[i];
+    let k = s.inbetweens.partition_point(|x| x.weight < weight);
+    s.inbetweens.insert(k, b);
+    Ok(k)
+}
+
+/// Take the in-between at `weight` off `name`.
+pub fn remove_inbetween(rig: &mut Rig, name: &str, weight: f32) -> anyhow::Result<()> {
+    let i = index(rig, name)?;
+    let k = rig.mesh.shapes[i]
+        .inbetween_at(weight)
+        .ok_or_else(|| anyhow::anyhow!("'{name}' has no in-between at {weight:.2}"))?;
+    rig.mesh.shapes[i].inbetweens.remove(k);
+    Ok(())
 }
 
 /// The moves of a soft brush in a pose: every vertex within `radius` of `at`
@@ -669,6 +1025,197 @@ pub fn brush_moves(posed: &[Vec3], at: Vec3, radius: f32, offset: Vec3) -> Vec<(
             })
         })
         .collect()
+}
+
+/// What the sculpt brush does to the vertices under it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SculptBrush {
+    /// Drag the vertices along with the pointer.
+    #[default]
+    Grab,
+    /// Pull each vertex toward its neighbours' average (evens out bumps).
+    Smooth,
+    /// Like Smooth but only along the surface, so the shape's volume stays.
+    Relax,
+    /// Push the vertices out along their normals (in with a negative amount).
+    Inflate,
+    /// Take the shape's own offsets back off, toward the mesh without it.
+    Erase,
+}
+
+impl SculptBrush {
+    pub const ALL: [SculptBrush; 5] = [
+        SculptBrush::Grab,
+        SculptBrush::Smooth,
+        SculptBrush::Relax,
+        SculptBrush::Inflate,
+        SculptBrush::Erase,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SculptBrush::Grab => "Grab",
+            SculptBrush::Smooth => "Smooth",
+            SculptBrush::Relax => "Relax",
+            SculptBrush::Inflate => "Inflate",
+            SculptBrush::Erase => "Erase",
+        }
+    }
+}
+
+/// The brush's reach at distance `d` from its centre: 1 there, fading
+/// smoothly to 0 at `radius`.
+pub fn falloff(d: f32, radius: f32) -> f32 {
+    if radius <= 0.0 || d >= radius {
+        return 0.0;
+    }
+    let t = 1.0 - (d / radius).powi(2);
+    t * t
+}
+
+/// Unit vertex normals of a posed mesh, the same on every copy of a vertex
+/// split at a seam (`weld` gives each vertex its welded index).
+pub fn welded_normals(posed: &[Vec3], indices: &[u32], weld: &[u32]) -> Vec<Vec3> {
+    let raw = crate::mesh::smooth_normals(posed, indices);
+    let mut sum = vec![Vec3::ZERO; posed.len()];
+    for (v, n) in raw.iter().enumerate() {
+        if let Some(&w) = weld.get(v)
+            && let Some(s) = sum.get_mut(w as usize)
+        {
+            *s += *n;
+        }
+    }
+    (0..posed.len())
+        .map(|v| {
+            let w = weld.get(v).map_or(v, |&w| w as usize);
+            sum.get(w).copied().unwrap_or_default().normalize_or_zero()
+        })
+        .collect()
+}
+
+/// The vertices within `radius` of `at`, with their falloff.
+fn under_brush(posed: &[Vec3], at: Vec3, radius: f32) -> impl Iterator<Item = (usize, f32)> + '_ {
+    posed.iter().enumerate().filter_map(move |(v, p)| {
+        let f = falloff(p.distance(at), radius);
+        (f > 0.0).then_some((v, f))
+    })
+}
+
+fn neighbour_mean(posed: &[Vec3], adjacency: &[Vec<u32>], v: usize) -> Option<Vec3> {
+    let nb = adjacency.get(v)?;
+    (!nb.is_empty()).then(|| nb.iter().map(|&j| posed[j as usize]).sum::<Vec3>() / nb.len() as f32)
+}
+
+/// Smooth: each vertex under the brush moves toward its neighbours' average
+/// by `strength` (0 to 1) at the centre.
+pub fn smooth_moves(
+    posed: &[Vec3],
+    adjacency: &[Vec<u32>],
+    at: Vec3,
+    radius: f32,
+    strength: f32,
+) -> Vec<(usize, Vec3)> {
+    under_brush(posed, at, radius)
+        .filter_map(|(v, f)| {
+            let mean = neighbour_mean(posed, adjacency, v)?;
+            Some((v, posed[v] + (mean - posed[v]) * (strength * f)))
+        })
+        .collect()
+}
+
+/// Relax: like [`smooth_moves`] with the move along the normal taken out, so
+/// vertices even out across the surface without it shrinking.
+pub fn relax_moves(
+    posed: &[Vec3],
+    normals: &[Vec3],
+    adjacency: &[Vec<u32>],
+    at: Vec3,
+    radius: f32,
+    strength: f32,
+) -> Vec<(usize, Vec3)> {
+    under_brush(posed, at, radius)
+        .filter_map(|(v, f)| {
+            let mean = neighbour_mean(posed, adjacency, v)?;
+            let d = mean - posed[v];
+            let n = normals.get(v).copied().unwrap_or_default();
+            Some((v, posed[v] + (d - n * d.dot(n)) * (strength * f)))
+        })
+        .collect()
+}
+
+/// Inflate: each vertex under the brush moves `amount` metres along its
+/// normal at the centre (inward when negative).
+pub fn inflate_moves(
+    posed: &[Vec3],
+    normals: &[Vec3],
+    at: Vec3,
+    radius: f32,
+    amount: f32,
+) -> Vec<(usize, Vec3)> {
+    under_brush(posed, at, radius)
+        .map(|(v, f)| {
+            let n = normals.get(v).copied().unwrap_or_default();
+            (v, posed[v] + n * (amount * f))
+        })
+        .collect()
+}
+
+/// Erase: scale the target's offsets under the brush (measured on the mesh
+/// as `posed` shows it) down by `strength` at the centre, toward no change.
+/// Returns how many vertices changed.
+pub fn erase(
+    rig: &mut Rig,
+    name: &str,
+    inbetween: Option<f32>,
+    posed: &[Vec3],
+    at: Vec3,
+    radius: f32,
+    strength: f32,
+) -> anyhow::Result<usize> {
+    let i = index(rig, name)?;
+    let s = &mut rig.mesh.shapes[i];
+    let (vertices, offsets) = match inbetween {
+        Some(w) => {
+            let k = s
+                .inbetween_at(w)
+                .ok_or_else(|| anyhow::anyhow!("'{name}' has no in-between at {w:.2}"))?;
+            let b = &mut s.inbetweens[k];
+            (&b.vertices, &mut b.offsets)
+        }
+        None => (&s.vertices, &mut s.offsets),
+    };
+    let mut changed = 0;
+    for (&v, d) in vertices.iter().zip(offsets.iter_mut()) {
+        let f = posed
+            .get(v as usize)
+            .map_or(0.0, |p| falloff(p.distance(at), radius));
+        if f > 0.0 && *d != Vec3::ZERO {
+            *d *= (1.0 - strength * f).max(0.0);
+            changed += 1;
+        }
+    }
+    // Drop the vertices that no longer move (keeping normal offsets in step).
+    if inbetween.is_none() && !s.normal_offsets.is_empty() {
+        return Ok(changed);
+    }
+    match inbetween {
+        Some(w) => {
+            let k = s.inbetween_at(w).unwrap_or_default();
+            let n = rig.mesh.positions.len();
+            let b = &mut rig.mesh.shapes[i].inbetweens[k];
+            *b = Inbetween::from_dense(b.weight, &b.dense(n));
+        }
+        None => {
+            let n = rig.mesh.positions.len();
+            let old = rig.mesh.shapes[i].clone();
+            let mut fresh = Shape::from_dense(name, &old.dense(n));
+            fresh.weight = old.weight;
+            fresh.driver = old.driver;
+            fresh.inbetweens = old.inbetweens;
+            rig.mesh.shapes[i] = fresh;
+        }
+    }
+    Ok(changed)
 }
 
 /// The shape of a rig by name.
@@ -931,6 +1478,118 @@ mod tests {
                 .bone,
             "lowerarm_l"
         );
+    }
+
+    #[test]
+    fn inbetweens_blend_in_order_and_fold_back() {
+        // Without in-betweens the weight scales the offsets, past 1 too.
+        assert_eq!(target_mix(&[1.0], 0.3), vec![0.3]);
+        assert_eq!(target_mix(&[1.0], 1.5), vec![1.5]);
+        let m = target_mix(&[0.25, 0.5, 1.0], 0.375);
+        assert!((m[0] - 0.5).abs() < 1e-6 && (m[1] - 0.5).abs() < 1e-6 && m[2] == 0.0);
+        assert!((target_mix(&[0.25, 0.5, 1.0], 0.125)[0] - 0.5).abs() < 1e-6);
+        let m = target_mix(&[0.25, 0.5, 1.0], 0.75);
+        assert!((m[1] - 0.5).abs() < 1e-6 && (m[2] - 0.5).abs() < 1e-6);
+
+        let mut rig =
+            crate::rig::auto_rig(crate::demo::demo_humanoid(), "demo", Default::default()).unwrap();
+        let n = rig.mesh.vertex_count();
+        let rest = vec![Quat::IDENTITY; rig.skeleton.bones.len()];
+        let mut dense = vec![Vec3::ZERO; n];
+        dense[3] = Vec3::new(0.0, 0.1, 0.0);
+        let mut s = Shape::from_dense("lift", &dense);
+        s.weight = 0.5;
+        rig.mesh.shapes.push(s);
+        // A new in-between starts where the shape is: nothing moves.
+        let before = posed_mesh(&rig, &rest);
+        assert_eq!(add_inbetween(&mut rig, "lift", 0.5).unwrap(), 0);
+        assert!(add_inbetween(&mut rig, "lift", 0.5).is_err());
+        assert!(add_inbetween(&mut rig, "lift", 1.0).is_err());
+        let after = posed_mesh(&rig, &rest);
+        assert!(before[3].distance(after[3]) < 1e-6);
+        // Sculpt the in-between sideways: at 0.5 the vertex is there, at 1 the
+        // full shape is untouched, at 0.25 it is half way to the in-between.
+        let to = after[3] + Vec3::new(0.05, 0.0, 0.0);
+        let mats = skin_matrices(&rig.skeleton, &rest);
+        sculpt_target(&mut rig, "lift", Some(0.5), &rest, &mats, &[(3, to)]).unwrap();
+        assert!(posed_mesh(&rig, &rest)[3].distance(to) < 1e-5);
+        set_weight(&mut rig, "lift", 1.0).unwrap();
+        let full = posed_mesh(&rig, &rest)[3] - rig.mesh.positions[3];
+        assert!(full.distance(Vec3::new(0.0, 0.1, 0.0)) < 1e-5);
+        set_weight(&mut rig, "lift", 0.25).unwrap();
+        let quarter = posed_mesh(&rig, &rest)[3] - rig.mesh.positions[3];
+        assert!(
+            quarter.distance(Vec3::new(0.025, 0.025, 0.0)) < 1e-5,
+            "{quarter}"
+        );
+        rig.mesh.validate().unwrap();
+        // Out to formats without in-betweens and back: the same shape.
+        let flat = flat_targets(&rig.mesh.shapes);
+        assert_eq!(
+            flat.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            ["lift_ib50", "lift"]
+        );
+        assert!((flat[0].weight - 0.5).abs() < 1e-6 && flat[1].weight == 0.0);
+        let as_shapes: Vec<Shape> = flat
+            .iter()
+            .map(|t| {
+                let mut s = Shape::from_dense(&t.name, &[]);
+                s.vertices = t.vertices.to_vec();
+                s.offsets = t.offsets.to_vec();
+                s.weight = t.weight;
+                s
+            })
+            .collect();
+        let back = fold_inbetweens(as_shapes);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].inbetweens, rig.mesh.shapes[0].inbetweens);
+        assert!((back[0].weight - 0.25).abs() < 1e-6);
+        assert_eq!(parse_inbetween_name("a_b_ib35"), Some(("a_b", 0.35)));
+        assert_eq!(parse_inbetween_name("ib35"), None);
+        // Mirror and split carry the in-betweens.
+        let twin = mirror_on_rig(&mut rig, "lift", Some("lift_m")).unwrap();
+        assert_eq!(find(&rig, &twin).unwrap().inbetweens.len(), 1);
+        let [l, _] = split_on_rig(&mut rig, "lift", None, None).unwrap();
+        assert_eq!(find(&rig, &l).unwrap().inbetweens.len(), 1);
+        remove_inbetween(&mut rig, "lift", 0.5).unwrap();
+        assert!(find(&rig, "lift").unwrap().inbetweens.is_empty());
+    }
+
+    #[test]
+    fn sculpt_brushes_smooth_relax_inflate_and_erase() {
+        // A bumpy row of points: the middle one sticks up.
+        let posed = vec![
+            Vec3::new(-0.1, 0.0, 0.0),
+            Vec3::new(0.0, 0.05, 0.0),
+            Vec3::new(0.1, 0.0, 0.0),
+        ];
+        let adj = vec![vec![1], vec![0, 2], vec![1]];
+        let s = smooth_moves(&posed, &adj, posed[1], 0.05, 1.0);
+        let mid = s.iter().find(|m| m.0 == 1).unwrap().1;
+        assert!(mid.y.abs() < 1e-6, "smooth flattens the bump: {mid}");
+        // Relax with the normal along Y doesn't flatten it: it only slides.
+        let normals = vec![Vec3::Y; 3];
+        let r = relax_moves(&posed, &normals, &adj, posed[1], 0.05, 1.0);
+        assert!((r.iter().find(|m| m.0 == 1).unwrap().1.y - 0.05).abs() < 1e-6);
+        let i = inflate_moves(&posed, &normals, posed[1], 0.05, 0.01);
+        assert!((i.iter().find(|m| m.0 == 1).unwrap().1.y - 0.06).abs() < 1e-6);
+        assert!(falloff(0.05, 0.05) == 0.0 && falloff(0.0, 0.05) == 1.0);
+
+        let mut rig =
+            crate::rig::auto_rig(crate::demo::demo_humanoid(), "demo", Default::default()).unwrap();
+        let n = rig.mesh.vertex_count();
+        let mut dense = vec![Vec3::ZERO; n];
+        dense[0] = Vec3::X * 0.01;
+        dense[n - 1] = Vec3::X * 0.01;
+        rig.mesh.shapes.push(Shape::from_dense("e", &dense));
+        let posed = rig.mesh.positions.clone();
+        let at = posed[0];
+        let radius = 1e-4;
+        assert_eq!(
+            erase(&mut rig, "e", None, &posed, at, radius, 1.0).unwrap(),
+            1
+        );
+        assert_eq!(find(&rig, "e").unwrap().vertices, vec![n as u32 - 1]);
     }
 
     #[test]

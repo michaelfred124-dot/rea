@@ -32,6 +32,38 @@ pub enum SelectOp {
     Remove,
 }
 
+/// What a drag on the mesh does. One tool at a time: switching to one turns
+/// the others off, so the viewport never paints and sculpts at once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MeshTool {
+    /// Drags orbit the camera and clicks pick guides and controls.
+    View,
+    /// Drags paint the shown bone's weights.
+    Paint,
+    /// Clicks and box drags select vertices.
+    Select,
+    /// Drags sculpt the picked shape.
+    Sculpt,
+}
+
+impl MeshTool {
+    pub const ALL: [MeshTool; 4] = [
+        MeshTool::View,
+        MeshTool::Paint,
+        MeshTool::Select,
+        MeshTool::Sculpt,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MeshTool::View => "View",
+            MeshTool::Paint => "Paint",
+            MeshTool::Select => "Select",
+            MeshTool::Sculpt => "Sculpt",
+        }
+    }
+}
+
 /// The weight tools' state: what is selected, locked, copied and hovered.
 pub struct SkinTools {
     /// The select tool is on: clicks and drags on the mesh select vertices.
@@ -57,6 +89,12 @@ pub struct SkinTools {
     /// The next change in the weight table starts a new undo step (set when a
     /// cell starts being dragged or typed in, so the whole edit is one step).
     pub table_step: bool,
+    /// Bones whose name contains this are listed under Skin weights.
+    pub bone_filter: String,
+    /// The mesh shows every bone's weights at once, each in its own colour.
+    pub color_all: bool,
+    /// The vertex the inspector shows: the last one under the pointer.
+    pub inspect: Option<usize>,
     /// Surface neighbours of the mesh (seam copies welded), built once per character.
     neighbours: Option<Arc<Vec<Vec<u32>>>>,
 }
@@ -75,6 +113,9 @@ impl Default for SkinTools {
             box_to: None,
             table_step: true,
             scroll_to_tools: 0,
+            bone_filter: String::new(),
+            color_all: false,
+            inspect: None,
             neighbours: None,
         }
     }
@@ -620,6 +661,46 @@ fn visible_vertices(pr: &Projector, mesh: &hive_rig::mesh::Mesh, positions: &[Ve
             !nearest.is_finite() || d <= nearest + tolerance
         })
         .collect()
+}
+
+impl Studio {
+    /// The tool a drag on the mesh uses now.
+    pub fn mesh_tool(&self) -> MeshTool {
+        if self.painting {
+            MeshTool::Paint
+        } else if self.sculpting {
+            MeshTool::Sculpt
+        } else if self.skin_tools.selecting {
+            MeshTool::Select
+        } else {
+            MeshTool::View
+        }
+    }
+
+    /// Switch the mesh tool, turning the others off. Says what is missing
+    /// when the tool has nothing to work on yet; Sculpt needs a picked shape.
+    pub fn set_mesh_tool(&mut self, tool: MeshTool) {
+        let built = self.doc.as_ref().is_some_and(|d| d.rig.is_some());
+        if tool != MeshTool::View && !built {
+            self.warning("Build the rig first: the mesh tools work on the built skin.");
+            return;
+        }
+        if tool == MeshTool::Sculpt && self.shape_pick.is_none() {
+            self.warning("Pick a shape under Blendshapes (or make one), then sculpt it.");
+            return;
+        }
+        self.painting = tool == MeshTool::Paint;
+        self.sculpting = tool == MeshTool::Sculpt;
+        self.skin_tools.selecting = tool == MeshTool::Select;
+        self.skin_tools.box_from = None;
+        self.stroke = None;
+        if matches!(tool, MeshTool::View | MeshTool::Select) {
+            self.brush_at = None;
+        }
+        if tool == MeshTool::Paint && self.weights_bone.is_none() {
+            self.warning("Pick a bone in the list under Skin weights to paint it.");
+        }
+    }
 }
 
 #[cfg(test)]

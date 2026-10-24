@@ -284,6 +284,8 @@ pub struct Studio {
     pub sculpting: bool,
     /// Sculpt brush radius, as a fraction of the body height.
     pub sculpt_radius: f32,
+    /// The sculpt brush, its strength and the target it sculpts.
+    pub shape_tools: ShapeTools,
     /// The mesh images loaded for the viewport, one entry per mesh image
     /// (`None` where it couldn't be decoded), keyed by the document's serial.
     textures: Option<(u64, Vec<Option<egui::TextureHandle>>)>,
@@ -338,11 +340,15 @@ impl Default for Studio {
             shape_pick: None,
             sculpting: false,
             sculpt_radius: 0.03,
+            shape_tools: ShapeTools::default(),
             textures: None,
             doc_serial: 0,
         }
     }
 }
+
+/// The weights view's key for showing every bone's weights at once.
+pub const ALL_BONES: &str = "\u{0}all bones";
 
 // --------------------------------------------------------------------------- operations
 
@@ -394,6 +400,7 @@ impl Studio {
         self.shape_undo.clear();
         self.shape_pick = None;
         self.sculpting = false;
+        self.shape_tools = ShapeTools::default();
         self.textures = None;
         self.doc_serial += 1;
         self.doc = Some(doc);
@@ -1311,6 +1318,49 @@ impl Studio {
         self.info(format!("Copied the {from} side's weights onto the {to}."));
     }
 
+    /// Copy the skin weights of the rig saved at `path` (another character,
+    /// or this one built earlier) onto the built rig, matching bones by name.
+    pub fn copy_weights_from(&mut self, path: &Path) -> bool {
+        let from = match Rig::load(path) {
+            Ok(r) => r,
+            Err(e) => {
+                self.fail(format!("Couldn't read {}: {e:#}", path.display()));
+                return false;
+            }
+        };
+        let Some(doc) = &mut self.doc else {
+            return false;
+        };
+        let Some(rig) = &doc.rig else {
+            self.fail("Build the rig first, then copy weights onto it.");
+            return false;
+        };
+        let (skin, report) = hive_rig::rig::copy_weights(&from, rig);
+        doc.push_skin_undo();
+        if let Some(rig) = &mut doc.rig {
+            rig.skin = skin;
+        }
+        doc.exported = false;
+        self.weight_colors = None;
+        let name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        if report.unmatched.is_empty() {
+            self.info(format!(
+                "Copied the weights of {name} ({} bones matched).",
+                report.matched
+            ));
+        } else {
+            self.warning(format!(
+                "Copied the weights of {name}; {} had no match and took their neighbours' skin: {}.",
+                report.unmatched.len(),
+                report.unmatched.join(", ")
+            ));
+        }
+        true
+    }
+
     /// Smooth the built rig's weights, around the bone shown in the weights view
     /// or everywhere.
     pub fn smooth_weights(&mut self) {
@@ -1842,14 +1892,32 @@ impl Studio {
         })
     }
 
+    /// The mesh's colours in the weights view: one bone's weights as a heat
+    /// map, or, for [`ALL_BONES`], every bone in its own colour, blended.
     fn weights_for(&mut self, bone: &str) -> Option<&[Color32]> {
         let doc = self.doc.as_ref()?;
         let rig = doc.rig.as_ref()?;
         if self.weight_colors.as_ref().is_none_or(|(b, _)| b != bone) {
-            let index = rig.skeleton.index_of(bone)?;
-            let colors = (0..rig.skin.vertex_count())
-                .map(|v| view::weight_color(rig.skin.weight(v, index)))
-                .collect();
+            let colors = if bone == ALL_BONES {
+                (0..rig.skin.vertex_count())
+                    .map(|v| {
+                        let mut c = [0.0f32; 3];
+                        for (j, w) in rig.skin.influences(v) {
+                            let b = view::bone_color(j);
+                            for (k, x) in [b.r(), b.g(), b.b()].into_iter().enumerate() {
+                                c[k] += w * f32::from(x);
+                            }
+                        }
+                        let [r, g, b] = c.map(|x| x.round().clamp(0.0, 255.0) as u8);
+                        Color32::from_rgb(r, g, b)
+                    })
+                    .collect()
+            } else {
+                let index = rig.skeleton.index_of(bone)?;
+                (0..rig.skin.vertex_count())
+                    .map(|v| view::weight_color(rig.skin.weight(v, index)))
+                    .collect()
+            };
             self.weight_colors = Some((bone.to_string(), colors));
         }
         self.weight_colors.as_ref().map(|(_, c)| c.as_slice())
@@ -2001,11 +2069,13 @@ mod skin_edit;
 mod ui;
 
 pub use posing::Tool;
-pub use skin_edit::{SelectOp, SkinTools};
+pub use shapes::ShapeTools;
+pub use skin_edit::{MeshTool, SelectOp, SkinTools};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hive_rig::shapes::SculptBrush;
 
     fn demo_studio() -> Studio {
         let mut s = Studio::default();
@@ -2878,6 +2948,157 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    /// The vertex of the mesh as shown nearest to `p`.
+    fn nearest_shown(s: &Studio, p: Vec3) -> Vec3 {
+        let shown = s.shown_positions().unwrap();
+        *shown
+            .iter()
+            .min_by(|a, b| a.distance(p).total_cmp(&b.distance(p)))
+            .unwrap()
+    }
+
+    #[test]
+    fn inbetweens_and_sculpt_brushes_work_on_the_picked_target() {
+        let mut s = demo_studio();
+        assert!(s.build(), "{}", s.status);
+        s.pose = Some(Pose {
+            bone: "lowerarm_l".into(),
+            axis: 1,
+            degrees: 90.0,
+        });
+        assert!(s.new_corrective(), "{}", s.status);
+        let elbow = {
+            let rig = s.doc.as_ref().unwrap().rig.as_ref().unwrap();
+            rig.skeleton.bones[rig.skeleton.index_of("lowerarm_l").unwrap()].head
+        };
+        let up = Vec3::new(0.0, 0.02, 0.0);
+        assert!(s.begin_sculpt());
+        assert!(s.sculpt_at(elbow, up) > 0, "{}", s.status);
+        // Half way through the bend the shape is at 0.5: an in-between goes there.
+        s.pose.as_mut().unwrap().degrees = 45.0;
+        let shape = s.shapes()[0].clone();
+        assert!((s.shape_weight_now(&shape) - 0.5).abs() < 0.01);
+        assert!(s.add_inbetween_here(), "{}", s.status);
+        assert_eq!(s.shape_tools.target, Some(0.5));
+        assert_eq!(s.mesh_tool(), MeshTool::Sculpt);
+        let ib = s.shapes()[0].inbetweens[0].clone();
+        assert!((ib.weight - 0.5).abs() < 1e-6);
+        // It starts where the shape was at 0.5: half the full offsets.
+        let full = &s.shapes()[0];
+        for (v, o) in ib.vertices.iter().zip(&ib.offsets) {
+            let k = full.vertices.iter().position(|x| x == v).unwrap();
+            assert!(o.distance(full.offsets[k] * 0.5) < 1e-5);
+        }
+        // Sculpting now moves the in-between, not the full shape.
+        let full_before = s.shapes()[0].offsets.clone();
+        assert!(s.begin_sculpt());
+        assert!(s.sculpt_at(elbow, Vec3::new(0.0, 0.0, 0.01)) > 0);
+        assert_eq!(s.shapes()[0].offsets, full_before);
+        assert_ne!(s.shapes()[0].inbetweens[0].offsets, ib.offsets);
+        // Pose there puts the bone where the in-between is fully on.
+        s.pose.as_mut().unwrap().degrees = 10.0;
+        assert!(s.pose_to_target());
+        assert!((s.pose.as_ref().unwrap().degrees - 45.0).abs() < 1e-3);
+
+        // The dab brushes, each on the in-between at its pose.
+        let at = nearest_shown(&s, elbow);
+        let dense = |s: &Studio| {
+            let n = s.doc.as_ref().unwrap().mesh.positions.len();
+            s.shapes()[0].inbetweens[0].dense(n)
+        };
+        for brush in [
+            SculptBrush::Inflate,
+            SculptBrush::Smooth,
+            SculptBrush::Relax,
+        ] {
+            s.shape_tools.brush = brush;
+            let before = dense(&s);
+            assert!(s.begin_sculpt());
+            assert!(s.sculpt_dab(at, false) > 0, "{brush:?}: {}", s.status);
+            assert_ne!(dense(&s), before, "{brush:?}");
+        }
+        s.shape_tools.brush = SculptBrush::Erase;
+        s.shape_tools.strength = 1.0;
+        assert!(s.sculpt_dab(at, false) > 0, "{}", s.status);
+        // The undo steps come back off one by one, and the in-between goes.
+        assert!(s.remove_inbetween(0.5), "{}", s.status);
+        assert!(s.shapes()[0].inbetweens.is_empty());
+        assert_eq!(s.shape_tools.target, None);
+        s.undo_shapes();
+        assert_eq!(s.shapes()[0].inbetweens.len(), 1);
+
+        // A free shape's slider follows the target being sculpted.
+        assert!(s.new_shape());
+        assert!(s.sculpt_at(elbow, up) > 0);
+        assert!(s.add_inbetween_here(), "{}", s.status);
+        let free = s.shapes().last().unwrap();
+        assert_eq!(free.inbetweens.len(), 1);
+        assert!((free.weight - 0.5).abs() < 1e-6);
+        s.pick_target(None);
+        assert_eq!(s.shapes().last().unwrap().weight, 1.0);
+    }
+
+    #[test]
+    fn mesh_tools_are_one_at_a_time() {
+        let mut s = demo_studio();
+        s.set_mesh_tool(MeshTool::Paint);
+        assert_eq!(
+            s.mesh_tool(),
+            MeshTool::View,
+            "nothing to paint before a build"
+        );
+        assert!(s.build(), "{}", s.status);
+        s.weights_bone = Some("upperarm_l".into());
+        s.set_mesh_tool(MeshTool::Paint);
+        assert_eq!(s.mesh_tool(), MeshTool::Paint);
+        s.set_mesh_tool(MeshTool::Select);
+        assert!(!s.painting && s.skin_tools.selecting);
+        s.set_mesh_tool(MeshTool::Sculpt);
+        assert_eq!(s.mesh_tool(), MeshTool::Select, "no shape to sculpt yet");
+        assert!(s.warn);
+        assert!(s.new_shape());
+        assert_eq!(s.mesh_tool(), MeshTool::Sculpt);
+        assert!(!s.skin_tools.selecting);
+        s.set_mesh_tool(MeshTool::Paint);
+        assert!(s.painting && !s.sculpting);
+        s.set_mesh_tool(MeshTool::View);
+        assert!(!s.painting && !s.sculpting && !s.skin_tools.selecting);
+    }
+
+    #[test]
+    fn weights_copy_from_a_saved_rig_and_show_all_bones() {
+        let mut s = demo_studio();
+        assert!(s.build(), "{}", s.status);
+        let dir = std::env::temp_dir().join(format!("hive_studio_copy_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("demo.hive.json");
+        let saved = s.doc.as_ref().unwrap().rig.clone().unwrap();
+        std::fs::write(&path, serde_json::to_string(&saved).unwrap()).unwrap();
+        // Spoil the left side, then take the saved weights back.
+        s.mirror_weights(Side::Right);
+        assert!(s.copy_weights_from(&path), "{}", s.status);
+        let rig = s.doc.as_ref().unwrap().rig.as_ref().unwrap();
+        let n = rig.skin.vertex_count();
+        let bone = rig.skeleton.index_of("upperarm_l").unwrap();
+        let off = (0..n)
+            .filter(|&v| (rig.skin.weight(v, bone) - saved.skin.weight(v, bone)).abs() > 0.05)
+            .count();
+        assert!(off * 50 < n, "{off} of {n} vertices differ");
+        assert!(!s.copy_weights_from(&dir.join("missing.hive.json")));
+        std::fs::remove_dir_all(&dir).ok();
+        // Every bone in its own colour: a vertex on one bone takes its colour.
+        let rig = s.doc.as_ref().unwrap().rig.clone().unwrap();
+        let colors = s.weights_for(ALL_BONES).unwrap().to_vec();
+        assert_eq!(colors.len(), n);
+        let solo = (0..n)
+            .find(|&v| rig.skin.influences(v).count() == 1)
+            .unwrap();
+        let (j, _) = rig.skin.influences(solo).next().unwrap();
+        let (a, b) = (colors[solo], view::bone_color(j));
+        assert!((i32::from(a.r()) - i32::from(b.r())).abs() <= 1);
+        assert!((i32::from(a.g()) - i32::from(b.g())).abs() <= 1);
     }
 
     #[test]

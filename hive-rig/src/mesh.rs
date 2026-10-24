@@ -402,7 +402,11 @@ impl Mesh {
         }));
         for s in &other.shapes {
             let mut s = s.clone();
-            for v in &mut s.vertices {
+            for v in s
+                .vertices
+                .iter_mut()
+                .chain(s.inbetweens.iter_mut().flat_map(|b| &mut b.vertices))
+            {
                 *v += base as u32;
             }
             match self.shapes.iter_mut().find(|x| x.name == s.name) {

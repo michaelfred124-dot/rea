@@ -194,15 +194,23 @@ pub fn write(rig: &Rig) -> Vec<u8> {
     };
 
     let sets = rig.skin.width().div_ceil(4).max(1);
-    let shapes_dense: Vec<Vec<Vec3>> = mesh
-        .shapes
+    // glTF has no in-betweens: each is a morph target of its own
+    // (`<shape>_ib50`), weighted so together they give the shape's weight.
+    let flat = crate::shapes::flat_targets(&mesh.shapes);
+    let nv = mesh.vertex_count();
+    let dense = |vertices: &[u32], values: &[Vec3]| {
+        let mut out = vec![Vec3::ZERO; nv];
+        for (&v, d) in vertices.iter().zip(values) {
+            if let Some(o) = out.get_mut(v as usize) {
+                *o += *d;
+            }
+        }
+        out
+    };
+    let shapes_dense: Vec<Vec<Vec3>> = flat.iter().map(|t| dense(t.vertices, t.offsets)).collect();
+    let shape_normals: Vec<Option<Vec<Vec3>>> = flat
         .iter()
-        .map(|s| s.dense(mesh.vertex_count()))
-        .collect();
-    let shape_normals: Vec<Option<Vec<Vec3>>> = mesh
-        .shapes
-        .iter()
-        .map(|s| (!s.normal_offsets.is_empty()).then(|| s.dense_normals(mesh.vertex_count())))
+        .map(|t| (!t.normals.is_empty()).then(|| dense(t.vertices, t.normals)))
         .collect();
 
     let groups = mesh.object_groups(&rig.name);
@@ -301,10 +309,12 @@ pub fn write(rig: &Rig) -> Vec<u8> {
         }
         // Morph targets: the shapes that move this object (a shape that moves
         // nothing at all is kept on the first object, so it isn't lost).
-        let mine: Vec<usize> = (0..mesh.shapes.len())
-            .filter(|&s| {
-                let sh = &mesh.shapes[s];
-                sh.vertices.iter().any(|&v| r.contains(&(v as usize)))
+        let mine: Vec<usize> = (0..flat.len())
+            .filter(|&t| {
+                let sh = &mesh.shapes[flat[t].shape];
+                let moves = |vs: &[u32]| vs.iter().any(|&v| r.contains(&(v as usize)));
+                moves(&sh.vertices)
+                    || sh.inbetweens.iter().any(|b| moves(&b.vertices))
                     || (gi == 0 && sh.vertices.is_empty())
             })
             .collect();
@@ -362,13 +372,9 @@ pub fn write(rig: &Rig) -> Vec<u8> {
             .collect();
         let mut m = json!({ "name": g.name, "primitives": primitives });
         if !mine.is_empty() {
-            m["weights"] = json!(
-                mine.iter()
-                    .map(|&s| mesh.shapes[s].weight)
-                    .collect::<Vec<_>>()
-            );
+            m["weights"] = json!(mine.iter().map(|&t| flat[t].weight).collect::<Vec<_>>());
             m["extras"] = json!({
-                "targetNames": mine.iter().map(|&s| mesh.shapes[s].name.as_str()).collect::<Vec<_>>()
+                "targetNames": mine.iter().map(|&t| flat[t].name.as_str()).collect::<Vec<_>>()
             });
         }
         meshes.push(m);
@@ -537,12 +543,18 @@ mod tests {
 
     #[test]
     fn glb_keeps_objects_materials_attributes_and_shapes() {
-        let r = rig::auto_rig(
+        let mut r = rig::auto_rig(
             crate::demo::dressed_humanoid(),
             "dressed",
             Default::default(),
         )
         .unwrap();
+        // An in-between on the shape: a morph target of its own (`gem_puff_ib40`).
+        crate::shapes::add_inbetween(&mut r, "gem_puff", 0.4).unwrap();
+        for o in &mut r.mesh.shapes[0].inbetweens[0].offsets {
+            *o += Vec3::new(0.001, 0.0, 0.0);
+        }
+        r.mesh.shapes[0].weight = 0.2;
         let bytes = write(&r);
         let g = gltf::Gltf::from_slice(&bytes).expect("valid glb");
         // One mesh per object, sharing one skin; a primitive per piece.
@@ -568,6 +580,7 @@ mod tests {
             .map(|e| e.get().to_string())
             .unwrap_or_default();
         assert!(names.contains("gem_puff"), "{names}");
+        assert!(names.contains("gem_puff_ib40"), "{names}");
 
         // Back through our own loader: the same pieces, attributes and shape.
         let dir = std::env::temp_dir().join(format!("hive-rig-glb-dressed-{}", std::process::id()));
@@ -604,5 +617,14 @@ mod tests {
         for (x, y) in a.offsets.iter().zip(&b.offsets) {
             assert!((*x - *y).length() < 1e-5);
         }
+        // The in-between folds back into its shape, with the shape's weight.
+        assert_eq!(back.shapes.len(), m.shapes.len());
+        assert_eq!(a.inbetweens.len(), 1);
+        assert_eq!(a.inbetweens[0].weight, 0.4);
+        assert_eq!(a.inbetweens[0].vertices, b.inbetweens[0].vertices);
+        for (x, y) in a.inbetweens[0].offsets.iter().zip(&b.inbetweens[0].offsets) {
+            assert!((*x - *y).length() < 1e-5);
+        }
+        assert!((a.weight - 0.2).abs() < 1e-5, "{}", a.weight);
     }
 }

@@ -1366,9 +1366,12 @@ pub fn read(bytes: &[u8], dir: Option<&Path>) -> Result<FbxScene> {
                 name: s.name,
                 weight: s.weight,
                 driver: None,
+                inbetweens: Vec::new(),
             }
         })
         .collect();
+    // In-betweens hive-rig wrote as `<shape>_ib<percent>` channels.
+    mesh.shapes = crate::shapes::fold_inbetweens(std::mem::take(&mut mesh.shapes));
     Ok(FbxScene { mesh, joints, skin })
 }
 

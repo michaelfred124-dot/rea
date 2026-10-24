@@ -659,13 +659,19 @@ pub fn write(rig: &Rig) -> Vec<u8> {
             connections.push(connect(bone_ids[i], cluster_id));
         }
 
-        // Blend shapes: a channel and a shape geometry per shape that moves
+        // Blend shapes: a channel and a shape geometry per target that moves
         // this object (a shape that moves nothing stays on the first object).
-        let mine: Vec<&crate::shapes::Shape> = mesh
-            .shapes
+        // In-betweens are channels of their own (`<shape>_ib50`), weighted to
+        // give the shape's weight: Blender's FBX importer refuses in-between
+        // shapes on one channel, and Unreal makes a morph target per channel.
+        let flat = crate::shapes::flat_targets(&mesh.shapes);
+        let mine: Vec<&crate::shapes::FlatTarget> = flat
             .iter()
-            .filter(|s| {
-                s.vertices.iter().any(|&v| r.contains(&(v as usize)))
+            .filter(|t| {
+                let s = &mesh.shapes[t.shape];
+                let moves = |vs: &[u32]| vs.iter().any(|&v| r.contains(&(v as usize)));
+                moves(&s.vertices)
+                    || s.inbetweens.iter().any(|b| moves(&b.vertices))
                     || (g.object == groups[0].object && s.vertices.is_empty())
             })
             .collect();
@@ -684,18 +690,18 @@ pub fn write(rig: &Rig) -> Vec<u8> {
             );
             count("Deformer");
             connections.push(connect(blend_id, geometry_id));
-            for s in mine {
+            for t in mine {
                 let (channel_id, shape_id) = (new_id(), new_id());
                 let mut idx = Vec::new();
                 let mut offsets = Vec::new();
                 let mut normals = Vec::new();
-                for (k, (&v, d)) in s.vertices.iter().zip(&s.offsets).enumerate() {
+                for (k, (&v, d)) in t.vertices.iter().zip(t.offsets).enumerate() {
                     if !r.contains(&(v as usize)) {
                         continue;
                     }
                     idx.push((v - start) as i32);
                     offsets.extend((*d * CM).to_array().map(|x| x as f64));
-                    let n = s.normal_offsets.get(k).copied().unwrap_or(Vec3::ZERO);
+                    let n = t.normals.get(k).copied().unwrap_or(Vec3::ZERO);
                     normals.extend(n.to_array().map(|x| x as f64));
                 }
                 objects.push(
@@ -703,7 +709,7 @@ pub fn write(rig: &Rig) -> Vec<u8> {
                         "Geometry",
                         [
                             shape_id.into(),
-                            object_name(&s.name, "Geometry").into(),
+                            object_name(&t.name, "Geometry").into(),
                             "Shape".into(),
                         ],
                     )
@@ -719,13 +725,13 @@ pub fn write(rig: &Rig) -> Vec<u8> {
                         "Deformer",
                         [
                             channel_id.into(),
-                            object_name(&s.name, "SubDeformer").into(),
+                            object_name(&t.name, "SubDeformer").into(),
                             "BlendShapeChannel".into(),
                         ],
                     )
                     .with([
                         Node::one("Version", 100),
-                        Node::one("DeformPercent", (s.weight * 100.0) as f64),
+                        Node::one("DeformPercent", (t.weight * 100.0) as f64),
                         Node::one("FullWeights", Prop::F64s(vec![100.0])),
                     ]),
                 );
