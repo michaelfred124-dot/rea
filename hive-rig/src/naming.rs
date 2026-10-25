@@ -317,6 +317,9 @@ impl Naming {
             s.fk_controls.iter_mut().for_each(ctrl);
             ctrl(&mut s.settings);
         }
+        if let Some(fb) = &mut controls.face_board {
+            fb.rename(ctrl, bone);
+        }
         Ok(())
     }
 }

@@ -304,6 +304,31 @@ jobs:
             --demo --build --weights upperarm_l --all-bones --vertices --bone-filter arm \
             --screenshot "$RUNNER_TEMP/hive-rig-skin-tools.ppm"
           test "$(head -c 2 "$RUNNER_TEMP/hive-rig-skin-tools.ppm")" = P6
+      - name: Face board - sliders, lip zippers, sticky lips; Maya and Unreal builders
+        run: |
+          f="$RUNNER_TEMP/face_board"
+          cargo run --locked -q -- demo -o "$f"
+          for p in eyes jaw face; do cargo run --locked -q -- add "$f/hive_demo.guides.json" "$p"; done
+          cargo run --locked -q -- rebuild "$f/hive_demo.hive.json"
+          r="$f/hive_demo.hive.json"
+          cargo run --locked -q -- shape "$r" sculpt blink_l --at 0.03,1.62,0.08 --radius 0.03 --offset 0,-0.005,0
+          cargo run --locked -q -- shape "$r" board --auto
+          cargo run --locked -q -- shape "$r" list | tee "$f/log.txt"
+          grep -q "blink_l .*follows the face board's lid_l slider going y-" "$f/log.txt"
+          # The board's expression run against the sliders in Maya; its nodes in Unreal.
+          python3 -I tests/dcc_stub_run.py maya "$f/hive_demo_maya.py" | tee "$f/maya.txt"
+          grep -q "maya face board ran against stubs" "$f/maya.txt"
+          python3 -I tests/dcc_stub_run.py unreal "$f/hive_demo_unreal.py" | tee "$f/unreal.txt"
+          grep -q "unreal face board ran against stubs" "$f/unreal.txt"
+          # The studio with the board posed: a brow up, a smile, the jaw open and
+          # the left zipper part way, with the board's pads in Properties.
+          xvfb-run -a -s "-screen 0 1400x900x24" cargo run --locked -q --bin HiveRig -- \
+            "$r" --mode rig --no-toast --no-outliner \
+            --set board_brow_l_ctrl=0,0.012,0 --set board_corner_l_ctrl=0.005,0.014,0 \
+            --set board_corner_r_ctrl=-0.005,0.014,0 --set board_jaw_ctrl=0,-0.009,0 \
+            --set board_zip_l_ctrl=-0.015,0,0 --view front --zoom 3.5 --look 0.42,1.68,0 \
+            --screenshot "$RUNNER_TEMP/hive-rig-face-board.ppm"
+          test "$(head -c 2 "$RUNNER_TEMP/hive-rig-face-board.ppm")" = P6
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: hive-demo-rigs
@@ -384,6 +409,17 @@ jobs:
           cargo run -q -- control "$rig/hive_demo.guides.json" calf_l_fk_ctrl --color cyan --size 0.09 --twin
           cargo run -q -- rebuild "$rig/hive_demo.hive.json"
           python tests/blender_check.py "$rig/hive_demo_blender.py" "$rig/hive_demo.glb"
+      - name: Face board in Blender - sliders, lip zippers, sticky lips, linked shapes
+        run: |
+          f="$RUNNER_TEMP/face_board"
+          cargo run -q -- demo -o "$f"
+          for p in eyes jaw face; do cargo run -q -- add "$f/hive_demo.guides.json" "$p"; done
+          cargo run -q -- rebuild "$f/hive_demo.hive.json"
+          cargo run -q -- shape "$f/hive_demo.hive.json" sculpt blink_l --at 0.03,1.62,0.08 --radius 0.03 --offset 0,-0.005,0
+          cargo run -q -- shape "$f/hive_demo.hive.json" board --auto
+          python tests/blender_check.py "$f/hive_demo_blender.py" "$f/hive_demo.glb" | tee "$f/log.txt"
+          grep -q "face board checked" "$f/log.txt"
+          python tests/blender_anim_check.py "$f/hive_demo_blender.py"
       - name: Skin weights in Blender - 8 influences (JOINTS_1), 4 with pruning, copied weights
         run: |
           s="$RUNNER_TEMP/skin"

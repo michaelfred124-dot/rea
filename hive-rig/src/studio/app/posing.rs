@@ -267,7 +267,8 @@ impl Studio {
                 }
                 _ => continue,
             }
-            out.set_channels(name, ch);
+            // A face board slider stays in its track.
+            out.set_channels(name, pose::limit_channels(rig, name, ch));
         }
         self.posing.pose = out;
     }
@@ -275,6 +276,10 @@ impl Studio {
     /// Set a picked control's channels while a channel edit runs (undo is
     /// recorded when it starts).
     pub fn set_control_channels(&mut self, control: &str, ch: Channels) {
+        let ch = match self.pose_rig() {
+            Some((_, rig)) => pose::limit_channels(rig, control, ch),
+            None => ch,
+        };
         self.posing.pose.set_channels(control, ch);
     }
 
@@ -695,6 +700,112 @@ impl Studio {
         });
     }
 
+    /// The face board as pads: one per slider, a square for the ones that
+    /// move both ways and a strip for the others, each dot where its slider
+    /// sits. Drag a dot to pose (one undo step per drag); double-click puts it
+    /// back at rest.
+    pub fn face_board_pads(&mut self, ui: &mut egui::Ui) {
+        let Some((_, rig)) = self.pose_rig() else {
+            return;
+        };
+        let Some(fb) = rig.face_board.clone() else {
+            return;
+        };
+        const SIDE: f32 = 46.0;
+        const THIN: f32 = 14.0;
+        let dim = Color32::from_white_alpha(28);
+        let accent = crate::theme::ACCENT;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(10.0, 8.0);
+            for sl in &fb.sliders {
+                let [mx, my] = sl.moves();
+                let size = egui::vec2(if mx { SIDE } else { THIN }, if my { SIDE } else { THIN });
+                ui.vertical(|ui| {
+                    let (rect, r) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+                    let span = |r: [f32; 2]| (r[1] - r[0]).max(1e-6);
+                    let at = |v: [f32; 2]| {
+                        Pos2::new(
+                            if mx {
+                                rect.left() + (v[0] - sl.x[0]) / span(sl.x) * rect.width()
+                            } else {
+                                rect.center().x
+                            },
+                            if my {
+                                rect.bottom() - (v[1] - sl.y[0]) / span(sl.y) * rect.height()
+                            } else {
+                                rect.center().y
+                            },
+                        )
+                    };
+                    let ch = self.posing.pose.channels(&sl.control);
+                    let value = sl.value(ch.translate);
+                    let painter = ui.painter();
+                    painter.rect_filled(rect, 4.0, Color32::from_white_alpha(8));
+                    painter.rect_stroke(rect, 4.0, Stroke::new(1.0, dim), egui::StrokeKind::Inside);
+                    let rest = at([0.0, 0.0]);
+                    painter.line_segment(
+                        [
+                            Pos2::new(rect.left(), rest.y),
+                            Pos2::new(rect.right(), rest.y),
+                        ],
+                        Stroke::new(1.0, dim),
+                    );
+                    painter.line_segment(
+                        [
+                            Pos2::new(rest.x, rect.top()),
+                            Pos2::new(rest.x, rect.bottom()),
+                        ],
+                        Stroke::new(1.0, dim),
+                    );
+                    let hot = r.hovered() || r.dragged();
+                    let off = value != [0.0, 0.0];
+                    painter.circle_filled(
+                        at(value),
+                        if hot { 5.5 } else { 4.5 },
+                        if off {
+                            accent
+                        } else {
+                            Color32::from_white_alpha(150)
+                        },
+                    );
+                    if r.drag_started() {
+                        self.begin_pose_edit();
+                    }
+                    if r.dragged()
+                        && let Some(p) = r.interact_pointer_pos()
+                    {
+                        let x = sl.x[0] + (p.x - rect.left()) / rect.width() * span(sl.x);
+                        let y = sl.y[0] + (rect.bottom() - p.y) / rect.height() * span(sl.y);
+                        let v = [if mx { x } else { 0.0 }, if my { y } else { 0.0 }];
+                        let t = Vec3::new(v[0], v[1], 0.0) * sl.travel;
+                        self.set_control_channels(
+                            &sl.control,
+                            Channels {
+                                translate: t,
+                                ..Channels::default()
+                            },
+                        );
+                    }
+                    if r.double_clicked() && off {
+                        self.begin_pose_edit();
+                        self.set_control_channels(&sl.control, Channels::default());
+                    }
+                    r.on_hover_text(format!(
+                        "{}: {:.2}, {:.2}",
+                        sl.part.replace('_', " "),
+                        value[0],
+                        value[1]
+                    ));
+                    ui.label(
+                        egui::RichText::new(sl.part.replace('_', " "))
+                            .size(10.5)
+                            .color(crate::theme::TEXT_FAINT),
+                    );
+                });
+            }
+        });
+    }
+
     /// Record undo once at the start of a channel-box edit.
     fn start_channel_edit(&mut self) {
         if self.posing.drag_start.is_none() {
@@ -771,6 +882,43 @@ mod tests {
         let start = s.posing.pose.clone();
         s.apply_gizmo(&start, GizmoOp::Move(Vec3::X * 0.3));
         assert!(s.posing.pose.is_rest());
+    }
+
+    #[test]
+    fn face_board_sliders_pose_the_face_and_stay_in_their_tracks() {
+        let mut s = built();
+        s.add_face();
+        assert!(s.build(), "{}", s.status);
+        s.mode = Mode::Rig;
+        let (sk, rig) = s.pose_rig().unwrap();
+        let fb = rig.face_board.clone().expect("a face comes with its board");
+        let jaw = fb.part("jaw").unwrap().clone();
+        let lid = sk.index_of("lid_up_l").unwrap();
+        let rest = s.frame().unwrap();
+        // Dragged far past the end of its track, the slider stops there.
+        s.select_control(&jaw.control, false);
+        let start = s.posing.pose.clone();
+        s.apply_gizmo(&start, GizmoOp::Move(Vec3::new(0.0, -1.0, 0.3)));
+        let ch = s.posing.pose.channels(&jaw.control);
+        assert!(
+            (ch.translate - Vec3::new(0.0, -jaw.travel, 0.0)).length() < 1e-5,
+            "{:?}",
+            ch.translate
+        );
+        // The channel box holds it too.
+        let lid_slider = fb.part("lid_l").unwrap().clone();
+        s.set_control_channels(
+            &lid_slider.control,
+            Channels {
+                translate: Vec3::new(0.5, -3.0, 0.0) * lid_slider.travel,
+                ..Channels::default()
+            },
+        );
+        let ch = s.posing.pose.channels(&lid_slider.control);
+        assert!((ch.translate - Vec3::new(0.0, -lid_slider.travel, 0.0)).length() < 1e-5);
+        // The lid closes in the viewport.
+        let posed = s.frame().unwrap();
+        assert!(posed.bones[lid].1.y < rest.bones[lid].1.y - 0.002);
     }
 
     #[test]

@@ -366,7 +366,8 @@ A rig is a list of components, each placed by a few guide points:
 | spline | two or more (`j1`…) | a curve-driven chain (tentacle): curve controls, an FK layer, `stretch` and `volume` |
 | eyes | eye_l, eye_r, target | `eye_l`, `eye_r` aimed by a look-at control that follows the head or stays in the world |
 | jaw | jaw, chin | `jaw` with a rotate control |
-| face | brows (3 a side), upper and lower lids, cheeks, nose, upper and lower lip, lip corners | 17 face joints on the head, each with a small control that moves and rotates it; lids pivot on the eye, the lower lip rides on the jaw |
+| face | brows (3 a side), upper and lower lids, cheeks, nose, upper and lower lip, lip corners | 17 face joints on the head (plus `--joints` 0 to 3 extra lip joints a side, 1 by default), each with a small control that moves and rotates it; lids pivot on the eye, the lower lip rides on the jaw; a face board beside the head (see below) |
+| face_board | none | adds the face board to a face that has none |
 
 The first rig detects the body and places the default biped. From then on you
 can change the layout and rebuild:
@@ -376,7 +377,8 @@ hive-rig add out/hero.guides.json fingers           # five fingers on each hand
 hive-rig add out/hero.guides.json tail --joints 6
 hive-rig add out/hero.guides.json eyes              # look-at eyes on the head
 hive-rig add out/hero.guides.json jaw
-hive-rig add out/hero.guides.json face              # brow, lid, cheek, nose and lip joints
+hive-rig add out/hero.guides.json face              # brow, lid, cheek, nose and lip joints, and the face board
+hive-rig add out/hero.guides.json face --joints 2   # two extra lip joints a side
 hive-rig add out/hero.guides.json chain --parent head --joints 2 --id ear_l
 hive-rig add out/hero.guides.json tentacle --joints 10 --controls 5   # curve-driven, from the pelvis
 hive-rig spine out/hero.guides.json --spline true    # the spine follows a curve (hips, mid, chest)
@@ -511,7 +513,45 @@ face joint gets a small diamond control that moves and rotates it (the Blender
 builder uses Copy Transforms, Maya a parent constraint, Unreal a transform
 copy), and its skin weights fade out within a few centimetres so a brow never
 pulls the eye. The eyelids pivot on the eye joint and the lower lip follows the
-jaw when the rig has them.
+jaw when the rig has them (add the jaw before the face).
+
+### The face board, lip zippers and sticky lips
+
+`add face` also puts a **face board** beside the head: a panel (moving it
+moves the whole board, never the face) with sixteen sliders that pose the face
+from one place. Each slider's value is how far it has moved along its track,
+-1 to 1, held to the track:
+
+| Slider | Moves | What it does |
+|--------|-------|--------------|
+| brow_l, brow_r | up/down, in/out | raises and lowers the brow (the outer end most), pulls it in toward the nose |
+| lid_l, lid_r | up/down | closes the upper lid over the eye (down) or opens it wide, the lower lid a little |
+| nose, cheek_l, cheek_r | up/down | sneer, cheek raise |
+| lip_up, lip_low | up/down | raises or lowers the upper or lower lip, most in the middle |
+| corner_l, corner_r | up/down, in/out | smile or frown, wide or narrow; the lip joints next to the corner follow, less |
+| mouth | up/down, left/right | moves the whole mouth |
+| jaw | down (open), up, left/right | turns the jaw |
+| zip_l, zip_r | one way | lip zipper: from that corner, the upper and lower lip joints close together onto the line between them, pair by pair, until the whole mouth is shut |
+| sticky | one way | sticky lips: as the jaw opens the middle of the mouth stays shut and lets go as it opens wider, the sides first |
+
+The board moves each face control through an offset between the control and
+its parent, so the face controls still work on top of it, and its sliders
+drive shapes too: `hive-rig shape <rig> board <shape> <slider> <x+|x-|y+|y->
+[--weight W]` links one, and `shape board --auto` links shapes by their names
+(a `blink_l` follows `lid_l` going down, `jawOpen` the jaw, `smile_r`
+`corner_r` going up, and so on; `--off` unlinks). In the app the face card has
+a Face board switch and the lip joint count, and picking the board or a slider
+shows the whole board as pads in Properties to drag (double-click puts one
+back).
+
+Every builder makes the same board: Blender (drivers on helper bones between
+each face control and its parent, Limit Location tracks, Copy Location toward
+the sealed place for the lip seal, all checked in real Blender against
+hive-rig's numbers), Maya (one expression driving a group under each face
+control, transformLimits on the sliders, a two-target point constraint per
+lip joint for the seal) and Unreal (a null under each face control set by the
+Control Rig graph, and the seal after the face bones; both only against
+stubs).
 
 ### Bring your own skeleton (joints to guides)
 
@@ -1058,6 +1098,8 @@ python -I tests/blender_mesh_check.py out/hero_blender.py --source hero.glb --fb
 python -I tests/blender_mesh_check.py out/hive_demo_blender.py --corrective elbow_fix_l lowerarm_l_fk_ctrl
 python -I tests/blender_roundtrip_check.py out/hive_demo_blender.py --corrective elbow_fix_r lowerarm_r_fk_ctrl --slider brow_up
 python3 tests/dcc_stub_run.py maya out/hive_demo_maya.py --send         # Maya Send to Hive
+# A face board: add eyes, jaw and face to the demo's guides, rebuild, then the
+# Blender check above checks the sliders, zippers and sticky lips against hive-rig.
 python tests/blender_guides_check.py out/hive_demo_blender.py           # guides and rebuild
 python tests/blender_quad_check.py dog/hive_dog_blender.py dog/hive_dog.glb   # after demo --quadruped -o dog
 python tests/blender_spline_check.py out/hive_demo_blender.py out/hive_demo.glb   # after add tentacle, spine --spline true, rebuild

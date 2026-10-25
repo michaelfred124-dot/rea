@@ -48,6 +48,7 @@ SCRIPT = [""]
 CV_POSITIONS = {}  # "curveShape.cv[i]" -> world position set by the Maya builder
 TIME = [7.0]  # Maya's current frame
 BLEND_SHAPES = []  # blendShape nodes the Maya builder made
+EXPRESSIONS = {}  # Maya expression name -> its text
 
 
 def stub_maya():
@@ -82,7 +83,7 @@ def stub_maya():
                 if kwargs.get("query") and kwargs.get("name"):
                     return name + "_constraint"
                 calls.append((name, args))
-                return [kwargs.get("name", name + "1")]
+                return [kwargs.get("name", "%s%d" % (name, len(calls)))]
             if name == "xform":
                 if kwargs.get("q") and (kwargs.get("matrix") or kwargs.get("m")):
                     x, y, z = positions.get(args[0], [0.0, 0.0, 0.0])
@@ -168,6 +169,7 @@ def stub_maya():
                 return [made]
             if name == "expression":
                 calls.append(("expression", kwargs.get("name", "")))
+                EXPRESSIONS[kwargs.get("name", "")] = kwargs.get("string", "")
                 return None
             if name == "playbackOptions":
                 return 1.0 if kwargs.get("minTime") else 3.0
@@ -192,7 +194,7 @@ def stub_maya():
               "window", "deleteUI", "columnLayout", "rowLayout", "setParent", "button", "text", "separator",
               "checkBox", "showWindow", "confirmDialog", "skinPercent", "pointConstraint",
               "shadingNode", "uvLink", "blendShape", "aliasAttr", "loadPlugin", "currentTime",
-              "playbackOptions", "textScrollList", "promptDialog", "listConnections"]:
+              "playbackOptions", "textScrollList", "promptDialog", "listConnections", "transformLimits"]:
         setattr(cmds, n, generic(n))
 
     om = types.ModuleType("maya.api.OpenMaya")
@@ -454,6 +456,97 @@ if __name__ == "__main__":
                 said = ns["send_edits"](False, True)
                 assert "Imported shapes" in said or not shapes, said
                 print("maya send to hive ran hive-rig shape import: ok")
+        board = rig["controls"].get("face_board")
+        if board:
+            # The face board's expression, run here: each slider's amounts, the
+            # helpers' moves and turns, the lip seal's weights and the shapes
+            # that follow a slider, from the sliders' translates.
+            import re
+
+            text = EXPRESSIONS[ns["NAME"] + "_face_board_expr"]
+            node_attr = re.compile(r"(?<![\w.$])([A-Za-z_]\w*)\.([A-Za-z]\w*(?:\[\d+\])?)")
+
+            class Plugs(dict):
+                def __missing__(self, k):
+                    return 1.0 if k.endswith(".scaleX") else 0.0
+
+            def run_expression(plugs):
+                env = {"min": min, "max": max, "clamp": lambda lo, hi, v: min(max(v, lo), hi)}
+                out = {}
+                for line in text.split("\n"):
+                    line = line.strip().rstrip(";")
+                    if line.startswith("float "):
+                        line = line[len("float "):]
+                    lhs, rhs = line.split(" = ", 1)
+                    rhs = node_attr.sub(lambda m: "P[%r]" % (m.group(1) + "." + m.group(2)), rhs)
+                    rhs = rhs.replace("$", "v_")
+                    env["P"] = Plugs(plugs)
+                    value = eval(rhs, env)
+                    if lhs.startswith("$"):
+                        env["v_" + lhs[1:]] = value
+                    else:
+                        out[lhs] = value
+                return out
+
+            sliders = {s_["part"]: s_ for s_ in board["sliders"]}
+
+            def at(values, gaps=None):
+                plugs = dict(gaps or {})
+                for part, (x, y) in values.items():
+                    s_ = sliders[part]
+                    plugs[s_["control"] + ".translateX"] = x * s_["travel"] * 100.0
+                    plugs[s_["control"] + ".translateY"] = y * s_["travel"] * 100.0
+                return run_expression(plugs)
+
+            def amount(v, d):
+                return max(v[0 if d[0] == "x" else 1] * (1.0 if d[1] == "+" else -1.0), 0.0)
+
+            # At rest nothing moves; posed, every helper moves and turns by its
+            # drives, sliders held to their tracks.
+            assert all(abs(v - (1.0 if ".t0_W0" in k else 0.0)) < 1e-12 for k, v in at({}).items())
+            pose = {"jaw": (0.0, -3.0), "brow_l": (-1.0, 1.0), "corner_r": (0.6, 0.8), "lid_l": (0.0, -0.5)}
+            got = at(pose)
+            held = {"jaw": (0.0, -1.0), "brow_l": (-1.0, 1.0), "corner_r": (0.6, 0.8), "lid_l": (0.0, -0.5)}
+            checked = 0
+            for o in board["offsets"]:
+                for attr, key, k in (("translate", "translate", 100.0), ("rotate", "rotate", 1.0)):
+                    for i, axis in enumerate("XYZ"):
+                        want = sum(d.get(key, [0, 0, 0])[i] * k * amount(held.get(d["part"], (0.0, 0.0)), d["dir"])
+                                   for d in o["drives"])
+                        plug = "%s_board.%s%s" % (o["control"], attr, axis)
+                        assert abs(got.get(plug, 0.0) - want) < 1e-6, (plug, got.get(plug), want)
+                        checked += abs(want) > 1e-9
+            assert checked > 10, checked
+            made = {c[1][-1] for c in calls if isinstance(c, tuple) and c[0] == "pointConstraint"}
+            seal = board.get("seal") or {"pairs": []}
+            for p in seal["pairs"]:
+                assert p["upper"] in made and p["lower"] in made, p
+            if seal["pairs"]:
+                weights = [k for k in got if ".t1_W1" in k]
+                # A zipper all the way seals every pair; at rest none.
+                assert len(weights) == 2 * len(seal["pairs"]), sorted(got)
+                assert all(abs(got[k]) < 1e-12 for k in weights)
+                gaps = {p["upper"] + "_seal_gap.distance": 100.0 * (p["rest_gap"] + 0.03) for p in seal["pairs"]}
+                zipped = at({"jaw": (0.0, -1.0), "zip_r": (1.0, 0.0)}, gaps)
+                assert all(abs(zipped[k] - 1.0) < 1e-9 for k in weights), zipped
+                # Sticky: the middle stays shut while its gap is small, lets go wide open.
+                middle = min(seal["pairs"], key=lambda p: abs(p["along"] - 0.5))
+                plug = next(k for k in weights if k.startswith(middle["upper"]))
+                small = {middle["upper"] + "_seal_gap.distance": 100.0 * (middle["rest_gap"] + 0.1 * seal["release"])}
+                assert abs(at({"sticky": (1.0, 0.0)}, small)[plug] - 1.0) < 1e-9
+                wide = {middle["upper"] + "_seal_gap.distance": 100.0 * (middle["rest_gap"] + 2.0 * seal["release"])}
+                assert abs(at({"sticky": (1.0, 0.0)}, wide)[plug]) < 1e-9
+            # Shapes that follow a slider.
+            linked = [s_ for s_ in shapes if s_.get("board")]
+            for s_ in linked:
+                link = s_["board"]
+                v = [0.0, 0.0]
+                v[0 if link["dir"][0] == "x" else 1] = 0.5 * (1.0 if link["dir"][1] == "+" else -1.0)
+                w = [val for k, val in at({link["part"]: tuple(v)}).items() if ".weight[" in k]
+                assert w and all(abs(x - min(0.5 * link.get("weight", 1.0), 1.0)) < 1e-9 for x in w), (s_["name"], w)
+            assert calls.count("transformLimits") == len(board["sliders"])
+            print("maya face board ran against stubs: %d helpers, %d lip pairs, %d linked shapes: ok"
+                  % (len(board["offsets"]), len(seal["pairs"]), len(linked)))
         if os.path.isfile(ns["HIVE_EXE"]) and "--guides" in sys_args:
             # Guide tools: edit, mirror, add a component, rebuild keeping weights.
             ns["show_guides"]()
@@ -504,12 +597,33 @@ if __name__ == "__main__":
             assert "Curve_" + target in made, target
         curves = [c.args[0] for c in vm_curves.call_args_list]
         assert sorted(curves) == sorted(expected), (curves, expected)
-        undriven = [s["name"] + "_shape" for s in all_shapes if not s.get("driver")]
+        undriven = [s["name"] + "_shape" for s in all_shapes if not s.get("driver") and not s.get("board")]
         shape_floats = {str(c.args[0]) for c in hc.add_control.call_args_list}
         assert all(u in shape_floats for u in undriven), (undriven, sorted(shape_floats)[:5])
         if all_shapes:
             print("unreal shape curves ran against stubs: %d curves, %d readers, %d sliders: ok"
                   % (len(expected), len(driven), len(undriven)))
+        # The face board: every slider's value both ways, a null under every
+        # face control it moves, set from its drives, the lip seal on every
+        # sealed joint, and the shapes that follow a slider.
+        board = rig.get("face_board")
+        if board:
+            for sl in board["sliders"]:
+                assert "BoardValue_%s_x" % sl["part"] in made and "BoardHeld_%s_y" % sl["part"] in made, sl["part"]
+            nulls = {str(c.args[0]) for c in hc.add_null.call_args_list}
+            for o in board["offsets"]:
+                assert o["control"] + "_board" in nulls, o["control"]
+                moves = any(any(abs(x) > 1e-9 for x in d.get("translate", [0, 0, 0])) for d in o["drives"])
+                turns = any(any(abs(x) > 1e-9 for x in d.get("rotate", [0, 0, 0])) for d in o["drives"])
+                assert ("Board_" + o["control"] in made) == moves and ("BoardTurn_" + o["control"] in made) == turns, o
+            pairs = (board.get("seal") or {}).get("pairs", [])
+            for pair in pairs:
+                assert "Seal_" + pair["upper"] in made and "Seal_" + pair["lower"] in made, pair
+            linked = [s["name"] for s in all_shapes if s.get("board")]
+            for name in linked:
+                assert "BoardShape_" + name in made and "Curve_" + name in made, name
+            print("unreal face board ran against stubs: %d sliders, %d nulls, %d lip pairs, %d linked shapes: ok"
+                  % (len(board["sliders"]), len(board["offsets"]), len(pairs), len(linked)))
         # Soft IK and stretch on every limb (a soft control on two-bone limbs);
         # volume on every spline joint on the curve.
         floats = {c.args[0] for c in hc.add_control.call_args_list}

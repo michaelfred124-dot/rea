@@ -73,12 +73,18 @@ patterns) applied to every export, and now:
   and shapes edited in Blender or Maya come back with **Send to Hive**
   (`weights import`, `shape import`).
 
+- **Face board, lip zippers and sticky lips**: a panel of sliders beside the
+  head that poses the brows, lids, nose, cheeks, lips, mouth corners and jaw,
+  and drives shapes linked to it (`shape board`); zippers close the lips from
+  either corner and sticky lips hold the middle shut as the jaw starts to
+  open. In the app as pads, in Blender, Maya and Unreal; see gap 2.
+
 ## Gaps, ranked by how much they'd help a rigger
 
 | # | Area | What Hive/Zoo offer publicly | What we'd build | Size |
 |---|------|------------------------------|-----------------|------|
 | 1 | Quadrupeds and creatures | Dog, horse, spider, dinosaur, werewolf templates; quad legs | Done: a `quad_leg` component (thigh, calf, hock and paw; two-bone IK aimed at a hock control, reverse paw roll, FK, stretch) and a dog layout (`demo --quadruped`), checked in real Blender. Also done: bird (arm wings, `quad_leg` legs with hocks, tail), spider (eight four-bone FK leg chains) and snake (spline spine and tail) layouts, demo bodies and built-in templates (`demo --creature`). Next: horse and dinosaur templates, IK legs beyond one arm and one leg a side (the spider's legs are FK only), wing feather chains, an automatic (spring) hock | Medium |
-| 2 | Face, next steps | Joint-based face plus face controls on a panel | Done: face joints. Next: a 2D face control board, lip zippers, sticky lips | Medium |
+| 2 | Face, next steps | Joint-based face plus face controls on a panel | Done: face joints, a 2D face board (sixteen sliders on a panel beside the head driving the face controls and linked shapes), lip zippers from either corner, sticky lips, extra lip joints. Checked in real Blender; Maya and Unreal only against stubs. Next: board presets (save and apply expressions), an eye-look pad, tongue and teeth, per-character tuning of how far each slider moves its joints | Medium |
 | 3 | Bendy limbs | Bendy/ribbon arms and legs, soft IK | Done: `bendy: true` on an arm or leg puts each segment's skin on four bend joints that follow a curve, arced by a bend control per segment, with a pin control at the elbow or knee; `soft` (0 to 1) on every arm and leg IK eases the reach near full extension and works with stretch. Checked in real Blender; Maya only against stubs; Unreal moves the bend joints onto the curve without turning them; soft IK in Unreal only against stubs. Next: bendy hind legs (`quad_leg`), a bend control twist, per-segment bend joint counts | Medium |
 | 4 | Spine and tentacles | Spline (IK) spine, tentacles, multi-branch FK | Done: a `spline` component (`hive-rig add <guides> tentacle`; joint and curve-control counts) whose curve controls bend a smooth curve the joints follow, with an FK layer, `stretch` on/off and `volume`, and `spine --spline true` for a spline spine (hips and chest controls end the curve). Spline IK on a hooked curve in Blender (checked in real Blender), ikSplineHandle with advanced twist in Maya, Fit Chain on Curve in Unreal (both only against stubs). Volume in Unreal (only against stubs). Next: twist along the chain in Blender, an exact curve in Unreal past four controls, a sliding (offset) attribute, multi-branch FK | Medium |
 | 5 | IK/FK and space matching | Snap IK to FK and back without a pop | Done in the Blender tab and Maya window, with matching across the playback range (keyed per frame). Unreal: IK/FK matching on the Sequencer's Control Rig track, per frame or over the playback range, from a Hive Rig editor menu or the Output Log (only against stubs). Next: try it in Unreal, mirror and reset pose in Unreal | Small |

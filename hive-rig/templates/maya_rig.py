@@ -316,6 +316,99 @@ def build_shape_drivers(RIG, shape_nodes, joint_of):
             ).format(dot=dot, quat=quat, bs=bs, i=i, start=d["start"], span=span))
 
 
+# --------------------------------------------------------------------------- face board
+# hive-rig's face_board module describes it: a slider's value is its move along
+# its track over its travel, held to the track; each face control it moves
+# hangs under a helper the sliders move and turn; the lip seal pulls each upper
+# and lower lip joint toward the line between them. One expression does it all.
+BOARD_DIRS = {"x+": ("X", 1.0, "xp"), "x-": ("X", -1.0, "xn"), "y+": ("Y", 1.0, "yp"), "y-": ("Y", -1.0, "yn")}
+ZIP_FALLOFF = 0.25
+STICKY_FADE = 0.5
+
+
+def board_var(part, direction):
+    return "$%s_%s" % (safe_node_name(part), BOARD_DIRS[direction][2])
+
+
+def build_board(board, top, ctrl_of, joint_of, shape_nodes, sealed_bones, helpers, shapes):
+    """The face board's expression, and the lip seal's nodes."""
+    lines = []
+    have = set()
+    for sl in board["sliders"]:
+        ctrl = ctrl_of.get(sl["control"])
+        for direction, (axis, sign, _) in BOARD_DIRS.items():
+            r = sl["x"] if axis == "X" else sl["y"]
+            topv = max(r[1] if sign > 0 else -r[0], 0.0)
+            value = "%s.translate%s * %.9g" % (ctrl, axis, sign / (sl["travel"] * SCALE)) if ctrl else "0"
+            lines.append("float %s = min(max(%s, 0), %.9g);" % (board_var(sl["part"], direction), value, topv))
+        if ctrl:
+            have.add(sl["part"])
+    # Each face control's helper: moved (cm) and turned (degrees) by its drives.
+    for o in board["offsets"]:
+        helper = helpers.get(o["control"])
+        if helper is None:
+            continue
+        for attr, key, k in (("translate", "translate", SCALE), ("rotate", "rotate", 1.0)):
+            for i, axis in enumerate("XYZ"):
+                terms = ["%.9g * %s" % (d.get(key, [0.0, 0.0, 0.0])[i] * k, board_var(d["part"], d["dir"]))
+                         for d in o["drives"] if d["part"] in have and abs(d.get(key, [0.0, 0.0, 0.0])[i]) > 1e-9]
+                if terms:
+                    lines.append("%s.%s%s = %s;" % (helper, attr, axis, " + ".join(terms)))
+    # The lip seal: each lip joint takes its control's turn, and its place is
+    # blended from where its control puts it toward its sealed group (under a
+    # seam between the two, turned with the frame joint) by the pair's weight.
+    seal = board.get("seal")
+    if seal and sealed_bones:
+        frame = joint_of.get(seal["frame_bone"])
+        for n, pair in enumerate(seal["pairs"]):
+            if pair["upper"] not in sealed_bones:
+                continue
+            follow = {}
+            for bone, control in ((pair["upper"], pair["upper_control"]), (pair["lower"], pair["lower_control"])):
+                f = cmds.group(empty=True, name=bone + "_seal_follow", parent=ctrl_of[control])
+                cmds.matchTransform(f, joint_of[bone], position=True, rotation=True)
+                follow[bone] = f
+            seam = cmds.group(empty=True, name=pair["upper"] + "_seam", parent=frame or top)
+            cmds.pointConstraint(follow[pair["upper"]], follow[pair["lower"]], seam, maintainOffset=False)
+            dist = cmds.createNode("distanceBetween", name=pair["upper"] + "_seal_gap")
+            cmds.connectAttr(follow[pair["upper"]] + ".worldMatrix[0]", dist + ".inMatrix1")
+            cmds.connectAttr(follow[pair["lower"]] + ".worldMatrix[0]", dist + ".inMatrix2")
+            along = float(pair["along"])
+            centre = 1.0 - abs(2.0 * along - 1.0)
+            release = float(seal["release"]) * centre
+            fade = max(STICKY_FADE * release, 1e-6)
+            w = "$seal%d" % n
+            lines.append("float %s_zip = clamp(0, 1, max(%s * %.9g - %.9g, %s * %.9g - %.9g) / %.9g);" % (
+                w, board_var("zip_l", "x-"), 1.0 + ZIP_FALLOFF, along,
+                board_var("zip_r", "x+"), 1.0 + ZIP_FALLOFF, 1.0 - along, ZIP_FALLOFF))
+            lines.append("float %s_gap = %s.distance / (%.9g * %s.scaleX) - %.9g;" % (
+                w, dist, SCALE, top, float(pair["rest_gap"])))
+            lines.append("float %s = max(%s_zip, clamp(0, 1, (%s * %.9g - max(%s_gap, 0)) / %.9g));" % (
+                w, w, board_var("sticky", "x+"), release, w, fade))
+            for bone in (pair["upper"], pair["lower"]):
+                sealed = cmds.group(empty=True, name=bone + "_sealed", parent=seam)
+                cmds.matchTransform(sealed, joint_of[bone], position=True, rotation=True)
+                j = joint_of[bone]
+                control = pair["upper_control"] if bone == pair["upper"] else pair["lower_control"]
+                cmds.orientConstraint(ctrl_of[control], j, maintainOffset=True)
+                con = cmds.pointConstraint(follow[bone], sealed, j, maintainOffset=False, name=bone + "_seal_point")[0]
+                w_own, w_sealed = cmds.pointConstraint(con, query=True, weightAliasList=True)
+                lines.append("%s.%s = 1 - %s;" % (con, w_own, w))
+                lines.append("%s.%s = %s;" % (con, w_sealed, w))
+    # Shapes that follow a slider.
+    for sh in shapes:
+        link = sh.get("board")
+        if not link or sh.get("driver") or sh["name"] not in shape_nodes:
+            continue
+        if link["part"] not in have:
+            cmds.warning("hive-rig: shape %s follows board slider %s, which the rig doesn't have" % (sh["name"], link["part"]))
+            continue
+        for bs, i in shape_nodes[sh["name"]]:
+            lines.append("%s.weight[%d] = clamp(0, 1, %s * %.9g);" % (
+                bs, i, board_var(link["part"], link["dir"]), float(link.get("weight", 1.0))))
+    cmds.expression(name=NAME + "_face_board_expr", string="\n".join(lines))
+
+
 def build(RIG, geos=None):
     """Build the skeleton, skin and controls for RIG. With `geos`, re-skin those
     existing meshes instead of creating new ones."""
@@ -438,6 +531,23 @@ def build(RIG, geos=None):
 
 
     chain_end_ik = {c["ik_control"]: c["end"] for c in CHAINS}
+    BOARD = RIG["controls"].get("face_board")
+    board_pivot = {o["control"]: o["pivot"] for o in (BOARD or {}).get("offsets", [])}
+    board_helper = {}  # face control -> the group the board moves and turns
+
+    def board_zero(name, offset, pivot):
+        """Face board: a group at the pivot, upright (so its channels are
+        hive-rig's axes), between a face control's offset and its parent; its
+        child `<control>_board` is what the board moves. Returns the upright group."""
+        up = cmds.listRelatives(offset, parent=True)[0]
+        zero = cmds.group(empty=True, name=name + "_board_zero", parent=up)
+        p = mpos(pivot)
+        cmds.xform(zero, worldSpace=True, matrix=[1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, p[0], p[1], p[2], 1])
+        helper = cmds.group(empty=True, name=name + "_board", parent=zero)
+        cmds.parent(offset, helper)
+        board_helper[name] = helper
+        return zero
+
     ctrl_of = {}
     offset_of = {}
     for c in CONTROLS:
@@ -460,14 +570,19 @@ def build(RIG, geos=None):
             cmds.xform(offset, worldSpace=True, translation=mpos(c["position"]))
         else:
             cmds.xform(offset, worldSpace=True, matrix=axis_matrix(c["axis"], c["position"]))
+        if c["kind"] in ("board", "slider"):
+            # Upright: a slider's translate is its move on the board.
+            p = mpos(c["position"])
+            cmds.xform(offset, worldSpace=True, matrix=[1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, p[0], p[1], p[2], 1])
         # The outline sits at the control's position (clavicle shape at the shoulder).
         place_outline(shapes, c["outline"])
+        follow = board_zero(c["name"], offset, board_pivot[c["name"]]) if c["name"] in board_pivot else offset
         if parent["type"] == "bone" and c["kind"] != "bend":  # bend offsets follow their curve (below)
-            cmds.parentConstraint(joint_of[parent["name"]], offset, maintainOffset=True)
+            cmds.parentConstraint(joint_of[parent["name"]], follow, maintainOffset=True)
         if c.get("spaces"):
             # Space switching: the offset follows whichever space the enum selects.
             cmds.addAttr(ctrl, longName="space", attributeType="enum", enumName=":".join(c["spaces"]), keyable=True)
-            con = cmds.parentConstraint(*[ctrl_of[s] for s in c["spaces"]] + [offset], maintainOffset=True)[0]
+            con = cmds.parentConstraint(*[ctrl_of[s] for s in c["spaces"]] + [follow], maintainOffset=True)[0]
             for i, alias in enumerate(cmds.parentConstraint(con, query=True, weightAliasList=True)):
                 pick = cmds.createNode("condition", name="%s_space%d_cond" % (c["name"], i))
                 cmds.setAttr(pick + ".secondTerm", i)
@@ -482,13 +597,25 @@ def build(RIG, geos=None):
         if c["kind"] == "hock" or (c["kind"] == "fk" and (not c["bone"] or copy_rule(bone_by_name[c["bone"]]) == "orient")):
             for attr in ("tx", "ty", "tz"):
                 cmds.setAttr(ctrl + "." + attr, lock=True, keyable=False, channelBox=False)
-        if c["kind"] in ("bend", "pin"):
+        if c["kind"] in ("bend", "pin", "slider"):
             for attr in ("rx", "ry", "rz"):
                 cmds.setAttr(ctrl + "." + attr, lock=True, keyable=False, channelBox=False)
+        if c["kind"] == "slider":
+            # A slider stays in its track.
+            sl = next(x for x in BOARD["sliders"] if x["control"] == c["name"])
+            k = sl["travel"] * SCALE
+            cmds.setAttr(ctrl + ".tz", lock=True, keyable=False, channelBox=False)
+            cmds.transformLimits(ctrl, translationX=(sl["x"][0] * k, sl["x"][1] * k), enableTranslationX=(True, True),
+                                 translationY=(sl["y"][0] * k, sl["y"][1] * k), enableTranslationY=(True, True))
         for attr in ("sx", "sy", "sz", "v"):
             cmds.setAttr(ctrl + "." + attr, lock=True, keyable=False, channelBox=False)
 
     # --------------------------------------------------------------------------- FK for non-limb bones
+    sealed_bones = set()
+    for pair in ((BOARD or {}).get("seal") or {}).get("pairs", []):
+        if all(n in joint_of for n in (pair["upper"], pair["lower"])) and all(
+                n in ctrl_of for n in (pair["upper_control"], pair["lower_control"])):
+            sealed_bones.update((pair["upper"], pair["lower"]))
     def chain_bones(chain):
         """The limb's bones from the top down; three-segment legs add the hock."""
         hock = chain.get("hock")
@@ -505,12 +632,16 @@ def build(RIG, geos=None):
         limb_bones.update(chain_bones(chain))
 
     for c in CONTROLS:
-        if c["kind"] in ("fk", "root") and c["bone"] and c["bone"] not in limb_bones:
+        if c["kind"] in ("fk", "root") and c["bone"] and c["bone"] not in limb_bones | sealed_bones:
             j = joint_of[c["bone"]]
             if copy_rule(bone_by_name[c["bone"]]) == "parent":
                 cmds.parentConstraint(ctrl_of[c["name"]], j, maintainOffset=True)
             else:
                 cmds.orientConstraint(ctrl_of[c["name"]], j, maintainOffset=True)
+
+    if BOARD:
+        build_board(BOARD, top, ctrl_of, joint_of, shape_nodes, sealed_bones, board_helper,
+                    RIG["mesh"].get("shapes", []))
 
     # Eyes: each eye joint aims at its control, keeping its rest orientation.
     for c in CONTROLS:

@@ -282,7 +282,7 @@ def build():
             return initial(bone_key(chain_end_ik[c["name"]]))
         if c["kind"] == "cog":
             return initial(bone_key(BASIS_BONES[0]))
-        if c["kind"] == "aim":
+        if c["kind"] in ("aim", "board", "slider"):
             return unreal.Transform(location=to_ue(c["position"]))
         if c["name"] in spline_of:
             # Curve and FK-layer controls turn like the joint they sit on, so the end
@@ -328,7 +328,7 @@ def build():
         settings = unreal.RigControlSettings()
         # Bend and pin controls only move: their value is an offset in the frame of
         # the bone they follow.
-        moves_only = c["kind"] in ("bend", "pin")
+        moves_only = c["kind"] in ("bend", "pin", "slider")
         settings.control_type = unreal.RigControlType.POSITION if moves_only else unreal.RigControlType.EULER_TRANSFORM
         try:
             settings.animation_type = unreal.RigControlAnimationType.ANIMATION_CONTROL
@@ -340,6 +340,12 @@ def build():
             value = unreal.RigHierarchy.make_control_value_from_vector(unreal.Vector(0.0, 0.0, 0.0))
         else:
             value = unreal.RigHierarchy.make_control_value_from_euler_transform(unreal.EulerTransform())
+        if c["name"] in BOARD_PIVOT:
+            rest = initial(parent) if parent.name != "None" else unreal.Transform()
+            at = unreal.Transform(location=to_ue(BOARD_PIVOT[c["name"]]), rotation=rest.rotation.rotator())
+            board_null[c["name"]] = (hc.add_null(c["name"] + "_board", parent, at, True, True, False),
+                                     at, rest.rotation, rest.translation)
+            parent = board_null[c["name"]][0]
         k = add_control(c["name"], parent, settings, value)
         world = target_transform(c)
         parent_world = initial(parent) if parent.name != "None" else unreal.Transform()
@@ -349,6 +355,9 @@ def build():
         return k
 
 
+    BOARD = RIG.get("face_board")
+    BOARD_PIVOT = {o["control"]: o["pivot"] for o in (BOARD or {}).get("offsets", [])}
+    board_null = {}  # face control -> (its board null, its rest transform, its parent's rest turn and place)
     for c in CONTROLS:
         # Hock controls hang from the reverse-foot ankle null, made below.
         if c["kind"] != "hock":
@@ -504,6 +513,187 @@ def build():
             limb_ctrls[ctrl] = chain
 
 
+    # ----------------------------------------------------------------------- face board
+    # hive-rig's face_board module describes it: a slider's value is its move
+    # along its track (in hive-rig's axes) over its travel, held to the track;
+    # each face control it moves hangs under a null the sliders move and turn
+    # (in the null's parent's frame, so hive-rig's model-space offset lands as it
+    # does there); the lip seal pulls each upper and lower lip joint toward the
+    # line between them.
+    ZIP_FALLOFF, STICKY_FADE = 0.25, 0.5
+    CM_PER_M = _length([to_ue_dir([1.0, 0.0, 0.0]).x, to_ue_dir([1.0, 0.0, 0.0]).y, to_ue_dir([1.0, 0.0, 0.0]).z])
+
+
+    def hive_axis(k):
+        e = [0.0, 0.0, 0.0]
+        e[k] = 1.0
+        return to_ue_dir(e)
+
+
+    def turn_sign():
+        """+1 when a turn about hive-rig's X by +a is a turn about the mapped X
+        by +a in Unreal, -1 when the axis conversion mirrors."""
+        y, z, x = hive_axis(1), hive_axis(2), hive_axis(0).normal()
+        swung = rotate(y, x, 0.3)
+        return 1.0 if (swung.x * z.x + swung.y * z.y + swung.z * z.z) > 0 else -1.0
+
+
+    def float_sum(name, terms):
+        """sum of coefficient * pin over (coefficient, pin) terms; a pin."""
+        total = None
+        for i, (coef, pin) in enumerate(terms):
+            part = op("FloatMul", "%s_%d" % (name, i), pin, coef)
+            total = part if total is None else op("FloatAdd", "%s_sum%d" % (name, i), total, part)
+        return total
+
+
+    def build_board_graph():
+        """Slider values, their amounts each way, and the nulls' moves and turns.
+        Returns {(part, direction): amount pin}."""
+        amounts = {}
+        for sl in BOARD["sliders"]:
+            if not any(c["name"] == sl["control"] for c in CONTROLS):
+                continue
+            value = unit("RigUnit_GetControlVector", "Get_" + sl["control"], {"Control": sl["control"]}) + ".Vector"
+            for k, axis in ((0, "x"), (1, "y")):
+                u = hive_axis(k)
+                n2 = u.x * u.x + u.y * u.y + u.z * u.z
+                along = math("VectorDot", "BoardValue_%s_%s" % (sl["part"], axis),
+                             {"B": vector_text(u * (1.0 / (n2 * sl["travel"])))})
+                vm.add_link(value, along + ".A")
+                lo, hi = sl[axis]
+                held = math("FloatClamp", "BoardHeld_%s_%s" % (sl["part"], axis),
+                            {"Minimum": "%.9g" % lo, "Maximum": "%.9g" % hi})
+                vm.add_link(along + ".Result", held + ".Value")
+                amounts[(sl["part"], axis + "+")] = op("FloatMax", "BoardAmount_%s_%sp" % (sl["part"], axis),
+                                                       held + ".Result", 0.0)
+                amounts[(sl["part"], axis + "-")] = op("FloatMax", "BoardAmount_%s_%sn" % (sl["part"], axis),
+                                                       op("FloatMul", "BoardNeg_%s_%s" % (sl["part"], axis),
+                                                          held + ".Result", -1.0), 0.0)
+        sign = turn_sign()
+        for o in BOARD["offsets"]:
+            if o["control"] not in board_null:
+                continue
+            null, at, turn, parent_at = board_null[o["control"]]
+            drives = [d for d in o["drives"] if (d["part"], d["dir"]) in amounts]
+            name = o["control"]
+            # Translation: the rest place plus each hive-rig axis's move, in the parent's frame.
+            moved = None
+            for k in range(3):
+                terms = [(d.get("translate", [0.0, 0.0, 0.0])[k], amounts[(d["part"], d["dir"])]) for d in drives
+                         if abs(d.get("translate", [0.0, 0.0, 0.0])[k]) > 1e-9]
+                if not terms:
+                    continue
+                local = turn.unrotate_vector(hive_axis(k))
+                step = math("VectorScale", "Board_%s_t%d" % (name, k), {"Value": vector_text(local)})
+                feed(step, "Factor", float_sum("Board_%s_t%d_amount" % (name, k), terms))
+                if moved is None:
+                    moved = step + ".Result"
+                else:
+                    total = math("VectorAdd", "Board_%s_t%d_add" % (name, k), {})
+                    vm.add_link(moved, total + ".A")
+                    vm.add_link(step + ".Result", total + ".B")
+                    moved = total + ".Result"
+            if moved is not None:
+                rest = math("VectorAdd", "Board_%s_place" % name,
+                            {"A": vector_text(turn.unrotate_vector(at.translation - parent_at))})
+                vm.add_link(moved, rest + ".B")
+                place = unit("RigUnit_SetTranslation", "Board_" + name,
+                             {"Item": item_pin("Null", null.name), "Space": "LocalSpace", "bPropagateToChildren": "True"})
+                vm.add_link(rest + ".Result", place + ".Value")
+                chain_exec(place)
+            # Turn: hive-rig's X, then Y, then Z (degrees), about the parent's axes.
+            spin = None
+            for k in range(3):
+                terms = [(d.get("rotate", [0.0, 0.0, 0.0])[k] * sign * math_pi / 180.0, amounts[(d["part"], d["dir"])])
+                         for d in drives if abs(d.get("rotate", [0.0, 0.0, 0.0])[k]) > 1e-9]
+                if not terms:
+                    continue
+                quat = math("QuaternionFromAxisAndAngle", "Board_%s_r%d" % (name, k),
+                            {"Axis": vector_text(turn.unrotate_vector(hive_axis(k).normal()))})
+                feed(quat, "Angle", float_sum("Board_%s_r%d_angle" % (name, k), terms))
+                if spin is None:
+                    spin = quat + ".Result"
+                else:
+                    after = math("QuaternionMul", "Board_%s_r%d_mul" % (name, k), {})
+                    vm.add_link(quat + ".Result", after + ".A")
+                    vm.add_link(spin, after + ".B")
+                    spin = after + ".Result"
+            if spin is not None:
+                node = unit("RigUnit_SetRotation", "BoardTurn_" + name,
+                            {"Item": item_pin("Null", null.name), "Space": "LocalSpace", "bPropagateToChildren": "True"})
+                vm.add_link(spin, node + ".Value")
+                chain_exec(node)
+        return amounts
+
+
+    def build_seal_graph(amounts):
+        """After the face bones follow their controls: each sealed lip pair's
+        joints move toward the line between them by the pair's weight."""
+        seal = BOARD.get("seal")
+        names = {b["name"] for b in BONES}
+        if not seal or seal["frame_bone"] not in names:
+            return
+
+        def amount(part, d):
+            return amounts.get((part, d), 0.0)
+
+        frame_now = unit("RigUnit_GetTransform", "Seal_frame_now",
+                         {"Item": item_pin("Bone", seal["frame_bone"]), "Space": "GlobalSpace"}) + ".Transform.Rotation"
+        frame_inv = math("QuaternionInverse", "Seal_frame_rest_inv",
+                         {"Value": "(X=%.9g,Y=%.9g,Z=%.9g,W=%.9g)" % tuple(
+                             getattr(initial(bone_key(seal["frame_bone"])).rotation, a) for a in "xyzw")})
+        frame_turn = math("QuaternionMul", "Seal_frame_turn", {})
+        vm.add_link(frame_now, frame_turn + ".A")
+        vm.add_link(frame_inv + ".Result", frame_turn + ".B")
+        for n, pair in enumerate(seal["pairs"]):
+            if pair["upper"] not in names or pair["lower"] not in names:
+                continue
+            up, low = pair["upper"], pair["lower"]
+            u = unit("RigUnit_GetTransform", "Seal_%s_now" % up,
+                     {"Item": item_pin("Bone", up), "Space": "GlobalSpace"}) + ".Transform.Translation"
+            l = unit("RigUnit_GetTransform", "Seal_%s_now" % low,
+                     {"Item": item_pin("Bone", low), "Space": "GlobalSpace"}) + ".Transform.Translation"
+            mid = math("VectorLerp", "Seal_%s_mid" % up, {"T": "0.5"})
+            vm.add_link(u, mid + ".A")
+            vm.add_link(l, mid + ".B")
+            ru, rl = bone_location(up), bone_location(low)
+            rest_mid = (ru + rl) * 0.5
+            along = float(pair["along"])
+            centre = 1.0 - abs(2.0 * along - 1.0)
+            release = float(seal["release"]) * centre
+            fade = max(STICKY_FADE * release, 1e-6)
+            zl = op("FloatSub", "Seal%d_zl" % n, op("FloatMul", "Seal%d_zl_k" % n, amount("zip_l", "x-"), 1.0 + ZIP_FALLOFF), along)
+            zr = op("FloatSub", "Seal%d_zr" % n, op("FloatMul", "Seal%d_zr_k" % n, amount("zip_r", "x+"), 1.0 + ZIP_FALLOFF), 1.0 - along)
+            zipped = math("FloatClamp", "Seal%d_zipped" % n, {"Minimum": "0.0", "Maximum": "1.0"})
+            feed(zipped, "Value", op("FloatDiv", "Seal%d_zip_fall" % n, op("FloatMax", "Seal%d_zip" % n, zl, zr), ZIP_FALLOFF))
+            dist = math("VectorDistance", "Seal%d_dist" % n, {})
+            vm.add_link(u, dist + ".A")
+            vm.add_link(l, dist + ".B")
+            gap = op("FloatMax", "Seal%d_gap" % n,
+                     op("FloatSub", "Seal%d_gap_m" % n, op("FloatDiv", "Seal%d_dist_m" % n, dist + ".Result", CM_PER_M),
+                        float(pair["rest_gap"])), 0.0)
+            hold = op("FloatSub", "Seal%d_hold" % n, op("FloatMul", "Seal%d_sticky" % n, amount("sticky", "x+"), release), gap)
+            stuck = math("FloatClamp", "Seal%d_stuck" % n, {"Minimum": "0.0", "Maximum": "1.0"})
+            feed(stuck, "Value", op("FloatDiv", "Seal%d_stuck_fall" % n, hold, fade))
+            weight = op("FloatMax", "Seal%d_weight" % n, zipped + ".Result", stuck + ".Result")
+            for bone, rest in ((up, ru), (low, rl)):
+                lean = math("QuaternionRotateVector", "Seal_%s_lean" % bone, {"Vector": vector_text(rest - rest_mid)})
+                vm.add_link(frame_turn + ".Result", lean + ".Transform")
+                target = math("VectorAdd", "Seal_%s_target" % bone, {})
+                vm.add_link(mid + ".Result", target + ".A")
+                vm.add_link(lean + ".Result", target + ".B")
+                own = u if bone == up else l
+                blend = math("VectorLerp", "Seal_%s_blend" % bone, {})
+                vm.add_link(own, blend + ".A")
+                vm.add_link(target + ".Result", blend + ".B")
+                feed(blend, "T", weight)
+                place = unit("RigUnit_SetTranslation", "Seal_" + bone,
+                             {"Item": item_pin("Bone", bone), "Space": "GlobalSpace", "bPropagateToChildren": "True"})
+                vm.add_link(blend + ".Result", place + ".Value")
+                chain_exec(place)
+
+
     def bezier_fit(params):
         """How each point of the four-point Bezier closest to a curve is made from
         the curve's points, as coefficients per point. It starts and ends on the
@@ -626,6 +816,7 @@ def build():
                 solve_spline(sp)
 
 
+    board_amounts = build_board_graph() if BOARD else {}
     for c in CONTROLS:
         solve_ready_splines()
         passed.add(c["name"])
@@ -642,6 +833,8 @@ def build():
             vm.add_link(get + ".Transform.Rotation", node + ".Value")
         chain_exec(node)
     solve_ready_splines()
+    if BOARD:
+        build_seal_graph(board_amounts)
 
     # Eyes: aim each eye bone's rest direction at its control.
     for c in CONTROLS:
@@ -971,8 +1164,14 @@ def build():
     # hive-rig gave them) that sets their curves, so they can be keyed here too.
     shape_owner = control_key(CONTROLS[0]["name"]) if CONTROLS else None
     for shape in BLEND_SHAPES:
+        link = shape.get("board")
         if shape.get("driver"):
             pin = build_reader(shape)
+        elif link and (link["part"], link["dir"]) in board_amounts:
+            pin = math("FloatClamp", "BoardShape_" + shape["name"], {"Minimum": "0.0", "Maximum": "1.0"})
+            feed(pin, "Value", op("FloatMul", "BoardShape_%s_weight" % shape["name"],
+                                  board_amounts[(link["part"], link["dir"])], float(link.get("weight", 1.0))))
+            pin = pin + ".Result"
         elif shape_owner is not None:
             add_float(shape["name"] + "_shape", shape_owner, 0.0, 1.0, shape.get("weight", 0.0))
             pin = get_float(shape["name"] + "_shape") + ".FloatValue"
@@ -1018,7 +1217,7 @@ def animator_data():
     floats = [f for l in limbs for f in l["floats"]]
     for sp in SPLINES:
         floats += [sp["name"] + "_stretch", sp["name"] + "_volume"]
-    moves_only = [c["name"] for c in CONTROLS if c["kind"] in ("bend", "pin")]
+    moves_only = [c["name"] for c in CONTROLS if c["kind"] in ("bend", "pin", "slider")]
     euler = [c["name"] for c in CONTROLS if c["name"] not in moves_only]
     return {"limbs": limbs, "floats": floats, "positions": moves_only, "transforms": euler}
 

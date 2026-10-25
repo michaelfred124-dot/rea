@@ -13,9 +13,10 @@ use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
 use crate::controls::{
-    BendSegment, Bendy, Control, ControlKind, ControlParent, ControlRig, FootRoll, HockSegment,
-    IkChain, SOFT_ZONE, Shape, SplineChain, ctrl_name, fk_name,
+    BendSegment, Bendy, Control, ControlKind, ControlParent, ControlRig, FaceBoard, FootRoll,
+    HockSegment, IkChain, SOFT_ZONE, Shape, SplineChain, ctrl_name, fk_name,
 };
+use crate::face_board::{self, Dir};
 use crate::landmarks::{Landmarks, mirror};
 use crate::naming::Naming;
 use crate::skeleton::{Region, Side, Skeleton, Twist};
@@ -237,6 +238,12 @@ pub struct Options {
     /// [`crate::controls::spring_hock`]); at 0 it keeps the hock control's angle.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub spring: f32,
+    /// Face: a face board beside the head (sliders posing the face joints
+    /// and face blendshapes) with lip zippers and sticky lips. On a face,
+    /// `joints` is the extra lip joints on each lip between its middle and
+    /// each corner (0 to 3; none when unset).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub board: bool,
 }
 
 fn is_zero(v: &f32) -> bool {
@@ -261,6 +268,7 @@ impl Default for Options {
             bendy: false,
             soft: 0.0,
             spring: 0.0,
+            board: false,
         }
     }
 }
@@ -959,8 +967,14 @@ pub enum Preset {
     Eyes,
     /// A jaw on the head.
     Jaw,
-    /// Face joints: brows, eyelids, cheeks, nose and lips.
+    /// Face joints: brows, eyelids, cheeks, nose and lips, with a lip joint
+    /// between the middle and each corner and a face board.
     Face,
+    /// A face board for a face that has none: sliders beside the head for the
+    /// brows, lids, cheeks, nose, mouth corners, lips and jaw, lip zippers and
+    /// sticky lips. `--joints` sets the extra lip joints a side (0 to 3).
+    #[value(name = "face_board", alias = "board", alias = "face-board")]
+    FaceBoard,
     /// Five toes on each foot, from the ball of the foot (3 joints each).
     Toes,
     /// Three-segment hind legs (thigh, calf, hock, paw) on the pelvis, left and right.
@@ -1225,8 +1239,25 @@ pub fn add_preset(g: &mut Guides, preset: Preset, opts: &AddOptions) -> Result<V
                 .guide("lip_low", mouth + v(0.0, -0.004, 0.0))
                 .guide("lip_corner_l", mouth + v(0.014, 0.0, -0.004))
                 .guide("lip_corner_r", mouth + v(-0.014, 0.0, -0.004));
+            // New faces come with a lip joint between the middle and each
+            // corner (so the lips can zip) and a face board.
+            c.options.joints = Some(opts.joints.unwrap_or(1));
+            c.options.board = true;
             g.components.push(c);
             added.push(id);
+        }
+        Preset::FaceBoard => {
+            let face = g
+                .components
+                .iter_mut()
+                .find(|c| c.kind == Kind::Face)
+                .context("add the face first (`add <guides> face`): the board poses its joints")?;
+            ensure!(!face.options.board, "the face already has a face board");
+            face.options.board = true;
+            if let Some(n) = opts.joints {
+                face.options.joints = Some(n);
+            }
+            added.push(face.id.clone());
         }
         Preset::Tentacle => {
             let joints = opts.joints.unwrap_or(8);
@@ -1895,6 +1926,7 @@ impl Builder {
             size,
             color,
             spaces: Vec::new(),
+            extra: Vec::new(),
             component: self.component.clone(),
         });
     }
@@ -1956,6 +1988,16 @@ pub fn build(g: &Guides) -> Result<Built> {
             Kind::Jaw => build_jaw(&mut b, p("jaw"), p("chin"), parent)?,
             Kind::Face => build_face(&mut b, c, parent)?,
         }
+    }
+    // The face board goes on last: it drives the jaw and the face, whatever
+    // order they were added in.
+    if let Some(face) = g
+        .components
+        .iter()
+        .find(|c| c.kind == Kind::Face && c.options.board)
+    {
+        b.component = face.id.clone();
+        build_board(&mut b, face)?;
     }
     assign_spaces(&mut b);
     b.rig.find_mirror_pairs();
@@ -2077,6 +2119,18 @@ fn validate(g: &Guides) -> Result<()> {
             c.id,
             c.options.spring
         );
+        ensure!(
+            !c.options.board || c.kind == Kind::Face,
+            "component {}: only the face has a face board",
+            c.id
+        );
+        if c.kind == Kind::Face {
+            ensure!(
+                c.options.joints.unwrap_or(0) <= MAX_LIP_JOINTS,
+                "component {}: a face takes 0 to {MAX_LIP_JOINTS} extra lip joints a side",
+                c.id
+            );
+        }
         if c.kind == Kind::Spine {
             let n = g.spine_joints(c);
             ensure!(
@@ -3029,7 +3083,14 @@ fn build_jaw(b: &mut Builder, jaw: Vec3, chin: Vec3, parent: &str) -> Result<()>
 /// eyelids pivot on the eyeball so rotating their control blinks.
 fn build_face(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
     let len = 0.012 * b.h;
-    for g in &c.guides {
+    let extras: Vec<Guide> = lip_joints(c)
+        .into_iter()
+        .map(|j| Guide {
+            name: j.name,
+            position: j.position,
+        })
+        .collect();
+    for g in c.guides.iter().chain(&extras) {
         let name = g.name.as_str();
         let side = if name.ends_with("_l") {
             Side::Left
@@ -3038,7 +3099,7 @@ fn build_face(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
         } else {
             Side::Center
         };
-        let bone_parent = if name == "lip_low" && b.sk.bone("jaw").is_some() {
+        let bone_parent = if name.starts_with("lip_low") && b.sk.bone("jaw").is_some() {
             "jaw"
         } else {
             parent
@@ -3073,6 +3134,368 @@ fn build_face(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
             side_color(side),
         );
     }
+    Ok(())
+}
+
+/// The most extra lip joints a face takes on each lip, each side.
+pub const MAX_LIP_JOINTS: usize = 3;
+
+/// An extra lip joint of a face: between the middle of a lip and a corner.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LipJoint {
+    /// `lip_up_1_l`: the upper lip's first joint out from the middle, on the left.
+    pub name: String,
+    pub position: Vec3,
+    pub upper: bool,
+    /// How far out toward the corner: 0 in the middle, 1 at the corner.
+    pub out: f32,
+    pub side: Side,
+}
+
+/// The face's extra lip joints (its `joints` option, none when unset): on each
+/// lip, evenly from the middle toward each corner, on an arc that bows forward
+/// like the mouth does.
+pub fn lip_joints(c: &Component) -> Vec<LipJoint> {
+    let n = c.options.joints.unwrap_or(0).min(MAX_LIP_JOINTS);
+    let mut out = Vec::new();
+    for (lip, upper) in [("up", true), ("low", false)] {
+        let Some(mid) = c.position(&format!("lip_{lip}")) else {
+            continue;
+        };
+        for (side, s) in [(Side::Left, "l"), (Side::Right, "r")] {
+            let Some(corner) = c.position(&format!("lip_corner_{s}")) else {
+                continue;
+            };
+            for k in 1..=n {
+                let t = k as f32 / (n + 1) as f32;
+                let mut p = mid.lerp(corner, t);
+                p.z = corner.z + (mid.z - corner.z) * (1.0 - t * t);
+                out.push(LipJoint {
+                    name: format!("lip_{lip}_{k}_{s}"),
+                    position: p,
+                    upper,
+                    out: t,
+                    side,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The face board's offsets as they are made: each face control's drives.
+struct Drives<'a> {
+    b: &'a Builder,
+    offsets: Vec<face_board::BoardOffset>,
+}
+
+impl Drives<'_> {
+    /// `bone`'s control moves `t` metres and turns `r` degrees for a unit of
+    /// `part` going `dir`. Skipped when the rig has no such control.
+    fn add(&mut self, bone: &str, part: &str, dir: Dir, t: Vec3, r: Vec3) {
+        let control = ctrl_name(bone);
+        let Some(head) = self.b.sk.bone(bone).map(|x| x.head) else {
+            return;
+        };
+        if !self.b.has_control(&control) || (t == Vec3::ZERO && r == Vec3::ZERO) {
+            return;
+        }
+        let i = match self.offsets.iter().position(|o| o.control == control) {
+            Some(i) => i,
+            None => {
+                self.offsets.push(face_board::BoardOffset {
+                    control,
+                    pivot: head,
+                    drives: Vec::new(),
+                });
+                self.offsets.len() - 1
+            }
+        };
+        let drives = &mut self.offsets[i].drives;
+        match drives.iter_mut().find(|d| d.part == part && d.dir == dir) {
+            Some(d) => {
+                d.translate += t;
+                d.rotate += r;
+            }
+            None => drives.push(face_board::BoardDrive {
+                part: part.to_string(),
+                dir,
+                translate: t,
+                rotate: r,
+            }),
+        }
+    }
+}
+
+/// The face board: a panel beside the head (on the character's left, level
+/// with the face) whose sliders move and turn the face controls, and the lip
+/// seal on the lip joints. See [`face_board`].
+fn build_board(b: &mut Builder, c: &Component) -> Result<()> {
+    use face_board::{HANDLE, LAYOUT, PANEL, STEP};
+    let h = b.h;
+    let step = STEP * h;
+    let parent = c.parent.as_deref().unwrap_or("head");
+    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for g in &c.guides {
+        lo = lo.min(g.position);
+        hi = hi.max(g.position);
+    }
+    ensure!(
+        lo.x <= hi.x,
+        "component {}: the face has no guides to place its board by",
+        c.id
+    );
+    let center = Vec3::new(hi.x + 0.05 * h + PANEL[0] * step, (lo.y + hi.y) * 0.5, hi.z);
+    let at = |p: [f32; 2]| center + Vec3::new(p[0], p[1], 0.0) * step;
+    let frame = "board_ctrl".to_string();
+    let top = LAYOUT
+        .iter()
+        .find(|s| s.part.is_empty())
+        .map_or([0.0, PANEL[1]], |s| s.at);
+    let parent_ctrl = b.parent_control(parent);
+    b.control(
+        frame.clone(),
+        ControlKind::Board,
+        parent_ctrl,
+        None,
+        at(top),
+        Vec3::Z,
+        Shape::FourArrows,
+        0.8 * step,
+        CENTER,
+    );
+    if let Some(ctrl) = b.rig.controls.last_mut() {
+        ctrl.extra = face_board::panel_lines(center, step);
+    }
+    let mut sliders = Vec::new();
+    for slot in LAYOUT.iter().filter(|s| !s.part.is_empty()) {
+        let name = format!("board_{}_ctrl", slot.part);
+        let side = if slot.part.ends_with("_l") {
+            Side::Left
+        } else if slot.part.ends_with("_r") {
+            Side::Right
+        } else {
+            Side::Center
+        };
+        b.control(
+            name.clone(),
+            ControlKind::Slider,
+            ControlParent::Control(frame.clone()),
+            None,
+            at(slot.at),
+            Vec3::Z,
+            Shape::Circle,
+            HANDLE * step,
+            side_color(side),
+        );
+        sliders.push(face_board::Slider {
+            part: slot.part.to_string(),
+            control: name,
+            travel: slot.travel * step,
+            x: slot.x,
+            y: slot.y,
+        });
+    }
+
+    let v = |x: f32, y: f32, z: f32| Vec3::new(x, y, z) * h;
+    let turn = |x: f32| Vec3::new(x, 0.0, 0.0);
+    let lips = lip_joints(c);
+    let mut d = Drives {
+        b,
+        offsets: Vec::new(),
+    };
+    for (s, sx) in [("l", 1.0f32), ("r", -1.0)] {
+        // The right side mirrors the left: side to side swaps.
+        let m = |t: Vec3| Vec3::new(t.x * sx, t.y, t.z);
+        let side_dir = |dir: Dir| if sx < 0.0 { dir.mirrored() } else { dir };
+        let brow = format!("brow_{s}");
+        let brows = [
+            (
+                "in",
+                v(0.0, 0.010, 0.001),
+                v(0.0, -0.006, 0.001),
+                v(-0.005, -0.002, 0.001),
+                Vec3::ZERO,
+            ),
+            (
+                "mid",
+                v(0.0, 0.011, 0.001),
+                v(0.0, -0.006, 0.0),
+                v(-0.003, -0.001, 0.0),
+                v(0.002, 0.0, 0.0),
+            ),
+            (
+                "out",
+                v(0.0, 0.008, 0.0),
+                v(0.0, -0.005, 0.0),
+                Vec3::ZERO,
+                v(0.003, 0.001, 0.0),
+            ),
+        ];
+        for (bone, up, down, inward, outward) in brows {
+            let bone = format!("brow_{bone}_{s}");
+            d.add(&bone, &brow, Dir::YPos, up, Vec3::ZERO);
+            d.add(&bone, &brow, Dir::YNeg, down, Vec3::ZERO);
+            d.add(&bone, &brow, side_dir(Dir::XNeg), m(inward), Vec3::ZERO);
+            d.add(&bone, &brow, side_dir(Dir::XPos), m(outward), Vec3::ZERO);
+        }
+        // Lids: turned about the eye to meet a little below the middle of
+        // the eye when they pivot on it, else slid shut.
+        let lid = format!("lid_{s}");
+        let (up, low) = (format!("lid_up_{s}"), format!("lid_low_{s}"));
+        let lid_bones = (d.b.sk.bone(&up).cloned(), d.b.sk.bone(&low).cloned());
+        if let (Some(ub), Some(lb)) = lid_bones {
+            let on_eye = c
+                .position(&up)
+                .is_some_and(|g| g.distance(ub.head) > 1e-4 * h);
+            if on_eye {
+                let angle = |p: Vec3, eye: Vec3| (p.y - eye.y).atan2(p.z - eye.z).to_degrees();
+                let (au, al) = (angle(ub.tail, ub.head), angle(lb.tail, lb.head));
+                let meet = al + 0.3 * (au - al);
+                d.add(&up, &lid, Dir::YNeg, Vec3::ZERO, turn(au - meet));
+                d.add(&low, &lid, Dir::YNeg, Vec3::ZERO, turn(al - meet));
+                d.add(&up, &lid, Dir::YPos, Vec3::ZERO, turn(-15.0));
+                d.add(&low, &lid, Dir::YPos, Vec3::ZERO, turn(8.0));
+            } else {
+                let gap = (ub.head.y - lb.head.y).max(0.002 * h);
+                let y = |k: f32| Vec3::new(0.0, k * gap, 0.0);
+                d.add(&up, &lid, Dir::YNeg, y(-0.7), Vec3::ZERO);
+                d.add(&low, &lid, Dir::YNeg, y(0.3), Vec3::ZERO);
+                d.add(&up, &lid, Dir::YPos, y(0.3), Vec3::ZERO);
+                d.add(&low, &lid, Dir::YPos, y(-0.2), Vec3::ZERO);
+            }
+        }
+        let cheek = format!("cheek_{s}");
+        d.add(
+            &cheek,
+            &cheek,
+            Dir::YPos,
+            m(v(0.001, 0.006, 0.002)),
+            Vec3::ZERO,
+        );
+        d.add(&cheek, &cheek, Dir::YNeg, v(0.0, -0.003, 0.0), Vec3::ZERO);
+        // Mouth corners, with the lip joints on that side taking a share by
+        // how far out toward the corner they are.
+        let corner = format!("corner_{s}");
+        let suffix = format!("_{s}");
+        let mut on_side: Vec<(String, f32)> = vec![(format!("lip_corner_{s}"), 1.0)];
+        on_side.extend(
+            lips.iter()
+                .filter(|j| j.side.suffix() == suffix)
+                .map(|j| (j.name.clone(), j.out * j.out)),
+        );
+        for (bone, k) in &on_side {
+            let k = *k;
+            d.add(
+                bone,
+                &corner,
+                Dir::YPos,
+                m(v(0.002, 0.007, -0.002)) * k,
+                Vec3::ZERO,
+            );
+            d.add(
+                bone,
+                &corner,
+                Dir::YNeg,
+                v(0.0, -0.006, 0.0) * k,
+                Vec3::ZERO,
+            );
+            let wide = m(v(0.007, 0.0, -0.002)) * k;
+            d.add(bone, &corner, side_dir(Dir::XPos), wide, Vec3::ZERO);
+            let narrow = m(v(-0.006, 0.0, 0.003)) * k;
+            d.add(bone, &corner, side_dir(Dir::XNeg), narrow, Vec3::ZERO);
+        }
+        d.add(&cheek, &corner, Dir::YPos, v(0.0, 0.003, 0.001), Vec3::ZERO);
+    }
+    d.add("nose", "nose", Dir::YPos, v(0.0, 0.004, 0.001), Vec3::ZERO);
+    d.add("nose", "nose", Dir::YNeg, v(0.0, -0.002, 0.0), Vec3::ZERO);
+    let mut every_lip: Vec<String> = ["lip_up", "lip_low", "lip_corner_l", "lip_corner_r"]
+        .map(String::from)
+        .to_vec();
+    every_lip.extend(lips.iter().map(|j| j.name.clone()));
+    for bone in &every_lip {
+        d.add(bone, "mouth", Dir::XPos, v(0.006, 0.0, 0.0), Vec3::ZERO);
+        d.add(bone, "mouth", Dir::XNeg, v(-0.006, 0.0, 0.0), Vec3::ZERO);
+        d.add(bone, "mouth", Dir::YPos, v(0.0, 0.005, 0.0), Vec3::ZERO);
+        d.add(bone, "mouth", Dir::YNeg, v(0.0, -0.005, 0.0), Vec3::ZERO);
+    }
+    for (lip, upper, raise, lower) in [
+        (
+            "lip_up",
+            true,
+            v(0.0, 0.004, 0.0005),
+            v(0.0, -0.003, -0.001),
+        ),
+        (
+            "lip_low",
+            false,
+            v(0.0, 0.003, -0.001),
+            v(0.0, -0.004, 0.0005),
+        ),
+    ] {
+        let mut bones = vec![(lip.to_string(), 1.0)];
+        bones.extend(
+            lips.iter()
+                .filter(|j| j.upper == upper)
+                .map(|j| (j.name.clone(), 1.0 - j.out)),
+        );
+        for (bone, k) in &bones {
+            d.add(bone, lip, Dir::YPos, raise * *k, Vec3::ZERO);
+            d.add(bone, lip, Dir::YNeg, lower * *k, Vec3::ZERO);
+        }
+    }
+    d.add("jaw", "jaw", Dir::YNeg, Vec3::ZERO, turn(25.0));
+    d.add("jaw", "jaw", Dir::YPos, Vec3::ZERO, turn(-3.0));
+    d.add(
+        "jaw",
+        "jaw",
+        Dir::XPos,
+        Vec3::ZERO,
+        Vec3::new(0.0, 8.0, 0.0),
+    );
+    d.add(
+        "jaw",
+        "jaw",
+        Dir::XNeg,
+        Vec3::ZERO,
+        Vec3::new(0.0, -8.0, 0.0),
+    );
+    let offsets = d.offsets;
+
+    // The lip seal: each upper lip joint with the lower one across from it.
+    let head = |name: &str| b.sk.bone(name).map(|x| x.head);
+    let (Some(left), Some(right)) = (head("lip_corner_l"), head("lip_corner_r")) else {
+        bail!("component {}: the face has no lip corners", c.id);
+    };
+    let width = (left.x - right.x).abs().max(1e-4 * h);
+    let mut pairs = vec![("lip_up".to_string(), "lip_low".to_string())];
+    for j in lips.iter().filter(|j| j.upper) {
+        pairs.push((j.name.clone(), j.name.replacen("lip_up", "lip_low", 1)));
+    }
+    let pairs = pairs
+        .into_iter()
+        .filter_map(|(u, l)| {
+            let (hu, hl) = (head(&u)?, head(&l)?);
+            Some(face_board::LipPair {
+                upper_control: ctrl_name(&u),
+                lower_control: ctrl_name(&l),
+                along: ((left.x - hu.x) / width).clamp(0.0, 1.0),
+                rest_gap: hu.distance(hl),
+                upper: u,
+                lower: l,
+            })
+        })
+        .collect();
+    b.rig.face_board = Some(FaceBoard {
+        frame,
+        sliders,
+        offsets,
+        seal: Some(face_board::LipSeal {
+            frame_bone: parent.to_string(),
+            release: 0.3 * width,
+            pairs,
+        }),
+    });
     Ok(())
 }
 

@@ -976,10 +976,11 @@ impl Studio {
             if let Some(rig) = &doc.rig
                 && rig.skeleton.bones.len() == sk.bones.len()
             {
-                frame.mesh = Some(hive_rig::shapes::posed_mesh_with(
+                frame.mesh = Some(hive_rig::shapes::posed_mesh_board(
                     rig,
                     &posed.locals(),
                     &posed.bones,
+                    &posed.board,
                 ));
             }
             return Some(frame);

@@ -112,7 +112,7 @@ pub fn build_rig(mesh: Mesh, name: &str, guides: Guides, opts: RigOptions) -> an
         .apply(&mut built.skeleton, &mut built.controls)?;
     guides.skin.validate()?;
     let skin = skin::compute(&mesh, &built.skeleton, opts.skin, guides.skin);
-    Ok(Rig {
+    let mut rig = Rig {
         format: FORMAT.into(),
         version: FORMAT_VERSION,
         written_by: None,
@@ -125,7 +125,10 @@ pub fn build_rig(mesh: Mesh, name: &str, guides: Guides, opts: RigOptions) -> an
         skeleton: built.skeleton,
         skin,
         controls: built.controls,
-    })
+    };
+    // Shapes named like a board move (blink_l, jawOpen) follow its slider.
+    crate::shapes::link_board(&mut rig);
+    Ok(rig)
 }
 
 impl Rig {

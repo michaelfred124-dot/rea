@@ -124,7 +124,8 @@ enum Command {
         /// Bone to attach a tail or chain to.
         #[arg(long)]
         parent: Option<String>,
-        /// Bones in a tail or chain.
+        /// Bones in a tail or chain; for a face or face board, the extra lip
+        /// joints on each lip between its middle and each corner (0 to 3).
         #[arg(long)]
         joints: Option<usize>,
         /// Component id for a tail or chain.
@@ -331,6 +332,26 @@ enum ShapeCommand {
         start: f32,
         #[arg(long, default_value_t = 90.0, allow_hyphen_values = true)]
         end: f32,
+    },
+    /// Drive a shape from a face board slider: its weight is how far the
+    /// slider has gone one way (times --weight). PART is a slider (brow_l,
+    /// lid_r, corner_l, jaw, ...) and DIR x+, x-, y+ or y- (up, down). With
+    /// --auto, every undriven shape named like a board move (blink_l, smile_r,
+    /// jawOpen) is linked instead.
+    Board {
+        #[arg(required_unless_present = "auto")]
+        name: Option<String>,
+        #[arg(required_unless_present_any = ["off", "auto"])]
+        part: Option<String>,
+        #[arg(required_unless_present_any = ["off", "auto"])]
+        dir: Option<String>,
+        #[arg(long, default_value_t = 1.0)]
+        weight: f32,
+        /// Stop following the board.
+        #[arg(long, conflicts_with_all = ["part", "auto"])]
+        off: bool,
+        #[arg(long, conflicts_with = "name")]
+        auto: bool,
     },
     /// Stop driving a shape; it keeps its own weight.
     Undrive {
@@ -1205,6 +1226,14 @@ fn shape_command(path: &Path, action: ShapeCommand) -> Result<()> {
             }
             for s in &rig.mesh.shapes {
                 let what = match &s.driver {
+                    None if s.board.is_some() => {
+                        let l = s.board.as_ref().unwrap();
+                        format!(
+                            "follows the face board's {} slider going {}",
+                            l.part,
+                            l.dir.key()
+                        )
+                    }
                     Some(d) => format!(
                         "driven by {} turning {:.0} to {:.0} degrees about ({:.2}, {:.2}, {:.2})",
                         d.bone, d.start, d.end, d.axis.x, d.axis.y, d.axis.z
@@ -1324,6 +1353,47 @@ fn shape_command(path: &Path, action: ShapeCommand) -> Result<()> {
                 }),
             )?;
             format!("'{name}' now follows {bone}: off at {start} degrees, on at {end}.")
+        }
+        ShapeCommand::Board {
+            name,
+            part,
+            dir,
+            weight,
+            off,
+            auto,
+        } => {
+            if auto {
+                let linked = shapes::link_board(&mut rig);
+                if linked.is_empty() {
+                    "No shape names matched a face board move.".to_string()
+                } else {
+                    format!("Linked to the face board: {}.", linked.join(", "))
+                }
+            } else {
+                let name = name.unwrap_or_default();
+                if off {
+                    shapes::set_board(&mut rig, &name, None)?;
+                    format!("'{name}' no longer follows the face board.")
+                } else {
+                    let (part, dir) = (part.unwrap_or_default(), dir.unwrap_or_default());
+                    let d = hive_rig::face_board::Dir::parse(&dir).ok_or_else(|| {
+                        anyhow::anyhow!("'{dir}' isn't a direction (x+, x-, y+, y-, up or down)")
+                    })?;
+                    shapes::set_board(
+                        &mut rig,
+                        &name,
+                        Some(hive_rig::face_board::BoardLink {
+                            part: part.clone(),
+                            dir: d,
+                            weight,
+                        }),
+                    )?;
+                    format!(
+                        "'{name}' follows the face board's {part} slider going {}.",
+                        d.key()
+                    )
+                }
+            }
         }
         ShapeCommand::Undrive { name } => {
             shapes::set_driver(&mut rig, &name, None)?;

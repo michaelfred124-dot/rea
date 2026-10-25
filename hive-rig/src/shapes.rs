@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use glam::{Mat4, Quat, Vec3};
 use serde::{Deserialize, Serialize};
 
+use crate::face_board::{self, BoardLink, Values};
 use crate::rig::Rig;
 use crate::skeleton::Skeleton;
 use crate::skin::SkinWeights;
@@ -39,6 +40,9 @@ pub struct Shape {
     /// A corrective shape: a joint's rotation sets the weight instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub driver: Option<PoseReader>,
+    /// Driven by a face board slider instead (see [`crate::face_board`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board: Option<BoardLink>,
     /// In-between targets: where the vertices are at a weight between 0 and 1
     /// (ascending by weight). The shape moves through them in order: from rest
     /// to the first, from one to the next, and from the last to the full
@@ -176,6 +180,7 @@ impl Shape {
             normal_offsets: Vec::new(),
             weight: 0.0,
             driver: None,
+            board: None,
             inbetweens: Vec::new(),
         }
     }
@@ -449,6 +454,7 @@ pub fn combine(shapes: &[&Shape], name: &str) -> Shape {
         vertices: keys,
         weight: 0.0,
         driver: None,
+        board: None,
         inbetweens: Vec::new(),
     }
 }
@@ -568,6 +574,7 @@ pub fn split(
             normal_offsets: Vec::new(),
             weight: shape.weight,
             driver: None,
+            board: None,
             inbetweens: Vec::new(),
         };
         let share = |v: u32| {
@@ -724,19 +731,32 @@ pub fn corrective_offsets(
 }
 
 /// Every shape's weight in a pose: driven shapes from their readers, the rest
-/// at their own weight. `bone_index` finds a reader's bone.
+/// at their own weight. `bone_index` finds a reader's bone. Shapes the face
+/// board drives are off (the board at rest); see [`weights_with_board`].
 pub fn weights_in_pose(
     shapes: &[Shape],
     local: &[Quat],
     bone_index: impl Fn(&str) -> Option<usize>,
 ) -> Vec<f32> {
+    weights_with_board(shapes, local, bone_index, &Values::new())
+}
+
+/// [`weights_in_pose`] with the face board's slider values for the shapes it
+/// drives.
+pub fn weights_with_board(
+    shapes: &[Shape],
+    local: &[Quat],
+    bone_index: impl Fn(&str) -> Option<usize>,
+    board: &Values,
+) -> Vec<f32> {
     shapes
         .iter()
-        .map(|s| match &s.driver {
-            Some(d) => bone_index(&d.bone)
+        .map(|s| match (&s.driver, &s.board) {
+            (Some(d), _) => bone_index(&d.bone)
                 .map(|i| d.weight(local.get(i).copied().unwrap_or(Quat::IDENTITY)))
                 .unwrap_or(0.0),
-            None => s.weight,
+            (None, Some(link)) => link.weight_at(board),
+            (None, None) => s.weight,
         })
         .collect()
 }
@@ -866,7 +886,18 @@ pub fn posed_mesh(rig: &Rig, locals: &[Quat]) -> Vec<Vec3> {
 /// rig, which moves and scales bones as well as turning them); `locals` are
 /// the same pose's local rotations, for the corrective readers.
 pub fn posed_mesh_with(rig: &Rig, locals: &[Quat], mats: &[Mat4]) -> Vec<Vec3> {
-    let weights = weights_in_pose(&rig.mesh.shapes, locals, |n| rig.skeleton.index_of(n));
+    posed_mesh_board(rig, locals, mats, &Values::new())
+}
+
+/// [`posed_mesh_with`] with the face board's slider values (a control-rig
+/// pose's [`crate::pose::Posed::board`]) for the shapes it drives.
+pub fn posed_mesh_board(rig: &Rig, locals: &[Quat], mats: &[Mat4], board: &Values) -> Vec<Vec3> {
+    let weights = weights_with_board(
+        &rig.mesh.shapes,
+        locals,
+        |n| rig.skeleton.index_of(n),
+        board,
+    );
     let base = apply(&rig.mesh.positions, &rig.mesh.shapes, &weights);
     deform(&base, &rig.skin, mats)
 }
@@ -1273,8 +1304,80 @@ pub fn mirror_on_rig(rig: &mut Rig, name: &str, new: Option<&str>) -> anyhow::Re
             end: d.end,
         });
     }
+    out.board = src.board.as_ref().map(mirror_link);
     rig.mesh.shapes.push(out);
     Ok(new)
+}
+
+/// A board link for the other side: the twin slider, side to side swapped.
+pub fn mirror_link(link: &BoardLink) -> BoardLink {
+    match other_side(&link.part) {
+        Some(part) => BoardLink {
+            part,
+            dir: link.dir.mirrored(),
+            weight: link.weight,
+        },
+        None => BoardLink {
+            part: link.part.clone(),
+            dir: link.dir.mirrored(),
+            weight: link.weight,
+        },
+    }
+}
+
+/// Drive `name` from a face board slider (or stop with `None`). It drops any
+/// pose reader: a shape has one driver.
+pub fn set_board(rig: &mut Rig, name: &str, link: Option<BoardLink>) -> anyhow::Result<()> {
+    let i = index(rig, name)?;
+    if let Some(l) = &link {
+        let board = rig.controls.face_board.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("the rig has no face board (`hive-rig add <guides> face_board`)")
+        })?;
+        let slider = board.part(&l.part).ok_or_else(|| {
+            let parts: Vec<&str> = board.sliders.iter().map(|s| s.part.as_str()).collect();
+            anyhow::anyhow!(
+                "the face board has no slider '{}' (it has {})",
+                l.part,
+                parts.join(", ")
+            )
+        })?;
+        let range = if l.dir.axis() == 0 {
+            slider.x
+        } else {
+            slider.y
+        };
+        anyhow::ensure!(
+            range[if l.dir.sign() > 0.0 { 1 } else { 0 }] != 0.0,
+            "the {} slider doesn't go {}",
+            l.part,
+            l.dir.key()
+        );
+        anyhow::ensure!(l.weight.is_finite(), "the weight must be a number");
+        rig.mesh.shapes[i].driver = None;
+    }
+    rig.mesh.shapes[i].board = link;
+    Ok(())
+}
+
+/// Link every shape that has no driver yet to the board slider its name says
+/// it goes with (`blink_l`, `jawOpen`, `smile_r`). Returns the shapes linked.
+pub fn link_board(rig: &mut Rig) -> Vec<String> {
+    let Some(board) = &rig.controls.face_board else {
+        return Vec::new();
+    };
+    let mut linked = Vec::new();
+    for s in &mut rig.mesh.shapes {
+        if s.driver.is_some() || s.board.is_some() {
+            continue;
+        }
+        if let Some(link) = face_board::match_shape(&s.name)
+            && board.part(&link.part).is_some()
+        {
+            s.board = Some(link);
+            linked.push(s.name.clone());
+        }
+    }
+    linked
 }
 
 /// Split `name` into left and right halves (default names: `<name>_l` and
@@ -1341,6 +1444,9 @@ pub fn set_driver(rig: &mut Rig, name: &str, reader: Option<PoseReader>) -> anyh
             r.start.is_finite() && r.end.is_finite() && r.start != r.end,
             "the reader needs two different angles"
         );
+    }
+    if reader.is_some() {
+        rig.mesh.shapes[i].board = None;
     }
     rig.mesh.shapes[i].driver = reader;
     Ok(())

@@ -166,7 +166,7 @@ pub fn script(rig: &Rig, target: Target, glb_path: &Path) -> Result<String> {
                 .mesh
                 .shapes
                 .iter()
-                .map(|s| json!({ "name": s.name, "weight": s.weight, "driver": s.driver, "inbetweens": s.points()[..s.inbetweens.len()] }))
+                .map(|s| json!({ "name": s.name, "weight": s.weight, "driver": s.driver, "board": s.board, "inbetweens": s.points()[..s.inbetweens.len()] }))
                 .collect();
             let data = json!({
                 "name": rig.name,
@@ -179,6 +179,8 @@ pub fn script(rig: &Rig, target: Target, glb_path: &Path) -> Result<String> {
                 "mirror_pairs": rig.controls.mirror_pairs,
                 "basis": basis,
                 "shapes": shapes,
+                // The face board's sliders, the face controls they move and the lip seal.
+                "face_board": rig.controls.face_board,
             });
             fill(UNREAL_TEMPLATE, &serde_json::to_string(&data)?, &glb)
         }

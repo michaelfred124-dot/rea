@@ -24,6 +24,7 @@ use glam::{EulerRot, Mat3, Mat4, Quat, Vec3};
 use serde::{Deserialize, Serialize};
 
 use crate::controls::{Control, ControlKind, ControlParent, ControlRig, FootRoll, soft_reach};
+use crate::face_board::{LipSeal, Values};
 use crate::skeleton::Skeleton;
 
 /// One control's transform channels: offsets from its rest placement, in its
@@ -236,6 +237,26 @@ pub fn attributes(rig: &ControlRig) -> Vec<Attribute> {
     out
 }
 
+/// The face board's slider values in a pose (by part).
+pub fn board_values(rig: &ControlRig, pose: &Pose) -> Values {
+    rig.face_board
+        .as_ref()
+        .map(|fb| fb.values(|c| pose.channels(c).translate))
+        .unwrap_or_default()
+}
+
+/// A control's channels as the rig takes them: a face board slider only
+/// slides along its track (no turn or scale, held to the track).
+pub fn limit_channels(rig: &ControlRig, control: &str, ch: Channels) -> Channels {
+    match rig.face_board.as_ref().and_then(|fb| fb.slider(control)) {
+        Some(s) => Channels {
+            translate: s.limit(ch.translate),
+            ..Channels::default()
+        },
+        None => ch,
+    }
+}
+
 fn attribute_default(rig: &ControlRig, control: &str, name: &str) -> f32 {
     for ch in &rig.ik_chains {
         if ch.ik_control == control {
@@ -279,7 +300,10 @@ pub fn locks(c: &Control, sk: &Skeleton) -> Locks {
             ControlKind::Hock => true,
             _ => false,
         },
-        rotate: matches!(c.kind, ControlKind::Bend | ControlKind::Pin),
+        rotate: matches!(
+            c.kind,
+            ControlKind::Bend | ControlKind::Pin | ControlKind::Slider
+        ),
         scale: !(c.kind == ControlKind::Root || (c.kind == ControlKind::Fk && bone.is_some())),
     }
 }
@@ -329,6 +353,8 @@ pub struct Posed {
     pub controls: Vec<Mat4>,
     /// Each control's parent transform (what its channels act under).
     pub parents: Vec<Mat4>,
+    /// The face board's slider values (by part), for the shapes they drive.
+    pub board: Values,
     rotations: Vec<Quat>,
     parent_of: Vec<Option<usize>>,
 }
@@ -382,6 +408,7 @@ pub fn evaluate(sk: &Skeleton, rig: &ControlRig, pose: &Pose) -> Posed {
         parent_of: sk.bones.iter().map(|b| b.parent).collect(),
         controls,
         parents,
+        board: e.board,
     }
 }
 
@@ -459,6 +486,11 @@ struct Eval<'a> {
     splines: Vec<Option<Vec<BoneState>>>,
     busy_bones: Vec<bool>,
     busy_controls: Vec<bool>,
+    /// The face board's slider values, and per control its board offset.
+    board: Values,
+    board_offsets: Vec<Option<Mat4>>,
+    /// Per bone: its lip pair in the seal, and whether it is the upper lip.
+    sealed: Vec<Option<(usize, bool)>>,
 }
 
 fn rot_of(m: Mat4) -> Quat {
@@ -610,6 +642,23 @@ impl<'a> Eval<'a> {
                 _ => {}
             }
         }
+        let board = board_values(rig, pose);
+        let mut board_offsets = vec![None; rig.controls.len()];
+        let mut sealed = vec![None; sk.bones.len()];
+        if let Some(fb) = &rig.face_board {
+            for o in &fb.offsets {
+                if let Some(&i) = control_index.get(o.control.as_str()) {
+                    board_offsets[i] = Some(o.matrix(&board));
+                }
+            }
+            for (k, p) in fb.seal.iter().flat_map(|s| s.pairs.iter()).enumerate() {
+                for (bone, upper) in [(&p.upper, true), (&p.lower, false)] {
+                    if let Some(i) = sk.index_of(bone) {
+                        sealed[i] = Some((k, upper));
+                    }
+                }
+            }
+        }
         let drivers = drivers
             .into_iter()
             .zip(&sk.bones)
@@ -635,6 +684,9 @@ impl<'a> Eval<'a> {
             splines: (0..rig.splines.len()).map(|_| None).collect(),
             busy_bones: vec![false; sk.bones.len()],
             busy_controls: vec![false; rig.controls.len()],
+            board,
+            board_offsets,
+            sealed,
         }
     }
 
@@ -666,7 +718,7 @@ impl<'a> Eval<'a> {
         self.busy_controls[i] = true;
         let parent = self.parent_frame(i);
         let c = &self.rig.controls[i];
-        let ch = self.pose.channels(&c.name);
+        let ch = limit_channels(self.rig, &c.name, self.pose.channels(&c.name));
         let frame = Mat4::from_quat(rest_frame(c, self.sk));
         let at = pivot(c, self.sk);
         let local = Mat4::from_translation(at)
@@ -680,8 +732,17 @@ impl<'a> Eval<'a> {
         m
     }
 
-    /// What a control's channels act under.
+    /// What a control's channels act under: its parent, then any offset the
+    /// face board gives it.
     fn parent_frame(&mut self, i: usize) -> Mat4 {
+        let parent = self.parent_frame_base(i);
+        match self.board_offsets[i] {
+            Some(offset) => parent * offset,
+            None => parent,
+        }
+    }
+
+    fn parent_frame_base(&mut self, i: usize) -> Mat4 {
         let rig = self.rig;
         let c = &rig.controls[i];
         // The hock control rides on its foot's goal (after the roll).
@@ -778,11 +839,14 @@ impl<'a> Eval<'a> {
                 let m = self.control(c);
                 let rot = rot_of(m);
                 let k = Mat3::from_quat(rot).transpose() * Mat3::from_mat4(m);
-                let head = if b.translate || b.parent.is_none() {
+                let mut head = if b.translate || b.parent.is_none() {
                     m.transform_point3(b.head)
                 } else {
                     self.carried_head(i)
                 };
+                if let Some((pair, upper)) = self.sealed[i] {
+                    head = self.seal(pair, upper).unwrap_or(head);
+                }
                 BoneState { head, rot, k }
             }
             Driver::Aim(c) => {
@@ -825,6 +889,29 @@ impl<'a> Eval<'a> {
                 }
             }
         })
+    }
+
+    /// Where the lip seal puts lip pair `k`'s upper (or lower) joint.
+    fn seal(&mut self, k: usize, upper: bool) -> Option<Vec3> {
+        let fb = self.rig.face_board.as_ref()?;
+        let seal = fb.seal.as_ref()?;
+        let p = &seal.pairs[k];
+        let sk = self.sk;
+        let (ui, li) = (sk.index_of(&p.upper)?, sk.index_of(&p.lower)?);
+        let rest = [sk.bones[ui].head, sk.bones[li].head];
+        let (uc, lc) = (
+            *self.control_index.get(p.upper_control.as_str())?,
+            *self.control_index.get(p.lower_control.as_str())?,
+        );
+        let u = self.control(uc).transform_point3(rest[0]);
+        let l = self.control(lc).transform_point3(rest[1]);
+        let frame = sk
+            .index_of(&seal.frame_bone)
+            .map_or(Quat::IDENTITY, |f| self.bone(f).rot);
+        let (zip, sticky) = LipSeal::inputs(&self.board);
+        let w = seal.weight(p, zip, sticky, u.distance(l) - p.rest_gap);
+        let [su, sl] = LipSeal::sealed(u, l, rest, frame, w);
+        Some(if upper { su } else { sl })
     }
 
     /// How far a bone has turned about its own length relative to its parent.
@@ -1584,5 +1671,234 @@ mod tests {
         assert!(!lock("hand_l_ik_ctrl").translate && lock("hand_l_ik_ctrl").scale);
         assert!(!lock("pelvis_ctrl").translate, "the pelvis moves");
         assert!(!lock("root_ctrl").scale);
+    }
+
+    /// The demo with a face (eyes and jaw too, in the order given), built.
+    fn face(order: &[Preset]) -> (Guides, Built) {
+        let (mut g, _) = biped();
+        for p in order {
+            components::add_preset(&mut g, *p, &AddOptions::default()).unwrap();
+        }
+        let b = components::build(&g).unwrap();
+        (g, b)
+    }
+
+    /// A slider set to a value (`[x, y]`, in units of its travel).
+    fn slide(pose: &mut Pose, b: &Built, part: &str, value: [f32; 2]) {
+        let s = b.controls.face_board.as_ref().unwrap().part(part).unwrap();
+        let t = Vec3::new(value[0], value[1], 0.0) * s.travel;
+        pose.set_channels(&s.control, moved(t));
+    }
+
+    #[test]
+    fn face_board_sliders_pose_the_face() {
+        for order in [
+            [Preset::Eyes, Preset::Jaw, Preset::Face],
+            [Preset::Face, Preset::Eyes, Preset::Jaw],
+        ] {
+            let (_, b) = face(&order);
+            let rest = Posed::rest(&b.skeleton, &b.controls);
+            // At rest the board changes nothing.
+            for i in 0..b.skeleton.bones.len() {
+                assert!(
+                    rest.bones[i].abs_diff_eq(Mat4::IDENTITY, 1e-5),
+                    "{} {}",
+                    b.skeleton.bones[i].name,
+                    rest.bones[i]
+                );
+            }
+            let mut pose = Pose::default();
+            slide(&mut pose, &b, "jaw", [0.0, -1.0]);
+            slide(&mut pose, &b, "lid_l", [0.0, -1.0]);
+            slide(&mut pose, &b, "brow_r", [0.0, 1.0]);
+            slide(&mut pose, &b, "corner_l", [0.0, 1.0]);
+            let p = evaluate(&b.skeleton, &b.controls, &pose);
+            // The jaw opens: the chin drops.
+            let chin = tail(&p, &b, "jaw").y - tail(&rest, &b, "jaw").y;
+            assert!(chin < -0.01, "the chin moved {chin}");
+            // The lower lip rides on the jaw when the face came after it.
+            let lip = head(&p, &b, "lip_low").y - head(&rest, &b, "lip_low").y;
+            if order[0] == Preset::Eyes {
+                assert!(lip < -0.005, "the lower lip moved {lip}");
+            }
+            // The left upper lid closes down over the eye; the right one stays.
+            let lid = tail(&p, &b, "lid_up_l").y - tail(&rest, &b, "lid_up_l").y;
+            assert!(lid < -0.003, "the lid moved {lid}");
+            assert_near(
+                tail(&p, &b, "lid_up_r"),
+                tail(&rest, &b, "lid_up_r"),
+                1e-6,
+                "right lid",
+            );
+            // The right brow goes up, the left one stays.
+            assert!(head(&p, &b, "brow_mid_r").y > head(&rest, &b, "brow_mid_r").y + 0.01);
+            assert_near(
+                head(&p, &b, "brow_mid_l"),
+                head(&rest, &b, "brow_mid_l"),
+                1e-6,
+                "left brow",
+            );
+            // A smile lifts the left corner and the lip joint beside it, less.
+            let up = |n: &str| head(&p, &b, n).y - head(&rest, &b, n).y;
+            assert!(up("lip_corner_l") > 0.01);
+            assert!(up("lip_up_1_l") > 0.001 && up("lip_up_1_l") < up("lip_corner_l"));
+            // The face controls still move their joints on top of the board.
+            let mut more = pose.clone();
+            more.set_channels("brow_mid_r_ctrl", moved(Vec3::new(0.0, 0.0, 0.01)));
+            let q = evaluate(&b.skeleton, &b.controls, &more);
+            assert_near(
+                head(&q, &b, "brow_mid_r"),
+                head(&p, &b, "brow_mid_r") + Vec3::Z * 0.01,
+                1e-5,
+                "brow control on top",
+            );
+            assert!(p.board["jaw"] == [0.0, -1.0]);
+        }
+    }
+
+    #[test]
+    fn face_board_sliders_stay_in_their_tracks() {
+        let (_, b) = face(&[Preset::Eyes, Preset::Jaw, Preset::Face]);
+        let fb = b.controls.face_board.as_ref().unwrap();
+        let jaw = fb.part("jaw").unwrap();
+        let lid = fb.part("lid_l").unwrap();
+        let mut far = Pose::default();
+        far.set_channels(&jaw.control, moved(Vec3::new(0.0, -5.0, 0.3) * jaw.travel));
+        far.set_channels(
+            &lid.control,
+            Channels {
+                translate: Vec3::new(2.0, -0.5, 0.0) * lid.travel,
+                rotate: Vec3::new(40.0, 0.0, 0.0),
+                ..Channels::default()
+            },
+        );
+        let mut end = Pose::default();
+        slide(&mut end, &b, "jaw", [0.0, -1.0]);
+        slide(&mut end, &b, "lid_l", [0.0, -0.5]);
+        let (a, e) = (
+            evaluate(&b.skeleton, &b.controls, &far),
+            evaluate(&b.skeleton, &b.controls, &end),
+        );
+        for i in 0..b.skeleton.bones.len() {
+            assert!(
+                a.bones[i].abs_diff_eq(e.bones[i], 1e-5),
+                "{}",
+                b.skeleton.bones[i].name
+            );
+        }
+        for i in 0..b.controls.controls.len() {
+            assert!(a.controls[i].abs_diff_eq(e.controls[i], 1e-5));
+        }
+        assert_eq!(a.board["lid_l"], [0.0, -0.5]);
+        // The slider itself shows where it is, held to its track.
+        let k = b
+            .controls
+            .controls
+            .iter()
+            .position(|x| x.name == lid.control)
+            .unwrap();
+        let at = b.controls.controls[k].position;
+        assert_near(
+            a.controls[k].transform_point3(at),
+            at - Vec3::Y * 0.5 * lid.travel,
+            1e-6,
+            "slider",
+        );
+        // Sliders only slide.
+        let c = b.controls.control(&jaw.control).unwrap();
+        let l = locks(c, &b.skeleton);
+        assert!(!l.translate && l.rotate && l.scale);
+        // Moving the panel carries every slider and leaves the face alone.
+        let mut panel = Pose::default();
+        panel.set_channels(&fb.frame, moved(Vec3::new(0.05, 0.0, 0.0)));
+        let p = evaluate(&b.skeleton, &b.controls, &panel);
+        let i = b
+            .controls
+            .controls
+            .iter()
+            .position(|x| x.name == jaw.control)
+            .unwrap();
+        assert_near(
+            p.controls[i].transform_point3(c.position),
+            c.position + Vec3::X * 0.05,
+            1e-5,
+            "slider",
+        );
+        assert!(p.bones.iter().all(|m| m.abs_diff_eq(Mat4::IDENTITY, 1e-5)));
+    }
+
+    #[test]
+    fn lip_zippers_and_sticky_lips_close_the_lips() {
+        let (_, b) = face(&[Preset::Eyes, Preset::Jaw, Preset::Face]);
+        let fb = b.controls.face_board.as_ref().unwrap();
+        let seal = fb.seal.as_ref().unwrap();
+        assert_eq!(seal.pairs.len(), 3, "the middle and a pair each side");
+        let gap = |p: &Posed, pair: &crate::face_board::LipPair| {
+            head(p, &b, &pair.upper).distance(head(p, &b, &pair.lower))
+        };
+        let mut open = Pose::default();
+        slide(&mut open, &b, "jaw", [0.0, -1.0]);
+        let o = evaluate(&b.skeleton, &b.controls, &open);
+        for pair in &seal.pairs {
+            assert!(gap(&o, pair) > pair.rest_gap + 0.01, "{} opens", pair.upper);
+        }
+        // The left zipper half way closes the left of the mouth only.
+        let mut half = open.clone();
+        slide(&mut half, &b, "zip_l", [-0.5, 0.0]);
+        let h = evaluate(&b.skeleton, &b.controls, &half);
+        let left = seal.pairs.iter().find(|p| p.upper == "lip_up_1_l").unwrap();
+        let right = seal.pairs.iter().find(|p| p.upper == "lip_up_1_r").unwrap();
+        assert!((gap(&h, left) - left.rest_gap).abs() < 1e-4, "left zipped");
+        assert!(gap(&h, right) > right.rest_gap + 0.01, "right still open");
+        // All the way, from either corner: the whole mouth closes.
+        let mut full = open.clone();
+        slide(&mut full, &b, "zip_r", [1.0, 0.0]);
+        let f = evaluate(&b.skeleton, &b.controls, &full);
+        for pair in &seal.pairs {
+            assert!(
+                (gap(&f, pair) - pair.rest_gap).abs() < 1e-4,
+                "{} zipped",
+                pair.upper
+            );
+        }
+        // Zipped lips meet between where the jaw and the head put them.
+        let mid = |p: &Posed, pair: &crate::face_board::LipPair| {
+            (head(p, &b, &pair.upper) + head(p, &b, &pair.lower)) * 0.5
+        };
+        assert_near(
+            mid(&f, &seal.pairs[0]),
+            mid(&o, &seal.pairs[0]),
+            1e-4,
+            "seam",
+        );
+        // Sticky lips: a little open, the middle stays shut and the sides part.
+        // Open the jaw until the middle of the mouth would be 0.4 of the
+        // release distance apart.
+        let middle = &seal.pairs[0];
+        let opened = |amount: f32| {
+            let mut p = Pose::default();
+            slide(&mut p, &b, "jaw", [0.0, -amount]);
+            p
+        };
+        let amount = (1..100)
+            .map(|k| k as f32 / 100.0)
+            .find(|&a| {
+                let n = evaluate(&b.skeleton, &b.controls, &opened(a));
+                gap(&n, middle) - middle.rest_gap > 0.4 * seal.release
+            })
+            .unwrap();
+        let mut ajar = opened(amount);
+        slide(&mut ajar, &b, "sticky", [1.0, 0.0]);
+        let s = evaluate(&b.skeleton, &b.controls, &ajar);
+        assert!(
+            (gap(&s, middle) - middle.rest_gap).abs() < 1e-4,
+            "sticky middle"
+        );
+        assert!(gap(&s, left) - left.rest_gap > gap(&s, middle) - middle.rest_gap);
+        // Wide open, sticky lips let go.
+        let mut wide = open.clone();
+        slide(&mut wide, &b, "sticky", [1.0, 0.0]);
+        let w = evaluate(&b.skeleton, &b.controls, &wide);
+        assert!(gap(&w, middle) > middle.rest_gap + 0.01);
     }
 }

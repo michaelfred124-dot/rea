@@ -283,6 +283,165 @@ if "brow_in_l_ctrl" in pb:
         check((head("lip_low") - lip0).length > 0.002, "the lower lip rides on the jaw")
         reset()
 
+BOARD = DATA["controls"].get("face_board")
+if BOARD:
+    # The face board: each slider moves and turns the face controls it drives by
+    # hive-rig's offsets (worked out here from the rig file the way hive-rig's
+    # pose evaluator does), sliders stay in their tracks, and the lip seal closes
+    # the lips. Names in the board data are already the exported ones.
+    import math
+    from mathutils import Euler, Matrix
+
+    bones = rig.pose.bones
+    sliders = {s["part"]: s for s in BOARD["sliders"]}
+
+    def slide(part, x, y):
+        s = sliders[part]
+        bones[s["control"]].location = (x * s["travel"], y * s["travel"], 0.0)
+        update()
+
+    def values():
+        out = {}
+        for part, s in sliders.items():
+            loc = bones[s["control"]].location
+            out[part] = (min(max(loc[0] / s["travel"], s["x"][0]), s["x"][1]),
+                         min(max(loc[1] / s["travel"], s["y"][0]), s["y"][1]))
+        return out
+
+    def amount(v, d):
+        axis, sign = (0 if d[0] == "x" else 1), (1.0 if d[1] == "+" else -1.0)
+        return max(v[axis] * sign, 0.0)
+
+    def offset(control):
+        """hive-rig's board offset of a control: (move, turn matrix, pivot), hive space."""
+        o = next(o for o in BOARD["offsets"] if o["control"] == control)
+        vals = values()
+        t, r = Vector((0, 0, 0)), Vector((0, 0, 0))
+        for d in o["drives"]:
+            a = amount(vals.get(d["part"], (0.0, 0.0)), d["dir"])
+            t += Vector(d.get("translate", (0, 0, 0))) * a
+            r += Vector(d.get("rotate", (0, 0, 0))) * a
+        turn = Euler([math.radians(x) for x in r], "XYZ").to_matrix()
+        return t, turn, Vector(o["pivot"])
+
+    def expected(control, point):
+        """Where the board puts a rest point (hive space) carried by `control`."""
+        t, turn, pivot = offset(control)
+        return pivot + t + turn @ (point - pivot)
+
+    def hive_pos(v):
+        return Vector((v[0], v[2], -v[1]))
+
+    def all_rest():
+        reset()
+        for s in BOARD["sliders"]:
+            bones[s["control"]].location = (0, 0, 0)
+        update()
+
+    jaw_ctrl = final("jaw_ctrl")
+    all_rest()
+    rest_pts = {b.name: (hive_pos(b.head.copy()), hive_pos(b.tail.copy())) for b in bones}
+    if "jaw" in sliders and any(o["control"] == jaw_ctrl for o in BOARD["offsets"]):
+        slide("jaw", 0.0, -1.0)
+        want = expected(jaw_ctrl, rest_pts[final("jaw")][1])
+        got = hive_pos(bones[final("jaw")].tail)
+        check((got - want).length < 1e-4 and want.y < rest_pts[final("jaw")][1].y - 0.01,
+              "the board's jaw slider opens the jaw as hive-rig does (%.6f m off)" % (got - want).length)
+        # Past the end of the track is the end of the track.
+        slide("jaw", 0.0, -4.0)
+        check((hive_pos(bones[final("jaw")].tail) - want).length < 1e-4, "a slider stops at the end of its track")
+        all_rest()
+    slide("lid_l", 0.0, -1.0)
+    lid = final("lid_up_l")
+    want = expected(final("lid_up_l_ctrl"), rest_pts[lid][1])
+    got = hive_pos(bones[lid].tail)
+    check((got - want).length < 1e-4 and want.y < rest_pts[lid][1].y - 0.002,
+          "the board's lid slider closes the upper lid as hive-rig does (%.6f m off)" % (got - want).length)
+    all_rest()
+    slide("brow_l", -1.0, 1.0)
+    slide("corner_r", 0.6, 0.8)
+    for bone in ("brow_in_l", "brow_out_l", "lip_corner_r", "lip_up_1_r"):
+        if final(bone) not in bones:
+            continue
+        want = expected(final(bone + "_ctrl"), rest_pts[final(bone)][0])
+        got = hive_pos(bones[final(bone)].head)
+        check((got - want).length < 1e-4 and (want - rest_pts[final(bone)][0]).length > 1e-3,
+              "the board moves %s as hive-rig does (%.6f m off)" % (bone, (got - want).length))
+    # The face control still moves its joint on top of the board.
+    before = hive_pos(bones[final("brow_in_l")].head)
+    bones[final("brow_in_l_ctrl")].location = (0.0, 0.0, 0.0)
+    move("brow_in_l_ctrl", (0, -0.01, 0))
+    check((hive_pos(bones[final("brow_in_l")].head) - before - Vector((0, 0, 0.01))).length < 1e-4,
+          "a face control moves its joint on top of the board")
+    all_rest()
+    # The panel carries its sliders and leaves the face alone.
+    frame = BOARD["frame"]
+    slider0 = BOARD["sliders"][0]["control"]
+    s0 = (rig.matrix_world @ bones[slider0].head).copy()
+    lip0 = (rig.matrix_world @ bones[final("lip_up")].head).copy()
+    m = bones[frame].matrix.copy()
+    m.translation += Vector((0.05, 0, 0))
+    bones[frame].matrix = m
+    update()
+    check(((rig.matrix_world @ bones[slider0].head) - s0 - Vector((0.05, 0, 0))).length < 1e-4
+          and ((rig.matrix_world @ bones[final("lip_up")].head) - lip0).length < 1e-6,
+          "moving the panel carries its sliders and leaves the face alone")
+    all_rest()
+    # Lip seal: with the jaw open, a zipper all the way closes every lip pair to
+    # its rest gap, meeting between where the controls put the lips; half way
+    # from the left it closes only the left.
+    seal = BOARD.get("seal") or {"pairs": []}
+
+    def gap(pair):
+        update()
+        return (bones[pair["upper"]].head - bones[pair["lower"]].head).length
+
+    if "jaw" in sliders and seal["pairs"]:
+        slide("jaw", 0.0, -1.0)
+        opened = {p["upper"]: gap(p) for p in seal["pairs"]}
+        check(all(opened[p["upper"]] > p["rest_gap"] + 0.005 for p in seal["pairs"]), "the open jaw parts the lips")
+        slide("zip_r", 1.0, 0.0)
+        for p in seal["pairs"]:
+            mid = (bones[p["upper_control"]].head + bones[p["lower_control"]].head) * 0.5
+            got = (bones[p["upper"]].head + bones[p["lower"]].head) * 0.5
+            check(abs(gap(p) - p["rest_gap"]) < 1e-4 and (got - mid).length < 1e-4,
+                  "the right zipper closes %s and %s between their controls" % (p["upper"], p["lower"]))
+        slide("zip_r", 0.0, 0.0)
+        slide("zip_l", -0.5, 0.0)
+        left = [p for p in seal["pairs"] if p["along"] < 0.3]
+        right = [p for p in seal["pairs"] if p["along"] > 0.7]
+        check(all(abs(gap(p) - p["rest_gap"]) < 1e-4 for p in left)
+              and all(gap(p) > p["rest_gap"] + 0.005 for p in right),
+              "the left zipper half way closes the left of the mouth only")
+        all_rest()
+        slide("jaw", 0.0, -0.08)
+        middle = min(seal["pairs"], key=lambda p: abs(p["along"] - 0.5))
+        apart = gap(middle)
+        slide("sticky", 1.0, 0.0)
+        check(apart > middle["rest_gap"] + 1e-3 and abs(gap(middle) - middle["rest_gap"]) < 1e-4,
+              "sticky lips hold the middle of the mouth shut as the jaw starts to open")
+        slide("jaw", 0.0, -1.0)
+        check(gap(middle) > middle["rest_gap"] + 0.005, "sticky lips let go when the jaw opens wide")
+        all_rest()
+    # Shapes that follow a board slider.
+    linked = [s for s in DATA["mesh"].get("shapes", []) if s.get("board") and not s.get("inbetweens")]
+    for s in linked:
+        key = geo.data.shape_keys.key_blocks[s["name"]]
+        link = s["board"]
+        sl = sliders[link["part"]]
+        axis, sign = (0 if link["dir"][0] == "x" else 1), (1.0 if link["dir"][1] == "+" else -1.0)
+        v = [0.0, 0.0]
+        v[axis] = 0.5 * sign
+        slide(link["part"], v[0], v[1])
+        bpy.context.evaluated_depsgraph_get().update()
+        got = key.value
+        want = min(max(0.5 * float(link.get("weight", 1.0)), 0.0), 1.0)
+        check(abs(got - want) < 1e-4, "shape %s follows board slider %s %s (%.3f)" % (s["name"], link["part"], link["dir"], got))
+        all_rest()
+        check(abs(key.value) < 1e-6, "shape %s is off with the board at rest" % s["name"])
+    print("face board checked: %d sliders, %d offsets, %d lip pairs, %d linked shapes"
+          % (len(BOARD["sliders"]), len(BOARD["offsets"]), len(seal["pairs"]), len(linked)))
+
 bpy.ops.wm.read_factory_settings(use_empty=True)
 bpy.ops.import_scene.gltf(filepath=glb)
 armatures = [o for o in bpy.data.objects if o.type == "ARMATURE"]

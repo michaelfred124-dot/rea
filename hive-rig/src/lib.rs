@@ -21,6 +21,7 @@ pub mod controls;
 pub mod demo;
 pub mod edits;
 pub mod export;
+pub mod face_board;
 pub mod import;
 pub mod joints;
 pub mod landmarks;

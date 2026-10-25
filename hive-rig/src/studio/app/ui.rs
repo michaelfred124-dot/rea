@@ -1198,21 +1198,21 @@ impl Studio {
                         .strong()
                         .color(TEXT),
                 );
-                let bone = c.bone.clone().unwrap_or_else(|| "none".into());
-                ui.label(
-                    RichText::new(format!(
-                        "{} control on {}",
-                        kind_word(c.kind),
-                        naming.bone(&bone)
-                    ))
-                    .size(12.5)
-                    .color(TEXT_FAINT),
-                );
+                let what = match &c.bone {
+                    Some(bone) => format!("{} control on {}", kind_word(c.kind), naming.bone(bone)),
+                    None => format!("{} control", kind_word(c.kind)),
+                };
+                ui.label(RichText::new(what).size(12.5).color(TEXT_FAINT));
                 ui.add_space(8.0);
                 if self.mode == Mode::Rig {
                     theme::label_caps(ui, "Pose");
                     self.channel_box(ui, &name);
                     ui.add_space(8.0);
+                    if matches!(c.kind, ControlKind::Board | ControlKind::Slider) {
+                        theme::label_caps(ui, "Face board");
+                        self.face_board_pads(ui);
+                        ui.add_space(8.0);
+                    }
                 }
                 let before = self.style_of(&name);
                 let mut change = components::StyleChange::default();
@@ -1987,6 +1987,39 @@ impl Studio {
                     }
                 });
                 self.limb_options(ui, &comp);
+            }
+            Kind::Face => {
+                let mut board = comp.options.board;
+                let mut lips = comp.options.joints.unwrap_or(0);
+                let before = (board, lips);
+                ui.horizontal(|ui| {
+                    theme::pill(ui, &mut board, "Face board").on_hover_text(
+                        "A panel of sliders beside the head that poses the brows, lids, \
+                         cheeks, mouth and jaw, with lip zippers and sticky lips",
+                    );
+                    ui.label(RichText::new("Lip joints").color(TEXT_DIM));
+                    ui.add(egui::DragValue::new(&mut lips).range(0..=components::MAX_LIP_JOINTS))
+                        .on_hover_text(
+                            "Extra joints along each lip between the middle and the corner",
+                        );
+                });
+                if (board, lips) != before {
+                    let id = comp.id.clone();
+                    self.edit("change the face", |g| {
+                        let c = component_mut(g, &id);
+                        c.options.board = board;
+                        c.options.joints = Some(lips);
+                        Ok(format!(
+                            "The face has {} and {}.",
+                            if board {
+                                "a face board"
+                            } else {
+                                "no face board"
+                            },
+                            super::count(lips, "lip joint"),
+                        ))
+                    });
+                }
             }
             _ => {}
         }
@@ -3411,13 +3444,23 @@ impl Studio {
                     || self.posing.selected.contains(&c.name);
                 // The same lines the Blender and Maya builders draw; a posed
                 // control turns and scales with its channels.
+                // The face board's panel draws its edge and tracks with it.
                 let outline = match frame.and_then(|f| f.control_mats.as_ref()) {
                     Some(mats) => c
-                        .outline_at(c.position, c.axis)
+                        .rest_lines()
                         .into_iter()
                         .map(|l| l.into_iter().map(|p| mats[i].transform_point3(p)).collect())
                         .collect(),
-                    None => c.outline_at(position, axis),
+                    None => {
+                        let shift = position - c.position;
+                        let mut lines = c.outline_at(position, axis);
+                        lines.extend(
+                            c.extra
+                                .iter()
+                                .map(|l| l.iter().map(|p| *p + shift).collect::<Vec<_>>()),
+                        );
+                        lines
+                    }
                 };
                 view::strokes(
                     painter,
@@ -5234,6 +5277,8 @@ fn kind_word(kind: ControlKind) -> &'static str {
         ControlKind::Spline => "Curve",
         ControlKind::Bend => "Bend",
         ControlKind::Pin => "Pin",
+        ControlKind::Board => "Face board",
+        ControlKind::Slider => "Face board slider",
         _ => "Animator",
     }
 }

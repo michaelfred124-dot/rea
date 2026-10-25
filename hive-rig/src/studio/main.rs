@@ -5,7 +5,7 @@
 //! [--lock BONE] [--bend DEGREES] [--bend-axis x|y|z] [--tools] [--vertices] [--hover] [--library] [--templates] [--export]
 //! [--select COMPONENT[,COMPONENT...]] [--pick NAME] [--pose BONE[=DEGREES[@x|y|z]]] [--shape NAME=WEIGHT]...
 //! [--corrective] [--inbetween WEIGHT] [--sculpt grab|smooth|relax|inflate|erase] [--all-bones]
-//! [--bone-filter TEXT] [--mode guides|skeleton|rig] [--joint-size SCALE] [--no-joint-xray] [--joints-menu] [--no-toast] [--view front|side|persp] [--zoom FACTOR] [--xray] [--screenshot OUT.ppm]`
+//! [--bone-filter TEXT] [--mode guides|skeleton|rig] [--joint-size SCALE] [--no-joint-xray] [--joints-menu] [--no-toast] [--no-outliner] [--view front|side|persp] [--zoom FACTOR] [--look X,Y,Z] [--xray] [--screenshot OUT.ppm]`
 //! (the flags exist so the window can be checked automatically).
 
 // No console window behind the app on Windows.
@@ -78,10 +78,14 @@ struct Launch {
     joints_menu: bool,
     /// Leave the status notification out of the screenshot.
     no_toast: bool,
+    /// `--no-outliner`: start with the outliner folded away.
+    no_outliner: bool,
     /// `--view front|side|persp`: turn the camera as the camera pill does.
     view: Option<String>,
     /// `--zoom FACTOR`: move the camera in by this factor after framing.
     zoom: Option<f32>,
+    /// `--look X,Y,Z`: aim the camera at this point (model space, metres).
+    look: Option<[f32; 3]>,
     /// See through the mesh.
     xray: bool,
     screenshot: Option<PathBuf>,
@@ -159,8 +163,19 @@ fn parse_args() -> Launch {
             Some("--no-joint-xray") => launch.no_joint_xray = true,
             Some("--joints-menu") => launch.joints_menu = true,
             Some("--no-toast") => launch.no_toast = true,
+            Some("--no-outliner") => launch.no_outliner = true,
             Some("--xray") => launch.xray = true,
             Some("--zoom") => launch.zoom = args.next().and_then(|s| s.to_str()?.parse().ok()),
+            Some("--look") => {
+                launch.look = args.next().and_then(|s| {
+                    let v: Vec<f32> = s
+                        .to_str()?
+                        .split(',')
+                        .filter_map(|x| x.trim().parse().ok())
+                        .collect();
+                    (v.len() == 3).then(|| [v[0], v[1], v[2]])
+                })
+            }
             Some("--view") => launch.view = args.next().map(|s| s.to_string_lossy().into_owned()),
             Some("--shape") => launch
                 .shapes
@@ -388,6 +403,9 @@ fn main() -> eframe::Result {
     if let Some(zoom) = launch.zoom.filter(|z| *z > 0.0) {
         studio.camera.dist /= zoom;
     }
+    if let Some([x, y, z]) = launch.look {
+        studio.camera.target = glam::Vec3::new(x, y, z);
+    }
     // Several ids (comma separated) are picked in order, as with Shift+click.
     for id in launch.select.iter().flat_map(|s| s.split(',')) {
         if let Some(c) = studio.component_index(id) {
@@ -395,6 +413,9 @@ fn main() -> eframe::Result {
         }
     }
 
+    if launch.no_outliner {
+        studio.outliner_open = false;
+    }
     if launch.no_toast {
         studio.status_serial = 0;
     }

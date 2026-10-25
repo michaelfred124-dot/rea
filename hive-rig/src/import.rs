@@ -704,6 +704,7 @@ pub fn load_gltf(path: &Path) -> Result<Mesh> {
                 vertices: keys,
                 weight,
                 driver: None,
+                board: None,
                 inbetweens: Vec::new(),
             }
         })

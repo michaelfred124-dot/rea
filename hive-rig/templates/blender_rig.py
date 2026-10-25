@@ -330,6 +330,24 @@ def add_reader_vars(drv, rig, bone_name):
         t.transform_space = "LOCAL_SPACE"
 
 
+def board_link(RIG, s):
+    """(slider, direction, weight expression of `a`) for a shape a face board
+    slider drives, else None."""
+    link = s.get("board")
+    board = RIG["controls"].get("face_board")
+    if not link or not board:
+        return None
+    slider = board_slider(board, link["part"])
+    if slider is None or slider["control"] not in rig_bone_names(RIG):
+        print("hive-rig: shape %s follows board slider %s, which the rig doesn't have" % (s["name"], link["part"]))
+        return None
+    return slider, link["dir"], "min(max(a * %.6g, 0), 1)" % float(link.get("weight", 1.0))
+
+
+def rig_bone_names(RIG):
+    return {c["name"] for c in RIG["controls"]["controls"]}
+
+
 def build_shapes(RIG, geos, rig):
     """Shape keys for hive-rig's blendshapes on the objects they move, at their
     weights; corrective shapes get a driver reading their bone's rotation.
@@ -349,6 +367,12 @@ def build_shapes(RIG, geos, rig):
         ui = rig.id_properties_ui(prop)
         ui.update(min=0.0, max=1.0, soft_min=0.0, soft_max=1.0, description="Weight of shape " + s["name"])
         reader = s.get("driver")
+        link = board_link(RIG, s)
+        if link is not None and not reader:
+            rig.driver_remove('["%s"]' % prop)
+            drv = board_driver(rig, '["%s"]' % prop)
+            board_amount_var(drv, rig, "a", link[0], link[1])
+            drv.expression = link[2]
         if reader and reader["bone"] in rig.data.bones:
             # A driven shape's weight is read once into the property; its keys
             # blend from it (one expression each would pass Blender's length limit).
@@ -378,6 +402,7 @@ def build_shapes(RIG, geos, rig):
             if reader and reader["bone"] not in rig.data.bones:
                 print("hive-rig: shape %s reads bone %s, which the rig doesn't have" % (s["name"], reader["bone"]))
                 reader = None
+            link = None if reader else board_link(RIG, s)
             for t, (key_name, _, vertices, offsets) in enumerate(targets):
                 kb = geo.data.shape_keys.key_blocks.get(key_name) or geo.shape_key_add(name=key_name, from_mix=False)
                 co = [0.0] * (3 * n)
@@ -396,11 +421,14 @@ def build_shapes(RIG, geos, rig):
                 else:
                     kb.slider_min = 0.0
                     kb.value = hat_value(points, t, s.get("weight", 0.0))
-                if reader is None and len(targets) == 1:
+                if reader is None and link is None and len(targets) == 1:
                     continue
                 drv = kb.driver_add("value").driver
                 drv.type = "SCRIPTED"
-                if reader is not None and len(targets) == 1:
+                if link is not None and len(targets) == 1:
+                    board_amount_var(drv, rig, "a", link[0], link[1])
+                    weight = link[2]
+                elif reader is not None and len(targets) == 1:
                     bone = rig.data.bones[reader["bone"]]
                     axis = (bone.matrix_local.to_3x3().inverted() @ to_blender(reader["axis"])).normalized()
                     add_reader_vars(drv, rig, reader["bone"])
@@ -413,6 +441,148 @@ def build_shapes(RIG, geos, rig):
                     var.targets[0].data_path = '["%s"]' % shape_property(s["name"])
                     weight = "weight"
                 drv.expression = weight if len(targets) == 1 else hat_expression(points, t, weight)
+
+
+# --------------------------------------------------------------------------- face board
+# hive-rig's face_board module describes it: sliders whose move along their
+# track (divided by their travel, held to the track) is their value; each face
+# control it moves gets a helper moved and turned by its drives; the lip seal
+# pulls each upper and lower lip joint toward the line between them.
+BOARD_DIRS = {"x+": (0, 1.0, "board_xp"), "x-": (0, -1.0, "board_xn"),
+              "y+": (1, 1.0, "board_yp"), "y-": (1, -1.0, "board_yn")}
+ZIP_FALLOFF = 0.25
+STICKY_FADE = 0.5
+
+
+def board_driver(owner, path, index=-1):
+    """A scripted driver on owner.path whose result is used as it is: the
+    keyframes some Blender versions put on a new driver's curve would remap it
+    (and lose the board's small moves)."""
+    fc = owner.driver_add(path, index) if index >= 0 else owner.driver_add(path)
+    while fc.keyframe_points:
+        fc.keyframe_points.remove(fc.keyframe_points[0])
+    for m in list(fc.modifiers):
+        fc.modifiers.remove(m)
+    fc.driver.type = "SCRIPTED"
+    return fc.driver
+
+
+def board_slider(board, part):
+    return next((s for s in board["sliders"] if s["part"] == part), None)
+
+
+def board_amount_var(drv, rig, name, slider, direction):
+    """A driver variable reading how far a slider has gone one way (0 to 1)."""
+    var = drv.variables.new()
+    var.name = name
+    var.type = "SINGLE_PROP"
+    var.targets[0].id = rig
+    var.targets[0].data_path = 'pose.bones["%s"]["%s"]' % (slider["control"], BOARD_DIRS[direction][2])
+    return var
+
+
+def build_board(board, rig, seal_rig):
+    """Drivers for the face board: each slider's four amounts (how far it has
+    gone each way, read from its location), the helpers of the face controls it
+    moves, and the lip seal's weights and constraints."""
+    pose = rig.pose.bones
+    for s in board["sliders"]:
+        pb = pose.get(s["control"])
+        if pb is None:
+            continue
+        lim = pb.constraints.new("LIMIT_LOCATION")
+        lim.name = "Track"
+        lim.owner_space = "LOCAL"
+        lim.use_transform_limit = True
+        for axis, r in (("x", s["x"]), ("y", s["y"]), ("z", [0.0, 0.0])):
+            setattr(lim, "use_min_" + axis, True)
+            setattr(lim, "use_max_" + axis, True)
+            setattr(lim, "min_" + axis, r[0] * s["travel"])
+            setattr(lim, "max_" + axis, r[1] * s["travel"])
+        for direction, (axis, sign, prop) in BOARD_DIRS.items():
+            r = s["x"] if axis == 0 else s["y"]
+            top = r[1] if sign > 0 else -r[0]
+            pb[prop] = 0.0
+            drv = board_driver(pb, '["%s"]' % prop)
+            var = drv.variables.new()
+            var.name = "v"
+            var.type = "SINGLE_PROP"
+            var.targets[0].id = rig
+            var.targets[0].data_path = 'pose.bones["%s"].location[%d]' % (s["control"], axis)
+            drv.expression = "min(max(v * %.9g, 0), %.9g)" % (sign / s["travel"], max(top, 0.0))
+    for o in board["offsets"]:
+        helper = pose.get("MCH_%s_board" % o["control"])
+        if helper is None:
+            continue
+        helper.rotation_mode = "XYZ"
+        for path, key, scale in (("location", "translate", 1.0), ("rotation_euler", "rotate", math.pi / 180.0)):
+            for k in range(3):
+                terms = [(d, d.get(key, [0.0, 0.0, 0.0])[k] * scale) for d in o["drives"]]
+                terms = [(d, c) for d, c in terms if abs(c) > 1e-9]
+                slider_terms = [(board_slider(board, d["part"]), d["dir"], c) for d, c in terms]
+                slider_terms = [t for t in slider_terms if t[0] is not None]
+                if not slider_terms:
+                    continue
+                drv = board_driver(helper, path, k)
+                parts = []
+                for i, (sl, direction, c) in enumerate(slider_terms):
+                    board_amount_var(drv, rig, "a%d" % i, sl, direction)
+                    parts.append("%.6g*a%d" % (c, i))
+                drv.expression = " + ".join(parts)
+    # The lip seal: the seam follows both lip controls (half way to the lower),
+    # its `seal` property is the pair's weight, and each lip joint is pulled to
+    # its sealed helper by that much.
+    seal = board.get("seal")
+    zl, zr, st = (board_slider(board, p) for p in ("zip_l", "zip_r", "sticky"))
+    for pair in seal_rig:
+        seam = pose[pair["seam"]]
+        for target, influence in ((pair["upper_control"], 1.0), (pair["lower_control"], 0.5)):
+            con = seam.constraints.new("COPY_LOCATION")
+            con.name = "Seam"
+            con.target, con.subtarget = rig, target
+            con.influence = influence
+        seam["seal"] = 0.0
+        drv = board_driver(seam, '["seal"]')
+        along = float(pair["along"])
+        centre = 1.0 - abs(2.0 * along - 1.0)
+        release = float(seal["release"]) * centre
+        fade = max(STICKY_FADE * float(seal["release"]) * centre, 1e-6)
+        zip_terms = []
+        if zl:
+            board_amount_var(drv, rig, "zl", zl, "x-")
+            zip_terms.append("zl*%.6g-%.6g" % (1.0 + ZIP_FALLOFF, along))
+        if zr:
+            board_amount_var(drv, rig, "zr", zr, "x+")
+            zip_terms.append("zr*%.6g-%.6g" % (1.0 + ZIP_FALLOFF, 1.0 - along))
+        zipped = "clamp(max(%s)/%.6g, 0, 1)" % (", ".join(zip_terms + ["-1"]), ZIP_FALLOFF)
+        stuck = "0"
+        if st:
+            board_amount_var(drv, rig, "s", st, "x+")
+            var = drv.variables.new()
+            var.name = "d"
+            var.type = "LOC_DIFF"
+            for t, bone in zip(var.targets, (pair["upper_control"], pair["lower_control"])):
+                t.id = rig
+                t.bone_target = bone
+            var = drv.variables.new()
+            var.name = "w"
+            var.type = "TRANSFORMS"
+            var.targets[0].id = rig
+            var.targets[0].transform_type = "SCALE_AVG"
+            stuck = "clamp((s*%.6g - max(d/w - %.6g, 0))/%.6g, 0, 1)" % (release, float(pair["rest_gap"]), fade)
+        drv.expression = "max(%s, %s)" % (zipped, stuck)
+        for bone, helper in ((pair["upper"], pair["up"]), (pair["lower"], pair["low"])):
+            con = pose[bone].constraints.new("COPY_LOCATION")
+            con.name = "Lip Seal"
+            con.target, con.subtarget = rig, helper
+            con.influence = 0.0
+            d = board_driver(con, "influence")
+            d.type = "AVERAGE"
+            var = d.variables.new()
+            var.name = "seal"
+            var.type = "SINGLE_PROP"
+            var.targets[0].id = rig
+            var.targets[0].data_path = 'pose.bones["%s"]["seal"]' % pair["seam"]
 
 
 def build(RIG, geos=None):
@@ -713,6 +883,39 @@ def build(RIG, geos=None):
         return signed_angle(base.x_axis, projected, base.tail - base.head)
 
 
+    # Face board: each face control it moves hangs under a helper at its pivot,
+    # upright with no roll so the helper's channels are hive-rig's axes (X left,
+    # Y up, Z forward); the board's drivers move and turn the helper. The panel
+    # and its sliders stand the same way, so a slider's location is its move
+    # on the board.
+    BOARD = RIG["controls"].get("face_board")
+    seal_rig = []
+    if BOARD:
+        for o in BOARD["offsets"]:
+            if o["control"] not in edit:
+                continue
+            ctrl = edit[o["control"]]
+            helper = mch("MCH_%s_board" % o["control"], head=to_blender(o["pivot"]))
+            edit[helper].parent = ctrl.parent
+            ctrl.parent = edit[helper]
+        for c in CONTROLS:
+            if c["kind"] in ("board", "slider"):
+                eb = edit[c["name"]]
+                eb.tail = eb.head + Vector((0.0, 0.0, max(c["size"], 0.01)))
+                eb.roll = 0.0
+        # Lip seal: a seam helper between each upper and lower lip control, on
+        # the head, with a helper at each lip's rest place under it; a sealed lip
+        # joint is pulled to its helper.
+        seal = BOARD.get("seal")
+        for pair in (seal or {}).get("pairs", []):
+            if pair["upper"] not in edit or pair["lower"] not in edit:
+                continue
+            up, low = edit[pair["upper"]].head.copy(), edit[pair["lower"]].head.copy()
+            seam = mch("MCH_%s_seam" % pair["upper"], head=(up + low) * 0.5, parent=seal["frame_bone"])
+            seal_rig.append(dict(pair, seam=seam,
+                                 up=mch("MCH_%s_sealed" % pair["upper"], head=up, parent=seam),
+                                 low=mch("MCH_%s_sealed" % pair["lower"], head=low, parent=seam)))
+
     pole_angles = {
         c["name"]: pole_angle(edit[c["upper"]], edit[c["lower"]], edit[c["pole_control"]].head)
         for c in CHAINS
@@ -753,9 +956,11 @@ def build(RIG, geos=None):
             c["kind"] == "fk" and (not c["bone"] or copy_rule(bone_by_name[c["bone"]]) == "COPY_ROTATION")
         ):
             pb.lock_location = (True, True, True)
-        if c["kind"] in ("bend", "pin"):
+        if c["kind"] in ("bend", "pin", "slider"):
             pb.lock_rotation = (True, True, True)
             pb.lock_rotation_w = True
+        if c["kind"] == "slider":
+            pb.lock_location[2] = True
         if has_collections:
             ctrl_coll.assign(arm_data.bones[c["name"]])
         if hasattr(pb, "color"):
@@ -1062,6 +1267,9 @@ def build(RIG, geos=None):
             reach.target, reach.subtarget = rig, seg["points"][i + 1]
             reach.rest_length = pb.bone.length
             reach.volume = "NO_VOLUME"
+
+    if BOARD:
+        build_board(BOARD, rig, seal_rig)
 
     # Space switching.
     for c in CONTROLS:

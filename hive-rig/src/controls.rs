@@ -7,6 +7,8 @@
 use glam::Vec3;
 use serde::{Deserialize, Serialize, Serializer};
 
+pub use crate::face_board::FaceBoard;
+
 /// How a control is drawn. The geometry lives here, in [`Shape::strokes`]: the
 /// Blender and Maya builders and the app all draw the same lines from it, and
 /// Unreal picks the matching shape from its built-in library.
@@ -430,6 +432,10 @@ pub enum ControlKind {
     Bend,
     /// Bendy limbs: the elbow or knee control where the two segments' curves meet.
     Pin,
+    /// The face board's panel: moving it moves its sliders (see [`FaceBoard`]).
+    Board,
+    /// A face board slider: its move along its track poses the face.
+    Slider,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -463,6 +469,10 @@ pub struct Control {
     /// parent and the animator can switch the control to follow any of the others.
     #[serde(default)]
     pub spaces: Vec<String>,
+    /// More lines drawn with the shape, fixed to the control (model space at
+    /// rest): the face board's panel edge and slider tracks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra: Strokes,
     /// Id of the component that built this control. Only known for a freshly
     /// built rig; it isn't written to rig files.
     #[serde(skip)]
@@ -474,6 +484,13 @@ impl Control {
     /// (its rest placement or a posed one).
     pub fn outline_at(&self, position: Vec3, axis: Vec3) -> Strokes {
         place_strokes(self.shape, position, axis, self.size)
+    }
+
+    /// The control's lines at rest: its shape and any extra lines.
+    pub fn rest_lines(&self) -> Strokes {
+        let mut out = self.outline();
+        out.extend(self.extra.iter().cloned());
+        out
     }
 
     pub fn outline(&self) -> Strokes {
@@ -496,6 +513,8 @@ impl Serialize for Control {
             color: [f32; 3],
             #[serde(skip_serializing_if = "<[String]>::is_empty")]
             spaces: &'a [String],
+            #[serde(skip_serializing_if = "<[Vec<Vec3>]>::is_empty")]
+            extra: &'a [Vec<Vec3>],
             outline: Vec<Vec<[f32; 3]>>,
         }
         // A tenth of a millimetre is plenty for a drawn line and keeps files small.
@@ -511,8 +530,9 @@ impl Serialize for Control {
             size: self.size,
             color: self.color,
             spaces: &self.spaces,
+            extra: &self.extra,
             outline: self
-                .outline()
+                .rest_lines()
                 .into_iter()
                 .map(|line| line.into_iter().map(round).collect())
                 .collect(),
@@ -760,6 +780,9 @@ pub struct ControlRig {
     /// scripts never guess sides from the exported naming convention.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mirror_pairs: Vec<[String; 2]>,
+    /// The face board: sliders beside the head posing the face, and the lip seal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub face_board: Option<FaceBoard>,
 }
 
 impl ControlRig {
@@ -861,6 +884,7 @@ mod tests {
             size: 0.05,
             color: [0.1, 0.4, 1.0],
             spaces: Vec::new(),
+            extra: Vec::new(),
             component: String::new(),
         }
     }

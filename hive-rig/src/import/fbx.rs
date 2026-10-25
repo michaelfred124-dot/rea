@@ -1366,6 +1366,7 @@ pub fn read(bytes: &[u8], dir: Option<&Path>) -> Result<FbxScene> {
                 name: s.name,
                 weight: s.weight,
                 driver: None,
+                board: None,
                 inbetweens: Vec::new(),
             }
         })
