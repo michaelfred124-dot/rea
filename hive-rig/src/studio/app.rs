@@ -434,6 +434,7 @@ impl Studio {
         self.sculpting = false;
         self.shape_tools = ShapeTools::default();
         self.textures = None;
+        self.posing = posing::Posing::default();
         self.doc_serial += 1;
         self.doc = Some(doc);
     }
@@ -578,8 +579,11 @@ impl Studio {
         doc.orientation = rig.orientation;
         // The automatic weights of the saved guides tell its painted vertices apart.
         doc.auto_skin = Some(rig.auto_weights(SkinOptions::default()));
+        let pose = rig.pose.clone();
         doc.rig = Some(rig);
         self.set_doc(doc);
+        // The pose it was saved in comes back too.
+        self.posing.pose = pose;
         match newer {
             Some(w) => self.warning(format!("Opened rig {}, but {w}.", path.display())),
             None => self.info(format!("Opened rig {}", path.display())),
@@ -1850,6 +1854,9 @@ impl Studio {
             .collect();
         let rig = doc.rig.as_mut().unwrap();
         rig.name = doc.name.clone();
+        // The pose posed in the Rig stage goes with the rig (and into the
+        // Blender and Maya pose libraries).
+        rig.pose = self.posing.pose.clone();
         let files = export::write_all(rig, dir, &targets)?;
         doc.out_dir = dir.to_path_buf();
         doc.exported = true;

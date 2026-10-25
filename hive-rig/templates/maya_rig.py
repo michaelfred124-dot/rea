@@ -703,6 +703,50 @@ def build(RIG, geos=None):
 
     GREATER, LESS = 2, 4  # condition operations
 
+    def spring_hock(chain, ik_ctrl, ik_chain, goal):
+        """A spring hock (hive-rig's spring_hock): a helper two-joint chain from
+        the hip to the ankle, its upper joint the thigh plus the hock (to
+        knee + ankle - hock) and its lower joint the calf, solved to the foot
+        goal with the limb's pole. The hock control hangs under a group on the
+        goal that turns with that upper joint by `spring`, so at 1 the hock
+        swings with the thigh as the paw moves and the control turns it further."""
+        hock, n = chain["hock"], chain["name"]
+        cmds.addAttr(ik_ctrl, longName="spring", attributeType="double", min=0, max=1,
+                     defaultValue=float(hock.get("default_spring", 0.0)), keyable=True)
+        head = lambda b: bone_by_name[b]["head"]
+        knee, top, ankle = head(chain["lower"]), head(hock["bone"]), head(chain["end"])
+        mid = [knee[k] + ankle[k] - top[k] for k in range(3)]
+        parent = cmds.listRelatives(ik_chain[0], parent=True)[0]
+        helper = []
+        for label, p in (("upper", head(chain["upper"])), ("lower", mid), ("end", ankle)):
+            j = cmds.createNode("joint", name="%s_spring_%s" % (n, label), parent=helper[-1] if helper else parent)
+            cmds.xform(j, worldSpace=True, translation=mpos(p))
+            cmds.setAttr(j + ".visibility", 0)
+            helper.append(j)
+        cmds.joint(helper[0], edit=True, orientJoint="xyz", secondaryAxisOrient="zup", zeroScaleOrient=True, children=True)
+        cmds.joint(helper[0], edit=True, setPreferredAngles=True, children=True)
+        handle = cmds.ikHandle(startJoint=helper[0], endEffector=helper[2], solver="ikRPsolver",
+                               name=n + "_spring_ikHandle")[0]
+        cmds.setAttr(handle + ".visibility", 0)
+        cmds.parent(handle, goal)
+        cmds.poleVectorConstraint(ctrl_of[chain["pole_control"]], handle)
+        # Where the hock control's offset sits at rest: kept on the goal, and
+        # carried by the helper's upper joint; `spring` blends between them.
+        offset = offset_of[hock["control"]]
+        follow = cmds.group(empty=True, name=n + "_spring_grp", parent=goal)
+        keep = cmds.group(empty=True, name=n + "_spring_keep", parent=goal)
+        carry = cmds.group(empty=True, name=n + "_spring_carry", parent=helper[0])
+        for g in (follow, keep, carry):
+            cmds.matchTransform(g, offset, position=True, rotation=True)
+        cmds.parent(offset, follow)
+        con = cmds.orientConstraint(keep, carry, follow, maintainOffset=False)[0]
+        cmds.setAttr(con + ".interpType", 2)  # shortest
+        w_keep, w_carry = cmds.orientConstraint(con, query=True, weightAliasList=True)
+        rest = cmds.createNode("reverse", name=n + "_spring_reverse")
+        cmds.connectAttr(ik_ctrl + ".spring", rest + ".inputX")
+        cmds.connectAttr(rest + ".outputX", con + "." + w_keep)
+        cmds.connectAttr(ik_ctrl + ".spring", con + "." + w_carry)
+
     limb_nodes = {}  # chain name -> its helper joints and IK goal, for the animator tools
     for chain in CHAINS:
         ik_ctrl = ctrl_of[chain["ik_control"]]
@@ -769,6 +813,7 @@ def build(RIG, geos=None):
             solve_to = cmds.group(empty=True, name=chain["name"] + "_hock_grp", parent=ctrl_of[hock["control"]])
             cmds.matchTransform(solve_to, joint_of[hock["bone"]], position=True, rotation=True)
             cmds.orientConstraint(goal, ik_chain[3], maintainOffset=True)
+            spring_hock(chain, ik_ctrl, ik_chain, goal)
         limb_nodes[chain["name"]] = {"fk_joints": fk_chain, "goal": goal, "solve_to": solve_to}
         cmds.orientConstraint(solve_to, ik_chain[2], maintainOffset=True)
 
@@ -1031,6 +1076,8 @@ def build(RIG, geos=None):
         d.update(ikFk=float(chain["default_blend"]), stretch=float(chain["default_stretch"]))
         if not hock:
             d["soft"] = float(chain["default_soft"])
+        else:
+            d["spring"] = float(hock.get("default_spring", 0.0))
         if chain.get("foot"):
             d["roll"] = 0.0
     for sp in SPLINES:
@@ -1068,7 +1115,7 @@ def build(RIG, geos=None):
 # switching. The limbs and the left/right twins come from hive-rig (ik_chains and
 # mirror_pairs), kept on the rig as `hiveAnim` with the bind frames. Matrices here are 4x4 lists of rows acting on
 # column vectors; Maya's flat worldMatrix is the transpose.
-ANIM_ATTRS = ("ikFk", "stretch", "soft", "roll", "space", "volume")
+ANIM_ATTRS = ("ikFk", "stretch", "soft", "roll", "space", "volume", "spring")
 CHANNELS = ("tx", "ty", "tz", "rx", "ry", "rz")
 
 
@@ -1260,29 +1307,34 @@ def fk_to_ik(name, force_key=False):
             m = world(limb["ik"])
             set_world(limb["ik"], with_translation(m, add(translation(m), scale(norm(have), want - distance))))
     hock = limb.get("hock")
-    if hock:
-        # Turn the hock control (it pivots on the ankle) until the group it carries
-        # at the hock point lines up with the FK hock joint.
-        carry = mat_mul(mat_inv(world(hock["control"])), world(hock["target"]))
-        set_world(hock["control"], mat_mul(fk[2], mat_inv(carry)))
     # The two-bone IK reaches the third joint: the end, or the hock joint.
     a, b, c = (translation(m) for m in fk[:3])
-    pole = world(limb["pole"])
-    set_world(limb["pole"], with_translation(pole, pole_position(limb, a, b, c, fk[0])))
-    cmds.setAttr(limb["ik"] + ".ikFk", 1)
-    # Turn the pole about the reach until the middle joint lands on the FK one.
     along = norm(sub(c, a))
     want = sub(sub(b, a), scale(along, dot(sub(b, a), along)))
-    for _ in range(8):
-        got = sub(translation(world(limb["joints"][1])), a)
-        got = sub(got, scale(along, dot(got, along)))
-        if dot(got, got) < 1e-12 or dot(want, want) < 1e-12:
-            break
-        angle = math.atan2(dot(cross(got, want), along), dot(got, want))
-        if abs(angle) < 1e-5:
-            break
+    # A spring hock turns with the solve the pole aims, so the hock and the pole
+    # are matched in turn until both settle.
+    sprung = hock and cmds.attributeQuery("spring", node=limb["ik"], exists=True) \
+        and cmds.getAttr(limb["ik"] + ".spring") > 0.0
+    for _ in range(6 if sprung else 1):
+        if hock:
+            # Turn the hock control (it pivots on the ankle) until the group it carries
+            # at the hock point lines up with the FK hock joint.
+            carry = mat_mul(mat_inv(world(hock["control"])), world(hock["target"]))
+            set_world(hock["control"], mat_mul(fk[2], mat_inv(carry)))
         pole = world(limb["pole"])
-        set_world(limb["pole"], with_translation(pole, rotate_about(translation(pole), a, along, angle)))
+        set_world(limb["pole"], with_translation(pole, pole_position(limb, a, b, c, fk[0])))
+        cmds.setAttr(limb["ik"] + ".ikFk", 1)
+        # Turn the pole about the reach until the middle joint lands on the FK one.
+        for _ in range(8):
+            got = sub(translation(world(limb["joints"][1])), a)
+            got = sub(got, scale(along, dot(got, along)))
+            if dot(got, got) < 1e-12 or dot(want, want) < 1e-12:
+                break
+            angle = math.atan2(dot(cross(got, want), along), dot(got, want))
+            if abs(angle) < 1e-5:
+                break
+            pole = world(limb["pole"])
+            set_world(limb["pole"], with_translation(pole, rotate_about(translation(pole), a, along, angle)))
     key_controls([limb["ik"], limb["pole"]] + ([hock["control"]] if hock else []), force_key)
 
 
@@ -1446,6 +1498,37 @@ def reset_pose(names=None):
             cmds.setAttr(n + "." + a, v)
     key_controls(names)
     return len(names)
+
+
+def add_studio_pose(rig_data, name="Studio pose"):
+    """Keep the pose posed in the hive-rig app (`studio_pose`: where it moves
+    each control, as a move of hive-rig's model space, and its settings) in the
+    pose library as `name`, leaving the rig at rest. Returns how many controls
+    it holds, or 0 when the rig has no such pose."""
+    studio = rig_data.get("studio_pose")
+    if not studio:
+        return 0
+    data = anim_data()
+    controls = {c["name"]: c for c in rig_data["controls"]["controls"]}
+
+    def depth(n):
+        parent = controls[n]["parent"]
+        return 1 + depth(parent["name"]) if parent["type"] == "control" and parent["name"] in controls else 0
+
+    for n in sorted((n for n in studio["controls"] if n in data["bind"]), key=depth):
+        flat = studio["controls"][n]
+        move = [[flat[col * 4 + row] for col in range(4)] for row in range(4)]
+        for i in range(3):  # metres to centimetres
+            move[i][3] *= SCALE
+        set_world(n, mat_mul(move, from_maya(data["bind"][n])))
+    for n, values in studio.get("attributes", {}).items():
+        for attr, v in values.items():
+            attr = {"ik_fk": "ikFk"}.get(attr, attr)
+            if cmds.objExists(n) and cmds.attributeQuery(attr, node=n, exists=True):
+                cmds.setAttr(n + "." + attr, v)
+    count = save_pose(name)
+    reset_pose()
+    return count
 
 
 def selected_controls():
@@ -1917,6 +2000,9 @@ def main():
         print("hive-rig: %s is already in the scene" % NAME)
     else:
         build(RIG_DATA)
+        # The pose posed in the hive-rig app, if any, in the pose library.
+        if add_studio_pose(RIG_DATA):
+            print("hive-rig: the pose from the hive-rig app is in the pose library as Studio pose")
     if "--save" in sys.argv:
         path = sys.argv[sys.argv.index("--save") + 1]
         cmds.file(rename=path)

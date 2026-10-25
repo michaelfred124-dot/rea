@@ -884,6 +884,50 @@ mod tests {
         assert!(s.posing.pose.is_rest());
     }
 
+    /// The pose is saved with the rig on export and comes back when the rig
+    /// is opened again; another character starts at rest.
+    #[test]
+    fn the_pose_is_saved_with_the_rig_and_reopens() {
+        let mut s = built();
+        let name = fk_on(&s, "lowerarm_l");
+        s.select_control(&name, false);
+        let start = s.posing.pose.clone();
+        s.begin_pose_edit();
+        s.apply_gizmo(&start, GizmoOp::Rotate(Vec3::Y, 0.8));
+        let (_, rig) = s.pose_rig().unwrap();
+        let ik = rig.ik_chains[0].ik_control.clone();
+        let rig = rig.clone();
+        assert!(s.posing.pose.set_attribute(&rig, &ik, "ik_fk", 0.25));
+        let posed = s.posing.pose.clone();
+        let dir = std::env::temp_dir().join(format!("hive_studio_pose_{}", std::process::id()));
+        s.targets = [true, true, false, false];
+        s.export(&dir).unwrap();
+        let path = dir.join("hive_demo.hive.json");
+        assert_eq!(hive_rig::Rig::load(&path).unwrap().pose, posed);
+        // The Blender and Maya builders get it for their pose libraries.
+        let script = std::fs::read_to_string(dir.join("hive_demo_blender.py")).unwrap();
+        assert!(script.contains("\"studio_pose\""));
+
+        let mut t = Studio::default();
+        t.open(&path);
+        assert!(!t.error, "{}", t.status);
+        assert_eq!(t.posing.pose, posed);
+        t.mode = Mode::Rig;
+        assert!(t.pose_shows());
+        // Another character (or the demo again) starts at rest.
+        t.load_demo();
+        assert!(t.posing.pose.is_rest());
+        // And a rig exported at rest has no pose in it.
+        let mut r = built();
+        r.targets = [false, false, false, false];
+        let rest_dir = dir.join("rest");
+        r.export(&rest_dir).unwrap();
+        let text = std::fs::read_to_string(rest_dir.join("hive_demo.hive.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(v.get("pose").is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn face_board_sliders_pose_the_face_and_stay_in_their_tracks() {
         let mut s = built();

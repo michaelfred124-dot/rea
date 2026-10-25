@@ -13,7 +13,7 @@ cargo run --release -- rig path/to/character.glb -o out/
 cargo run --release -- demo -o out/            # T-pose test character
 cargo run --release -- demo -o out/ --arm-drop 45   # A-pose
 cargo run --release -- demo -o out/ --quadruped     # a dog: spine, head, tail, four legs
-cargo run --release -- demo -o out/ --creature bird # also dog, spider, snake
+cargo run --release -- demo -o out/ --creature bird # also dog, spider, snake, horse, dinosaur
 cargo run --release -- demo -o out/ --bendy --soft 0.3   # bendy arms and legs with soft IK
 ```
 
@@ -250,7 +250,7 @@ How each target carries shapes, in-betweens and drivers:
 
 #### Send edits back to hive-rig
 
-Weights painted and shapes sculpted in Blender or Maya come back into the
+Weights painted and shapes sculpted in Blender, Maya or Unreal come back into the
 `.hive.json`, so they survive the next rebuild. The Blender panel's **Skin and
 Shapes** box and the Maya window's **Skin and Shapes** section have **Send to
 Hive** buttons (all, weights only, shapes only): they write
@@ -268,6 +268,33 @@ Imported weights follow the rig's influence limits; a shape keeps its driver
 as a new shape. **Rebuild** in either tool sends the edits first and keeps the
 edited weights. The mesh must keep hive-rig's vertices and their order.
 Blender's round trip is checked in real Blender; Maya's only against stubs.
+
+In Unreal, the **Hive Rig** menu has **Send to Hive** (weights and shapes,
+weights only, shapes only; from the Output Log `py "<name>_unreal.py"
+send_edits [--weights | --shapes]`) for weights painted on the imported
+Skeletal Mesh and morph targets edited there. Unreal keeps its own vertex
+order, so the tool exports the mesh as a binary FBX (`<name>_unreal_edits.fbx`,
+with its morph targets) and has hive-rig turn it into the same edits file:
+
+```bash
+hive-rig edits out/hero.hive.json hero_unreal_edits.fbx      # writes out/hero.edits.json
+```
+
+`hive-rig edits` takes any binary FBX exported from the rig's mesh in its rest
+pose. It finds the file's frame and units from the bones it shares with the rig
+(by name; an affine fit, or a turn and scale for a flat skeleton such as the
+snake's), gives each rig vertex the weights and shape offsets of the file's
+vertex at its place (within 0.1% of the body height; vertices sharing a place,
+as at a seam or where pieces meet, are paired off one to one by skin and normal),
+and folds `<shape>_ib50` morph targets back into in-betweens. Weights within
+0.005 of the rig's count as unchanged (`--weight-tolerance`), since Unreal keeps
+8-bit weights unless the mesh has High Precision Skin Weights on, and shape
+offsets within 0.01 mm of the rig's stay exactly the rig's. A rig vertex with
+no vertex there keeps its weights and shapes, with a warning. The matching is
+checked in `cargo test` (another frame, order, doubled vertices, 8-bit weights,
+the horse's shared points) and on an FBX written by real Blender's exporter
+from the rig's `.glb` (`tests/blender_fbx_edits_check.py`); the Unreal export
+itself (`AssetExportTask` with `SkeletalMeshExporterFBX`) only against stubs.
 
 Pose readers measure a bone's turn about one axis since rest (the twist part of
 its rotation about that axis, so turns about other axes change it little). Cone and RBF readers, and helper joints driven
@@ -448,6 +475,21 @@ layout's.
   the leg's shape. The paw has the biped foot's `roll` (heel, pads, then toe
   tip), and `stretch`, FK controls (thigh, calf, hock, paw) and `ik_fk` work as
   on a leg. Legs start in IK.
+* **Spring hock**: `spring` (0 to 1, on the IK control; `--spring` on `demo`,
+  **Hock spring** in the app's leg options) makes the hock swing with the thigh
+  as the paw moves, the way a horse's stifle and hock flex together, so lifting
+  a hoof folds the whole leg; the hock control turns it further. At 0 the hock
+  keeps the hock control's angle. Each builder solves a helper two-bone chain
+  from the hip to the ankle (its upper bone the thigh plus the hock, its lower
+  one the calf) to the foot goal with the leg's pole and turns the hock
+  control's parent with its upper bone, blended by `spring`
+  (`controls::spring_hock` is the maths): Blender (checked in real Blender), a
+  helper joint chain with an ikRPsolver and an orient constraint blended by the
+  attribute in Maya, and helper nulls solved by a Two Bone IK unit with a
+  weighted Set Rotation in Unreal (`<leg>_spring` float; both only against
+  stubs). FK to IK matches the hock and pole in turn until both settle. The
+  helper chain doesn't stretch in Maya and Unreal. The app's posing doesn't
+  run the spring yet.
 * **Front legs** are arm components laid out as a leg: the clavicle is the
   shoulder blade and the elbow points back. An arm whose elbow and wrist sit
   below the belly line (`crotch_y`) skins as a leg, starts in IK and gets an
@@ -468,7 +510,7 @@ app, or Edit Guides in Blender or Maya):
 
 ### More creatures: bird, spider and snake
 
-`hive-rig demo --creature <dog|bird|spider|snake>` rigs a built-in creature
+`hive-rig demo --creature <dog|bird|spider|snake|horse|dinosaur>` rigs a built-in creature
 with its own demo body (written as `hive_<creature>`; `--quadruped` is
 `--creature dog`). In the app, `HiveRig --demo bird` opens one. Each layout is
 also a built-in template (see [Rig templates](#rig-templates)), so it loads onto
@@ -491,6 +533,10 @@ any character, scaled to its height. They use the existing components only:
   **spline spine** of ten joints driven by five curve controls, a raised neck
   and head, and a spline (`tentacle`) tail of eight joints and four curve
   controls, all in the mid-plane.
+* **Horse** (`components::horse`): long front legs and `quad_leg` hind legs
+  that start with a full spring hock (`spring` 1), a long neck, head and tail.
+* **Dinosaur** (`components::dinosaur`): a theropod on two `quad_leg` legs,
+  short FK arms, a neck, a big head and a long spline tail.
 
 Every creature is skinned the same way, by distance through its body (see
 [Skin](#how-it-works)), so a spider's legs or a bird's wings never share
@@ -969,6 +1015,17 @@ have an **Animation** section and a **Pose Library**:
   poses (each mirrored) and every centre control is mirrored onto itself, so a
   character leaning and looking left leans and looks right. With controls
   selected, only those and their twins flip. Flipping twice gives the pose back.
+* **Studio pose**: a pose posed in the app's Rig stage is saved with the rig
+  (`pose` in the `.hive.json`, written on Export and opened again with the rig;
+  `rebuild` keeps it) and comes into the Blender and Maya pose libraries as
+  **Studio pose**, the rig itself built at rest. The builders get it as where
+  the pose moves each control in model space (hive-rig's evaluator,
+  `pose::evaluate`) and its settings, since each program's controls have their
+  own axes. `hive-rig pose <rig> --set CONTROL=tx,ty,tz,rx,ry,rz --attr
+  CONTROL.ik_fk=0 [--reset] [--bones posed.json]` poses a rig from the command
+  line the same way. Checked in real Blender (applied, every deforming bone
+  lands within 1 mm of hive-rig's pose); Maya only against stubs; not in Unreal
+  yet.
 * **Pose Library**: **Save Pose** keeps the current pose of the selected
   controls (or every control) under a name, in the scene file (on the armature
   in Blender, on the rig's top node in Maya). Each saved pose has **Apply**
@@ -1010,8 +1067,15 @@ Output Log: `py "<name>_unreal.py" flip_pose [--range]`,
 `delete_pose`. Unreal flips in world space, across the plane halfway between
 the left and right controls at rest (so it needs a rig with twins; a snake
 can't be flipped there), which for a whole pose is the same mirror image as
-Blender and Maya give. Mirror and reset pose and the space switch are Blender
-and Maya only; Control Rig's own space switching covers the last.
+Blender and Maya give. The same menu has **Mirror pose** (left to right or
+right to left, this frame or the playback range): the selected controls' poses
+(or every left, or right, control's) go mirrored onto their twins with their
+limb's settings, centre controls staying put; and **Reset pose** (this frame or
+the range): the selected controls (with a selected IK control's limb settings),
+or every control and setting, back to their initial values, keyed. From the
+Output Log: `py "<name>_unreal.py" mirror_pose [--right] [--range]` and
+`reset_pose [--range]`. The space switch is Blender and Maya only; Control
+Rig's own space switching covers it.
 
 ## Input requirements
 
@@ -1098,6 +1162,10 @@ python -I tests/blender_mesh_check.py out/hero_blender.py --source hero.glb --fb
 python -I tests/blender_mesh_check.py out/hive_demo_blender.py --corrective elbow_fix_l lowerarm_l_fk_ctrl
 python -I tests/blender_roundtrip_check.py out/hive_demo_blender.py --corrective elbow_fix_r lowerarm_r_fk_ctrl --slider brow_up
 python3 tests/dcc_stub_run.py maya out/hive_demo_maya.py --send         # Maya Send to Hive
+python3 tests/dcc_stub_run.py unreal out/hive_demo_unreal.py --send     # Unreal Send to Hive (after --targets unreal,fbx)
+python -I tests/blender_fbx_edits_check.py out/hive_demo.hive.json out/hive_demo.glb target/debug/hive-rig /tmp/work
+hive-rig pose out/hive_demo.hive.json --set head_ctrl=,,,0,-30,5 --bones out/posed.json
+python -I tests/blender_studio_pose_check.py out/hive_demo_blender.py out/posed.json   # the studio pose in Blender
 # A face board: add eyes, jaw and face to the demo's guides, rebuild, then the
 # Blender check above checks the sliders, zippers and sticky lips against hive-rig.
 python tests/blender_guides_check.py out/hive_demo_blender.py           # guides and rebuild
@@ -1284,8 +1352,23 @@ vertex, materials, textures, blend shapes, skins and the bind pose), OBJ and MTL
 import, the textures folder, and the corrective sculpt (in its pose the
 vertices land where they were put; at rest it's off).
 
+`blender_fbx_edits_check.py` stands real Blender in for Unreal: it imports the
+rig's `.glb`, repaints one vertex onto the head and pushes one shape key point,
+exports an FBX with Blender's exporter, runs `hive-rig edits`, `weights import`
+and `shape import`, and checks that exactly that vertex (and its seam copies)
+changed weights, the point moved by the push and every other offset is exactly
+as it was; CI runs it on the demo (with an in-between) and the horse.
+`blender_studio_pose_check.py` checks that the studio pose is in Blender's pose
+library and, applied, puts every deforming bone where `hive-rig pose --bones`
+says (FK, IK, the body, a pole, a foot roll and an IK/FK switch in CI).
+
 The Maya and Unreal builders, and the Maya and Unreal animator tools and Maya guide tools, are checked against stub
-APIs. That catches script errors but doesn't prove the application calls behave
+APIs. The stubs also check the spring hock (Maya's helper chain, pole and
+blended orient constraint; Unreal's helper solve before the leg's own, the
+hock control hung from the turning null), Unreal's mirror pose (only the twins
+move, with their limb settings, on a frame or the range) and reset pose, and
+Unreal's Send to Hive (an FBX export with morph targets, then `hive-rig edits`
+and the imports leave an unedited rig unchanged). That catches script errors but doesn't prove the application calls behave
 as intended (the spline chains' ikSplineHandle and Fit Chain on Curve setups
 included). The Maya stub also checks that every control curve point is placed
 on the control's outline, that every shape reaches a blendShape target and every
@@ -1301,7 +1384,7 @@ glTF-to-Unreal import mirrors, which is untested in Unreal.
 ## Not yet included
 
 See [the gap list](docs/hive-gaps.md)
-for what's planned. In short: cone and RBF pose readers, more creature templates (horse, dinosaur), IK legs beyond one
-arm and one leg a side (the spider's legs are FK chains), guide editing in Unreal (rebuild with the CLI and rerun the script), mirror
-and reset pose in Unreal, ASCII FBX input,
+for what's planned. In short: cone and RBF pose readers, IK legs beyond one
+arm and one leg a side (the spider's legs are FK chains), guide editing in Unreal (rebuild with the CLI and rerun the script),
+the spring hock in the app's posing, the studio pose in Unreal, ASCII FBX input,
 FBX animation, and the mesh details listed under [Mesh fidelity](#mesh-fidelity).

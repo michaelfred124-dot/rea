@@ -144,12 +144,34 @@ fn basis_bones(rig: &Rig) -> Vec<String> {
     picked.into_iter().map(|(n, _)| n.to_string()).collect()
 }
 
+/// The rig as the Blender and Maya builders read it: with a pose posed in the
+/// app, also `studio_pose`, where that pose puts each control as a move of
+/// model space (a column-major 4x4 from rest to posed, in metres, Y up), and
+/// its attribute values, for the builders' pose libraries. A move rather than
+/// channels, since each program's controls have their own local axes.
+fn with_studio_pose(rig: &Rig) -> Result<String> {
+    if rig.pose.is_rest() {
+        return Ok(serde_json::to_string(rig)?);
+    }
+    let posed = crate::pose::evaluate(&rig.skeleton, &rig.controls, &rig.pose);
+    let moves: serde_json::Map<String, serde_json::Value> = rig
+        .controls
+        .controls
+        .iter()
+        .zip(&posed.controls)
+        .map(|(c, m)| (c.name.clone(), json!(m.to_cols_array())))
+        .collect();
+    let mut v = serde_json::to_value(rig)?;
+    v["studio_pose"] = json!({ "controls": moves, "attributes": rig.pose.attributes });
+    Ok(serde_json::to_string(&v)?)
+}
+
 /// Generate the builder script for one DCC.
 pub fn script(rig: &Rig, target: Target, glb_path: &Path) -> Result<String> {
     let glb = glb_path.to_string_lossy().replace('"', "");
     Ok(match target {
-        Target::Blender => fill(BLENDER_TEMPLATE, &serde_json::to_string(rig)?, &glb),
-        Target::Maya => fill(MAYA_TEMPLATE, &serde_json::to_string(rig)?, &glb),
+        Target::Blender => fill(BLENDER_TEMPLATE, &with_studio_pose(rig)?, &glb),
+        Target::Maya => fill(MAYA_TEMPLATE, &with_studio_pose(rig)?, &glb),
         Target::Unreal => {
             // Unreal imports mesh and skin from the .glb; the script only needs
             // bone names and the control description.

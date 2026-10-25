@@ -104,6 +104,51 @@ enum Command {
         #[command(subcommand)]
         action: WeightsCommand,
     },
+    /// Pose a built rig's controls, the way the app's Rig stage does, and keep
+    /// the pose with the rig (the Blender and Maya builders put it in their
+    /// pose library as "Studio pose"). Writes the rig again.
+    Pose {
+        /// The `<name>.hive.json` of the rig.
+        rig: PathBuf,
+        /// A control's channels: CONTROL=tx,ty,tz,rx,ry,rz,sx,sy,sz (offsets
+        /// from rest in its rest frame, degrees; empty or missing values keep
+        /// what it has). Repeatable.
+        #[arg(long, allow_hyphen_values = true)]
+        set: Vec<String>,
+        /// A control's attribute: CONTROL.NAME=VALUE, such as
+        /// `arm_l_ik_ctrl.ik_fk=0`. Repeatable.
+        #[arg(long, allow_hyphen_values = true)]
+        attr: Vec<String>,
+        /// Start from rest instead of the rig's pose.
+        #[arg(long)]
+        reset: bool,
+        /// Also write where the pose puts every bone's head and tail (metres,
+        /// hive-rig's frame) to this JSON file.
+        #[arg(long)]
+        bones: Option<PathBuf>,
+    },
+    /// Turn a skinned mesh another program exported from the rig (an FBX
+    /// written by Unreal's exporter, say) into the edits file that `weights
+    /// import` and `shape import` read. Its frame, units and vertex order may
+    /// differ: the frame is found from the bones it shares with the rig, and
+    /// each rig vertex takes the weights and shapes of the file's vertex at
+    /// its place.
+    Edits {
+        /// The `<name>.hive.json` of the rig.
+        rig: PathBuf,
+        /// The exported mesh (binary .fbx), in the rig's rest pose.
+        mesh: PathBuf,
+        /// Where to write the edits (default: `<name>.edits.json` next to the rig).
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// The program that wrote the mesh, kept in the file.
+        #[arg(long, default_value = "unreal")]
+        source: String,
+        /// Weights this close to the rig's count as unchanged (Unreal keeps
+        /// 8-bit weights unless High Precision Skin Weights is on).
+        #[arg(long, default_value_t = 0.005)]
+        weight_tolerance: f32,
+    },
     /// Blendshapes on a built rig: sculpt corrective shapes in a pose, drive
     /// them from a joint's rotation, mirror, split, combine and set weights.
     /// Writes the rig again (its .glb, .hive.json and the scripts and .fbx
@@ -1471,6 +1516,88 @@ fn shape_command(path: &Path, action: ShapeCommand) -> Result<()> {
     Ok(())
 }
 
+/// `hive-rig pose`: set channels and attributes on the rig's pose, write the
+/// rig again, and optionally where the pose puts the bones.
+fn pose_command(
+    path: &Path,
+    set: &[String],
+    attr: &[String],
+    reset: bool,
+    bones: Option<&Path>,
+) -> Result<()> {
+    use anyhow::Context;
+    let mut rig = load_rig(path)?;
+    if reset {
+        rig.pose = Default::default();
+    }
+    for text in set {
+        let (name, values) = text
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--set takes CONTROL=tx,ty,tz,rx,ry,rz,sx,sy,sz"))?;
+        anyhow::ensure!(
+            rig.controls.control(name).is_some(),
+            "'{}' has no control '{name}'",
+            rig.name
+        );
+        let mut ch = rig.pose.channels(name);
+        for (i, v) in values.split(',').enumerate() {
+            anyhow::ensure!(i < 9, "--set {name}: at most nine channels");
+            if !v.trim().is_empty() {
+                ch.set(
+                    i,
+                    v.trim()
+                        .parse()
+                        .with_context(|| format!("--set {name}: '{v}'"))?,
+                );
+            }
+        }
+        rig.pose.set_channels(name, ch);
+    }
+    for text in attr {
+        let parsed = text
+            .split_once('=')
+            .and_then(|(lhs, v)| Some((lhs.rsplit_once('.')?, v)));
+        let Some(((control, name), value)) = parsed else {
+            anyhow::bail!("--attr takes CONTROL.NAME=VALUE");
+        };
+        let value: f32 = value
+            .trim()
+            .parse()
+            .with_context(|| format!("--attr {control}.{name}"))?;
+        let controls = rig.controls.clone();
+        anyhow::ensure!(
+            rig.pose.set_attribute(&controls, control, name, value),
+            "'{control}' has no attribute '{name}'"
+        );
+    }
+    if let Some(out) = bones {
+        let posed = hive_rig::pose::evaluate(&rig.skeleton, &rig.controls, &rig.pose);
+        let at: serde_json::Map<String, serde_json::Value> = rig
+            .skeleton
+            .bones
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                let (h, t) = (posed.head(&rig.skeleton, i), posed.tail(&rig.skeleton, i));
+                (b.name.clone(), serde_json::json!({ "head": h, "tail": t }))
+            })
+            .collect();
+        std::fs::write(out, serde_json::to_vec_pretty(&at)?)
+            .with_context(|| format!("writing {}", out.display()))?;
+    }
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let targets = existing_targets(dir, &rig.name);
+    export::write_all(&rig, dir, &targets)?;
+    println!(
+        "Posed {} controls and {} attributes on '{}'. Wrote {} again.",
+        rig.pose.channels.len(),
+        rig.pose.attributes.values().map(|a| a.len()).sum::<usize>(),
+        rig.name,
+        path.display()
+    );
+    Ok(())
+}
+
 fn weights_command(action: WeightsCommand) -> Result<()> {
     match action {
         WeightsCommand::Copy {
@@ -1756,6 +1883,8 @@ fn main() -> Result<()> {
             let opts = common.options();
             let mut new = build_rig(old.mesh.clone(), &old.name, guides, opts)?;
             new.orientation = old.orientation;
+            // The studio pose names controls; those the new rig lacks are ignored.
+            new.pose = old.pose.clone();
             if keep_weights {
                 // The old rig's automatic weights tell its hand edits apart.
                 let base = old.auto_weights(opts.skin);
@@ -1768,6 +1897,60 @@ fn main() -> Result<()> {
             write(&new, &out, &common.output)
         }
         Command::Weights { action } => weights_command(action),
+        Command::Pose {
+            rig: path,
+            set,
+            attr,
+            reset,
+            bones,
+        } => pose_command(&path, &set, &attr, reset, bones.as_deref()),
+        Command::Edits {
+            rig,
+            mesh,
+            out,
+            source,
+            weight_tolerance,
+        } => {
+            let r = load_rig(&rig)?;
+            anyhow::ensure!(
+                mesh.extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("fbx")),
+                "{} isn't an .fbx: export the mesh as binary FBX",
+                mesh.display()
+            );
+            let scene = hive_rig::import::fbx::load(&mesh)?;
+            let (edits, m) = hive_rig::edits::from_scene(
+                &r,
+                &scene,
+                &source,
+                (weight_tolerance > 0.0).then_some(weight_tolerance),
+            )?;
+            let out = out.unwrap_or_else(|| {
+                rig.parent()
+                    .unwrap_or(Path::new("."))
+                    .join(format!("{}.edits.json", r.name))
+            });
+            edits.write(&out)?;
+            println!(
+                "Wrote {}: {} of {} vertices matched (within {:.2} mm), {} shapes; lined up on {} bones (within {:.2} mm).",
+                out.display(),
+                m.matched,
+                m.matched + m.unmatched,
+                m.vertex_error * 1000.0,
+                edits.shapes.as_ref().map_or(0, Vec::len),
+                m.bones,
+                m.bone_error * 1000.0
+            );
+            if m.unmatched > 0 {
+                eprintln!(
+                    "warning: {} vertices of '{}' have no vertex of {} at their place; they keep the rig's weights and shapes",
+                    m.unmatched,
+                    r.name,
+                    mesh.display()
+                );
+            }
+            Ok(())
+        }
         Command::Shape { rig, action } => shape_command(&rig, action),
         Command::Add {
             guides,

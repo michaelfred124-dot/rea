@@ -8,6 +8,9 @@ Bendy limbs are an approximation here: the bend joints slide onto the curve the
 bend and pin controls describe but don't turn along it. Soft IK eases the reach
 near full extension like the Blender and Maya builds (the `<limb>_soft` float),
 and spline chains thin as they stretch with their `<chain>_volume` float.
+A hind leg with a hock gets a `<leg>_spring` float: a helper two-bone solve
+from the hip to the ankle turns the hock control's parent, so the hock swings
+with the thigh as the paw moves (0 keeps the hock control's own angle).
 
 Animator tools (Sequencer): with the Level Sequence that animates the Control
 Rig open, the "Hive Rig" editor menu this script adds matches a limb IK to FK
@@ -26,9 +29,19 @@ a driver gets a float control `<shape>_shape` (at its hive-rig weight) setting
 its curve instead. In-betweens come in as morph targets of their own
 (`<shape>_ib50`); the shape's curves blend through them in order.
 
-The script also adds a "Hive Poses" menu: flip the pose into its mirror image
-and a pose library (save, apply, apply mirrored), on the Level Sequence that
-animates the Control Rig; poses are kept in <name>.poses.json next to it.
+The script also adds a "Hive Poses" menu: flip the pose into its mirror image,
+mirror one side onto the other, reset to the rest pose (this frame or the
+playback range) and a pose library (save, apply, apply mirrored), on the Level
+Sequence that animates the Control Rig; poses are kept in <name>.poses.json
+next to it. From the Output Log:
+    py "<this file>" mirror_pose [--right] [--range]
+    py "<this file>" reset_pose [--range]
+
+"Send to Hive" (in the Hive Rig menu) exports the Skeletal Mesh, with weights
+painted in Unreal and edited morph targets, as <name>_unreal_edits.fbx and runs
+`hive-rig edits` on it, writing <name>.edits.json for `hive-rig weights import`
+and `hive-rig shape import`:
+    py "<this file>" send_edits [--weights | --shapes]
 
 Requirements: Unreal Engine 5.2+ with the "Python Editor Script Plugin" and
 "Control Rig" plugins enabled. Run from Tools > Execute Python Script, or
@@ -52,6 +65,9 @@ BASIS_BONES = RIG["basis"]  # pelvis, left hand, head, left ball where the rig h
 
 # The .glb written next to this script. Edit if you moved it.
 GLB_PATH = r"""__HIVE_GLB_PATH__"""
+# The hive-rig program, used by Send to Hive. Change this if you moved it
+# since generating this script.
+HIVE_EXE = r"""__HIVE_EXE__"""
 DESTINATION = "/Game/HiveRig/" + NAME
 # Set to an existing asset path to skip the import, e.g. "/Game/Characters/Hero".
 SKELETAL_MESH_PATH = ""
@@ -380,6 +396,8 @@ def build():
             add_float(chain["name"] + "_roll", owner, -90.0, 120.0, 0.0)
         if not chain.get("hock"):
             add_float(chain["name"] + "_soft", owner, 0.0, 1.0, chain["default_soft"])
+        else:
+            add_float(chain["name"] + "_spring", owner, 0.0, 1.0, chain["hock"].get("default_spring", 0.0))
     for sp in SPLINES:
         add_float(sp["name"] + "_stretch", control_key(sp["settings"]), 0.0, 1.0, sp["default_stretch"])
         add_float(sp["name"] + "_volume", control_key(sp["settings"]), 0.0, 1.0, sp["default_volume"])
@@ -426,15 +444,43 @@ def build():
 
     # Three-segment legs: the hock control rides on the ankle null (so it follows the
     # roll) and carries a null at the hock bone, which the thigh and calf solve to.
+    #
+    # Spring hocks (hive-rig's spring_hock): the hock control hangs under a
+    # `<limb>_spring_follow` null on the ankle, which the graph turns with the upper null
+    # of a helper two-bone chain (hip, knee + ankle - hock, ankle) solved to the
+    # foot goal with the limb's pole, weighted by the `<limb>_spring` float. At 1
+    # the hock swings with the thigh as the paw moves; the control turns it further.
     hock_null = {}
+    spring_rig = {}
     for chain in CHAINS:
         hock = chain.get("hock")
         if not hock:
             continue
         n = chain["name"]
         ankle = foot_rig[n]["ankle"] if n in foot_rig else control_key(chain["ik_control"])
-        hock_ctrl = make_control(next(c for c in CONTROLS if c["name"] == hock["control"]), ankle)
+        hock_def = next(c for c in CONTROLS if c["name"] == hock["control"])
+        at_rest = target_transform(hock_def)
+        follow = hc.add_null(n + "_spring_follow", ankle, at_rest, True, True, False)
+        hock_ctrl = make_control(hock_def, follow)
         hock_null[n] = hc.add_null(n + "_hock", hock_ctrl, initial(bone_key(hock["bone"])), True, True, False)
+        hip, knee = bone_location(chain["upper"]), bone_location(chain["lower"])
+        top, foot_at = bone_location(hock["bone"]), bone_location(chain["end"])
+        mid = knee + foot_at - top
+        bend = mid - (hip + foot_at) * 0.5
+        bend = bend.normal() if bend.length() > 1e-3 else unreal.Vector(0, 1, 0)
+
+        def aimed(at, toward, bend=bend):
+            """At `at`, its X axis toward `toward` and its Y toward the bend."""
+            rot = unreal.MathLibrary.make_rot_from_xy(toward - at, bend)
+            return unreal.Transform(location=at, rotation=rot)
+
+        upper_parent = next(b["parent"] for b in BONES if b["name"] == chain["upper"])
+        parent = bone_key(BONES[upper_parent]["name"]) if upper_parent is not None else unreal.RigElementKey()
+        upper = hc.add_null(n + "_spring_upper", parent, aimed(hip, mid), True, True, False)
+        lower = hc.add_null(n + "_spring_lower", upper, aimed(mid, foot_at), True, True, False)
+        end = hc.add_null(n + "_spring_end", lower, aimed(foot_at, foot_at + (foot_at - mid)), True, True, False)
+        carry = hc.add_null(n + "_spring_carry", upper, at_rest, True, True, False)
+        spring_rig[n] = dict(follow=follow, upper=upper, lower=lower, end=end, carry=carry)
 
     # ----------------------------------------------------------------------- forward solve graph
     def find_begin_node():
@@ -892,6 +938,31 @@ def build():
         solve_to = get_null(hock_null[chain["name"]]) if chain["name"] in hock_null else effector
         pole = get_control(chain["pole_control"])
         stretch = get_float(chain["name"] + "_stretch")
+        spring = spring_rig.get(chain["name"])
+        if spring:
+            # Solve the helper chain to the foot goal, then turn the hock control's
+            # null with its upper null by `spring`, before the leg's own solve
+            # reads the hock null.
+            helper = unit("RigUnit_TwoBoneIKSimplePerItem", "SpringIK_" + chain["name"], {
+                "ItemA": item_pin("Null", spring["upper"].name),
+                "ItemB": item_pin("Null", spring["lower"].name),
+                "EffectorItem": item_pin("Null", spring["end"].name),
+                "PrimaryAxis": "(X=1.000000,Y=0.000000,Z=0.000000)",
+                "SecondaryAxis": "(X=0.000000,Y=1.000000,Z=0.000000)",
+                "PoleVectorKind": "Location",
+                "bEnableStretch": "False",
+                "bPropagateToChildren": "True",
+            })
+            vm.add_link(effector + ".Transform.Translation", helper + ".Effector.Translation")
+            vm.add_link(effector + ".Transform.Rotation", helper + ".Effector.Rotation")
+            vm.add_link(pole + ".Transform.Translation", helper + ".PoleVector")
+            chain_exec(helper)
+            turn = unit("RigUnit_SetRotation", "Spring_" + chain["name"],
+                        {"Item": item_pin("Null", spring["follow"].name), "Space": "GlobalSpace",
+                         "bPropagateToChildren": "True"})
+            vm.add_link(get_null(spring["carry"]) + ".Transform.Rotation", turn + ".Value")
+            vm.add_link(get_float(chain["name"] + "_spring") + ".FloatValue", turn + ".Weight")
+            chain_exec(turn)
 
         # Soft IK and stretch, the way hive-rig's soft_reach describes them: `d` is
         # the distance from the shoulder or hip to the goal and `length` the chain's;
@@ -1212,7 +1283,7 @@ def animator_data():
             "hock": {"control": hock["control"], "target": n + "_hock"} if hock else None,
             "soft": None if hock else {"zone": float(c["soft_zone"])},
             "floats": [n + "_ik_fk", n + "_stretch"] + ([n + "_roll"] if c.get("foot") else [])
-            + ([] if hock else [n + "_soft"]),
+            + ([n + "_spring"] if hock else [n + "_soft"]),
         })
     floats = [f for l in limbs for f in l["floats"]]
     for sp in SPLINES:
@@ -1444,32 +1515,36 @@ def match_fk_to_ik(ctx, limb):
             moved = v_add(vec(now.translation), v_scale(v_norm(have), want - v_len(have)))
             place(ctx, ik, turned_like(unreal.Vector(*moved), now))
     hock = limb.get("hock")
-    if hock:
-        # Turn the hock control (it pivots on the ankle) until the null it carries
-        # at the hock point lines up with the FK hock joint.
-        ctrl = control_key(hock["control"])
-        carry = global_of(ctx, null_key(hock["target"])).make_relative(global_of(ctx, ctrl))
-        target = carry.inverse() * turned_like(fk[2].translation, fk[2])
-        place(ctx, ctrl, turned_like(global_of(ctx, ctrl).translation, target))
     # The two-bone solve reaches the third joint: the end, or the hock joint.
     a, b, c = (vec(t.translation) for t in fk[:3])
     pole = control_key(limb["pole"])
-    place(ctx, pole, turned_like(unreal.Vector(*pole_position(ctx, limb, a, b, c, fk[0])), global_of(ctx, pole)))
-    set_float(ctx, blend, 1.0)
-    # Turn the pole about the reach until the middle joint lands on the FK one.
     along = v_norm(v_sub(c, a))
     want = v_sub(v_sub(b, a), v_scale(along, v_dot(v_sub(b, a), along)))
-    for _ in range(8):
-        got = v_sub(vec(global_of(ctx, bone_key(limb["bones"][1])).translation), a)
-        got = v_sub(got, v_scale(along, v_dot(got, along)))
-        if v_dot(got, got) < 1e-8 or v_dot(want, want) < 1e-8:
-            break
-        angle = _math.atan2(v_dot(v_cross(got, want), along), v_dot(got, want))
-        if abs(angle) < 1e-5:
-            break
-        now = global_of(ctx, pole)
-        moved = rotate_about(vec(now.translation), a, along, angle)
-        place(ctx, pole, turned_like(unreal.Vector(*moved), now))
+    # A spring hock turns with the solve the pole aims, so the hock and the pole
+    # are matched in turn until both settle.
+    sprung = hock and get_float(ctx, limb["name"] + "_spring") > 0.0
+    for _ in range(6 if sprung else 1):
+        if hock:
+            # Turn the hock control (it pivots on the ankle) until the null it carries
+            # at the hock point lines up with the FK hock joint.
+            ctrl = control_key(hock["control"])
+            carry = global_of(ctx, null_key(hock["target"])).make_relative(global_of(ctx, ctrl))
+            target = carry.inverse() * turned_like(fk[2].translation, fk[2])
+            place(ctx, ctrl, turned_like(global_of(ctx, ctrl).translation, target))
+        place(ctx, pole, turned_like(unreal.Vector(*pole_position(ctx, limb, a, b, c, fk[0])), global_of(ctx, pole)))
+        set_float(ctx, blend, 1.0)
+        # Turn the pole about the reach until the middle joint lands on the FK one.
+        for _ in range(8):
+            got = v_sub(vec(global_of(ctx, bone_key(limb["bones"][1])).translation), a)
+            got = v_sub(got, v_scale(along, v_dot(got, along)))
+            if v_dot(got, got) < 1e-8 or v_dot(want, want) < 1e-8:
+                break
+            angle = _math.atan2(v_dot(v_cross(got, want), along), v_dot(got, want))
+            if abs(angle) < 1e-5:
+                break
+            now = global_of(ctx, pole)
+            moved = rotate_about(vec(now.translation), a, along, angle)
+            place(ctx, pole, turned_like(unreal.Vector(*moved), now))
     return [limb["ik"], limb["pole"], blend] + ([hock["control"]] if hock else [])
 
 
@@ -1546,6 +1621,15 @@ def register_menu():
                                          'py "%s" %s %s%s' % (path, tool, limb["name"], suffix))
                 menu.add_menu_entry("Match", entry)
                 count += 1
+    # Send to Hive: weights painted and morph targets edited here, back to the rig.
+    for key_name, label, command in (("send", "Send to Hive (weights and shapes)", "send_edits"),
+                                     ("send_weights", "Send to Hive (weights only)", "send_edits --weights"),
+                                     ("send_shapes", "Send to Hive (shapes only)", "send_edits --shapes")):
+        entry = unreal.ToolMenuEntry(name="HiveRig_%s_%s" % (NAME, key_name), type=unreal.MultiBlockType.MENU_ENTRY)
+        entry.set_label(label)
+        entry.set_string_command(unreal.ToolMenuStringCommandType.COMMAND, "", 'py "%s" %s' % (path, command))
+        menu.add_menu_entry("Skin and Shapes", entry)
+        count += 1
     menus.refresh_all_widgets()
     return count
 
@@ -1692,6 +1776,89 @@ def flip_pose(frames=None, names=None):
     return count
 
 
+def mirror_copies(names, source):
+    """The (from, onto) twin pairs Mirror Pose copies: the given controls onto
+    their twins (both of a pair given: the `source` side onto the other), or
+    every `source`-side ("left" or "right") control when none are given."""
+    pairs = RIG.get("mirror_pairs", [])
+    twin = twins()
+    lefts = {left for left, _ in pairs}
+    if names:
+        picked = [n for n in names if n in twin]
+        return [(n, twin[n]) for n in picked if twin[n] not in picked or (n in lefts) == (source == "left")]
+    return [(l, r) if source == "left" else (r, l) for l, r in pairs]
+
+
+def mirror_in_rig(ctx, names, source):
+    """Copy each control's pose of `names` (see mirror_copies) onto its twin,
+    mirrored, with its limb's settings, without keying. Returns the controls
+    and settings it changed."""
+    copies = mirror_copies(names, source)
+    if not copies:
+        return []
+    onto = {dst for _, dst in copies}
+    order = [c["name"] for c in CONTROLS if c["name"] in onto]  # parents first
+    # Each target is worked out from its twin (the source) before anything moves.
+    targets = flip_targets(ctx, order, mirror_plane(ctx))
+    for name in order:
+        p, q = targets[name]
+        place(ctx, control_key(name), unreal.Transform(location=unreal.Vector(*p),
+                                                       rotation=unreal.Quat(*q).rotator()))
+    sources = {src for src, _ in copies}
+    values = {f: get_float(ctx, f) for f in ANIM["floats"]}
+    changed = []
+    for f, other in float_twins().items():
+        # `f` belongs to a limb mirrored onto: it takes its twin limb's value.
+        limb = next((c for c in CHAINS if f.startswith(c["name"] + "_")), None)
+        if limb and limb["ik_control"] in onto and twins().get(limb["ik_control"]) in sources:
+            set_float(ctx, f, values[other])
+            changed.append(f)
+    return order + changed
+
+
+def mirror_pose(frames=None, names=None, source="left"):
+    """Copy the pose of the selected controls (or of every `source`-side
+    control) onto their twins on the other side, mirrored, on `frames` (the
+    current frame when None) and key it. Centre controls stay as they are.
+    Returns how many controls took a mirrored pose on the last frame."""
+    ctx = rig_in_sequencer()
+    if not RIG.get("mirror_pairs"):
+        raise RuntimeError("hive-rig: %s has no left/right controls to mirror" % NAME)
+    here = current_frame()
+    names = names or selected_controls(ctx)
+    count = 0
+    for f in ([here] if frames is None else list(frames)):
+        load_frame(ctx, f)
+        changed = mirror_in_rig(ctx, names, source)
+        key_controls(ctx, changed, f)
+        count = len([c for c in changed if c not in ANIM["floats"]])
+    unreal.log("hive-rig: mirrored %d controls" % count)
+    return count
+
+
+def reset_pose(frames=None, names=None):
+    """Put the selected controls (or every control and setting) back to their
+    rest values on `frames` (the current frame when None) and key them. A
+    selected IK control takes its limb's settings back too. Returns how many
+    values it reset on the last frame."""
+    ctx = rig_in_sequencer()
+    here = current_frame()
+    names = list(names or selected_controls(ctx) or [c["name"] for c in CONTROLS] + ANIM["floats"])
+    for c in CHAINS:
+        if c["ik_control"] in names:
+            names += [f for f in ANIM["floats"] if f.startswith(c["name"] + "_") and f not in names]
+    h = ctx[1].get_hierarchy()
+    for f in ([here] if frames is None else list(frames)):
+        load_frame(ctx, f)
+        for n in names:
+            rest = h.get_control_value(control_key(n), unreal.RigControlValueType.INITIAL)
+            h.set_control_value(control_key(n), rest, unreal.RigControlValueType.CURRENT)
+        solve(ctx[1])
+        key_controls(ctx, names, f)
+    unreal.log("hive-rig: reset %d controls and settings" % len(names))
+    return len(names)
+
+
 def poses_path():
     return os.path.join(os.path.dirname(script_path()), NAME + ".poses.json")
 
@@ -1786,6 +1953,10 @@ def pose_tool(fn):
         frames = playback_frames(rig_in_sequencer()[0]) if "--range" in args else None
         if fn is flip_pose:
             return flip_pose(frames)
+        if fn is mirror_pose:
+            return mirror_pose(frames, None, "right" if "--right" in args else "left")
+        if fn is reset_pose:
+            return reset_pose(frames)
         if fn is apply_pose:
             return apply_pose(" ".join(rest), "--mirrored" in args, frames)
         return fn(" ".join(rest))
@@ -1794,6 +1965,8 @@ def pose_tool(fn):
 
 TOOLS.update({
     "flip_pose": pose_tool(flip_pose),
+    "mirror_pose": pose_tool(mirror_pose),
+    "reset_pose": pose_tool(reset_pose),
     "save_pose": pose_tool(save_pose),
     "apply_pose": pose_tool(apply_pose),
     "delete_pose": pose_tool(delete_pose),
@@ -1801,8 +1974,9 @@ TOOLS.update({
 
 
 def register_pose_menu():
-    """A "Hive Rig poses" menu: Flip Pose, Save Pose (named by the frame) and,
-    per saved pose, Apply and Apply Mirrored."""
+    """A "Hive Rig poses" menu: Flip, Mirror and Reset Pose (this frame or the
+    playback range), Save Pose (named by the frame) and, per saved pose, Apply
+    and Apply Mirrored."""
     menus = unreal.ToolMenus.get()
     bar = menus.find_menu("LevelEditor.MainMenu")
     if bar is None:
@@ -1817,6 +1991,12 @@ def register_pose_menu():
     path = script_path().replace("\\", "/")
     entries = [("flip", "Flip pose (this frame)", "flip_pose"),
                ("flip_range", "Flip pose (playback range)", "flip_pose --range"),
+               ("mirror", "Mirror pose left to right (this frame)", "mirror_pose"),
+               ("mirror_range", "Mirror pose left to right (playback range)", "mirror_pose --range"),
+               ("mirror_right", "Mirror pose right to left (this frame)", "mirror_pose --right"),
+               ("mirror_right_range", "Mirror pose right to left (playback range)", "mirror_pose --right --range"),
+               ("reset", "Reset pose (this frame)", "reset_pose"),
+               ("reset_range", "Reset pose (playback range)", "reset_pose --range"),
                ("save", "Save pose (as Pose N; rename it in the .poses.json)", "save_pose"),
                ]
     for pose in sorted(pose_library()):
@@ -1829,6 +2009,92 @@ def register_pose_menu():
         menu.add_menu_entry("Poses", entry)
     menus.refresh_all_widgets()
     return len(entries)
+
+
+# ----------------------------------------------------------------------- send edits back
+# Weights painted and morph targets edited on the imported Skeletal Mesh go back
+# into the rig: the mesh is exported as an FBX next to the rig, hive-rig turns
+# it into the same <name>.edits.json Blender's and Maya's Send to Hive write
+# (each rig vertex takes the weights and shapes of the FBX vertex at its place,
+# since Unreal keeps its own vertex order), and takes the weights and shapes in.
+def rig_files():
+    folder = os.path.dirname(GLB_PATH)
+    return os.path.join(folder, NAME + ".hive.json"), os.path.join(folder, NAME + "_unreal_edits.fbx")
+
+
+def run_hive(*args):
+    import subprocess
+
+    if not HIVE_EXE or not os.path.isfile(HIVE_EXE):
+        raise RuntimeError("hive-rig program not found; set HIVE_EXE at the top of this script (%r)" % HIVE_EXE)
+    done = subprocess.run([HIVE_EXE] + [str(a) for a in args], capture_output=True, text=True)
+    if done.returncode != 0:
+        raise RuntimeError("hive-rig %s failed: %s" % (args[0], (done.stderr or done.stdout).strip()))
+    return done.stdout
+
+
+def find_skeletal_mesh():
+    """The rig's Skeletal Mesh: SKELETAL_MESH_PATH, or the one the import made."""
+    if SKELETAL_MESH_PATH:
+        return unreal.load_asset(SKELETAL_MESH_PATH)
+    for path in unreal.EditorAssetLibrary.list_assets(DESTINATION, recursive=True):
+        asset = unreal.load_asset(path)
+        if isinstance(asset, unreal.SkeletalMesh):
+            return asset
+    raise RuntimeError("hive-rig: no Skeletal Mesh under %s; set SKELETAL_MESH_PATH at the top of this script"
+                       % DESTINATION)
+
+
+def export_mesh_fbx(mesh, path):
+    """Write the Skeletal Mesh (its reference pose, skin and morph targets) as a
+    binary FBX."""
+    options = unreal.FbxExportOption()
+    options.ascii = False
+    options.export_morph_targets = True
+    options.level_of_detail = False
+    options.collision = False
+    options.export_preview_mesh = False
+    task = unreal.AssetExportTask()
+    task.object = mesh
+    task.filename = path
+    task.automated = True
+    task.prompt = False
+    task.replace_identical = True
+    task.exporter = unreal.SkeletalMeshExporterFBX()
+    task.options = options
+    if not unreal.Exporter.run_asset_export_task(task) or not os.path.isfile(path):
+        raise RuntimeError("hive-rig: Unreal couldn't export %s to %s" % (mesh.get_name(), path))
+    return path
+
+
+def send_edits(weights=True, shapes=True):
+    """Send the weights painted and morph targets edited in Unreal back to
+    hive-rig: export the mesh, write <name>.edits.json and import it into the
+    .hive.json, so the next rebuild (and every builder) keeps them. Weights
+    within 0.005 of the rig's count as unchanged, since Unreal keeps 8-bit
+    weights unless the mesh has High Precision Skin Weights on."""
+    hive_path, fbx_path = rig_files()
+    edits = os.path.join(os.path.dirname(hive_path), NAME + ".edits.json")
+    export_mesh_fbx(find_skeletal_mesh(), fbx_path)
+    said = [run_hive("edits", hive_path, fbx_path, "-o", edits, "--source", "unreal").strip().splitlines()[0]]
+    if weights:
+        said.append(run_hive("weights", "import", hive_path, edits).strip().splitlines()[0])
+    if shapes:
+        with open(edits) as f:
+            if json.load(f).get("shapes"):
+                said.append(run_hive("shape", hive_path, "import", edits).strip().splitlines()[-1])
+    message = " ".join(said)
+    unreal.log("hive-rig: " + message)
+    return message
+
+
+def send_tool(args):
+    """send_edits [--weights | --shapes]: both unless one is named."""
+    only_w, only_s = "--weights" in args, "--shapes" in args
+    return send_edits(weights=only_w or not only_s, shapes=only_s or not only_w)
+
+
+TOOLS["send_edits"] = send_tool
 
 
 def main(argv=None):

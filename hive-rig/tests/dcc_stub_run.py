@@ -4,10 +4,12 @@ Catches Python-level mistakes (typos, wrong names, bad data access) in the
 generated scripts without needing the DCC installed. It does not prove the DCC
 API calls behave as intended; that needs the real application.
 
-Usage: python3 dcc_stub_run.py maya|unreal <script.py> [--guides]
+Usage: python3 dcc_stub_run.py maya|unreal <script.py> [--guides] [--send]
 
 With --guides (Maya), also runs the guide tools, which call the hive-rig build
-that generated the script and rewrite files next to it.
+that generated the script and rewrite files next to it. With --send, also runs
+Send to Hive, which calls that hive-rig (Unreal: needs the rig's .fbx, from
+`--targets fbx`, to stand in for the mesh Unreal exports).
 """
 
 import runpy
@@ -114,6 +116,9 @@ def stub_maya():
                 return None
             if name == "listConnections":
                 return []
+            if name == "connectAttr":
+                calls.append(("connectAttr", args))
+                return None
             if name == "setAttr":
                 if kwargs.get("type") in ("pointArray", "componentList"):
                     calls.append(("setAttr_" + kwargs["type"], args[0]))
@@ -312,6 +317,10 @@ def stub_unreal():
     unreal.RigElementKey.side_effect = lambda type=None, name="": types.SimpleNamespace(type=type, name=name)
     vm = blueprint.get_controller_by_name.return_value
     vm.get_graph.return_value.get_nodes.return_value = []
+    # New nulls and controls come back as their keys.
+    hc = blueprint.get_hierarchy_controller.return_value
+    hc.add_null.side_effect = lambda name, *a, **k: types.SimpleNamespace(type="Null", name=name)
+    hc.add_control.side_effect = lambda name, *a, **k: types.SimpleNamespace(type="Control", name=name)
     # The animator tools: an open Level Sequence (frame 7, playback 1 to 3) that
     # animates this Control Rig, whose hierarchy is the blueprint's.
     editor = unreal.LevelSequenceEditorBlueprintLibrary
@@ -385,6 +394,16 @@ if __name__ == "__main__":
         for chain in rig["controls"]["ik_chains"]:
             ik = chain["ik_control"]
             assert ns["cmds"].attributeQuery("soft", node=ik) != bool(chain.get("hock")), chain["name"]
+            if chain.get("hock"):
+                # Spring hock: a `spring` attribute at its default, a helper chain
+                # solved to the goal, and the hock control's group turned between
+                # the goal and the helper's upper joint by it.
+                n = chain["name"]
+                assert ns["cmds"].getAttr(ik + ".spring") == chain["hock"].get("default_spring", 0.0), n
+                assert ("orientConstraint", (n + "_spring_keep", n + "_spring_carry", n + "_spring_grp")) in calls, n
+                assert ("poleVectorConstraint", (chain["pole_control"], n + "_spring_ikHandle")) in calls, n
+                assert ("connectAttr", (ik + ".spring", n + "_spring_reverse.inputX")) in calls, n
+                assert anim["defaults"][ik]["spring"] == chain["hock"].get("default_spring", 0.0), n
             for seg in ("upper", "lower") if chain.get("bendy") else ():
                 for joint in chain["bendy"][seg]["joints"]:
                     assert ("parentConstraint", (joint + "_bend_twist", joint)) in calls, joint
@@ -397,6 +416,13 @@ if __name__ == "__main__":
         assert ns["flip_pose"]() == len(anim["controls"])
         if anim["mirror"]:
             assert ns["flip_pose"]([anim["mirror"][0][0]]) == 2
+        # A pose posed in hive-rig is in the library from the start.
+        if rig.get("studio_pose"):
+            assert "Studio pose" in ns["pose_library"](), sorted(ns["pose_library"]())
+            stored = ns["pose_library"]()["Studio pose"]
+            assert sorted(stored) == sorted(anim["controls"]), len(stored)
+            ns["delete_pose"]("Studio pose")
+            print("maya studio pose in the pose library against stubs: ok")
         # Pose library: save, apply, apply mirrored, selected only, delete.
         assert ns["save_pose"]("stub pose") == len(anim["controls"])
         assert sorted(ns["pose_library"]()) == ["stub pose"]
@@ -631,6 +657,19 @@ if __name__ == "__main__":
             n = chain["name"]
             assert "SoftAim_" + n in made and "Stretch_" + chain["lower"] in made, n
             assert (n + "_soft" in floats) != bool(chain.get("hock")), n
+            if chain.get("hock"):
+                # Spring hock: a `<limb>_spring` float at its default, the helper
+                # chain solved before the leg's own solve, and the hock control
+                # hung from the null that turns with it.
+                assert n + "_spring" in floats and n + "_spring" in ns["ANIM"]["floats"], n
+                spring_default = [c.args[3] for c in hc.add_control.call_args_list if c.args[0] == n + "_spring"]
+                assert len(spring_default) == 1, n
+                order = [c.args[3] for c in vm.add_unit_node_from_struct_path.call_args_list]
+                assert order.index("SpringIK_" + n) < order.index("Spring_" + n) < order.index("IK_" + n), n
+                nulls = {c.args[0]: c.args[1] for c in hc.add_null.call_args_list}
+                assert nulls[n + "_spring_carry"].name == n + "_spring_upper", n
+                hock_parent = [c.args[1] for c in hc.add_control.call_args_list if c.args[0] == chain["hock"]["control"]]
+                assert [p.name for p in hock_parent] == [n + "_spring_follow"], (n, hock_parent)
         for sp in splines:
             assert sp["name"] + "_volume" in floats, sp["name"]
             for b in sp["bones"][:-1]:
@@ -652,7 +691,7 @@ if __name__ == "__main__":
                     assert loaded == keys == frames, (n, to, argv, loaded, keys)
                     assert blend == {(f, 0.5) for f in frames}, blend  # the stub reads every float as 0.5
         entries = ns["register_menu"]()
-        assert entries == 4 * len(rig["ik_chains"]), entries
+        assert entries == 4 * len(rig["ik_chains"]) + 3, entries  # and Send to Hive
         if rig["ik_chains"]:
             print("unreal animator tools ran against stubs: %d limbs: ok" % len(rig["ik_chains"]))
         # Pose tools: flip (every control, on this frame and over the range),
@@ -680,12 +719,53 @@ if __name__ == "__main__":
             # the same, a centre control stays on the mirror plane.
             point, normal = ns["mirror_plane"]((None, lib.get_control_rigs.return_value[0].control_rig))
             assert abs(sum(n * n for n in normal) - 1.0) < 1e-6
+            # Mirror pose: every left control onto its right twin (or back), with
+            # the limb settings, on this frame or over the range; only the twins move.
+            pairs = rig["mirror_pairs"]
+            for argv, onto, frames in ((["mirror_pose"], {r for _, r in pairs}, {7}),
+                                       (["mirror_pose", "--range"], {r for _, r in pairs}, {1, 2, 3}),
+                                       (["mirror_pose", "--right"], {l for l, _ in pairs}, {7})):
+                lib.reset_mock()
+                hierarchy.set_global_transform.reset_mock()
+                assert ns["main"](argv) == len(pairs), argv
+                placed = {c.args[0].name for c in hierarchy.set_global_transform.call_args_list}
+                assert placed == onto, (argv, sorted(placed ^ onto))
+                keyed = {c.args[3] for c in lib.set_local_control_rig_euler_transform.call_args_list}
+                assert keyed == frames, (argv, keyed)
+                settings = {c.args[2] for c in lib.set_local_control_rig_float.call_args_list}
+                for chain in rig["ik_chains"]:
+                    side = chain["ik_control"] in onto
+                    has_twin = chain["name"] + "_ik_fk" in twins_f
+                    assert (chain["name"] + "_ik_fk" in settings) == (side and has_twin), (argv, chain["name"])
+            # One control given: only its twin takes the pose.
+            hierarchy.set_global_transform.reset_mock()
+            assert ns["mirror_pose"](None, [pairs[0][0]]) == 1
+            assert {c.args[0].name for c in hierarchy.set_global_transform.call_args_list} == {pairs[0][1]}
+            print("unreal mirror pose ran against stubs: %d twins: ok" % len(pairs))
         else:
-            try:
-                ns["main"](["flip_pose"])
-                raise AssertionError("a rig without twins can't be flipped")
-            except RuntimeError:
-                pass
+            for argv in (["flip_pose"], ["mirror_pose"]):
+                try:
+                    ns["main"](argv)
+                    raise AssertionError("a rig without twins can't be flipped or mirrored")
+                except RuntimeError:
+                    pass
+        # Reset pose: every control and setting back to its initial value, keyed.
+        every = len(names) + len(ns["ANIM"]["floats"])
+        for argv, frames in ((["reset_pose"], {7}), (["reset_pose", "--range"], {1, 2, 3})):
+            lib.reset_mock()
+            hierarchy.get_control_value.reset_mock()
+            assert ns["main"](argv) == every, argv
+            initial = sys.modules["unreal"].RigControlValueType.INITIAL
+            rest = {c.args[0].name for c in hierarchy.get_control_value.call_args_list if c.args[1] is initial}
+            assert rest == set(names) | set(ns["ANIM"]["floats"]), sorted(set(names) - rest)[:5]
+            keyed = {c.args[3] for c in lib.set_local_control_rig_euler_transform.call_args_list}
+            assert keyed == frames, keyed
+        # A selected IK control takes its limb's settings back with it.
+        if rig["ik_chains"]:
+            chain = rig["ik_chains"][0]
+            got = ns["reset_pose"](None, [chain["ik_control"]])
+            assert got == 1 + len([f for f in ns["ANIM"]["floats"] if f.startswith(chain["name"] + "_")]), got
+        print("unreal reset pose ran against stubs: ok")
         # The flip's maths with real turns: quaternions survive the round trip,
         # and a posed left control's twin lands on its mirror image.
         import math as m_
@@ -730,11 +810,41 @@ if __name__ == "__main__":
         if rig.get("mirror_pairs"):
             assert ns["main"](["apply_pose", "Arms", "up", "--mirrored", "--range"]) > 0
         entries = ns["register_pose_menu"]()
-        assert entries == 3 + 2 * 2, entries
+        assert entries == 9 + 2 * 2, entries
         ns["main"](["delete_pose", "Pose 1"])
         assert sorted(ns["pose_library"]()) == ["Arms up"]
         os.remove(poses)
         print("unreal pose tools ran against stubs: ok")
+        # Send to Hive: the Skeletal Mesh is exported as a binary FBX with its
+        # morph targets (here the rig's own .fbx stands in for Unreal's), which
+        # hive-rig turns into the edits file and imports: nothing changed.
+        own_fbx = os.path.join(os.path.dirname(os.path.abspath(script)), rig["name"] + ".fbx")
+        if os.path.isfile(ns["HIVE_EXE"]) and "--send" in sys_args and os.path.isfile(own_fbx):
+            import shutil
+
+            ue = sys.modules["unreal"]
+            ue.EditorAssetLibrary.list_assets.return_value = ["/Game/HiveRig/mesh"]
+            exported = []
+
+            def export(task):
+                exported.append(task)
+                shutil.copy(own_fbx, task.filename)
+                return True
+
+            ue.Exporter.run_asset_export_task.side_effect = export
+            hive_path = ns["rig_files"]()[0]
+            before = json.load(open(hive_path))
+            said = ns["main"](["send_edits"])
+            assert len(exported) == 1 and exported[0].options.export_morph_targets is True, exported
+            assert exported[0].options.ascii is False and exported[0].exporter is ue.SkeletalMeshExporterFBX.return_value
+            assert "0 of %d vertices changed" % len(before["mesh"]["positions"]) in said, said
+            edits = json.load(open(os.path.join(os.path.dirname(hive_path), rig["name"] + ".edits.json")))
+            assert edits["source"] == "unreal" and edits["weight_tolerance"] == 0.005, sorted(edits)
+            assert sorted(s["name"] for s in edits["shapes"]) == sorted(s["name"] for s in rig.get("shapes", []))
+            after = json.load(open(hive_path))
+            assert after["skin"] == before["skin"] and after["mesh"].get("shapes") == before["mesh"].get("shapes")
+            assert ("Imported shapes" in said) == bool(rig.get("shapes")), said
+            print("unreal send to hive ran hive-rig edits, weights import and shape import against stubs: ok")
     else:
         raise SystemExit("unknown kind " + kind)
     print("%s builder ran against stubs: ok" % kind)

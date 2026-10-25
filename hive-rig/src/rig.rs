@@ -38,6 +38,11 @@ pub struct Rig {
     pub skeleton: Skeleton,
     pub skin: SkinWeights,
     pub controls: ControlRig,
+    /// The control-rig pose posed in the app (Rig stage), kept with the rig so
+    /// it comes back on reopening. The Blender and Maya builders add it to
+    /// their pose library as "Studio pose". Absent means rest.
+    #[serde(default, skip_serializing_if = "crate::pose::Pose::is_rest")]
+    pub pose: crate::pose::Pose,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -125,6 +130,7 @@ pub fn build_rig(mesh: Mesh, name: &str, guides: Guides, opts: RigOptions) -> an
         skeleton: built.skeleton,
         skin,
         controls: built.controls,
+        pose: Default::default(),
     };
     // Shapes named like a board move (blink_l, jawOpen) follow its slider.
     crate::shapes::link_board(&mut rig);

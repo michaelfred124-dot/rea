@@ -235,6 +235,27 @@ jobs:
           cargo run --locked -q -- rebuild "$b/hive_demo.hive.json"
           python3 -I tests/dcc_stub_run.py maya "$b/hive_demo_maya.py"
           python3 -I tests/dcc_stub_run.py unreal "$b/hive_demo_unreal.py"
+      - name: Spring hocks, Unreal mirror/reset pose and Send to Hive - Maya and Unreal builders
+        run: |
+          # Horse (spring 1), dinosaur and dog (spring 0): the spring helper chain
+          # in Maya and Unreal, mirror and reset pose in Unreal, and Unreal's
+          # Send to Hive (the rig's own .fbx stands in for Unreal's export).
+          for creature in horse dinosaur dog; do
+            cr="$RUNNER_TEMP/spring_$creature"
+            cargo run --locked -q -- demo --creature "$creature" -o "$cr" --targets maya,unreal,fbx
+            python3 -I tests/dcc_stub_run.py maya "$cr/hive_${creature}_maya.py"
+            python3 -I tests/dcc_stub_run.py unreal "$cr/hive_${creature}_unreal.py" --send
+          done
+          # An exported mesh turned into an edits file: nothing changes.
+          cr="$RUNNER_TEMP/spring_horse"
+          cargo run --locked -q -- edits "$cr/hive_horse.hive.json" "$cr/hive_horse.fbx"
+          cargo run --locked -q -- weights import "$cr/hive_horse.hive.json" "$cr/hive_horse.edits.json" | tee "$cr/log.txt"
+          grep -q "0 of [0-9]* vertices changed" "$cr/log.txt"
+          # A pose posed with the CLI (as in the app) goes into Maya's pose library.
+          p="$RUNNER_TEMP/studio_pose_maya"
+          cargo run --locked -q -- demo -o "$p" --targets maya,unreal
+          cargo run --locked -q -- pose "$p/hive_demo.hive.json" --set head_ctrl=,,,0,-30,5 --attr foot_r_ik_ctrl.roll=30
+          python3 -I tests/dcc_stub_run.py maya "$p/hive_demo_maya.py"
       - name: Blendshapes - sculpt, mirror, split, combine, drive; Maya and Unreal builders
         run: |
           s="$RUNNER_TEMP/blendshapes"
@@ -657,6 +678,31 @@ jobs:
           cargo run -q -- shape "$r" weight brow_up 0.25
           python -I tests/blender_mesh_check.py "$s/hive_demo_blender.py" --corrective elbow_fix_r lowerarm_r_fk_ctrl --fbx "$s/hive_demo.fbx"
           python -I tests/blender_roundtrip_check.py "$s/hive_demo_blender.py" --corrective elbow_fix_r lowerarm_r_fk_ctrl --slider brow_up
+      - name: Send to Hive from an exported FBX (Blender standing in for Unreal), and the studio pose
+        run: |
+          # Blender imports the .glb, repaints a vertex and moves a shape key point,
+          # and its FBX exporter writes the mesh; hive-rig edits brings it back.
+          s="$RUNNER_TEMP/fbx_edits"
+          cargo run -q -- demo -o "$s/rig"
+          r="$s/rig/hive_demo.hive.json"
+          cargo run -q -- shape "$r" sculpt brow_up --at 0.03,1.72,0.1 --radius 0.06 --offset 0,0.02,0
+          cargo run -q -- shape "$r" inbetween brow_up 0.4
+          cargo run -q -- shape "$r" sculpt brow_up --inbetween 0.4 --at 0.03,1.72,0.1 --radius 0.06 --offset 0.01,0,0
+          python -I tests/blender_fbx_edits_check.py "$r" "$s/rig/hive_demo.glb" "$PWD/target/debug/hive-rig" "$s/work"
+          # The horse's body pieces meet at shared points with different skins.
+          cargo run -q -- demo --creature horse -o "$s/horse"
+          python -I tests/blender_fbx_edits_check.py "$s/horse/hive_horse.hive.json" "$s/horse/hive_horse.glb" \
+            "$PWD/target/debug/hive-rig" "$s/hwork"
+          # A pose posed in hive-rig lands in Blender's pose library and matches
+          # hive-rig's evaluator: FK, IK, the body, a pole, roll and IK/FK.
+          p="$RUNNER_TEMP/studio_pose"
+          cargo run -q -- demo -o "$p" --targets blender
+          cargo run -q -- pose "$p/hive_demo.hive.json" --set cog_ctrl=0.05,-0.08,0.02,0,15,0 \
+            --set spine_02_ctrl=,,,10,0,12 --set head_ctrl=,,,0,-30,5 --set upperarm_l_fk_ctrl=,,,20,30,-40 \
+            --set foot_l_ik_ctrl=0.1,0.2,0.15,20,0,10 --set calf_r_pole_ctrl=0.2,0,0 \
+            --set hand_r_ik_ctrl=-0.1,0.1,0.2 --attr hand_r_ik_ctrl.ik_fk=1 --attr foot_r_ik_ctrl.roll=30 \
+            --bones "$p/posed.json"
+          python -I tests/blender_studio_pose_check.py "$p/hive_demo_blender.py" "$p/posed.json"
       - name: Edit guides, add fingers and a tail, and rebuild in Blender
         run: |
           cargo run -q -- demo -o "$RUNNER_TEMP/guides"

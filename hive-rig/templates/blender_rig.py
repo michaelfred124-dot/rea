@@ -1679,6 +1679,36 @@ def reset_pose(rig, names=None):
     return len(names)
 
 
+def add_studio_pose(rig, RIG, name="Studio pose"):
+    """Keep the pose posed in the hive-rig app (`studio_pose`: where it moves
+    each control, as a move of hive-rig's model space, and its settings) in the
+    pose library as `name`, leaving the rig at rest. Returns how many controls
+    it holds, or 0 when the rig has no such pose."""
+    studio = RIG.get("studio_pose")
+    if not studio:
+        return 0
+    turn = Matrix(((1, 0, 0, 0), (0, 0, -1, 0), (0, 1, 0, 0), (0, 0, 0, 1)))  # hive-rig axes to Blender's
+    pose = rig.pose.bones
+
+    def depth(pb):
+        return 0 if pb.parent is None else 1 + depth(pb.parent)
+
+    names = sorted((n for n in studio["controls"] if n in pose), key=lambda n: depth(pose[n]))
+    for n in names:
+        flat = studio["controls"][n]
+        move = Matrix([[flat[col * 4 + row] for col in range(4)] for row in range(4)])
+        pose[n].matrix = turn @ move @ turn.inverted() @ pose[n].bone.matrix_local
+        refresh(rig)
+    for n, values in studio.get("attributes", {}).items():
+        for prop, v in values.items():
+            if n in pose and prop in pose[n].keys():
+                pose[n][prop] = type(pose[n][prop])(v)
+    refresh(rig)
+    count = save_pose(rig, name)
+    reset_pose(rig)
+    return count
+
+
 def set_bone_selected(pb, value):
     if "select" in pb.bl_rna.properties:  # Blender 5: selection lives on the pose bone
         pb.select = value
@@ -2331,7 +2361,10 @@ def main():
     if existing is not None and existing.get("hive_guides"):
         print("hive-rig: %s is already in this file; the Hive tab is ready" % RIG_DATA["name"])
     else:
-        build(RIG_DATA)
+        rig, _ = build(RIG_DATA)
+        # The pose posed in the hive-rig app, if any, in the pose library.
+        if add_studio_pose(rig, RIG_DATA):
+            print("hive-rig: the pose from the hive-rig app is in the pose library as Studio pose")
     register()
 
     # Optional: `-- --save path.blend` when run headless.
