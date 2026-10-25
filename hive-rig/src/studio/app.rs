@@ -190,6 +190,32 @@ pub struct Frame {
     pub mesh: Option<Vec<Vec3>>,
 }
 
+/// How joints and bones are drawn in the viewport.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct JointDisplay {
+    /// Joints and bones are drawn at all.
+    pub show: bool,
+    /// Drawn over the mesh; off, the mesh in front hides them.
+    pub xray: bool,
+    /// Display size, a factor on the size picked from the character's height.
+    pub size: f32,
+}
+
+impl JointDisplay {
+    pub const MIN_SIZE: f32 = 0.25;
+    pub const MAX_SIZE: f32 = 3.0;
+}
+
+impl Default for JointDisplay {
+    fn default() -> Self {
+        JointDisplay {
+            show: true,
+            xray: true,
+            size: 1.0,
+        }
+    }
+}
+
 /// The weight brush: what it does, how big and how strong.
 #[derive(Clone, Copy, Debug)]
 pub struct Brush {
@@ -235,6 +261,10 @@ pub struct Studio {
     pub naming_draft: Option<Naming>,
     pub show_mesh: bool,
     pub xray: bool,
+    /// Joint and bone display: shown, drawn through the mesh, and their size.
+    pub joints: JointDisplay,
+    /// The joint display menu under the camera pill is open.
+    pub display_open: bool,
     /// Deform bone whose weights colour the mesh (needs a built rig).
     pub weights_bone: Option<String>,
     /// The weight brush is on: dragging on the mesh paints `weights_bone`.
@@ -317,6 +347,8 @@ impl Default for Studio {
             naming_draft: None,
             show_mesh: true,
             xray: false,
+            joints: JointDisplay::default(),
+            display_open: false,
             weights_bone: None,
             painting: false,
             brush: Brush::default(),

@@ -66,12 +66,17 @@ impl Camera {
         let proj = directx::perspective(self.fov_y, aspect, self.dist * 0.01, self.dist * 100.0);
         let view = look_at_mat4(self.eye(), self.target, Vec3::Y);
         let vp = proj * view;
+        let forward = (self.target - self.eye()).normalize();
+        let right = forward.cross(Vec3::Y).normalize_or(Vec3::X);
         Projector {
             vp,
             inv: vp.inverse(),
             rect,
             eye: self.eye(),
-            forward: (self.target - self.eye()).normalize(),
+            forward,
+            right,
+            up: right.cross(forward),
+            focal: rect.height().max(1.0) / (2.0 * (self.fov_y * 0.5).tan()),
         }
     }
 }
@@ -82,6 +87,11 @@ pub struct Projector {
     pub rect: Rect,
     pub eye: Vec3,
     pub forward: Vec3,
+    /// The camera's screen right and up, in world space.
+    pub right: Vec3,
+    pub up: Vec3,
+    /// Pixels per world unit at one unit in front of the camera.
+    focal: f32,
 }
 
 impl Projector {
@@ -95,6 +105,17 @@ impl Projector {
         let x = self.rect.left() + (ndc.x + 1.0) * 0.5 * self.rect.width();
         let y = self.rect.top() + (1.0 - ndc.y) * 0.5 * self.rect.height();
         Some((Pos2::new(x, y), ndc.z))
+    }
+
+    /// Pixels per world unit at `p`'s depth (0 behind the camera), for sizing
+    /// things drawn on screen at a world size.
+    pub fn scale_at(&self, p: Vec3) -> f32 {
+        let depth = (p - self.eye).dot(self.forward);
+        if depth <= 1e-6 {
+            0.0
+        } else {
+            self.focal / depth
+        }
     }
 
     pub fn pos(&self, p: Vec3) -> Option<Pos2> {
@@ -179,7 +200,9 @@ struct TriLook {
 /// vertex (for the weight view). Otherwise each piece takes its material's
 /// colour, vertex colours and, where `textures` has its image loaded (one
 /// entry per mesh image), the base colour texture; pieces without a material
-/// are `base`. `alpha` below 1 lets the bones show through.
+/// are `base`. `alpha` below 1 lets the bones show through. `inside` are skeleton
+/// pieces (sorted far to near) to sort in among the triangles, so the mesh in
+/// front of a joint hides it.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_mesh(
     painter: &egui::Painter,
@@ -190,6 +213,7 @@ pub fn draw_mesh(
     vertex_colors: Option<&[Color32]>,
     textures: Option<&[Option<egui::TextureId>]>,
     alpha: f32,
+    inside: &[crate::joints::Prim],
 ) {
     let screen: Vec<Option<(Pos2, f32)>> = positions.iter().map(|&p| pr.project(p)).collect();
     // Each triangle's look, from its piece's material.
@@ -240,7 +264,15 @@ pub fn draw_mesh(
             painter.add(Shape::mesh(std::mem::take(out)));
         }
     };
-    for (_, k, t) in tris {
+    let mut inside = inside.iter().peekable();
+    for (depth, k, t) in tris {
+        // Skeleton pieces farther than this triangle go first.
+        if inside.peek().is_some_and(|p| p.depth > depth) {
+            flush(&mut out);
+            while let Some(p) = inside.next_if(|p| p.depth > depth) {
+                crate::joints::paint_one(painter, p);
+            }
+        }
         let look = looks.get(k).copied().unwrap_or(plain);
         let texture_id = look.texture.map_or(egui::TextureId::default(), |t| t.0);
         if out.texture_id != texture_id {
@@ -288,6 +320,9 @@ pub fn draw_mesh(
         out.add_triangle(base_index, base_index + 1, base_index + 2);
     }
     flush(&mut out);
+    for p in inside {
+        crate::joints::paint_one(painter, p);
+    }
 }
 
 /// Model-space line strips, such as a control's outline. A strip that crosses

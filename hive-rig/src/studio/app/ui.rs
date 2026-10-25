@@ -25,6 +25,7 @@ use hive_rig::template::{self, Listed, Scope, Source, Template};
 use super::{
     Category, Doc, Drag, FingerSides, Mode, Pose, RigPick, Studio, Tool, count, push_undo,
 };
+use crate::joints;
 use crate::theme::{
     self, ACCENT, BORDER, CARD, CARD_HI, ERR, OK, TEXT, TEXT_DIM, TEXT_FAINT, WARN,
 };
@@ -37,7 +38,12 @@ const PICK_RADIUS: f32 = 10.0;
 /// size on screen, the guide's own centre inside them, and the reach of the ring.
 const HANDLE_HALF: f32 = 11.0;
 const HANDLE_CORE: f32 = 6.5;
-const HANDLE_RADIUS: f32 = 16.0;
+/// How far past the bracket corners a handle still grabs.
+const HANDLE_REACH: f32 = 2.0;
+/// Joint size as a fraction of the character's height, at display size 1.
+const JOINT_SIZE: f32 = 0.0095;
+/// Reach, in pixels, around bones too thin to hit on screen.
+const BONE_REACH: f32 = 6.0;
 const HANDLE: Color32 = Color32::from_rgb(230, 52, 52);
 const JOINT: Color32 = Color32::from_rgb(255, 205, 60);
 /// Picked parts, Maya-style light blue.
@@ -75,6 +81,18 @@ fn side_color(side: Side) -> Color32 {
         Side::Left => theme::LEFT,
         Side::Right => theme::RIGHT,
     }
+}
+
+/// A deform bone's colour: its side's colour, softened so the shading reads.
+fn bone_tint(side: Side) -> Color32 {
+    let c = side_color(side);
+    let m = |x: u8, g: u8| ((x as f32) * 0.78 + (g as f32) * 0.22) as u8;
+    Color32::from_rgb(m(c.r(), 200), m(c.g(), 200), m(c.b(), 205))
+}
+
+/// Half the size of a component's handle brackets, around a guide ring of radius `r`.
+fn handle_half(r: f32) -> f32 {
+    (r + 6.0).max(HANDLE_HALF)
 }
 
 fn side_label(side: Side) -> &'static str {
@@ -541,10 +559,20 @@ impl Studio {
     }
 
     fn camera_pill(&mut self, ctx: &egui::Context) {
+        let mut toggle: Option<Rect> = None;
         floating_area("camera", Align2::RIGHT_TOP, Vec2::new(-EDGE, EDGE)).show(ctx, |ui| {
             pill_frame().show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
+                    let r = joints_button(ui, self.display_open);
+                    if r.clicked() {
+                        self.display_open = !self.display_open;
+                    }
+                    toggle = Some(r.rect);
+                    ui.add_space(4.0);
+                    let (line, _) = ui.allocate_exact_size(Vec2::new(1.0, 18.0), Sense::hover());
+                    ui.painter().rect_filled(line, 0.0, BORDER);
+                    ui.add_space(4.0);
                     for (name, yaw, pitch) in [
                         ("Front", 0.0, 0.05),
                         ("Side", std::f32::consts::FRAC_PI_2, 0.05),
@@ -565,6 +593,61 @@ impl Studio {
                 });
             });
         });
+        if self.display_open {
+            self.joint_display_menu(ctx, toggle);
+        }
+    }
+
+    /// The joint display options under the camera pill: shown or hidden, drawn
+    /// through the mesh or not, and their size.
+    fn joint_display_menu(&mut self, ctx: &egui::Context, toggle: Option<Rect>) {
+        let area = floating_area("joint_display", Align2::RIGHT_TOP, Vec2::new(-EDGE, EDGE + 46.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                panel_frame().show(ui, |ui| {
+                    ui.set_width(236.0);
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    theme::label_caps(ui, "Joints");
+                    ui.horizontal(|ui| {
+                        theme::pill(ui, &mut self.joints.show, "Show")
+                            .on_hover_text("Draw the joints and bones");
+                        theme::pill(ui, &mut self.joints.xray, "X-ray")
+                            .on_hover_text("Draw the joints through the mesh");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Size").color(TEXT_DIM));
+                        ui.spacing_mut().slider_width = 150.0;
+                        ui.add_enabled(
+                            self.joints.show,
+                            egui::Slider::new(
+                                &mut self.joints.size,
+                                super::JointDisplay::MIN_SIZE..=super::JointDisplay::MAX_SIZE,
+                            )
+                            .logarithmic(true)
+                            .max_decimals(2),
+                        );
+                    });
+                    ui.label(
+                        RichText::new(if self.joints.xray {
+                            "Joints show through the mesh."
+                        } else {
+                            "The mesh hides the joints inside it. Turn on X-ray (mesh) to see through it."
+                        })
+                        .size(12.0)
+                        .color(TEXT_FAINT),
+                    );
+                });
+            });
+        // A click anywhere else closes it.
+        let clicked_away = ctx.input(|i| {
+            i.pointer.any_pressed()
+                && i.pointer.interact_pos().is_some_and(|p| {
+                    !area.response.rect.contains(p) && !toggle.is_some_and(|t| t.contains(p))
+                })
+        });
+        if clicked_away {
+            self.display_open = false;
+        }
     }
 
     // ----------------------------------------------------------------------- notifications
@@ -3007,12 +3090,13 @@ impl Studio {
                     continue;
                 };
                 let d = s.distance(at);
-                // A component's first guide sits inside its handle: only the centre
-                // grabs the guide, the ring around it grabs the component.
+                let r = self.guide_radius(pr, g.position, c.kind);
+                // A component's first guide sits inside its handle: only the ring
+                // grabs the guide, the brackets around it grab the component.
                 let reach = if gi == 0 && c.kind != Kind::Root {
-                    HANDLE_CORE
+                    r.max(HANDLE_CORE)
                 } else {
-                    PICK_RADIUS
+                    (r + 3.0).max(PICK_RADIUS)
                 };
                 // Nearest on screen; ties (overlapping guides) go to the nearer one.
                 if d <= reach && best.is_none_or(|b| (d, depth) < (b.0, b.1)) {
@@ -3026,14 +3110,25 @@ impl Studio {
     /// The control or bone under the pointer in the build stages. Controls win over
     /// the bones beneath them.
     fn pick_rig(&self, pr: &Projector, at: Pos2) -> Option<RigPick> {
+        let frame = self.frame()?;
+        self.pick_rig_in(pr, at, &frame)
+    }
+
+    /// `pick_rig` on a frame already worked out.
+    fn pick_rig_in(&self, pr: &Projector, at: Pos2, frame: &super::Frame) -> Option<RigPick> {
         if self.mode == Mode::Guides {
             return None;
         }
         let doc = self.doc.as_ref()?;
         let built = doc.preview.as_ref().ok()?;
-        let frame = self.frame()?;
         let mut best: Option<(f32, RigPick)> = None;
-        for (i, c) in built.controls.controls.iter().enumerate() {
+        // Controls are only drawn, so only picked, in the controls stage.
+        let controls = if self.mode == Mode::Rig {
+            &built.controls.controls[..]
+        } else {
+            &[]
+        };
+        for (i, c) in controls.iter().enumerate() {
             let Some(s) = pr.pos(frame.controls[i]) else {
                 continue;
             };
@@ -3045,19 +3140,152 @@ impl Studio {
         if best.is_some() {
             return best.map(|b| b.1);
         }
-        for (i, b) in built.skeleton.bones.iter().enumerate() {
-            if self.mode == Mode::Rig && !b.deform {
-                continue;
+        // The joints and bones as drawn: the front-most ball or face under the
+        // pointer, unless the mesh hides it.
+        let (shown, specs) = self.bone_specs(Some(frame), None);
+        let prims = joints::build(pr, &specs);
+        let mut max_depth = 1.0;
+        if !self.joints.xray && self.show_mesh {
+            let (o, d) = pr.ray(at);
+            if let Some(hit) = self.hit_mesh(o, d)
+                && let Some((_, depth)) = pr.project(hit)
+            {
+                max_depth = depth;
             }
-            let (Some(h), Some(t)) = (pr.pos(frame.bones[i].0), pr.pos(frame.bones[i].1)) else {
+        }
+        let bones = &built.skeleton.bones;
+        if let Some(k) = joints::hit(&prims, at, max_depth) {
+            return Some(RigPick::Bone(bones[shown[k]].name.clone()));
+        }
+        // Bones too small on screen to hit get a few pixels of reach.
+        for (k, spec) in specs.iter().enumerate() {
+            let (Some(h), Some(t)) = (pr.pos(spec.head), pr.pos(spec.tail)) else {
                 continue;
             };
             let d = distance_to_segment(at, h, t);
-            if d <= PICK_RADIUS && best.as_ref().is_none_or(|x| d < x.0) {
-                best = Some((d, RigPick::Bone(b.name.clone())));
+            // Hidden behind the mesh there, as the drawn pieces are.
+            let along = (at - h).dot(t - h) / (t - h).length_sq().max(1e-6);
+            let near = spec.head.lerp(spec.tail, along.clamp(0.0, 1.0));
+            let hidden = pr.project(near).is_none_or(|(_, z)| z > max_depth);
+            if !hidden && d <= BONE_REACH && best.as_ref().is_none_or(|x| d < x.0) {
+                best = Some((d, RigPick::Bone(bones[shown[k]].name.clone())));
             }
         }
         best.map(|b| b.1)
+    }
+
+    /// The joints' size before any bone shortens it: a fraction of the
+    /// character's height, times the display size.
+    pub fn joint_base(&self) -> f32 {
+        let height = self.doc.as_ref().map_or(1.8, |d| d.guides.body.height);
+        height * JOINT_SIZE * self.joints.size
+    }
+
+    /// A guide's ring radius on screen, from the joint display size.
+    pub fn guide_radius(&self, pr: &Projector, p: Vec3, kind: Kind) -> f32 {
+        let r = (self.joint_base() * 1.45 * pr.scale_at(p)).clamp(4.5, 24.0);
+        if kind == Kind::Face {
+            (r * 0.65).max(3.5)
+        } else {
+            r
+        }
+    }
+
+    /// The bones to draw in the current stage, as the indices of the skeleton's
+    /// bones they draw and how each looks. Empty with the joints hidden.
+    pub fn bone_specs(
+        &self,
+        frame: Option<&super::Frame>,
+        hover: Option<&str>,
+    ) -> (Vec<usize>, Vec<joints::BoneSpec>) {
+        let Some(doc) = &self.doc else {
+            return Default::default();
+        };
+        let Ok(built) = &doc.preview else {
+            return Default::default();
+        };
+        if !self.joints.show {
+            return Default::default();
+        }
+        let bones = &built.skeleton.bones;
+        let ends: Vec<(Vec3, Vec3)> = bones
+            .iter()
+            .enumerate()
+            .map(|(i, b)| frame.map_or((b.head, b.tail), |f| f.bones[i]))
+            .collect();
+        let lens: Vec<f32> = ends.iter().map(|(h, t)| h.distance(*t)).collect();
+        let base = self.joint_base();
+        // Bones with a child starting at their tail end there in the child's
+        // joint; the others get an end joint.
+        let mut carried = vec![false; bones.len()];
+        for (j, b) in bones.iter().enumerate() {
+            if let Some(p) = b.parent
+                && ends[j].0.distance(ends[p].1) < 0.5 * base
+            {
+                carried[p] = true;
+            }
+        }
+        let guides = self.mode == Mode::Guides;
+        let weighted = (!self.skin_tools.color_all)
+            .then_some(self.weights_bone.as_deref())
+            .flatten();
+        let (mut shown, mut specs) = (Vec::new(), Vec::new());
+        for (i, b) in bones.iter().enumerate() {
+            if self.mode == Mode::Rig && !b.deform {
+                continue;
+            }
+            // Short bones (fingers, toes, face) get smaller joints.
+            let short = [Some(lens[i]), b.parent.map(|p| lens[p])]
+                .into_iter()
+                .flatten()
+                .filter(|l| *l > 1e-5)
+                .fold(f32::INFINITY, f32::min);
+            let mut radius = base.min(0.45 * short).max(0.3 * base);
+            // Twist helpers sit along their limb: smaller, so the limb's own
+            // joints stay the ones that read.
+            let twist = b.twist.is_some();
+            if twist {
+                radius *= 0.7;
+            }
+            if self.mode == Mode::Rig {
+                radius *= 0.85;
+            }
+            // The preview uses internal names; the weights list uses exported ones.
+            let picked = self.rig_pick == Some(RigPick::Bone(b.name.clone()))
+                || weighted.is_some_and(|w| w == doc.guides.naming.bone(&b.name));
+            let state = if guides {
+                joints::State::Normal
+            } else if picked {
+                joints::State::Picked
+            } else if hover == Some(b.name.as_str()) {
+                joints::State::Hover
+            } else {
+                joints::State::Normal
+            };
+            let color = if b.deform {
+                bone_tint(b.side)
+            } else {
+                Color32::from_rgb(128, 133, 146)
+            };
+            shown.push(i);
+            specs.push(joints::BoneSpec {
+                head: ends[i].0,
+                tail: ends[i].1,
+                radius,
+                // In the guides stage the guides are the joints.
+                joint: !guides,
+                end: !guides && !carried[i],
+                color,
+                state,
+                alpha: match self.mode {
+                    Mode::Guides => 0.4,
+                    Mode::Rig => 0.9,
+                    Mode::Skeleton => 1.0,
+                },
+                width: if b.deform && !twist { 1.0 } else { 0.6 },
+            });
+        }
+        (shown, specs)
     }
 
     /// The red handle of a component under the pointer, if any. Each component
@@ -3074,8 +3302,13 @@ impl Studio {
             .enumerate()
             .filter(|(_, c)| c.kind != Kind::Root)
             .filter_map(|(ci, c)| {
-                let d = pr.pos(c.guides.first()?.position)?.distance(at);
-                (d <= HANDLE_RADIUS).then_some((d, ci))
+                let first = c.guides.first()?.position;
+                let d = pr.pos(first)?.distance(at);
+                // Out to the bracket corners and a little past.
+                let reach = handle_half(self.guide_radius(pr, first, c.kind))
+                    * std::f32::consts::SQRT_2
+                    + HANDLE_REACH;
+                (d <= reach).then_some((d, ci))
             })
             .min_by(|a, b| a.0.total_cmp(&b.0))
             .map(|(_, ci)| ci)
@@ -3093,12 +3326,14 @@ impl Studio {
             if c.kind == Kind::Root {
                 continue;
             }
-            let Some(at) = c.guides.first().and_then(|g| pr.pos(g.position)) else {
+            let Some(first) = c.guides.first().map(|g| g.position) else {
                 continue;
             };
+            let Some(at) = pr.pos(first) else { continue };
             let live = hot == Some(ci) || self.handle_drag == Some(ci);
             let picked = self.picked.iter().any(|(id, _)| *id == c.id);
-            let half = HANDLE_HALF + if live { 2.0 } else { 0.0 };
+            let half =
+                handle_half(self.guide_radius(pr, first, c.kind)) + if live { 2.0 } else { 0.0 };
             if live {
                 painter.rect_filled(
                     Rect::from_center_size(at, Vec2::splat(2.0 * half)),
@@ -3130,6 +3365,19 @@ impl Studio {
         };
         let Some(doc) = &self.doc else { return };
         let frame = self.frame();
+        // The bone under the pointer lights up (not while dragging something).
+        let idle = self.drag.is_none() && self.posing.gizmo.is_none() && self.stroke.is_none();
+        let hover_bone = match (pointer, &frame) {
+            (Some(p), Some(f)) if idle && pr.rect.contains(p) => match self.pick_rig_in(pr, p, f) {
+                Some(RigPick::Bone(b)) => Some(b),
+                _ => None,
+            },
+            _ => None,
+        };
+        let (_, specs) = self.bone_specs(frame.as_ref(), hover_bone.as_deref());
+        let skeleton = joints::build(pr, &specs);
+        // Without joint x-ray the mesh in front hides the joints.
+        let occluded = self.show_mesh && !self.joints.xray;
         if self.show_mesh {
             let alpha = if self.xray { 0.3 } else { 1.0 };
             let base = Color32::from_rgb(168, 172, 182);
@@ -3144,12 +3392,17 @@ impl Studio {
                 colors.as_deref(),
                 Some(&textures),
                 alpha,
+                if occluded { &skeleton } else { &[] },
             );
         }
         let Ok(built) = &doc.preview else { return };
         let bones = &built.skeleton.bones;
         let frame = frame.as_ref();
+        if !occluded {
+            joints::paint(painter, &skeleton);
+        }
 
+        // Controls over the skeleton, as animators pick them.
         if self.mode == Mode::Rig {
             for (i, c) in built.controls.controls.iter().enumerate() {
                 let position = frame.map_or(c.position, |f| f.controls[i]);
@@ -3172,33 +3425,6 @@ impl Studio {
                     &outline,
                     Stroke::new(if picked { 3.5 } else { 2.0 }, rgb(c.color)),
                 );
-            }
-        }
-        let bone_alpha = if self.mode == Mode::Guides { 0.45 } else { 1.0 };
-        for (i, b) in bones.iter().enumerate() {
-            if self.mode == Mode::Rig && !b.deform {
-                continue;
-            }
-            let (head, tail) = frame.map_or((b.head, b.tail), |f| f.bones[i]);
-            let (Some(h), Some(t)) = (pr.pos(head), pr.pos(tail)) else {
-                continue;
-            };
-            // The preview uses internal names; the weights list uses exported ones.
-            let picked = self.rig_pick == Some(RigPick::Bone(b.name.clone()));
-            let weighted = weights
-                .as_deref()
-                .is_some_and(|w| w == doc.guides.naming.bone(&b.name));
-            let color = if picked || weighted {
-                ACCENT
-            } else if b.deform {
-                Color32::from_rgb(226, 228, 236)
-            } else {
-                Color32::from_rgb(130, 134, 150)
-            };
-            bone_shape(painter, h, t, color.gamma_multiply(bone_alpha));
-            // In the guides stage the guides are the joints.
-            if self.mode != Mode::Guides {
-                joint_marker(painter, h, if picked { ACCENT } else { JOINT });
             }
         }
         if self.mode != Mode::Guides {
@@ -3253,6 +3479,11 @@ impl Studio {
             let order = self.picked.iter().position(|(id, _)| *id == c.id);
             let picked = order.is_some();
             let pts: Vec<Option<Pos2>> = c.guides.iter().map(|g| pr.pos(g.position)).collect();
+            let radii: Vec<f32> = c
+                .guides
+                .iter()
+                .map(|g| self.guide_radius(pr, g.position, c.kind))
+                .collect();
             // Link the component to the bone it hangs from.
             if let (Some(parent), Some(Some(first))) = (&c.parent, pts.first())
                 && let Some(pb) = bones.iter().find(|b| &b.name == parent)
@@ -3278,10 +3509,17 @@ impl Studio {
                     }
                 }
             } else if c.kind != Kind::Face {
-                // Face guides are separate joints, not a chain.
-                for w in pts.windows(2) {
+                // Face guides are separate joints, not a chain. Links run from
+                // ring to ring, so the rings stay open.
+                for (k, w) in pts.windows(2).enumerate() {
                     if let [Some(a), Some(b)] = w {
-                        painter.line_segment([*a, *b], line);
+                        let (ra, rb) = (radii[k], radii[k + 1]);
+                        let d = *b - *a;
+                        let len = d.length();
+                        if len > ra + rb + 2.0 {
+                            let dir = d / len;
+                            painter.line_segment([*a + dir * ra, *b - dir * rb], line);
+                        }
                     }
                 }
             }
@@ -3289,29 +3527,42 @@ impl Studio {
                 let Some(p) = p else { continue };
                 let sel = self.selected == Some((ci, Some(gi)));
                 let hot = hover == Some((ci, gi));
-                let scale = if c.kind == Kind::Face { 0.6 } else { 1.0 };
-                let r = if sel || hot { 7.0 } else { 5.5 } * scale;
+                let r = radii[gi] + if sel || hot { 1.5 } else { 0.0 };
                 if sel || hot {
-                    painter.circle_filled(*p, r + 5.0, JOINT.gamma_multiply(0.22));
+                    painter.circle_filled(*p, r + 5.0, side_color(c.side).gamma_multiply(0.2));
                 }
-                let ring = match (sel, picked) {
-                    (true, _) => Stroke::new(2.4, Color32::WHITE),
-                    (_, true) => Stroke::new(2.0, PICK),
-                    _ => Stroke::new(1.8, JOINT),
+                let color = match (sel, picked) {
+                    (true, _) => Color32::WHITE,
+                    (_, true) => PICK,
+                    _ => side_color(c.side),
+                };
+                // The notch aims down the chain, the way the joint will point.
+                let aim = if matches!(c.kind, Kind::Face | Kind::Eyes | Kind::Root) {
+                    None
+                } else {
+                    let next = pts.get(gi + 1).copied().flatten();
+                    let prev = gi.checked_sub(1).and_then(|k| pts[k]);
+                    match (next, prev) {
+                        (Some(n), _) => Some(n - *p),
+                        (None, Some(q)) => Some(*p - q),
+                        _ => None,
+                    }
+                    .filter(|d| d.length() > 1.0)
+                    .map(|d| d.normalized())
                 };
                 // Eyes get a wide ring like an eye control; the root a double ring.
                 if c.kind == Kind::Eyes && gi < 2 {
-                    painter.circle_stroke(*p, r + 8.0, Stroke::new(1.6, ring.color));
+                    painter.circle_stroke(*p, r + 7.0, Stroke::new(1.4, color));
                 }
                 if c.kind == Kind::Root {
-                    painter.circle_stroke(*p, r + 9.0, Stroke::new(1.6, ring.color));
+                    painter.circle_stroke(*p, r + 7.0, Stroke::new(1.6, color));
                     painter.circle_stroke(
                         *p,
-                        r + 13.0,
-                        Stroke::new(1.0, ring.color.gamma_multiply(0.6)),
+                        r + 11.0,
+                        Stroke::new(1.0, color.gamma_multiply(0.6)),
                     );
                 }
-                guide_control(painter, *p, r, ring, side_color(c.side));
+                guide_ring(painter, *p, r, color, if sel { 2.6 } else { 2.0 }, aim);
                 let mark = marks.get(&(ci, gi));
                 if let Some(issue) = mark {
                     let color = match issue.severity {
@@ -3323,11 +3574,11 @@ impl Studio {
                 if sel || hot {
                     label_chip(
                         painter,
-                        *p + Vec2::new(14.0, -14.0),
+                        *p + Vec2::new(r + 9.0, -(r + 9.0)),
                         &format!("{}  ·  {}", c.id, c.guides[gi].name),
                     );
                     if let Some(issue) = mark {
-                        label_chip(painter, *p + Vec2::new(14.0, 12.0), &issue.message);
+                        label_chip(painter, *p + Vec2::new(r + 9.0, r + 7.0), &issue.message);
                     }
                 }
             }
@@ -4127,7 +4378,7 @@ fn paint_art_backdrop(painter: &egui::Painter, r: Rect, hot: bool) {
 const SKIN: Color32 = Color32::from_rgb(68, 76, 92);
 const BONE: Color32 = Color32::from_rgb(140, 148, 166);
 
-/// A guide drawn as in the view: a yellow ring around a diamond coloured by side.
+/// A guide drawn as in the view: a hollow ring coloured by side.
 fn joint(painter: &egui::Painter, at: Pos2, x: f32, r: f32) {
     let color = if x.abs() < 0.5 {
         theme::CENTER
@@ -4136,13 +4387,7 @@ fn joint(painter: &egui::Painter, at: Pos2, x: f32, r: f32) {
     } else {
         theme::RIGHT
     };
-    guide_control(
-        painter,
-        at,
-        r + 0.6,
-        Stroke::new(1.0, JOINT.gamma_multiply(0.75)),
-        color,
-    );
+    guide_ring(painter, at, r + 0.6, color, 1.3, None);
 }
 
 /// The part a card adds: a honey chain of guide controls, with the red handle
@@ -4163,7 +4408,7 @@ fn hot_chain(painter: &egui::Painter, pts: &[Pos2], width: f32, hot: bool) {
     ));
     let r = width + 1.8;
     for p in pts {
-        guide_control(painter, *p, r, Stroke::new(1.6, honey), honey);
+        guide_ring(painter, *p, r, honey, 1.4, None);
     }
     if width >= 1.8
         && let Some(first) = pts.first()
@@ -4993,7 +5238,48 @@ fn kind_word(kind: ControlKind) -> &'static str {
     }
 }
 
-/// A joint as a small ring with a cross, so it reads as a joint rather than a dot.
+/// The camera pill's joint display button: a joint glyph, "Joints" and a chevron.
+fn joints_button(ui: &mut Ui, open: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(86.0, 26.0), Sense::click());
+    let painter = ui.painter();
+    let hot = response.hovered() || open;
+    if hot {
+        painter.rect_filled(rect, 10, Color32::from_white_alpha(10));
+    }
+    let color = if open { ACCENT } else { TEXT_DIM };
+    // A small bone with its joint.
+    let c = rect.left_center() + Vec2::new(13.0, 0.0);
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            c + Vec2::new(1.0, -3.0),
+            c + Vec2::new(8.0, -6.0),
+            c + Vec2::new(3.0, 1.5),
+        ],
+        color.gamma_multiply(0.55),
+        Stroke::new(1.0, color),
+    ));
+    painter.circle_filled(c, 3.4, color);
+    painter.text(
+        rect.left_center() + Vec2::new(26.0, 0.0),
+        Align2::LEFT_CENTER,
+        "Joints",
+        FontId::proportional(13.0),
+        color,
+    );
+    let k = rect.right_center() - Vec2::new(10.0, 0.0);
+    painter.add(egui::Shape::line(
+        vec![
+            k + Vec2::new(-3.5, -1.5),
+            k + Vec2::new(0.0, 2.0),
+            k + Vec2::new(3.5, -1.5),
+        ],
+        Stroke::new(1.5, color),
+    ));
+    response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("Joint display: show, x-ray, size")
+}
+
 /// Four corner brackets around `at`: a component's handle.
 fn brackets(painter: &egui::Painter, at: Pos2, half: f32, stroke: Stroke) {
     let arm = half * 0.45;
@@ -5004,22 +5290,28 @@ fn brackets(painter: &egui::Painter, at: Pos2, half: f32, stroke: Stroke) {
     }
 }
 
-/// A guide drawn as a joint control: a dark core, a coloured ring and a small
-/// diamond tinted by side, rather than a plain dot.
-fn guide_control(painter: &egui::Painter, at: Pos2, r: f32, ring: Stroke, core: Color32) {
-    painter.circle_filled(at, r, Color32::from_black_alpha(150));
-    painter.circle_stroke(at, r, ring);
-    let d = r * 0.45;
-    painter.add(egui::Shape::convex_polygon(
-        vec![
-            at + Vec2::new(0.0, -d),
-            at + Vec2::new(d, 0.0),
-            at + Vec2::new(0.0, d),
-            at + Vec2::new(-d, 0.0),
-        ],
-        core,
-        Stroke::NONE,
-    ));
+/// A guide: a hollow ring in its side's colour with a pip at the exact spot and
+/// a notch aiming down the chain. Hollow so guides read as placement handles,
+/// apart from the solid joints the build makes from them.
+fn guide_ring(
+    painter: &egui::Painter,
+    at: Pos2,
+    r: f32,
+    color: Color32,
+    width: f32,
+    aim: Option<Vec2>,
+) {
+    let ink = Color32::from_black_alpha(200);
+    painter.circle_filled(at, r, Color32::from_black_alpha(60));
+    painter.circle_stroke(at, r, Stroke::new(width + 2.4, ink));
+    painter.circle_stroke(at, r, Stroke::new(width, color));
+    painter.circle_filled(at, (r * 0.2).max(1.6), color);
+    // The axis tick: out from the ring, down the chain.
+    if let Some(d) = aim {
+        let (from, to) = (at + d * (r - 1.0), at + d * (r + (r * 0.5).max(4.5)));
+        painter.line_segment([from, to], Stroke::new(width + 2.4, ink));
+        painter.line_segment([from, to], Stroke::new(width, color));
+    }
 }
 
 /// A check's marker beside a guide: a small warning triangle with a "!".
@@ -5056,20 +5348,6 @@ fn pole_marker(painter: &egui::Painter, at: Pos2) {
     painter.circle_stroke(at, 9.0, Stroke::new(1.0, POLE.gamma_multiply(0.6)));
 }
 
-fn joint_marker(painter: &egui::Painter, at: Pos2, color: Color32) {
-    painter.circle_filled(at, 4.5, Color32::from_black_alpha(160));
-    painter.circle_stroke(at, 4.5, Stroke::new(1.6, color));
-    let arm = 7.0;
-    painter.line_segment(
-        [at - Vec2::X * arm, at + Vec2::X * arm],
-        Stroke::new(1.0, color),
-    );
-    painter.line_segment(
-        [at - Vec2::Y * arm, at + Vec2::Y * arm],
-        Stroke::new(1.0, color),
-    );
-}
-
 /// Screen distance from `p` to the segment `a`-`b`.
 fn distance_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
     let ab = b - a;
@@ -5097,4 +5375,126 @@ fn bone_shape(painter: &egui::Painter, head: Pos2, tail: Pos2, color: Color32) {
         Stroke::new(1.2, color),
     ));
     painter.circle_filled(head, 2.5, color);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn studio(mode: Mode) -> (Studio, Projector) {
+        let mut s = Studio::default();
+        s.load_demo();
+        assert!(s.build(), "{}", s.status);
+        s.mode = mode;
+        s.camera.yaw = 0.0;
+        s.camera.pitch = 0.05;
+        s.frame_camera();
+        let pr = s
+            .camera
+            .projector(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 860.0)));
+        (s, pr)
+    }
+
+    fn bone(s: &Studio, name: &str) -> (Vec3, Vec3) {
+        let doc = s.doc.as_ref().unwrap();
+        let b = doc.preview.as_ref().unwrap().skeleton.bone(name).unwrap();
+        (b.head, b.tail)
+    }
+
+    fn picks(s: &Studio, pr: &Projector, at: Pos2) -> Option<String> {
+        match s.pick_rig(pr, at) {
+            Some(RigPick::Bone(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn clicks_pick_the_joint_balls_and_bone_bodies_as_drawn() {
+        let (mut s, pr) = studio(Mode::Skeleton);
+        let (head, tail) = bone(&s, "lowerarm_l");
+        // The elbow's ball and the forearm's body, a fifth of the way down
+        // (before its twist helper starts).
+        let elbow = pr.pos(head).unwrap();
+        assert_eq!(picks(&s, &pr, elbow).as_deref(), Some("lowerarm_l"));
+        let body = pr.pos(head + (tail - head) * 0.2).unwrap();
+        assert_eq!(picks(&s, &pr, body).as_deref(), Some("lowerarm_l"));
+        // Well off the arm, nothing.
+        assert_eq!(picks(&s, &pr, elbow + Vec2::new(0.0, 40.0)), None);
+        // Just past the ball's drawn edge misses at size 1 and hits once the
+        // joints are drawn bigger.
+        let r = s.joint_base() * pr.scale_at(head);
+        let past = elbow + Vec2::new(0.0, r * 1.6 + BONE_REACH);
+        assert_eq!(picks(&s, &pr, past), None);
+        s.joints.size = 3.0;
+        assert_eq!(picks(&s, &pr, past).as_deref(), Some("lowerarm_l"));
+        // Hidden joints can't be picked.
+        s.joints.show = false;
+        assert_eq!(picks(&s, &pr, elbow), None);
+    }
+
+    #[test]
+    fn the_mesh_hides_joints_from_picking_without_x_ray() {
+        let (mut s, pr) = studio(Mode::Skeleton);
+        // The chest joint, inside the body.
+        let (head, _) = bone(&s, "spine_02");
+        // A little off the centre line, where the body's mesh has an edge.
+        let at = pr.pos(head).unwrap() + Vec2::new(1.5, 1.0);
+        assert_eq!(picks(&s, &pr, at).as_deref(), Some("spine_02"));
+        s.joints.xray = false;
+        assert_eq!(picks(&s, &pr, at), None);
+        // With the mesh hidden there is nothing in front.
+        s.show_mesh = false;
+        assert_eq!(picks(&s, &pr, at).as_deref(), Some("spine_02"));
+    }
+
+    #[test]
+    fn guide_rings_and_handles_grow_with_the_display_size() {
+        let (mut s, pr) = studio(Mode::Guides);
+        let arm = s.component_index("arm_l").unwrap();
+        let g = &s.doc.as_ref().unwrap().guides.components[arm].guides;
+        let (elbow, first) = (g[2].position, g[0].position);
+        let at = pr.pos(elbow).unwrap();
+        let r = s.guide_radius(&pr, elbow, Kind::Arm);
+        assert!(r > 5.0, "ring radius {r}");
+        assert_eq!(s.pick_guide(&pr, at + Vec2::new(r, 0.0)), Some((arm, 2)));
+        let far = at + Vec2::new(0.0, r + 12.0);
+        assert_eq!(s.pick_guide(&pr, far), None);
+        s.joints.size = 3.0;
+        let big = s.guide_radius(&pr, elbow, Kind::Arm);
+        assert!(big > r + 5.0);
+        assert_eq!(s.pick_guide(&pr, far), Some((arm, 2)));
+        // The brackets around the first guide sit outside its ring and grab
+        // the component, the ring itself the guide.
+        let f = pr.pos(first).unwrap();
+        let rf = s.guide_radius(&pr, first, Kind::Arm);
+        let corner = f + Vec2::splat(handle_half(rf) * 0.9);
+        assert_eq!(s.pick_guide(&pr, corner), None);
+        assert_eq!(s.handle_at(&pr, corner), Some(arm));
+        assert_eq!(s.pick_guide(&pr, f), Some((arm, 0)));
+    }
+
+    #[test]
+    fn rig_stage_shows_deform_bones_and_lights_the_hovered_one() {
+        let (s, _) = studio(Mode::Rig);
+        let (shown, specs) = s.bone_specs(None, Some("calf_l"));
+        let bones = &s
+            .doc
+            .as_ref()
+            .unwrap()
+            .preview
+            .as_ref()
+            .unwrap()
+            .skeleton
+            .bones;
+        assert!(shown.iter().all(|&i| bones[i].deform));
+        assert_eq!(shown.len(), specs.len());
+        let calf = shown
+            .iter()
+            .position(|&i| bones[i].name == "calf_l")
+            .unwrap();
+        assert_eq!(specs[calf].state, joints::State::Hover);
+        // End joints only where no child carries on: the head's tip, not the calf.
+        let head = shown.iter().position(|&i| bones[i].name == "head").unwrap();
+        assert!(specs[head].end && !specs[calf].end);
+    }
 }

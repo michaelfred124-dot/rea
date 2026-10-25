@@ -5,13 +5,14 @@
 //! [--lock BONE] [--bend DEGREES] [--bend-axis x|y|z] [--tools] [--vertices] [--hover] [--library] [--templates] [--export]
 //! [--select COMPONENT[,COMPONENT...]] [--pick NAME] [--pose BONE[=DEGREES[@x|y|z]]] [--shape NAME=WEIGHT]...
 //! [--corrective] [--inbetween WEIGHT] [--sculpt grab|smooth|relax|inflate|erase] [--all-bones]
-//! [--bone-filter TEXT] [--screenshot OUT.ppm]`
+//! [--bone-filter TEXT] [--mode guides|skeleton|rig] [--joint-size SCALE] [--no-joint-xray] [--joints-menu] [--no-toast] [--view front|side|persp] [--zoom FACTOR] [--xray] [--screenshot OUT.ppm]`
 //! (the flags exist so the window can be checked automatically).
 
 // No console window behind the app on Windows.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod app;
+mod joints;
 mod theme;
 mod view;
 
@@ -67,6 +68,22 @@ struct Launch {
     all_bones: bool,
     /// Search the bone list for this.
     bone_filter: Option<String>,
+    /// `--mode guides|skeleton|rig`: the stage the viewport shows.
+    mode: Option<String>,
+    /// `--joint-size SCALE`: the joint display size.
+    joint_size: Option<f32>,
+    /// `--no-joint-xray`: let the mesh hide the joints.
+    no_joint_xray: bool,
+    /// Open the joint display menu.
+    joints_menu: bool,
+    /// Leave the status notification out of the screenshot.
+    no_toast: bool,
+    /// `--view front|side|persp`: turn the camera as the camera pill does.
+    view: Option<String>,
+    /// `--zoom FACTOR`: move the camera in by this factor after framing.
+    zoom: Option<f32>,
+    /// See through the mesh.
+    xray: bool,
     screenshot: Option<PathBuf>,
 }
 
@@ -135,6 +152,16 @@ fn parse_args() -> Launch {
             Some("--bone-filter") => {
                 launch.bone_filter = args.next().map(|s| s.to_string_lossy().into_owned())
             }
+            Some("--mode") => launch.mode = args.next().map(|s| s.to_string_lossy().into_owned()),
+            Some("--joint-size") => {
+                launch.joint_size = args.next().and_then(|s| s.to_str()?.parse().ok())
+            }
+            Some("--no-joint-xray") => launch.no_joint_xray = true,
+            Some("--joints-menu") => launch.joints_menu = true,
+            Some("--no-toast") => launch.no_toast = true,
+            Some("--xray") => launch.xray = true,
+            Some("--zoom") => launch.zoom = args.next().and_then(|s| s.to_str()?.parse().ok()),
+            Some("--view") => launch.view = args.next().map(|s| s.to_string_lossy().into_owned()),
             Some("--shape") => launch
                 .shapes
                 .extend(args.next().map(|s| s.to_string_lossy().into_owned())),
@@ -334,11 +361,42 @@ fn main() -> eframe::Result {
             _ => app::Tool::Select,
         };
     }
+    if let Some(mode) = &launch.mode {
+        studio.mode = match mode.as_str() {
+            "guides" => app::Mode::Guides,
+            "skeleton" => app::Mode::Skeleton,
+            _ => app::Mode::Rig,
+        };
+    }
+    if let Some(size) = launch.joint_size {
+        studio.joints.size = size.clamp(app::JointDisplay::MIN_SIZE, app::JointDisplay::MAX_SIZE);
+    }
+    if launch.no_joint_xray {
+        studio.joints.xray = false;
+    }
+    studio.display_open = launch.joints_menu;
+    if let Some(view) = &launch.view {
+        let (yaw, pitch) = match view.as_str() {
+            "front" => (0.0, 0.05),
+            "side" => (std::f32::consts::FRAC_PI_2, 0.05),
+            _ => (0.55, 0.22),
+        };
+        studio.camera.yaw = yaw;
+        studio.camera.pitch = pitch;
+    }
+    studio.xray |= launch.xray;
+    if let Some(zoom) = launch.zoom.filter(|z| *z > 0.0) {
+        studio.camera.dist /= zoom;
+    }
     // Several ids (comma separated) are picked in order, as with Shift+click.
     for id in launch.select.iter().flat_map(|s| s.split(',')) {
         if let Some(c) = studio.component_index(id) {
             studio.toggle_pick(c, None);
         }
+    }
+
+    if launch.no_toast {
+        studio.status_serial = 0;
     }
 
     let options = eframe::NativeOptions {
