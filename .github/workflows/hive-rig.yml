@@ -46,6 +46,21 @@ jobs:
           xvfb-run -a -s "-screen 0 1400x900x24" cargo run --locked -q --bin HiveRig -- \
             --demo spider --build --screenshot "$RUNNER_TEMP/hive-rig-spider.ppm"
           test "$(head -c 2 "$RUNNER_TEMP/hive-rig-spider.ppm")" = P6
+      - name: Developer API - the scripted example, help-all, ASCII FBX into edits
+        run: |
+          a="$RUNNER_TEMP/api"
+          cargo run --locked -q --example script_rig -- - "$a/script"
+          test -s "$a/script/scripted.hive.json" && test -s "$a/script/scripted.fbx"
+          cargo run --locked -q -- help-all --markdown > "$a.md"
+          grep -q '^### `hive-rig weights copy`' "$a.md"
+          cargo run --locked -q -- demo -o "$a/demo" -t fbx
+          python3 -I tests/fbx_to_ascii.py "$a/demo/hive_demo.fbx" "$a/demo/hive_demo_ascii.fbx"
+          head -1 "$a/demo/hive_demo_ascii.fbx" | grep -q "; FBX 7.4.0 project file"
+          cargo run --locked -q -- edits "$a/demo/hive_demo.hive.json" "$a/demo/hive_demo_ascii.fbx" -o "$a/ascii.edits.json"
+          cargo run --locked -q -- edits "$a/demo/hive_demo.hive.json" "$a/demo/hive_demo.fbx" -o "$a/binary.edits.json"
+          cmp "$a/ascii.edits.json" "$a/binary.edits.json"
+          cargo run --locked -q -- weights import "$a/demo/hive_demo.hive.json" "$a/ascii.edits.json" | tee "$a.log"
+          grep -q "0 of 2676 vertices changed" "$a.log"
       - name: Skin tools - influence limits, prune, copy weights, keep weights on rebuild
         run: |
           s="$RUNNER_TEMP/skin"
@@ -663,6 +678,11 @@ jobs:
             done
             # The same guides (and components) from either file.
             python3 -I tests/compare_guides.py "$f/$m-glb/$m.guides.json" "$f/$m-fbx/$m.guides.json"
+            # The Blender FBX rewritten as ASCII FBX rigs the same, to the byte.
+            python3 -I tests/fbx_to_ascii.py "$f/models/$m/$m.fbx" "$f/models/$m/${m}_ascii.fbx"
+            cargo run -q --release -- rig "$f/models/$m/${m}_ascii.fbx" -n "$m" -o "$f/$m-ascii" -t blender
+            python3 -I tests/compare_guides.py "$f/$m-fbx/$m.guides.json" "$f/$m-ascii/$m.guides.json" --tolerance 0.000001
+            cmp "$f/$m-fbx/$m.glb" "$f/$m-ascii/$m.glb"
           done
           grep -q "^Orientation: up +Y, facing -Z" "$f/Soldier-fbx.log"
           grep -q "^Template: dog" "$f/Fox-fbx.log"

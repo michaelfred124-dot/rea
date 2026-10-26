@@ -1,5 +1,5 @@
 //! Mesh importers: Wavefront OBJ (with its .mtl), glTF 2.0 (.gltf / .glb) and
-//! binary FBX 7.x ([`fbx`]).
+//! FBX 7.x, binary or ASCII ([`fbx`]).
 //!
 //! All keep what the character looks like: every object and material piece,
 //! normals, UV sets, tangents and vertex colours, materials with their texture
@@ -57,7 +57,7 @@ fn extension(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Read a binary FBX and check it has a mesh.
+/// Read an FBX (binary or ASCII) and check it has a mesh.
 fn load_fbx(path: &Path) -> Result<fbx::FbxScene> {
     let scene = fbx::load(path)?;
     if scene.mesh.positions.is_empty() {

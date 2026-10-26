@@ -17,6 +17,12 @@ cargo run --release -- demo -o out/ --creature bird # also dog, spider, snake, h
 cargo run --release -- demo -o out/ --bendy --soft 0.3   # bendy arms and legs with soft IK
 ```
 
+Scripting rig builds (every CLI command and flag, the guides, rig, scene,
+edits and pose file formats, the Rust library and how the Blender, Maya and
+Unreal scripts call back into `hive-rig`) is documented in the
+[developer API](docs/api.md); `hive-rig help-all --markdown` prints its CLI
+reference, and `cargo run --example script_rig` builds a rig from Rust.
+
 ## The Hive Rig app
 
 `HiveRig` (`HiveRig.exe` on Windows) is a desktop rigging app built on the same
@@ -118,8 +124,8 @@ uncompressed, so files are larger than ones written with compression.
 
 ### FBX input
 
-Every command and the app that take a `.glb` also take a binary `.fbx` (7.x,
-from Maya, Blender, 3ds Max, Mixamo or hive-rig itself): `hive-rig rig
+Every command and the app that take a `.glb` also take an `.fbx` (7.x, binary
+or ASCII, from Maya, Blender, 3ds Max, Mixamo or hive-rig itself): `hive-rig rig
 hero.fbx -o out`, `check --mesh hero.fbx`, `shape --from sculpt.fbx`, or
 dropping it on the app. The reader (`src/import/fbx.rs`, inflating with `miniz_oxide`) is written from the
 public binary layout too, with no SDK: it reads 32- and 64-bit records (7.4
@@ -137,7 +143,10 @@ A vertex is split only where its corners' normals, UVs or colours really
 differ (not by rounding noise), so an FBX that Blender made from a `.glb`
 reads back with the `.glb`'s vertices in the same order. Leaf bones an
 exporter adds to mark where a bone ends (Blender's `<bone>_end`) are left out.
-ASCII FBX isn't read (save it as binary). A texture is looked for only under
+ASCII FBX 7.x is read into the same records as binary (`src/import/fbx/ascii.rs`,
+from the public text form: `Name: values { children }` records, `*count { a:
+... }` arrays, `Class::Name` objects, base64 embedded files), so everything
+above holds for both; ASCII 6.x and older isn't read. A texture is looked for only under
 the `.fbx`'s folder: an absolute path in the file keeps just its file name.
 
 ### Mesh fidelity
@@ -350,7 +359,7 @@ with its morph targets) and has hive-rig turn it into the same edits file:
 hive-rig edits out/hero.hive.json hero_unreal_edits.fbx      # writes out/hero.edits.json
 ```
 
-`hive-rig edits` takes any binary FBX exported from the rig's mesh in its rest
+`hive-rig edits` takes any FBX (binary or ASCII) exported from the rig's mesh in its rest
 pose. It finds the file's frame and units from the bones it shares with the rig
 (by name; an affine fit, or a turn and scale for a flat skeleton such as the
 snake's), gives each rig vertex the weights and shape offsets of the file's
@@ -1361,7 +1370,8 @@ the `.glb` it imports. Guides files are always in hive-rig's frame.
 ## Testing
 
 ```bash
-cargo test                       # landmarks, skeleton, skin, controls, glTF and FBX read back
+cargo test                       # landmarks, skeleton, skin, controls, glTF and FBX read back, docs/api.md current
+python3 -I tests/fbx_to_ascii.py hero.fbx hero_ascii.fbx   # a binary FBX rewritten as ASCII, to try the ASCII reader
 python3 tests/dcc_stub_run.py maya out/hive_demo_maya.py      # Python-level check
 python3 tests/dcc_stub_run.py unreal out/hive_demo_unreal.py  # Python-level check
 pip install bpy && python tests/blender_check.py out/hive_demo_blender.py out/hive_demo.glb
@@ -1403,11 +1413,16 @@ vertex, normal, UV, colour, piece, material, texture, blend shape, bone and
 skin influence reads back), on the same file rewritten with compressed arrays,
 64-bit records, a Z-up axis system in inches and a model turned by rotation,
 pre-rotation and pivot, with clusters storing their mesh transform either way
-the format is written in the wild, on damaged and ASCII files, and by reading a
-turned rig's `.fbx` back into the same guides. In CI, Blender's own importer
+the format is written in the wild, on damaged files, and by reading a
+turned rig's `.fbx` back into the same guides. ASCII FBX is tested the same
+way: the record tree written as text (comments, arrays broken over lines,
+`Class::Name` objects, an embedded image as base64) must read as exactly the
+scene its binary file reads as, and cut or changed text must fail cleanly. In CI, Blender's own importer
 and exporter turn public models (Fox, Soldier, Michelle, CesiumMan) into FBX
 files; hive-rig rigs each from its `.glb` and its `.fbx`, and the two guides
-files must agree (`compare_guides.py`), and `blender_skin_eval.py` reads the
+files must agree (`compare_guides.py`); each Blender FBX is also rewritten as
+ASCII by `tests/fbx_to_ascii.py` (written from the format separately from the
+Rust reader) and must rig to the same guides and a byte-identical `.glb`; and `blender_skin_eval.py` reads the
 `.fbx` with Blender's FBX importer and requires every rig vertex to sit on one
 of Blender's, then compares the weights with the artist's. Unknown chains
 (ears, a branching tail, hair, with IK helpers left out, on a biped and on the
@@ -1603,5 +1618,5 @@ glTF-to-Unreal import mirrors, which is untested in Unreal.
 See [the gap list](docs/hive-gaps.md)
 for what's planned. In short: cone and RBF pose readers, guide editing in Unreal (rebuild with the CLI and rerun the script),
 the Unity avatar template and Mixamo names tried in Unity and Unreal,
-the spring hock in the app's posing, the studio pose in Unreal, ASCII FBX input,
+the spring hock in the app's posing, the studio pose in Unreal,
 FBX animation, and the mesh details listed under [Mesh fidelity](#mesh-fidelity).

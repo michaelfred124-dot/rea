@@ -27,7 +27,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Rig a character (.obj, .gltf, .glb or binary .fbx; a biped in T- or A-pose, or an
+    /// Rig a character (.obj, .gltf, .glb or .fbx; a biped in T- or A-pose, or an
     /// animal on four legs). Its up axis and facing are detected (or given with
     /// --up and --forward).
     Rig {
@@ -142,7 +142,7 @@ enum Command {
     Edits {
         /// The `<name>.hive.json` of the rig.
         rig: PathBuf,
-        /// The exported mesh (binary .fbx), in the rig's rest pose.
+        /// The exported mesh (.fbx, binary or ASCII), in the rig's rest pose.
         mesh: PathBuf,
         /// Where to write the edits (default: `<name>.edits.json` next to the rig).
         #[arg(short, long)]
@@ -323,6 +323,12 @@ enum Command {
         /// Centre side token (empty to leave it out).
         #[arg(long)]
         center: Option<String>,
+    },
+    /// Print the help of every command and subcommand, with every flag.
+    HelpAll {
+        /// As Markdown (the CLI reference in docs/api.md is this output).
+        #[arg(long)]
+        markdown: bool,
     },
 }
 
@@ -2961,7 +2967,7 @@ fn main() -> Result<()> {
             anyhow::ensure!(
                 mesh.extension()
                     .is_some_and(|e| e.eq_ignore_ascii_case("fbx")),
-                "{} isn't an .fbx: export the mesh as binary FBX",
+                "{} isn't an .fbx: export the mesh as FBX",
                 mesh.display()
             );
             let scene = hive_rig::import::fbx::load(&mesh)?;
@@ -3200,5 +3206,147 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
+        Command::HelpAll { markdown } => {
+            print!("{}", help_all(markdown));
+            Ok(())
+        }
+    }
+}
+
+/// The help of every command, from clap's own definitions so it can't drift
+/// from the program: Markdown for docs/api.md, or plain text.
+fn help_all(markdown: bool) -> String {
+    use clap::CommandFactory;
+    let mut cli = Cli::command();
+    cli.build();
+    let mut out = String::new();
+    if markdown {
+        for sub in cli.get_subcommands() {
+            help_markdown(sub, "hive-rig", &mut out);
+        }
+    } else {
+        help_text(&mut cli, &mut out);
+    }
+    out
+}
+
+fn help_text(cmd: &mut clap::Command, out: &mut String) {
+    out.push_str(&format!("{}\n\n", cmd.render_long_help()));
+    let names: Vec<String> = cmd
+        .get_subcommands()
+        .map(|s| s.get_name().to_string())
+        .filter(|n| n != "help")
+        .collect();
+    for n in names {
+        if let Some(sub) = cmd.find_subcommand_mut(&n) {
+            out.push_str(&format!("{}\n", "=".repeat(72)));
+            help_text(sub, out);
+        }
+    }
+}
+
+/// One line of text from clap's help, which may wrap over several.
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn help_markdown(cmd: &clap::Command, parent: &str, out: &mut String) {
+    if cmd.get_name() == "help" {
+        return;
+    }
+    let path = format!("{parent} {}", cmd.get_name());
+    out.push_str(&format!("### `{path}`\n\n"));
+    if let Some(about) = cmd.get_long_about().or(cmd.get_about()) {
+        out.push_str(&format!("{}\n\n", one_line(&about.to_string())));
+    }
+    let mut usage = vec![path.clone()];
+    let args: Vec<&clap::Arg> = cmd
+        .get_arguments()
+        .filter(|a| !a.is_hide_set() && !matches!(a.get_id().as_str(), "help" | "version"))
+        .collect();
+    if args.iter().any(|a| !a.is_positional()) {
+        usage.push("[OPTIONS]".into());
+    }
+    for a in args.iter().filter(|a| a.is_positional()) {
+        let name = format!("<{}>", a.get_id().as_str().to_uppercase());
+        let many = matches!(a.get_num_args(), Some(r) if r.max_values() > 1);
+        let name = if many { format!("{name}...") } else { name };
+        usage.push(if a.is_required_set() {
+            name
+        } else {
+            format!("[{name}]")
+        });
+    }
+    if cmd.get_subcommands().any(|s| s.get_name() != "help") {
+        usage.push("<COMMAND>".into());
+    }
+    out.push_str(&format!("```\n{}\n```\n\n", usage.join(" ")));
+    for a in &args {
+        let flag = if a.is_positional() {
+            format!("<{}>", a.get_id().as_str().to_uppercase())
+        } else {
+            let mut f = Vec::new();
+            if let Some(s) = a.get_short() {
+                f.push(format!("-{s}"));
+            }
+            if let Some(l) = a.get_long() {
+                f.push(format!("--{l}"));
+            }
+            let mut f = f.join(", ");
+            if a.get_action().takes_values() {
+                let value = a
+                    .get_value_names()
+                    .and_then(|v| v.first())
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| a.get_id().as_str().to_uppercase());
+                f.push_str(&format!(" <{value}>"));
+            }
+            f
+        };
+        let repeat = if !a.is_positional() && matches!(a.get_action(), clap::ArgAction::Append) {
+            " (repeatable)"
+        } else {
+            ""
+        };
+        let help = a
+            .get_long_help()
+            .or(a.get_help())
+            .map(|h| one_line(&h.to_string()))
+            .unwrap_or_default();
+        let mut extra = Vec::new();
+        let values: Vec<String> = a
+            .get_possible_values()
+            .iter()
+            .filter(|v| !v.is_hide_set())
+            .map(|v| format!("`{}`", v.get_name()))
+            .collect();
+        if !values.is_empty() && a.get_action().takes_values() {
+            extra.push(format!("one of {}", values.join(", ")));
+        }
+        let flag_only = matches!(
+            a.get_action(),
+            clap::ArgAction::SetTrue | clap::ArgAction::SetFalse | clap::ArgAction::Count
+        );
+        let defaults: Vec<String> = a
+            .get_default_values()
+            .iter()
+            .map(|v| v.to_string_lossy().into_owned())
+            .collect();
+        if !defaults.is_empty() && !flag_only {
+            extra.push(format!("default `{}`", defaults.join(",")));
+        }
+        let extra = if extra.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", extra.join("; "))
+        };
+        let sep = if help.is_empty() { "" } else { ": " };
+        out.push_str(&format!("- `{flag}`{repeat}{sep}{help}{extra}\n"));
+    }
+    if !args.is_empty() {
+        out.push('\n');
+    }
+    for sub in cmd.get_subcommands() {
+        help_markdown(sub, &path, out);
     }
 }

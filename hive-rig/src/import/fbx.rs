@@ -1,10 +1,11 @@
-//! Binary FBX (7.x) reader: meshes with their normals, UV sets, vertex
+//! FBX (7.x, binary and ASCII) reader: meshes with their normals, UV sets, vertex
 //! colours, materials and textures, blend shapes, the skeleton and its skin.
 //!
 //! Written from the publicly described binary layout (no FBX SDK): a header
 //! with the version, a tree of named records whose properties are typed
 //! scalars, strings and arrays (arrays optionally zlib-compressed), and a
-//! footer. From 7.5 the record offsets are 64-bit. ASCII FBX isn't read.
+//! footer. From 7.5 the record offsets are 64-bit. ASCII FBX 7.x is read into
+//! the same record tree ([`ascii`]), so everything below serves both.
 //!
 //! The scene is read the way the format describes it: objects (models,
 //! geometry, materials, textures, deformers, poses) joined by connections, each
@@ -48,7 +49,7 @@ pub struct FbxScene {
     pub skin: Vec<Vec<(usize, f32)>>,
 }
 
-/// Read a binary FBX file.
+/// Read an FBX file (binary or ASCII 7.x).
 pub fn load(path: &Path) -> Result<FbxScene> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     read(&bytes, path.parent()).with_context(|| format!("reading {}", path.display()))
@@ -340,14 +341,13 @@ impl Reader<'_> {
     }
 }
 
-/// The top-level records of a binary FBX file, and its version.
+/// The top-level records of a binary or ASCII FBX file, and its version.
 pub(crate) fn parse_records(bytes: &[u8]) -> Result<(u32, Vec<Node>)> {
     if !bytes.starts_with(MAGIC) {
-        let head = &bytes[..bytes.len().min(4096)];
-        if head.windows(18).any(|w| w == b"FBXHeaderExtension") {
-            bail!("this is an ASCII FBX; hive-rig reads binary FBX (7.x): save it as binary");
+        if ascii::looks_ascii(bytes) {
+            return ascii::parse(bytes);
         }
-        bail!("not a binary FBX file");
+        bail!("not an FBX file (binary or ASCII 7.x)");
     }
     ensure!(bytes.len() >= 27, "the FBX header is cut short");
     let version = u32::from_le_bytes(bytes[23..27].try_into().unwrap());
@@ -754,7 +754,7 @@ struct GatheredShape {
     has_normals: bool,
 }
 
-/// Read a binary FBX held in memory. `dir` is where texture files are looked for.
+/// Read an FBX (binary or ASCII 7.x) held in memory. `dir` is where texture files are looked for.
 pub fn read(bytes: &[u8], dir: Option<&Path>) -> Result<FbxScene> {
     let (_, top) = parse_records(bytes)?;
     let doc = Doc::new(&top);
@@ -1449,3 +1449,5 @@ fn texture_image(
 
 #[cfg(test)]
 mod tests;
+
+mod ascii;
