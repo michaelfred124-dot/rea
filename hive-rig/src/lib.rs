@@ -18,6 +18,7 @@
 pub mod checks;
 pub mod components;
 pub mod controls;
+pub mod custom_shapes;
 pub mod demo;
 pub mod edits;
 pub mod export;
@@ -30,6 +31,7 @@ pub mod naming;
 pub mod orient;
 pub mod pose;
 pub mod rig;
+pub mod scene;
 pub mod shapes;
 pub mod skeleton;
 pub mod skin;

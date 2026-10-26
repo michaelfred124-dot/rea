@@ -42,7 +42,16 @@ a joint; with Symmetry on, its twin on the other side follows.
   for quadrupeds, and a custom chain. Its **Templates** category lists saved
   setups (see [Rig templates](#rig-templates)).
 * **The export window** (Ctrl+E) picks the programs (and **Export FBX** for
-  game engines), the naming convention, the file name and the folder.
+  game engines), the naming convention, the file name and the folder. With
+  several characters, **Export every character** writes them all and the
+  scene builders (see [Several characters in one scene](#several-characters-in-one-scene)).
+* **Custom control shapes**: with a control picked, Properties lists your own
+  shapes under the built-in ones. **Draw…** opens a grid to click points on
+  (open or closed lines, several lines, mirrored across the middle), and
+  **Import…** reads an .svg or .json. See [Custom control shapes](#custom-control-shapes).
+* **Characters**: the top of the outliner lists the scene's characters. Click
+  one to edit it while the others stand dimmed beside it; **Add character**
+  and **Build all** are there too.
 
 Every change rebuilds the bone and control preview at once; Ctrl+Z and Ctrl+Y
 undo and redo, Ctrl+B builds, 1/2/3 switch views and F frames the character.
@@ -770,6 +779,52 @@ Unreal draws the look-alike from Control Rig's default shape library in the
 table above. If the library lacks that name, Unreal uses the circle. Those
 names and their orientation haven't been checked in Unreal yet.
 
+#### Custom control shapes
+
+Besides the built-in shapes, a control can be drawn with a shape of your own.
+Shapes are lines of points on a grid from -1 to 1 across the control (x
+right, y up), open or closed, and can be mirrored across the up axis so you
+draw one half. They live in two places: your **shape library**
+(`shapes.json` in `%APPDATA%\hive-rig` on Windows, `~/.config/hive-rig`
+elsewhere, or the file `HIVE_RIG_SHAPES` names), shared by every character,
+and the guides file's `custom_shapes`, so a rig built anywhere has the shapes
+it uses. Rig templates carry the shapes their controls use.
+
+In the app, pick a control: under **Custom shapes** in Properties, click a
+shape to use it (with Symmetry, on the twin too). **Draw…** opens the editor:
+click points on the grid (snapped to eighths unless you turn Snap off; a
+right-click takes the last one back), tick Closed or Mirror X, start a **New
+line**, then name it and **Save and use**: it is saved to your library and put
+on the control. **Import…** takes an .svg
+(polylines, polygons, lines and straight-line paths; curves aren't read) or a
+.json file of points. The **Line width** slider sets how thick the control's
+lines are drawn.
+
+```bash
+# Half a crown drawn with mirror on, kept in the library and the guides
+hive-rig shapes draw crown "0,-0.5 0.75,-0.5 0.875,0.5 0.5,0.125 0.25,0.625 0,0.25" --mirror --guides out/hero.guides.json
+hive-rig shapes draw tick "-0.6,0 -0.2,-0.5 0.7,0.6"        # open line; `|` starts another line, --closed closes
+hive-rig shapes import badge.svg --guides out/hero.guides.json
+hive-rig shapes list --guides out/hero.guides.json
+hive-rig shapes export crown crown.svg                      # or .json
+hive-rig shapes remove crown --guides out/hero.guides.json  # its controls get their built-in shape back
+hive-rig control out/hero.guides.json head_ctrl --custom crown --line-width 3
+hive-rig control out/hero.guides.json hand_l_ik_ctrl --import-shape badge.svg --twin --line-width 0.5
+```
+
+`--custom` takes a shape from the guides or, failing that, the library;
+`--import-shape` imports and uses one in a step. A built-in `--shape` replaces a
+custom one. A .json shape is `{"lines": [{"points": [[x, y], ...], "closed":
+true}], "mirror_x": false}`, a bare list of points, or a library file.
+
+Blender and Maya draw a custom shape exactly, like the built-in ones (its lines
+are in the rig's `outline`). Unreal's Control Rig only draws shapes from its
+shape library, so a custom shape is drawn there as the nearest built-in shape
+(`hive-rig shapes list` names it). Line width is a control's `line_width`
+(default 1): Blender sets the bone's wire width (Blender 4.2 or later, 1 to
+16, so thinner than 1 draws at 1), Maya the curves' Line Width, and Unreal
+uses the library's thin shape below 1.
+
 From the right-click menu, **Import components…** brings the premade parts of
 another guides file in, hung from the bone under the pointer. The CLI has the
 same: `hive-rig import <guides> <other.guides.json> --parent ball_l` and
@@ -777,6 +832,56 @@ same: `hive-rig import <guides> <other.guides.json> --parent ball_l` and
 rig already uses is refused rather than renamed (a parts template renames instead).
 
 Toes (`hive-rig add <guides> toes`) are five chains from each foot's ball.
+
+### Several characters in one scene
+
+A scene file (`<name>.scene.json`) holds several characters, each with its own
+mesh, guides and rig, standing at its own place, and props held across
+characters: a control of one character (usually its prop socket's) that
+follows a bone of another, such as a sword on the hero's hand socket held by
+the rival's left hand.
+
+```bash
+hive-rig scene new duel.scene.json hero=hero.glb rival=demo@-1.45,0,0.15 dog=demo:dog@1.6,0,0.3
+hive-rig scene add duel.scene.json extra=out/extra.hive.json@0,0,-2
+hive-rig scene prop duel.scene.json hero --id sword          # socket in hand_r: control sword_01_r_ctrl
+hive-rig scene hold duel.scene.json --prop hero:sword_01_r_ctrl --holder rival:hand_l --held 1
+hive-rig scene list duel.scene.json
+hive-rig scene build duel.scene.json                         # every character, into duel_rigs/
+hive-rig scene build duel.scene.json --only rival            # one; the others keep their last export
+hive-rig scene release duel.scene.json --prop hero:sword_01_r_ctrl
+hive-rig scene remove duel.scene.json dog                    # and the holds that name it
+```
+
+A character is a mesh file, a saved rig (`.hive.json`: its guides and
+weights come with it) or a demo layout, with `@x,y,z` its place in metres.
+`scene build` writes each character's usual exports and three scene builders:
+
+* `duel_scene_blender.py` builds every character's armature and mesh in one
+  Blender file at its place. A held prop's control gets a Child Of constraint
+  (`Held by rival`) on the holder's bone, its influence driven by a `held`
+  property on the control: 0 keeps the prop on its own socket, 1 puts it in the
+  other hand, and anything between blends; at rest the hold doesn't move it.
+* `duel_scene_maya.py` builds each character in its own namespace (`hero:`,
+  `rival:`), so the same joint names live side by side, places its top group,
+  and puts a `<control>_held` group above the prop control, parent-constrained
+  to the holder's joint and weighted by a `held` attribute on the control.
+  `use("hero")` makes a character current and opens its Hive Rig window.
+* `duel_scene_unreal.py` imports each character and builds its Control Rig,
+  places a Skeletal Mesh actor of each in the open level, and adds a socket
+  `held_<character>_<control>` on the holder's mesh at the holding bone. A
+  Control Rig only sees its own character's bones, so the hold itself isn't
+  built in Unreal: attach a prop mesh to that socket, or bake it in Blender or
+  Maya.
+
+In the app, **File > Open scene…** opens a scene, **Add character to the
+scene…** (or **Add character** in the outliner) brings another character in
+beside the others, and **Save scene…** writes the scene with each built
+character's rig in `<scene>_rigs/` so its weights come back. Each character
+keeps its own undo history and pose. With a prop control picked and more than
+one character, Properties shows **Held by another character**: pick the
+character, the bone and how much it's held, then **Hold**; a dashed line joins
+the prop to the hand.
 
 ### Rig templates
 
@@ -1199,6 +1304,8 @@ cargo test                       # landmarks, skeleton, skin, controls, glTF and
 python3 tests/dcc_stub_run.py maya out/hive_demo_maya.py      # Python-level check
 python3 tests/dcc_stub_run.py unreal out/hive_demo_unreal.py  # Python-level check
 pip install bpy && python tests/blender_check.py out/hive_demo_blender.py out/hive_demo.glb
+python tests/blender_scene_check.py out/duel_rigs/duel_scene_blender.py # several characters, held props
+python3 tests/dcc_stub_run.py maya out/duel_rigs/duel_scene_maya.py      # scene builders run too
 python -I tests/blender_skin_eval.py out/hive_demo.hive.json            # skin weight quality
 sh tests/fetch_skin_models.sh /tmp/models CesiumMan    # real models (pinned), then:
 hive-rig rig /tmp/models/CesiumMan/CesiumMan.glb -o /tmp/cm

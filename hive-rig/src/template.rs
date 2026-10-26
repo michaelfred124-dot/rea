@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::components::{
     self, AddOptions, Component, ControlStyle, Guides, Kind, Preset, id_names, is_premade_part,
 };
+use crate::custom_shapes::CustomShape;
 use crate::naming::Naming;
 use crate::skin::SkinLimits;
 
@@ -56,6 +57,9 @@ pub struct Template {
     /// Control looks keyed by control name, with sizes in body heights.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub control_styles: BTreeMap<String, ControlStyle>,
+    /// The custom shapes those looks use, by name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub custom_shapes: BTreeMap<String, CustomShape>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,8 +182,13 @@ impl Template {
             .filter(|c| picked.contains(c.component.as_str()))
             .filter_map(|c| {
                 let style = g.control_styles.get(&c.name)?;
-                Some((c.name.clone(), scale_style(*style, 1.0 / h)))
+                Some((c.name.clone(), scale_style(style.clone(), 1.0 / h)))
             })
+            .collect::<BTreeMap<String, ControlStyle>>();
+        let custom_shapes = control_styles
+            .values()
+            .filter_map(|s| s.custom.as_ref())
+            .filter_map(|n| Some((n.clone(), g.custom_shapes.get(n)?.clone())))
             .collect();
         Ok(Template {
             format: TEMPLATE_FORMAT.into(),
@@ -191,6 +200,7 @@ impl Template {
             naming: (scope == Scope::Layout && !g.naming.is_default()).then(|| g.naming.clone()),
             skin: (scope == Scope::Layout && !g.skin.is_default()).then_some(g.skin),
             control_styles,
+            custom_shapes,
         })
     }
 
@@ -284,10 +294,11 @@ impl Template {
                     limits.validate()?;
                     out.skin = limits;
                 }
+                out.custom_shapes.extend(self.custom_shapes.clone());
                 out.control_styles = self
                     .control_styles
                     .iter()
-                    .map(|(k, s)| (k.clone(), scale_style(*s, h)))
+                    .map(|(k, s)| (k.clone(), scale_style(s.clone(), h)))
                     .collect();
                 components::build(&out).context("the template doesn't build on this character")?;
                 Applied {
@@ -369,10 +380,11 @@ impl Template {
             applied.added.push(id);
             g.components.push(c);
         }
+        g.custom_shapes.extend(self.custom_shapes.clone());
         for (name, style) in &self.control_styles {
             let name = ctrl_map.get(name).unwrap_or(name);
             g.control_styles
-                .insert(name.clone(), scale_style(*style, g.body.height));
+                .insert(name.clone(), scale_style(style.clone(), g.body.height));
         }
         components::build(g).context("the template's parts don't fit this rig")?;
         Ok(applied)
@@ -629,10 +641,26 @@ mod tests {
             shape: Some(Shape::Cube),
             size: Some(0.2),
             color: Some([0.1, 0.9, 0.2]),
+            ..Default::default()
         };
-        components::set_control_style(&mut g, "tail_01_ctrl", style).unwrap();
+        components::set_control_style(&mut g, "tail_01_ctrl", style.clone()).unwrap();
+        // A drawn shape travels with the look that uses it.
+        let drawn = crate::custom_shapes::CustomShape::line(
+            vec![[0.0, 1.0], [1.0, 0.0], [0.0, -1.0]],
+            false,
+            true,
+        );
+        components::add_custom_shape(&mut g, "kite", drawn.clone()).unwrap();
+        components::add_custom_shape(&mut g, "unused", drawn.clone()).unwrap();
+        let kite = ControlStyle {
+            custom: Some("kite".into()),
+            line_width: Some(3.0),
+            ..Default::default()
+        };
+        components::set_control_style(&mut g, "head_ctrl", kite.clone()).unwrap();
 
         let t = Template::from_guides(&g, None, "studio").unwrap();
+        assert_eq!(t.custom_shapes.keys().collect::<Vec<_>>(), ["kite"]);
         assert_eq!(t.scope, Scope::Layout);
         let text = serde_json::to_string_pretty(&t).unwrap();
         let back = Template::parse(&text).unwrap();
@@ -655,9 +683,20 @@ mod tests {
         }
         assert_eq!(target.naming, g.naming);
         assert_eq!(target.skin, g.skin);
-        let got = target.control_styles["tail_01_ctrl"];
+        let got = target.control_styles["tail_01_ctrl"].clone();
         assert_eq!((got.shape, got.color), (style.shape, style.color));
         assert!((got.size.unwrap() - 0.2).abs() < 1e-6);
+        assert_eq!(target.custom_shapes["kite"], drawn);
+        assert_eq!(target.control_styles["head_ctrl"], kite);
+        let built = components::build(&target).unwrap();
+        assert!(
+            built
+                .controls
+                .control("head_ctrl")
+                .unwrap()
+                .custom
+                .is_some()
+        );
     }
 
     #[test]

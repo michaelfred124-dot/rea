@@ -252,6 +252,18 @@ enum Command {
         /// The shape, by its guides.json name (circle, gear, curved_arrow...).
         #[arg(long)]
         shape: Option<String>,
+        /// A custom shape by name, from the guides or the user's shape library
+        /// (see `hive-rig shapes`).
+        #[arg(long, conflicts_with = "shape")]
+        custom: Option<String>,
+        /// Import a shape (.svg polylines or .json points) into the guides and
+        /// the shape library, and use it on these controls.
+        #[arg(long, conflicts_with_all = ["shape", "custom"])]
+        import_shape: Option<PathBuf>,
+        /// Line thickness, 1 being normal (Blender wire width, Maya line width,
+        /// Unreal's thin or thick shape).
+        #[arg(long)]
+        line_width: Option<f32>,
         /// Radius or half-extent in metres.
         #[arg(long)]
         size: Option<f32>,
@@ -272,6 +284,20 @@ enum Command {
         #[arg(long)]
         reset: bool,
     },
+    /// Custom control shapes: the user's shape library and the ones in a
+    /// guides file. Draw one from points, import one (.svg or .json), export
+    /// one, or remove one.
+    Shapes {
+        #[command(subcommand)]
+        action: ShapesCommand,
+    },
+    /// Several characters in one scene file: make one, add characters and
+    /// props held across characters, and build and export them together or
+    /// one at a time.
+    Scene {
+        #[command(subcommand)]
+        action: SceneCommand,
+    },
     /// Show or set how a guides file names joints and controls on export.
     Naming {
         guides: PathBuf,
@@ -291,6 +317,120 @@ enum Command {
         /// Centre side token (empty to leave it out).
         #[arg(long)]
         center: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ShapesCommand {
+    /// List the shapes in the user's library and, given a guides file, in it.
+    List {
+        #[arg(long)]
+        guides: Option<PathBuf>,
+    },
+    /// Make a shape from points `x,y x,y ...` on a grid centred on the control.
+    Draw {
+        name: String,
+        /// Points as `x,y` pairs separated by spaces; `|` starts another line.
+        #[arg(allow_hyphen_values = true)]
+        points: String,
+        /// Join the last point back to the first.
+        #[arg(long)]
+        closed: bool,
+        /// Mirror the lines across the up axis (draw one half).
+        #[arg(long)]
+        mirror: bool,
+        /// Also keep it in this guides file.
+        #[arg(long)]
+        guides: Option<PathBuf>,
+    },
+    /// Import a shape from an .svg (polylines, polygons, lines, straight paths)
+    /// or a .json file of points, into the library (and a guides file).
+    Import {
+        file: PathBuf,
+        /// The shape's name; the file's name if not given.
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        guides: Option<PathBuf>,
+    },
+    /// Write a shape (from the guides if given, else the library) as .svg or .json.
+    Export {
+        name: String,
+        out: PathBuf,
+        #[arg(long)]
+        guides: Option<PathBuf>,
+    },
+    /// Remove a shape from the library, or from a guides file (its controls get
+    /// their built-in shape back).
+    Remove {
+        name: String,
+        #[arg(long)]
+        guides: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SceneCommand {
+    /// Make a scene file from characters: `NAME=FILE[@x,y,z]`, where FILE is a
+    /// character (.glb, .fbx, .obj), a saved rig (.hive.json) or `demo`,
+    /// `demo:dog`, `demo:bird`... and `@x,y,z` places it in the scene (metres).
+    New {
+        out: PathBuf,
+        #[arg(required = true)]
+        characters: Vec<String>,
+    },
+    /// Add a character to a scene.
+    Add {
+        scene: PathBuf,
+        /// `NAME=FILE[@x,y,z]`, as for `scene new`.
+        character: String,
+    },
+    /// Hold a prop of one character in another's hand: `--prop A:CONTROL`
+    /// (a control of character A, such as its prop socket's) follows
+    /// `--holder B:BONE`, switchable with a `held` setting on the control.
+    Hold {
+        scene: PathBuf,
+        #[arg(long)]
+        prop: String,
+        #[arg(long)]
+        holder: String,
+        /// Start held (1) or on its own socket (0).
+        #[arg(long, default_value_t = 1.0)]
+        held: f32,
+    },
+    /// Stop holding a prop.
+    Release {
+        scene: PathBuf,
+        #[arg(long)]
+        prop: String,
+    },
+    /// List the characters and the held props.
+    List { scene: PathBuf },
+    /// Give a character a prop socket: a one-bone chain in a hand whose
+    /// control carries the prop (and another character can hold).
+    Prop {
+        scene: PathBuf,
+        character: String,
+        /// The bone it hangs from.
+        #[arg(long, default_value = "hand_r")]
+        hand: String,
+        /// The socket component's id.
+        #[arg(long, default_value = "prop_r")]
+        id: String,
+    },
+    /// Take a character out of the scene (and the holds that name it).
+    Remove { scene: PathBuf, character: String },
+    /// Build every character (or `--only` some) and export them with the scene
+    /// builders `<scene>_blender.py`, `_maya.py` and `_unreal.py`.
+    Build {
+        scene: PathBuf,
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// Only these characters (the scene builders then hold the others' last export).
+        #[arg(long, value_delimiter = ',')]
+        only: Vec<String>,
+        #[command(flatten)]
+        common: Common,
     },
 }
 
@@ -993,11 +1133,34 @@ fn parse_color(text: &str) -> Result<[f32; 3]> {
 fn control_command(
     path: &Path,
     names: &[String],
-    change: components::StyleChange,
+    mut change: components::StyleChange,
     scope: components::StyleScope,
     reset: bool,
+    import_shape: Option<&Path>,
 ) -> Result<()> {
     let mut guides = load_guides(path)?;
+    if let Some(file) = import_shape {
+        let (name, shape) = hive_rig::custom_shapes::CustomShape::import(file)?;
+        components::add_custom_shape(&mut guides, &name, shape.clone())?;
+        if let Err(e) = keep_in_library(&name, &shape) {
+            eprintln!("warning: {e:#}");
+        }
+        println!("Imported the shape '{name}' from {}.", file.display());
+        change.custom = Some(name);
+        if names.is_empty() {
+            guides.save(path)?;
+            return Ok(());
+        }
+    }
+    if let Some(name) = &change.custom
+        && !guides.custom_shapes.contains_key(name)
+    {
+        let lib = user_library()?;
+        let shape = lib.shapes.get(name).ok_or_else(|| {
+            anyhow::anyhow!("no custom shape named '{name}' in the guides or the shape library (see `hive-rig shapes list`)")
+        })?;
+        components::add_custom_shape(&mut guides, name, shape.clone())?;
+    }
     let built = components::build(&guides)?;
     let naming = guides.naming.clone();
     // Accept the internal or the exported name.
@@ -1022,10 +1185,16 @@ fn control_command(
         );
         for c in &built.controls.controls {
             let [r, gr, b] = c.color;
+            let shape = match &c.custom {
+                Some(s) => format!("custom:{}", s.name),
+                None => serde_json::to_string(&c.shape)?
+                    .trim_matches('"')
+                    .to_string(),
+            };
             println!(
                 "{:<28} {:<16} {:>6.3} m  {:.2},{:.2},{:.2}{}",
                 naming.control(&c.name),
-                serde_json::to_string(&c.shape)?.trim_matches('"'),
+                shape,
                 c.size,
                 r,
                 gr,
@@ -1041,7 +1210,7 @@ fn control_command(
     }
     anyhow::ensure!(
         reset || change != components::StyleChange::default(),
-        "give --shape, --size, --scale, --color or --reset"
+        "give --shape, --custom, --import-shape, --size, --scale, --color, --line-width or --reset"
     );
     let mut changed = Vec::new();
     for name in names {
@@ -1051,7 +1220,12 @@ fn control_command(
             components::reset_styles(&mut guides, targets.iter().map(|(n, _)| n.as_str()));
             changed.extend(targets.into_iter().map(|(n, _)| n));
         } else {
-            changed.extend(components::restyle(&mut guides, &name, change, scope)?);
+            changed.extend(components::restyle(
+                &mut guides,
+                &name,
+                change.clone(),
+                scope,
+            )?);
         }
     }
     changed.sort();
@@ -1065,6 +1239,352 @@ fn control_command(
         shown.join(", "),
         path.display()
     );
+    Ok(())
+}
+
+/// `CHARACTER:NAME`.
+fn split_ref(text: &str) -> Result<(String, String)> {
+    let (a, b) = text
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("'{text}': give it as CHARACTER:NAME"))?;
+    Ok((a.trim().to_string(), b.trim().to_string()))
+}
+
+fn scene_dir(path: &Path) -> PathBuf {
+    path.parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .to_path_buf()
+}
+
+fn scene_command(action: SceneCommand) -> Result<()> {
+    use hive_rig::scene::{self, BoneRef, Hold, PropRef, Scene};
+    let add_character = |s: &mut Scene, text: &str, dir: &Path| -> Result<()> {
+        let (name, source, offset) = scene::parse_character_arg(text)?;
+        let c = scene::character_from_source(&name, &source, dir, offset)?;
+        println!(
+            "  {} from {} at {:.2},{:.2},{:.2}: {} components",
+            c.name,
+            c.source,
+            offset.x,
+            offset.y,
+            offset.z,
+            c.guides.components.len()
+        );
+        s.add(c)
+    };
+    match action {
+        SceneCommand::New { out, characters } => {
+            let file = out
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let stem = file
+                .strip_suffix(scene::SCENE_SUFFIX)
+                .or_else(|| file.strip_suffix(".json"))
+                .unwrap_or(&file);
+            let mut s = Scene::new(stem);
+            let dir = scene_dir(&out);
+            println!("Scene {}:", s.name);
+            for c in &characters {
+                add_character(&mut s, c, &dir)?;
+            }
+            s.save(&out)?;
+            println!("Saved {}", out.display());
+        }
+        SceneCommand::Add {
+            scene: path,
+            character,
+        } => {
+            let mut s = Scene::load(&path)?;
+            add_character(&mut s, &character, &scene_dir(&path))?;
+            s.save(&path)?;
+            println!("Saved {}", path.display());
+        }
+        SceneCommand::Remove {
+            scene: path,
+            character,
+        } => {
+            let mut s = Scene::load(&path)?;
+            s.remove(&character)?;
+            s.save(&path)?;
+            println!("Removed {character}; saved {}", path.display());
+        }
+        SceneCommand::Prop {
+            scene: path,
+            character,
+            hand,
+            id,
+        } => {
+            let mut s = Scene::load(&path)?;
+            let c = s
+                .character_mut(&character)
+                .ok_or_else(|| anyhow::anyhow!("no character named '{character}'"))?;
+            let control = scene::add_prop_socket(&mut c.guides, &hand, &id)?;
+            s.save(&path)?;
+            println!(
+                "Added a prop socket on {character}'s {hand}: its control is {control}. Saved {}",
+                path.display()
+            );
+        }
+        SceneCommand::Hold {
+            scene: path,
+            prop,
+            holder,
+            held,
+        } => {
+            let mut s = Scene::load(&path)?;
+            let (pc, control) = split_ref(&prop)?;
+            let (hc, bone) = split_ref(&holder)?;
+            s.hold(Hold {
+                prop: PropRef {
+                    character: pc.clone(),
+                    control: control.clone(),
+                },
+                holder: BoneRef {
+                    character: hc.clone(),
+                    bone: bone.clone(),
+                },
+                held,
+            })?;
+            s.save(&path)?;
+            println!(
+                "{pc}'s {control} is held by {hc}'s {bone} (held {held}). Saved {}",
+                path.display()
+            );
+        }
+        SceneCommand::Release { scene: path, prop } => {
+            let mut s = Scene::load(&path)?;
+            let (character, control) = split_ref(&prop)?;
+            anyhow::ensure!(
+                s.release(&PropRef { character, control }),
+                "{prop} isn't held"
+            );
+            s.save(&path)?;
+            println!("Released {prop}. Saved {}", path.display());
+        }
+        SceneCommand::List { scene: path } => {
+            let s = Scene::load(&path)?;
+            println!("Scene {}: {} character(s)", s.name, s.characters.len());
+            for c in &s.characters {
+                println!(
+                    "  {:<16} {:<28} at {:.2},{:.2},{:.2}  {} components{}",
+                    c.name,
+                    c.source,
+                    c.offset.x,
+                    c.offset.y,
+                    c.offset.z,
+                    c.guides.components.len(),
+                    c.rig
+                        .as_ref()
+                        .map(|r| format!(", built: {r}"))
+                        .unwrap_or_default()
+                );
+            }
+            for h in &s.holds {
+                println!(
+                    "  {}:{} held by {}:{} (held {})",
+                    h.prop.character, h.prop.control, h.holder.character, h.holder.bone, h.held
+                );
+            }
+        }
+        SceneCommand::Build {
+            scene: path,
+            out,
+            only,
+            common,
+        } => {
+            let mut s = Scene::load(&path)?;
+            let dir = scene_dir(&path);
+            let out = out.unwrap_or_else(|| dir.join(format!("{}_rigs", s.name)));
+            for c in &mut s.characters {
+                if only.is_empty() || only.contains(&c.name) {
+                    common.skin.apply(&mut c.guides.skin)?;
+                }
+            }
+            let files = scene::build_and_write(
+                &mut s,
+                &dir,
+                &out,
+                &only,
+                &common.output.targets,
+                common.options(),
+            )?;
+            s.save(&path)?;
+            let built: Vec<&str> = s
+                .characters
+                .iter()
+                .filter(|c| only.is_empty() || only.contains(&c.name))
+                .map(|c| c.name.as_str())
+                .collect();
+            println!(
+                "Built {} of {} character(s) ({}) with {} held prop(s):",
+                built.len(),
+                s.characters.len(),
+                built.join(", "),
+                s.holds.len()
+            );
+            for f in files {
+                println!("  {}", f.display());
+            }
+            println!("Saved {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn user_library() -> Result<hive_rig::custom_shapes::ShapeLibrary> {
+    match hive_rig::custom_shapes::library_path() {
+        Some(p) => hive_rig::custom_shapes::ShapeLibrary::load(&p),
+        None => Ok(Default::default()),
+    }
+}
+
+/// Add a shape to the user's library file.
+fn keep_in_library(name: &str, shape: &hive_rig::custom_shapes::CustomShape) -> Result<PathBuf> {
+    let path = hive_rig::custom_shapes::library_path()
+        .ok_or_else(|| anyhow::anyhow!("no home folder for the shape library"))?;
+    let mut lib = hive_rig::custom_shapes::ShapeLibrary::load(&path)?;
+    lib.insert(name, shape.clone())?;
+    lib.save(&path)?;
+    Ok(path)
+}
+
+fn shapes_command(action: ShapesCommand) -> Result<()> {
+    use hive_rig::custom_shapes::CustomShape;
+    let describe = |s: &CustomShape| {
+        let points: usize = s.lines.iter().map(|l| l.points.len()).sum();
+        format!(
+            "{} line(s), {points} points{}, looks like {} in Unreal",
+            s.lines.len(),
+            if s.mirror_x { ", mirrored" } else { "" },
+            s.look_alike().label().to_lowercase()
+        )
+    };
+    let add_to_guides = |path: &Path, name: &str, shape: &CustomShape| -> Result<()> {
+        let mut g = load_guides(path)?;
+        components::add_custom_shape(&mut g, name, shape.clone())?;
+        g.save(path)?;
+        println!("Kept '{name}' in {}.", path.display());
+        Ok(())
+    };
+    match action {
+        ShapesCommand::List { guides } => {
+            let lib = user_library()?;
+            let where_ = hive_rig::custom_shapes::library_path()
+                .map_or_else(|| "(no home folder)".into(), |p| p.display().to_string());
+            println!("Shape library {where_}: {} shape(s)", lib.shapes.len());
+            for (name, s) in &lib.shapes {
+                println!("  {name:<24} {}", describe(s));
+            }
+            if let Some(path) = guides {
+                let g = load_guides(&path)?;
+                println!("In {}: {} shape(s)", path.display(), g.custom_shapes.len());
+                for (name, s) in &g.custom_shapes {
+                    let used = g
+                        .control_styles
+                        .values()
+                        .filter(|st| st.custom.as_deref() == Some(name))
+                        .count();
+                    println!("  {name:<24} {}, on {used} control(s)", describe(s));
+                }
+            }
+        }
+        ShapesCommand::Draw {
+            name,
+            points,
+            closed,
+            mirror,
+            guides,
+        } => {
+            let mut lines = Vec::new();
+            for part in points.split('|') {
+                let pts = part
+                    .split_whitespace()
+                    .map(|p| {
+                        let v: Vec<f32> = p
+                            .split(',')
+                            .map(|x| x.trim().parse::<f32>())
+                            .collect::<std::result::Result<_, _>>()
+                            .map_err(|_| anyhow::anyhow!("'{p}' isn't an x,y point"))?;
+                        anyhow::ensure!(v.len() == 2, "'{p}' isn't an x,y point");
+                        Ok([v[0], v[1]])
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                lines.push(hive_rig::custom_shapes::ShapeLine {
+                    points: pts,
+                    closed,
+                });
+            }
+            let shape = CustomShape {
+                lines,
+                mirror_x: mirror,
+            };
+            shape.validate()?;
+            let lib = keep_in_library(&name, &shape)?;
+            println!(
+                "Saved '{name}' ({}) in {}.",
+                describe(&shape),
+                lib.display()
+            );
+            if let Some(path) = guides {
+                add_to_guides(&path, &name, &shape)?;
+            }
+        }
+        ShapesCommand::Import { file, name, guides } => {
+            let (stem, shape) = CustomShape::import(&file)?;
+            let name = name.unwrap_or(stem);
+            let lib = keep_in_library(&name, &shape)?;
+            println!(
+                "Imported '{name}' ({}) into {}.",
+                describe(&shape),
+                lib.display()
+            );
+            if let Some(path) = guides {
+                add_to_guides(&path, &name, &shape)?;
+            }
+        }
+        ShapesCommand::Export { name, out, guides } => {
+            let shape = match &guides {
+                Some(p) => load_guides(p)?.custom_shapes.get(&name).cloned(),
+                None => user_library()?.shapes.get(&name).cloned(),
+            }
+            .ok_or_else(|| anyhow::anyhow!("no custom shape named '{name}'"))?;
+            let svg = out
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("svg"));
+            let text = if svg {
+                shape.to_svg()
+            } else {
+                serde_json::to_string_pretty(&shape)?
+            };
+            std::fs::write(&out, text)?;
+            println!("Wrote '{name}' to {}.", out.display());
+        }
+        ShapesCommand::Remove { name, guides } => match guides {
+            Some(path) => {
+                let mut g = load_guides(&path)?;
+                let n = components::remove_custom_shape(&mut g, &name)?;
+                g.save(&path)?;
+                println!(
+                    "Removed '{name}' from {}; {n} control(s) have their built-in shape back.",
+                    path.display()
+                );
+            }
+            None => {
+                let path = hive_rig::custom_shapes::library_path()
+                    .ok_or_else(|| anyhow::anyhow!("no home folder for the shape library"))?;
+                let mut lib = hive_rig::custom_shapes::ShapeLibrary::load(&path)?;
+                anyhow::ensure!(
+                    lib.shapes.remove(&name).is_some(),
+                    "no shape named '{name}' in {}",
+                    path.display()
+                );
+                lib.save(&path)?;
+                println!("Removed '{name}' from {}.", path.display());
+            }
+        },
+    }
     Ok(())
 }
 
@@ -2090,6 +2610,9 @@ fn main() -> Result<()> {
             guides,
             controls,
             shape,
+            custom,
+            import_shape,
+            line_width,
             size,
             scale,
             color,
@@ -2099,17 +2622,28 @@ fn main() -> Result<()> {
         } => {
             let change = components::StyleChange {
                 shape: shape.as_deref().map(parse_shape).transpose()?,
+                custom,
                 size,
                 scale,
                 color: color.as_deref().map(parse_color).transpose()?,
+                line_width,
             };
             let scope = match (component, twin) {
                 (true, twins) => components::StyleScope::Component { twins },
                 (false, true) => components::StyleScope::WithTwin,
                 (false, false) => components::StyleScope::One,
             };
-            control_command(&guides, &controls, change, scope, reset)
+            control_command(
+                &guides,
+                &controls,
+                change,
+                scope,
+                reset,
+                import_shape.as_deref(),
+            )
         }
+        Command::Shapes { action } => shapes_command(action),
+        Command::Scene { action } => scene_command(action),
         Command::Naming {
             guides,
             preset,

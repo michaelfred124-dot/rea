@@ -113,6 +113,18 @@ worst = [shape_mismatch(c) for c in RIG_CONTROLS]
 check(all(w is not None and w < 1e-3 for w in worst),
       "every control shape sits on its outline (%d controls, %d shapes)"
       % (len(RIG_CONTROLS), len({c["shape"] for c in RIG_CONTROLS})))
+# Custom shapes (drawn or imported in hive-rig) are drawn from the same
+# outline, and a control's line width is its wire width (Blender 4.2+).
+CUSTOM = [c for c in RIG_CONTROLS if c.get("custom")]
+if CUSTOM:
+    check(all(shape_mismatch(c) is not None and shape_mismatch(c) < 1e-3 for c in CUSTOM),
+          "custom control shapes drawn on their outline (%s)"
+          % ", ".join(sorted({c["custom"]["name"] for c in CUSTOM})))
+WIDE = [c for c in RIG_CONTROLS if c.get("line_width") is not None]
+if WIDE and hasattr(rig.pose.bones[WIDE[0]["name"]], "custom_shape_wire_width"):
+    check(all(abs(rig.pose.bones[c["name"]].custom_shape_wire_width - max(c["line_width"], 1.0)) < 1e-4
+              for c in WIDE),
+          "line width set as the wire width on %d controls" % len(WIDE))
 
 if hasattr(rig.pose.bones[RIG_CONTROLS[0]["name"]], "color"):
     off = max(max(abs(a - b) for a, b in zip(rig.pose.bones[c["name"]].color.custom.normal, c["color"]))

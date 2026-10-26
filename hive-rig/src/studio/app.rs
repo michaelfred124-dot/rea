@@ -60,6 +60,11 @@ pub struct Doc {
     /// The character as read from its file (its own frame), and what was
     /// detected, so the orientation can be changed after opening.
     pub source: Option<SourceFile>,
+    /// Where it stands in the scene, beside the other characters (metres).
+    pub offset: Vec3,
+    /// Where its mesh comes from, for a scene file: the file it was opened
+    /// from, or `demo` / `demo:<creature>`.
+    pub origin: Option<String>,
 }
 
 /// A character as its file has it, before it was turned into hive-rig's frame.
@@ -90,6 +95,8 @@ impl Doc {
             skin_redo: Vec::new(),
             orientation: Orientation::STANDARD,
             source: None,
+            offset: Vec3::ZERO,
+            origin: None,
         };
         doc.refresh();
         doc
@@ -321,6 +328,13 @@ pub struct Studio {
     textures: Option<(u64, Vec<Option<egui::TextureHandle>>)>,
     /// Bumped whenever a document is opened, so caches can tell documents apart.
     doc_serial: u64,
+    /// The scene's other characters and the props held across them.
+    pub cast: cast::Cast,
+    /// The user's custom control shapes, read on first use from `shape_lib_path`.
+    shape_lib: Option<hive_rig::custom_shapes::ShapeLibrary>,
+    pub shape_lib_path: Option<PathBuf>,
+    /// A control shape being drawn in the shape editor.
+    pub shape_draft: Option<control_shapes::ShapeDraft>,
 }
 
 impl Default for Studio {
@@ -375,6 +389,10 @@ impl Default for Studio {
             shape_tools: ShapeTools::default(),
             textures: None,
             doc_serial: 0,
+            cast: cast::Cast::default(),
+            shape_lib: None,
+            shape_lib_path: control_shapes::default_library_path(),
+            shape_draft: None,
         }
     }
 }
@@ -446,7 +464,9 @@ impl Studio {
             .file_name()
             .map(|n| n.to_string_lossy().to_lowercase())
             .unwrap_or_default();
-        let result = if file.ends_with(".guides.json") {
+        let result = if file.ends_with(hive_rig::scene::SCENE_SUFFIX) {
+            self.open_scene(path)
+        } else if file.ends_with(".guides.json") {
             self.open_guides(path)
         } else if file.ends_with(".hive.json") {
             self.open_rig(path)
@@ -476,7 +496,11 @@ impl Studio {
             Choice::default(),
             out_dir,
             &path.display().to_string(),
-        )
+        )?;
+        if let Some(doc) = &mut self.doc {
+            doc.origin = Some(path.to_string_lossy().into_owned());
+        }
+        Ok(())
     }
 
     /// Turn the open character to `choice` (unset parts detected) and place its
@@ -493,8 +517,12 @@ impl Studio {
             src.joints.clone(),
             doc.out_dir.clone(),
         );
+        let (offset, origin) = (doc.offset, doc.origin.clone());
         if let Err(e) = self.place_character(name.clone(), mesh, joints, choice, out_dir, &name) {
             self.fail(format!("Couldn't turn the character: {e:#}"));
+        }
+        if let Some(doc) = &mut self.doc {
+            (doc.offset, doc.origin) = (offset, origin);
         }
     }
 
@@ -579,6 +607,7 @@ impl Studio {
         doc.orientation = rig.orientation;
         // The automatic weights of the saved guides tell its painted vertices apart.
         doc.auto_skin = Some(rig.auto_weights(SkinOptions::default()));
+        doc.origin = Some(path.to_string_lossy().into_owned());
         let pose = rig.pose.clone();
         doc.rig = Some(rig);
         self.set_doc(doc);
@@ -615,13 +644,17 @@ impl Studio {
     pub fn load_demo(&mut self) {
         let mesh = demo::humanoid(0.0);
         let (guides, _) = detect_guides(&mesh);
-        self.set_doc(Doc::new("hive_demo".into(), mesh, guides, demo_out_dir()));
+        let mut doc = Doc::new("hive_demo".into(), mesh, guides, demo_out_dir());
+        doc.origin = Some("demo".into());
+        self.set_doc(doc);
         self.info("Demo character loaded. Drag the guides to adjust, then Build Rig.");
     }
 
     /// Open a built-in creature (dog, bird, spider, snake, horse or dinosaur) with its layout.
     pub fn load_creature(&mut self, c: demo::Creature) {
-        self.set_doc(Doc::new(c.rig_name(), c.mesh(), c.guides(), demo_out_dir()));
+        let mut doc = Doc::new(c.rig_name(), c.mesh(), c.guides(), demo_out_dir());
+        doc.origin = Some(format!("demo:{}", c.name()));
+        self.set_doc(doc);
         self.info(format!(
             "Demo {} loaded. Drag the guides to adjust, then Build Rig.",
             c.name()
@@ -2103,11 +2136,14 @@ fn push_undo(undo: &mut Vec<Guides>, g: &Guides) {
     }
 }
 
+mod cast;
+mod control_shapes;
 mod posing;
 mod shapes;
 mod skin_edit;
 mod ui;
 
+pub use control_shapes::ShapeDraft;
 pub use posing::Tool;
 pub use shapes::ShapeTools;
 pub use skin_edit::{MeshTool, SelectOp, SkinTools};
@@ -2115,6 +2151,7 @@ pub use skin_edit::{MeshTool, SelectOp, SkinTools};
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hive_rig::custom_shapes;
     use hive_rig::shapes::SculptBrush;
 
     fn demo_studio() -> Studio {
@@ -2530,7 +2567,7 @@ mod tests {
                 .guides
                 .control_styles
                 .get(n)
-                .copied()
+                .cloned()
         };
         let change = StyleChange {
             shape: Some(Shape::CurvedArrow),
@@ -3164,5 +3201,197 @@ mod tests {
             let mut s = demo_studio();
             assert!(s.apply_template(t, None), "{c:?}: {}", s.status);
         }
+    }
+
+    fn temp_dir(what: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("hive_studio_{what}_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Drawn, imported and library shapes go on controls (twins too), into
+    /// the user's library file and the built rig; line widths too; undo works.
+    #[test]
+    fn custom_shapes_are_drawn_kept_and_used() {
+        let dir = temp_dir("custom_shapes");
+        let lib = dir.join("shapes.json");
+        let mut s = demo_studio();
+        s.shape_lib_path = Some(lib.clone());
+        s.symmetry = true;
+        // Draw half a crown with mirror on.
+        let mut draft = ShapeDraft::new(Some("hand_l_ik_ctrl".into()));
+        for p in [[0.0, -0.5], [0.7, -0.5], [0.9, 0.5], [0.5, 0.1], [0.0, 0.6]] {
+            draft.add_point(p);
+        }
+        draft.add_point([0.0, 0.6]); // the same point twice is one point
+        assert_eq!(draft.lines[0].points.len(), 5);
+        draft.undo_point();
+        draft.add_point([0.01, 0.61]); // snaps onto the grid
+        assert_eq!(draft.lines[0].points[4], [0.0, 0.625]);
+        let shape = draft.shape();
+        assert!(
+            s.keep_custom_shape("crown", shape.clone(), Some("hand_l_ik_ctrl")),
+            "{}",
+            s.status
+        );
+        // In the library file, the guides, and on both hands.
+        let saved = custom_shapes::ShapeLibrary::load(&lib).unwrap();
+        assert!(saved.shapes.contains_key("crown"));
+        let g = &s.doc.as_ref().unwrap().guides;
+        assert!(g.custom_shapes.contains_key("crown"));
+        for c in ["hand_l_ik_ctrl", "hand_r_ik_ctrl"] {
+            assert_eq!(g.control_styles[c].custom.as_deref(), Some("crown"), "{c}");
+        }
+        // A bad name or an empty shape is refused.
+        assert!(!s.keep_custom_shape("no good!", shape.clone(), None));
+        assert!(!s.keep_custom_shape("empty", ShapeDraft::new(None).shape(), None));
+        // A fresh character offers the library's shape and uses it.
+        let mut t = demo_studio();
+        t.shape_lib_path = Some(lib.clone());
+        let choices = t.custom_shape_choices();
+        assert!(
+            choices
+                .iter()
+                .any(|(n, _, in_guides)| n == "crown" && !in_guides)
+        );
+        assert!(t.use_custom_shape("head_ctrl", "crown"), "{}", t.status);
+        assert!(
+            t.doc
+                .as_ref()
+                .unwrap()
+                .guides
+                .custom_shapes
+                .contains_key("crown")
+        );
+        assert!(!t.use_custom_shape("head_ctrl", "missing"));
+        t.undo();
+        assert!(
+            !t.doc
+                .as_ref()
+                .unwrap()
+                .guides
+                .custom_shapes
+                .contains_key("crown")
+        );
+        // Import from SVG onto the head, then thicker lines.
+        let svg = dir.join("badge.svg");
+        std::fs::write(
+            &svg,
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><polygon points="0,0 10,0 10,10 0,10"/></svg>"#,
+        )
+        .unwrap();
+        assert!(
+            s.import_custom_shape(&svg, Some("head_ctrl")),
+            "{}",
+            s.status
+        );
+        s.set_line_width("head_ctrl", 3.0);
+        assert!(s.build(), "{}", s.status);
+        let rig = s.doc.as_ref().unwrap().rig.as_ref().unwrap();
+        let head = rig.controls.control("head_ctrl").unwrap();
+        assert_eq!(head.custom.as_ref().map(|c| c.name.as_str()), Some("badge"));
+        assert_eq!(head.line_width, Some(3.0));
+        // Programs that only draw built-in shapes get the nearest: a square's.
+        use hive_rig::controls::Shape;
+        assert!(
+            matches!(head.shape, Shape::Square | Shape::Cube),
+            "{:?}",
+            head.shape
+        );
+        let hand = rig.controls.control("hand_r_ik_ctrl").unwrap();
+        assert_eq!(hand.custom.as_ref().map(|c| c.name.as_str()), Some("crown"));
+        assert!(
+            custom_shapes::ShapeLibrary::load(&lib)
+                .unwrap()
+                .shapes
+                .contains_key("badge")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two characters side by side: switch between them, hold one's prop in
+    /// the other's hand, build both, save and open the scene, export it.
+    #[test]
+    fn several_characters_in_one_scene() {
+        let dir = temp_dir("scene");
+        let mut s = demo_studio();
+        s.shape_lib_path = None;
+        s.add_prop();
+        assert!(!s.error, "{}", s.status);
+        assert!(s.add_demo_character(None), "{}", s.status);
+        assert_eq!(s.character_count(), 2);
+        let names = s.character_names();
+        assert_eq!(names.len(), 2);
+        assert_ne!(names[0], names[1], "each character has its own name");
+        // The new one stands beside the first, not inside it.
+        let other = s.doc.as_ref().unwrap();
+        assert!(other.offset.x > 0.3, "{}", other.offset);
+        assert_eq!(s.cast.active, 1);
+        // Back to the first: its edits are still there; the second's hand holds its prop.
+        assert!(s.switch_character(0));
+        let prop = s
+            .doc
+            .as_ref()
+            .unwrap()
+            .preview
+            .as_ref()
+            .unwrap()
+            .controls
+            .controls
+            .iter()
+            .map(|c| c.name.clone())
+            .find(|n| n.starts_with("prop"))
+            .expect("the prop's control");
+        assert!(
+            !s.hold_prop(&prop, &names[0], "hand_l", 1.0),
+            "not by itself"
+        );
+        assert!(
+            !s.hold_prop(&prop, &names[1], "wing_l", 1.0),
+            "not by a missing bone"
+        );
+        assert!(s.hold_prop(&prop, &names[1], "hand_l", 1.0), "{}", s.status);
+        assert_eq!(s.hold_of(&prop).unwrap().holder.character, names[1]);
+        assert!(s.build_all(), "{}", s.status);
+        assert_eq!(s.cast.active, 0);
+        assert!(s.character(1).unwrap().rig.is_some());
+        // Save, open again: both characters, their rigs and the hold come back.
+        let path = dir.join("pair.scene.json");
+        assert!(s.save_scene(&path), "{}", s.status);
+        assert!(
+            dir.join("pair_rigs")
+                .join(format!("{}.hive.json", names[1]))
+                .is_file()
+        );
+        let mut t = Studio {
+            shape_lib_path: None,
+            ..Default::default()
+        };
+        t.open(&path);
+        assert!(!t.error, "{}", t.status);
+        assert_eq!(t.character_names(), names);
+        assert_eq!(t.cast.holds.len(), 1);
+        assert!(
+            t.doc.as_ref().unwrap().rig.is_some(),
+            "the saved rig came back"
+        );
+        assert!((t.character(1).unwrap().offset - s.character(1).unwrap().offset).length() < 1e-5);
+        // Export every character and the scene builders.
+        let out = dir.join("out");
+        let files = t.export_scene(&out).unwrap();
+        for n in &names {
+            assert!(out.join(format!("{n}_blender.py")).is_file(), "{n}");
+        }
+        let blender = out.join("pair_scene_blender.py");
+        assert!(files.contains(&blender), "{files:?}");
+        let text = std::fs::read_to_string(&blender).unwrap();
+        assert!(text.contains(&prop) && text.contains("hand_l"));
+        // Taking the holder out drops the hold.
+        assert!(t.remove_character(1));
+        assert_eq!(t.character_count(), 1);
+        assert!(t.cast.holds.is_empty());
+        assert!(!t.remove_character(0), "a scene keeps one character");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

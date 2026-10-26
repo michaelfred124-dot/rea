@@ -7,6 +7,7 @@
 use glam::Vec3;
 use serde::{Deserialize, Serialize, Serializer};
 
+pub use crate::custom_shapes::NamedShape;
 pub use crate::face_board::FaceBoard;
 
 /// How a control is drawn. The geometry lives here, in [`Shape::strokes`]: the
@@ -393,9 +394,14 @@ pub fn shape_frame(axis: Vec3) -> [Vec3; 3] {
 
 /// `shape`'s lines at `position`, facing `axis`, at `size`, in model space.
 pub fn place_strokes(shape: Shape, position: Vec3, axis: Vec3, size: f32) -> Strokes {
+    place_lines(shape.strokes(), position, axis, size)
+}
+
+/// Unit-size lines in a shape's frame (see [`Strokes`]) placed at `position`,
+/// facing `axis`, at `size`, in model space.
+pub fn place_lines(strokes: Strokes, position: Vec3, axis: Vec3, size: f32) -> Strokes {
     let [across, along, up] = shape_frame(axis);
-    shape
-        .strokes()
+    strokes
         .into_iter()
         .map(|line| {
             line.into_iter()
@@ -461,10 +467,20 @@ pub struct Control {
     pub position: Vec3,
     /// Normal of the shape's main plane (circle facing down the bone, etc.).
     pub axis: Vec3,
+    /// The built-in shape, or with `custom`, the built-in shape that looks most
+    /// like it (what Unreal draws).
     pub shape: Shape,
+    /// A shape the user drew or imported, drawn instead of `shape`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom: Option<NamedShape>,
     /// Radius / half-extent in metres.
     pub size: f32,
     pub color: [f32; 3],
+    /// How thick the lines are drawn, 1 being each program's normal width
+    /// (Blender's wire width, Maya's line width; Unreal picks its thin or
+    /// thick library shape). Absent means normal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_width: Option<f32>,
     /// Space-switch targets. When non-empty, the first entry is the default
     /// parent and the animator can switch the control to follow any of the others.
     #[serde(default)]
@@ -483,7 +499,15 @@ impl Control {
     /// The control's shape in model space, drawn at `position` facing `axis`
     /// (its rest placement or a posed one).
     pub fn outline_at(&self, position: Vec3, axis: Vec3) -> Strokes {
-        place_strokes(self.shape, position, axis, self.size)
+        match &self.custom {
+            Some(c) => place_lines(c.shape.strokes(), position, axis, self.size),
+            None => place_strokes(self.shape, position, axis, self.size),
+        }
+    }
+
+    /// The control's line width, 1 when it has none of its own.
+    pub fn width(&self) -> f32 {
+        self.line_width.unwrap_or(1.0)
     }
 
     /// The control's lines at rest: its shape and any extra lines.
@@ -509,8 +533,12 @@ impl Serialize for Control {
             position: Vec3,
             axis: Vec3,
             shape: Shape,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            custom: &'a Option<NamedShape>,
             size: f32,
             color: [f32; 3],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            line_width: Option<f32>,
             #[serde(skip_serializing_if = "<[String]>::is_empty")]
             spaces: &'a [String],
             #[serde(skip_serializing_if = "<[Vec<Vec3>]>::is_empty")]
@@ -527,8 +555,10 @@ impl Serialize for Control {
             position: self.position,
             axis: self.axis,
             shape: self.shape,
+            custom: &self.custom,
             size: self.size,
             color: self.color,
+            line_width: self.line_width,
             spaces: &self.spaces,
             extra: &self.extra,
             outline: self
@@ -881,8 +911,10 @@ mod tests {
             position: Vec3::new(0.5, 1.2, 0.1),
             axis,
             shape,
+            custom: None,
             size: 0.05,
             color: [0.1, 0.4, 1.0],
+            line_width: None,
             spaces: Vec::new(),
             extra: Vec::new(),
             component: String::new(),

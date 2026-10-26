@@ -16,6 +16,7 @@ use crate::controls::{
     BendSegment, Bendy, Control, ControlKind, ControlParent, ControlRig, FaceBoard, FootRoll,
     HockSegment, IkChain, SOFT_ZONE, Shape, SplineChain, ctrl_name, fk_name,
 };
+use crate::custom_shapes::{CustomShape, NamedShape};
 use crate::face_board::{self, Dir};
 use crate::landmarks::{Landmarks, mirror};
 use crate::naming::Naming;
@@ -88,6 +89,10 @@ pub struct Guides {
     /// They survive rebuilds; a control that no longer exists is ignored.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub control_styles: BTreeMap<String, ControlStyle>,
+    /// Control shapes the user drew or imported, by name, for `control_styles`
+    /// to use (see [`crate::custom_shapes`]).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub custom_shapes: BTreeMap<String, CustomShape>,
     /// Influence limits for the skin weights (most bones per vertex, smallest
     /// weight kept). Absent means four influences and no pruning.
     #[serde(default, skip_serializing_if = "SkinLimits::is_default")]
@@ -95,10 +100,16 @@ pub struct Guides {
 }
 
 /// How one control looks. Unset fields keep the component's default.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ControlStyle {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shape: Option<Shape>,
+    /// A custom shape from the guides' `custom_shapes`, drawn instead of `shape`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom: Option<String>,
+    /// Line thickness, 1 being normal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_width: Option<f32>,
     /// Radius or half-extent in metres.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<f32>,
@@ -530,6 +541,7 @@ pub fn biped(lm: &Landmarks) -> Guides {
         naming: Naming::default(),
         skin: SkinLimits::default(),
         control_styles: BTreeMap::new(),
+        custom_shapes: BTreeMap::new(),
     }
 }
 
@@ -623,6 +635,7 @@ fn creature(h: f32, components: Vec<Component>, crotch_y: f32, torso_half_width:
         naming: Naming::default(),
         skin: SkinLimits::default(),
         control_styles: BTreeMap::new(),
+        custom_shapes: BTreeMap::new(),
     }
 }
 
@@ -1511,12 +1524,16 @@ pub enum StyleScope {
 
 /// A change to some controls' look: the fields that are set replace what the
 /// controls have, `scale` multiplies their current size, and the rest is kept.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+/// A built-in `shape` replaces a custom one and a `custom` shape (a name in the
+/// guides' `custom_shapes`) replaces a built-in one.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct StyleChange {
     pub shape: Option<Shape>,
+    pub custom: Option<String>,
     pub size: Option<f32>,
     pub scale: Option<f32>,
     pub color: Option<[f32; 3]>,
+    pub line_width: Option<f32>,
 }
 
 /// The colour a twin on the other side gets: the left and right side colours
@@ -1615,15 +1632,32 @@ pub fn restyle(
     if let Some(scale) = change.scale {
         ensure!(scale > 0.0, "control scale must be positive");
     }
+    if let Some(w) = change.line_width {
+        ensure!(w > 0.0, "line width must be positive");
+    }
+    if let Some(name) = &change.custom {
+        ensure!(
+            g.custom_shapes.contains_key(name),
+            "no custom shape named '{name}' in these guides"
+        );
+    }
     let built = build(g)?;
     let targets = style_targets(&built, control, scope)?;
     for (name, twin) in &targets {
         let Some(c) = built.controls.control(name) else {
             continue;
         };
-        let mut style = g.control_styles.get(name).copied().unwrap_or_default();
+        let mut style = g.control_styles.get(name).cloned().unwrap_or_default();
         if let Some(shape) = change.shape {
             style.shape = Some(shape);
+            style.custom = None;
+        }
+        if let Some(custom) = &change.custom {
+            style.custom = Some(custom.clone());
+            style.shape = None;
+        }
+        if let Some(w) = change.line_width {
+            style.line_width = Some(crate::custom_shapes::clamp_width(w));
         }
         if let Some(size) = change.size {
             style.size = Some(size);
@@ -1637,6 +1671,32 @@ pub fn restyle(
         set_control_style(g, name, style)?;
     }
     Ok(targets.into_iter().map(|(n, _)| n).collect())
+}
+
+/// Keep `shape` in the guides as `name`, replacing a shape of that name.
+pub fn add_custom_shape(g: &mut Guides, name: &str, shape: CustomShape) -> Result<()> {
+    crate::custom_shapes::check_name(name)?;
+    shape.validate()?;
+    g.custom_shapes.insert(name.to_string(), shape);
+    Ok(())
+}
+
+/// Take a custom shape out of the guides. Controls that used it get their
+/// built-in shape back. Returns how many controls did.
+pub fn remove_custom_shape(g: &mut Guides, name: &str) -> Result<usize> {
+    ensure!(
+        g.custom_shapes.remove(name).is_some(),
+        "no custom shape named '{name}' in these guides"
+    );
+    let mut n = 0;
+    g.control_styles.retain(|_, s| {
+        if s.custom.as_deref() == Some(name) {
+            s.custom = None;
+            n += 1;
+        }
+        *s != ControlStyle::default()
+    });
+    Ok(n)
 }
 
 /// Give the controls `names` their component's default look again.
@@ -1959,8 +2019,10 @@ impl Builder {
             position,
             axis,
             shape,
+            custom: None,
             size,
             color,
+            line_width: None,
             spaces: Vec::new(),
             extra: Vec::new(),
             component: self.component.clone(),
@@ -2070,6 +2132,18 @@ pub fn build(g: &Guides) -> Result<Built> {
         }
         if let Some(color) = style.color {
             c.color = color;
+        }
+        if let Some(shape) = style.custom.as_ref().and_then(|n| {
+            g.custom_shapes.get(n).map(|s| NamedShape {
+                name: n.clone(),
+                shape: s.clone(),
+            })
+        }) {
+            c.shape = shape.shape.look_alike();
+            c.custom = Some(shape);
+        }
+        if let Some(w) = style.line_width {
+            c.line_width = Some(crate::custom_shapes::clamp_width(w));
         }
     }
     Ok(Built {
@@ -4389,6 +4463,86 @@ mod tests {
     }
 
     #[test]
+    fn custom_shapes_and_line_widths_reach_the_built_controls() {
+        let mut g = demo_guides();
+        let hand = "hand_l_ik_ctrl".to_string();
+        let star = CustomShape::line(
+            vec![[0.0, 2.0], [0.5, 0.5], [2.0, 0.0], [0.5, -0.5], [0.0, -2.0]],
+            false,
+            true,
+        );
+        // A shape the guides don't have is refused.
+        let change = StyleChange {
+            custom: Some("star".into()),
+            line_width: Some(2.5),
+            ..Default::default()
+        };
+        assert!(restyle(&mut g, &hand, change.clone(), StyleScope::WithTwin).is_err());
+        add_custom_shape(&mut g, "star", star.clone()).unwrap();
+        assert!(add_custom_shape(&mut g, "a/b", star.clone()).is_err());
+        let changed = restyle(&mut g, &hand, change, StyleScope::WithTwin).unwrap();
+        assert_eq!(changed, ["hand_l_ik_ctrl", "hand_r_ik_ctrl"]);
+        let built = build(&g).unwrap();
+        for name in &changed {
+            let c = built.controls.control(name).unwrap();
+            assert_eq!(c.custom.as_ref().unwrap().name, "star");
+            assert_eq!(c.line_width, Some(2.5));
+            // Drawn from the custom lines (mirrored into one loop), at the
+            // control's size; Unreal gets the look-alike.
+            let outline = c.outline();
+            assert_eq!(outline.len(), 1);
+            assert_eq!(outline[0].len(), 9);
+            let reach = outline[0]
+                .iter()
+                .map(|p| p.distance(c.position))
+                .fold(0.0, f32::max);
+            assert!((reach - c.size).abs() < 1e-5, "{reach} vs {}", c.size);
+            assert_eq!(c.shape, star.look_alike());
+            let json = serde_json::to_value(c).unwrap();
+            assert_eq!(json["custom"]["name"], "star");
+            assert_eq!(json["line_width"], 2.5);
+            assert_eq!(json["outline"][0].as_array().unwrap().len(), 9);
+        }
+        // The guides keep the shape and the look through a save.
+        let text = serde_json::to_string(&g).unwrap();
+        let back: Guides = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.custom_shapes["star"], star);
+        assert_eq!(back.control_styles[&hand].custom.as_deref(), Some("star"));
+        // A built-in shape replaces the custom one, and the other way.
+        restyle(
+            &mut g,
+            &hand,
+            StyleChange {
+                shape: Some(Shape::Gear),
+                ..Default::default()
+            },
+            StyleScope::One,
+        )
+        .unwrap();
+        let built = build(&g).unwrap();
+        let c = built.controls.control(&hand).unwrap();
+        assert!(c.custom.is_none() && c.shape == Shape::Gear && c.line_width == Some(2.5));
+        // Widths are kept in range; removing the shape gives the twin its
+        // built-in shape back and keeps its width.
+        restyle(
+            &mut g,
+            "hand_r_ik_ctrl",
+            StyleChange {
+                line_width: Some(99.0),
+                ..Default::default()
+            },
+            StyleScope::One,
+        )
+        .unwrap();
+        assert_eq!(g.control_styles["hand_r_ik_ctrl"].line_width, Some(10.0));
+        assert_eq!(remove_custom_shape(&mut g, "star").unwrap(), 1);
+        assert!(remove_custom_shape(&mut g, "star").is_err());
+        let built = build(&g).unwrap();
+        let r = built.controls.control("hand_r_ik_ctrl").unwrap();
+        assert!(r.custom.is_none() && r.line_width == Some(10.0));
+    }
+
+    #[test]
     fn restyling_reaches_the_twin_and_the_component() {
         let mut g = demo_guides();
         let built = build(&g).unwrap();
@@ -4426,7 +4580,10 @@ mod tests {
             StyleScope::WithTwin,
         )
         .unwrap();
-        let (l, r) = (g.control_styles[&hand], g.control_styles[&hand_r]);
+        let (l, r) = (
+            g.control_styles[&hand].clone(),
+            g.control_styles[&hand_r].clone(),
+        );
         assert_eq!(
             (l.shape, l.size, l.color),
             (Some(Shape::Gear), Some(0.09), Some(LEFT))
@@ -4516,7 +4673,7 @@ mod tests {
             ControlStyle {
                 shape: Some(Shape::Cube),
                 size: Some(0.02),
-                color: None,
+                ..Default::default()
             },
         )
         .unwrap();

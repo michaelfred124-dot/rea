@@ -951,6 +951,9 @@ def build(RIG, geos=None):
         # The outline already sits at the control's position (e.g. clavicle at the shoulder).
         pb.custom_shape = outline_widget(c, pb.bone.matrix_local)
         pb.use_custom_shape_bone_size = False
+        if c.get("line_width") is not None and hasattr(pb, "custom_shape_wire_width"):
+            # Blender 4.2+; it draws wires 1 to 16 pixels wide.
+            pb.custom_shape_wire_width = min(max(c["line_width"], 1.0), 16.0)
         pb.rotation_mode = "XYZ"
         if c["kind"] == "hock" or (
             c["kind"] == "fk" and (not c["bone"] or copy_rule(bone_by_name[c["bone"]]) == "COPY_ROTATION")

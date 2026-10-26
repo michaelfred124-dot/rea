@@ -515,6 +515,8 @@ def build(RIG, geos=None):
             cmds.setAttr(shape + ".overrideEnabled", 1)
             cmds.setAttr(shape + ".overrideRGBColors", 1)
             cmds.setAttr(shape + ".overrideColorRGB", *c["color"])
+            if c.get("line_width") is not None:
+                cmds.setAttr(shape + ".lineWidth", c["line_width"])
         return ctrl, shapes
 
 

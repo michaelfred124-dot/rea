@@ -125,6 +125,8 @@ def stub_maya():
                     attrs[args[0]] = list(args[2:])
                 elif len(args) == 2 and isinstance(args[1], (int, float)) and ".weight[" in args[0]:
                     attrs[args[0]] = args[1]
+                elif len(args) == 2 and args[0].endswith(".lineWidth"):
+                    attrs[args[0]] = args[1]
                 if kwargs.get("type") == "string":
                     attrs[args[0]] = args[1]
                 return None
@@ -135,6 +137,11 @@ def stub_maya():
                 return "%s.%s" % (kwargs["node"], args[0]) in attrs
             if name == "objExists":
                 return args[0] in nodes
+            if name == "namespace":
+                calls.append(("namespace", tuple(sorted(kwargs.items()))))
+                if kwargs.get("exists"):
+                    return False
+                return None
             if name == "delete":
                 for n in args:
                     nodes.discard(n)
@@ -340,12 +347,73 @@ def stub_unreal():
     return vm, blueprint.get_hierarchy_controller.return_value
 
 
+def run_scene(kind, script):
+    """A scene builder: every character's own script run in turn, then the holds."""
+    import json
+    import os
+
+    data = json.loads(open(script).read().split('r"""', 1)[1].split('"""', 1)[0])
+    if kind == "maya":
+        calls = stub_maya()
+        sys.argv = [script, "--save", "/dev/null"]
+    elif kind == "unreal":
+        vm, hc = stub_unreal()
+        # Each character's import leaves its Skeletal Mesh in its folder.
+        sys.modules["unreal"].EditorAssetLibrary.list_assets.return_value = ["/Game/HiveRig/mesh"]
+        sys.argv = [script]
+    else:
+        raise SystemExit("unknown kind " + kind)
+    ns = runpy.run_path(script, run_name="hive_scene_stub")
+    live = ns["build"].__globals__
+    load = live["load_character"]
+    loaded = []
+
+    def load_one(c):
+        # The stubs read the character's own rig data (weights, vertex count).
+        path = os.path.join(live["HERE"], c["script"])
+        SCRIPT[0] = path
+        if kind == "maya":
+            N_VERTS[0] = len(json.loads(open(path).read().split('r"""', 1)[1].split('"""', 1)[0])["mesh"]["positions"])
+        loaded.append(c["name"])
+        return load(c)
+
+    live["load_character"] = load_one
+    live["main"]()
+    names = [c["name"] for c in data["characters"]]
+    assert loaded == names, loaded
+    if kind == "maya":
+        added = [dict(c[1]).get("add") for c in calls if isinstance(c, tuple) and c[0] == "namespace"]
+        assert [a for a in added if a] == names, added
+        assert calls.count("setWeights") >= len(names), calls.count("setWeights")
+        cmds = live["cmds"]
+        for h in data["holds"]:
+            ctrl = "%s:%s" % (h["prop_character"], h["prop_control"])
+            joint = "%s:%s" % (h["holder_character"], h["holder_bone"])
+            assert ("parentConstraint", (joint, ctrl + "_held")) in calls, (joint, ctrl)
+            assert cmds.getAttr(ctrl + ".held") == h["held"], ctrl
+            assert any(c[0] == "connectAttr" and c[1][0] == ctrl + ".held" for c in calls if isinstance(c, tuple))
+    else:
+        unreal = sys.modules["unreal"]
+        assert vm.add_link.call_count > 20 * len(names)
+        sockets = [c.args[1] for c in unreal.SkeletalMeshSocket.return_value.set_editor_property.call_args_list
+                   if c.args[0] == "socket_name"]
+        want = ["held_%s_%s" % (h["prop_character"], h["prop_control"]) for h in data["holds"]]
+        assert sockets == want, sockets
+        spawned = unreal.get_editor_subsystem.return_value.spawn_actor_from_object.call_args_list
+        assert [(c.args[1].x, c.args[1].y, c.args[1].z) for c in spawned] == [
+            (o[0] * 100.0, o[2] * 100.0, o[1] * 100.0) for o in (c["offset"] for c in data["characters"])], spawned
+    print("%s scene builder ran %d characters and %d holds against stubs: ok" % (kind, len(names), len(data["holds"])))
+
+
 if __name__ == "__main__":
     import os
 
     sys_args = sys.argv[3:]
     kind, script = sys.argv[1], sys.argv[2]
     SCRIPT[0] = script
+    if '\nSCENE = json.loads(r"""' in open(script).read():
+        run_scene(kind, script)
+        sys.exit(0)
     if kind == "maya":
         import json
 
@@ -369,6 +437,11 @@ if __name__ == "__main__":
                 for j, p in enumerate(line):
                     got = CV_POSITIONS.get("%s.cv[%d]" % (shape, j))
                     assert got is not None and max(abs(g - 100.0 * w) for g, w in zip(got, p)) < 1e-6, (shape, j)
+            # A control's own line width reaches every curve shape of it.
+            if c.get("line_width") is not None:
+                for i in range(len(c["outline"])):
+                    shape = c["name"] + "Shape" + (str(i) if i else "")
+                    assert ns["cmds"].getAttr(shape + ".lineWidth") == c["line_width"], shape
         # Animator tools: IK/FK matching, mirror, reset, select, space switch, and the window.
         anim = json.loads(ns["cmds"].getAttr(ns["TOP"] + ".hiveAnim"))
         # Limbs and left/right pairs where the rig has them (a snake has neither).
@@ -595,6 +668,10 @@ if __name__ == "__main__":
         sys.argv = [script]  # Output Log `py "<script>"`: build
         ns = runpy.run_path(script, run_name="__main__")
         assert vm.add_link.call_count > 20
+        # Thin lines (below 1) pick the library's thin shapes.
+        for c in json.loads(open(script).read().split('r"""', 1)[1].split('"""', 1)[0])["controls"]:
+            if c.get("line_width") is not None and c["line_width"] < 1.0:
+                assert ns["shape_for"](c["shape"], c["line_width"]).endswith("_Thin"), c["name"]
         # Spline chains: two Fit Chain on Curve units (keep length, then stretch) each.
         splines = json.loads(open(script).read().split('r"""', 1)[1].split('"""', 1)[0]).get("splines", [])
         units = [c.args[0] for c in vm.add_unit_node_from_struct_path.call_args_list]

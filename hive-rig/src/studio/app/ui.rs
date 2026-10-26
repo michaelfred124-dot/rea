@@ -317,6 +317,7 @@ impl Studio {
             self.dock(&ctx);
             self.library_window(&ctx);
             self.export_window(&ctx);
+            self.shape_editor(&ctx);
         }
         self.toast(&ctx);
         self.drop_overlay(&ctx);
@@ -390,6 +391,44 @@ impl Studio {
             if ui.button("Demo character").clicked() {
                 ui.close();
                 self.load_demo();
+            }
+            ui.separator();
+            if ui.button("Open scene…").clicked() {
+                ui.close();
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("Hive scene", &["json"])
+                    .pick_file()
+                {
+                    self.open(&p);
+                }
+            }
+            if ui
+                .add_enabled(has_doc, egui::Button::new("Add character to the scene…"))
+                .clicked()
+            {
+                ui.close();
+                if let Some(p) = character_dialog().pick_file() {
+                    self.add_character_file(&p);
+                }
+            }
+            if ui
+                .add_enabled(has_doc, egui::Button::new("Save scene…"))
+                .on_hover_text("Every character, its guides and built rig, and the held props")
+                .clicked()
+            {
+                ui.close();
+                let name = if self.cast.name.is_empty() {
+                    "scene".to_string()
+                } else {
+                    self.cast.name.clone()
+                };
+                if let Some(p) = rfd::FileDialog::new()
+                    .set_file_name(format!("{name}.scene.json"))
+                    .add_filter("Hive scene", &["json"])
+                    .save_file()
+                {
+                    self.save_scene(&p);
+                }
             }
             ui.separator();
             if ui
@@ -836,6 +875,7 @@ impl Studio {
                 if !open {
                     return;
                 }
+                self.characters_section(ui);
                 egui::ScrollArea::vertical()
                     .max_height(max_h.max(120.0))
                     .auto_shrink([false, true])
@@ -1108,9 +1148,10 @@ impl Studio {
                     }
                     let current = control_shape.unwrap_or(Shape::Circle);
                     ui.menu_button("Control shape", |ui| {
-                        if let Some(shape) = shape_grid(ui, current, 5) {
+                        if let Some(shape) = shape_grid(ui, Some(current), 5) {
                             let mut style = self.style_of(&name);
                             style.shape = Some(shape);
+                            style.custom = None;
                             self.restyle_control(&name, style);
                             ui.close();
                         }
@@ -1174,7 +1215,7 @@ impl Studio {
     fn style_of(&self, control: &str) -> ControlStyle {
         self.doc
             .as_ref()
-            .and_then(|d| d.guides.control_styles.get(control).copied())
+            .and_then(|d| d.guides.control_styles.get(control).cloned())
             .unwrap_or_default()
     }
 
@@ -1218,10 +1259,14 @@ impl Studio {
                 let mut change = components::StyleChange::default();
                 self.scroll_here(ui);
                 theme::label_caps(ui, "Shape");
-                if let Some(shape) = shape_grid(ui, c.shape, 5) {
+                if let Some(shape) = shape_grid(ui, c.custom.is_none().then_some(c.shape), 5) {
                     change.shape = Some(shape);
                 }
-                ui.label(RichText::new(c.shape.label()).size(12.0).color(TEXT_FAINT));
+                if c.custom.is_none() {
+                    ui.label(RichText::new(c.shape.label()).size(12.0).color(TEXT_FAINT));
+                }
+                ui.add_space(6.0);
+                self.custom_shape_section(ui, &c);
                 ui.add_space(6.0);
                 theme::label_caps(ui, "Size (metres)");
                 let mut size = c.size;
@@ -1281,8 +1326,10 @@ impl Studio {
                     .clicked()
                 {
                     let whole = components::StyleChange {
-                        shape: Some(c.shape),
+                        shape: c.custom.is_none().then_some(c.shape),
+                        custom: c.custom.as_ref().map(|s| s.name.clone()),
                         color: Some(c.color),
+                        line_width: c.line_width,
                         ..Default::default()
                     };
                     self.restyle_controls(
@@ -1299,6 +1346,9 @@ impl Studio {
                     self.restyle_control(&name, ControlStyle::default());
                 }
                 ui.add_space(8.0);
+                if self.character_count() > 1 {
+                    self.hold_section(ui, &name);
+                }
                 if let Some(bone) = c.bone {
                     self.pose_section(ui, &bone);
                 }
@@ -2628,6 +2678,8 @@ impl Studio {
         }
         let mut close = false;
         let mut export_dir = None;
+        let mut export_all = None;
+        let several = self.character_count() > 1;
         let mut choose = false;
         let mut apply: Option<Naming> = None;
         let modal = egui::Modal::new(egui::Id::unique("export"))
@@ -2802,6 +2854,16 @@ impl Studio {
                     if theme::primary(ui, "Export", 140.0, any).clicked() {
                         export_dir = Some(doc.out_dir.clone());
                     }
+                    if several
+                        && theme::secondary(ui, "Export every character", 190.0)
+                            .on_hover_text(
+                                "Every character of the scene into this folder, \
+                                 with scene builders that build them all and their held props",
+                            )
+                            .clicked()
+                    {
+                        export_all = Some(doc.out_dir.clone());
+                    }
                     if theme::secondary(ui, "Close", 90.0).clicked() {
                         close = true;
                     }
@@ -2828,6 +2890,20 @@ impl Studio {
                 && let Some(doc) = &mut self.doc
             {
                 doc.out_dir = dir;
+            }
+        }
+        if let Some(dir) = export_all {
+            match self.export_scene(&dir) {
+                Ok(files) => {
+                    let n = files.len();
+                    self.info(format!(
+                        "Exported {} characters and the scene builders to {}: {n} files",
+                        self.character_count(),
+                        dir.display()
+                    ));
+                    close = true;
+                }
+                Err(e) => self.fail(format!("Export failed: {e:#}")),
             }
         }
         if let Some(dir) = export_dir {
@@ -3413,6 +3489,8 @@ impl Studio {
         };
         let (_, specs) = self.bone_specs(frame.as_ref(), hover_bone.as_deref());
         let skeleton = joints::build(pr, &specs);
+        // The scene's other characters stand beside this one.
+        self.paint_cast(painter, pr);
         // Without joint x-ray the mesh in front hides the joints.
         let occluded = self.show_mesh && !self.joints.xray;
         if self.show_mesh {
@@ -3470,7 +3548,10 @@ impl Studio {
                     painter,
                     pr,
                     &outline,
-                    Stroke::new(if picked { 3.5 } else { 2.0 }, rgb(c.color)),
+                    Stroke::new(
+                        if picked { 3.5 } else { 2.0 } * c.width().sqrt().max(0.5),
+                        rgb(c.color),
+                    ),
                 );
             }
         }
@@ -5177,7 +5258,7 @@ fn paint_axes(painter: &egui::Painter, pr: &Projector, at: Pos2) {
 /// A bone as a thin diamond from head to tail.
 /// Every control shape as a grid of drawn tiles, `columns` wide. Returns the
 /// shape clicked, if it differs from `current`.
-fn shape_grid(ui: &mut Ui, current: Shape, columns: usize) -> Option<Shape> {
+fn shape_grid(ui: &mut Ui, current: Option<Shape>, columns: usize) -> Option<Shape> {
     const TILE: f32 = 40.0;
     let mut chosen = None;
     egui::Grid::new(ui.next_auto_id())
@@ -5185,7 +5266,7 @@ fn shape_grid(ui: &mut Ui, current: Shape, columns: usize) -> Option<Shape> {
         .show(ui, |ui| {
             for (i, shape) in Shape::ALL.into_iter().enumerate() {
                 let (rect, response) = ui.allocate_exact_size(Vec2::splat(TILE), Sense::click());
-                let on = shape == current;
+                let on = Some(shape) == current;
                 let hot = response.hovered();
                 let painter = ui.painter_at(rect);
                 painter.rect(

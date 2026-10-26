@@ -131,6 +131,69 @@ jobs:
           xvfb-run -a -s "-screen 0 1400x900x24" cargo run --locked -q --bin HiveRig -- \
             "$c/hive_demo.hive.json" --pick hand_l_ik_ctrl --tools --screenshot "$RUNNER_TEMP/hive-rig-control-styles.ppm"
           test "$(head -c 2 "$RUNNER_TEMP/hive-rig-control-styles.ppm")" = P6
+      - name: Custom control shapes - draw, import, line widths; Maya and Unreal builders
+        run: |
+          c="$RUNNER_TEMP/custom_shapes"
+          export HIVE_RIG_SHAPES="$c/library.json"
+          cargo run --locked -q -- demo -o "$c"
+          g="$c/hive_demo.guides.json"
+          # Half a crown drawn with mirror on; an SVG badge imported onto a hand and its twin.
+          cargo run --locked -q -- shapes draw crown "0,-0.5 0.75,-0.5 0.875,0.5 0.5,0.125 0.25,0.625 0,0.25" --mirror --guides "$g"
+          printf '%s\n' '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">' \
+            '<polygon points="50,2 61,38 98,38 68,60 79,96 50,74 21,96 32,60 2,38 39,38"/></svg>' > "$c/badge.svg"
+          cargo run --locked -q -- control "$g" head_ctrl --custom crown --line-width 3
+          cargo run --locked -q -- control "$g" hand_l_ik_ctrl --import-shape "$c/badge.svg" --twin --line-width 0.5
+          cargo run --locked -q -- shapes list --guides "$g" | tee "$c/log.txt"
+          grep -q "crown" "$c/log.txt" && grep -q "badge" "$c/log.txt"
+          test -f "$HIVE_RIG_SHAPES"
+          cargo run --locked -q -- shapes export crown "$c/crown.svg"
+          grep -q "<polyline\|<polygon" "$c/crown.svg"
+          cargo run --locked -q -- control "$g" | tee "$c/log.txt"
+          grep -Eq "^hand_r_ik_ctrl +custom:badge" "$c/log.txt"
+          cargo run --locked -q -- rebuild "$c/hive_demo.hive.json"
+          python3 -I tests/dcc_stub_run.py maya "$c/hive_demo_maya.py"
+          python3 -I tests/dcc_stub_run.py unreal "$c/hive_demo_unreal.py"
+          grep -q '"line_width":0.5' "$c/hive_demo_unreal.py"
+          # Removing a shape from the guides gives its controls their built-in shape back.
+          cargo run --locked -q -- shapes remove crown --guides "$g"
+          ! cargo run --locked -q -- control "$g" | grep -q "custom:crown" || exit 1
+          # The app with the badge picked and the shape editor's crown draft open.
+          cargo run --locked -q -- rebuild "$c/hive_demo.hive.json"
+          xvfb-run -a -s "-screen 0 1400x900x24" cargo run --locked -q --bin HiveRig -- \
+            "$c/hive_demo.hive.json" --pick hand_r_ik_ctrl --mode rig --no-toast --draw-shape \
+            --screenshot "$RUNNER_TEMP/hive-rig-custom-shapes.ppm"
+          test "$(head -c 2 "$RUNNER_TEMP/hive-rig-custom-shapes.ppm")" = P6
+      - name: Several characters in one scene - props held across characters; Maya and Unreal builders
+        run: |
+          d="$RUNNER_TEMP/scene"
+          s="$d/duel.scene.json"
+          mkdir -p "$d"
+          cargo run --locked -q -- scene new "$s" hero=demo rival=demo@-1.45,0,0.15 dog=demo:dog@1.6,0,0.3
+          cargo run --locked -q -- scene prop "$s" hero --id sword
+          cargo run --locked -q -- scene hold "$s" --prop hero:sword_01_r_ctrl --holder rival:hand_l
+          # A bone the holder doesn't have is refused.
+          ! cargo run --locked -q -- scene hold "$s" --prop hero:sword_01_r_ctrl --holder dog:wing_l || exit 1
+          cargo run --locked -q -- scene list "$s" | tee "$d/log.txt"
+          grep -q "hero:sword_01_r_ctrl held by rival:hand_l" "$d/log.txt"
+          cargo run --locked -q -- scene build "$s"
+          r="$d/duel_rigs"
+          for n in hero rival dog; do test -f "$r/$n.hive.json" && test -f "$r/${n}_blender.py"; done
+          python3 -I tests/dcc_stub_run.py maya "$r/duel_scene_maya.py" | tee "$d/log.txt"
+          grep -q "maya scene builder ran 3 characters and 1 holds" "$d/log.txt"
+          python3 -I tests/dcc_stub_run.py unreal "$r/duel_scene_unreal.py" | tee "$d/log.txt"
+          grep -q "unreal scene builder ran 3 characters and 1 holds" "$d/log.txt"
+          # One character again: the others keep their last export.
+          cargo run --locked -q -- scene build "$s" --only rival | tee "$d/log.txt"
+          grep -q "rival" "$d/log.txt"
+          # Taking the holder out drops the hold.
+          cp "$s" "$d/copy.scene.json"
+          cargo run --locked -q -- scene remove "$d/copy.scene.json" rival
+          ! cargo run --locked -q -- scene list "$d/copy.scene.json" | grep -q "held by" || exit 1
+          # The app with all three characters, the held sword picked.
+          xvfb-run -a -s "-screen 0 1400x900x24" cargo run --locked -q --bin HiveRig -- \
+            "$s" --build-all --pick sword_01_r_ctrl --mode rig --no-toast \
+            --view persp --look 0.1,0.8,0 --zoom 0.5 --screenshot "$RUNNER_TEMP/hive-rig-two-characters.ppm"
+          test "$(head -c 2 "$RUNNER_TEMP/hive-rig-two-characters.ppm")" = P6
       - name: Generate demo rigs (T-pose and A-pose)
         run: |
           cargo run --locked -q -- demo -o "$RUNNER_TEMP/t_pose"
@@ -450,6 +513,26 @@ jobs:
           cargo run -q -- control "$rig/hive_demo.guides.json" calf_l_fk_ctrl --color cyan --size 0.09 --twin
           cargo run -q -- rebuild "$rig/hive_demo.hive.json"
           python tests/blender_check.py "$rig/hive_demo_blender.py" "$rig/hive_demo.glb"
+      - name: Custom control shapes and line widths in Blender
+        run: |
+          rig="$RUNNER_TEMP/custom_shapes"
+          export HIVE_RIG_SHAPES="$rig/library.json"
+          cargo run -q -- demo -o "$rig"
+          cargo run -q -- shapes draw crown "0,-0.5 0.75,-0.5 0.875,0.5 0.5,0.125 0.25,0.625 0,0.25" --mirror --guides "$rig/hive_demo.guides.json"
+          cargo run -q -- shapes draw tick "-0.6,0 -0.2,-0.5 0.7,0.6" --guides "$rig/hive_demo.guides.json"
+          cargo run -q -- control "$rig/hive_demo.guides.json" head_ctrl --custom crown --line-width 3
+          cargo run -q -- control "$rig/hive_demo.guides.json" hand_l_ik_ctrl --custom tick --twin --line-width 0.5
+          cargo run -q -- rebuild "$rig/hive_demo.hive.json"
+          python tests/blender_check.py "$rig/hive_demo_blender.py" "$rig/hive_demo.glb"
+      - name: Several characters in one Blender file, a prop held across characters
+        run: |
+          d="$RUNNER_TEMP/scene"
+          mkdir -p "$d"
+          cargo run -q -- scene new "$d/duel.scene.json" hero=demo rival=demo@-1.45,0,0.15 dog=demo:dog@1.6,0,0.3
+          cargo run -q -- scene prop "$d/duel.scene.json" hero --id sword
+          cargo run -q -- scene hold "$d/duel.scene.json" --prop hero:sword_01_r_ctrl --holder rival:hand_l
+          cargo run -q -- scene build "$d/duel.scene.json"
+          python tests/blender_scene_check.py "$d/duel_rigs/duel_scene_blender.py"
       - name: Face board in Blender - sliders, lip zippers, sticky lips, linked shapes
         run: |
           f="$RUNNER_TEMP/face_board"

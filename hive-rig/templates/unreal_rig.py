@@ -77,7 +77,9 @@ HEIGHT_CM = RIG["height"] * 100.0
 
 # Each hive shape as the look-alike from Control Rig's default shape library.
 # Unreal draws its own meshes, so unlike Blender and Maya the lines are not
-# hive-rig's outline; a name the library lacks falls back to the circle.
+# hive-rig's outline; a name the library lacks falls back to the circle. A
+# custom shape (drawn or imported in hive-rig) arrives as the built-in shape
+# that looks most like it.
 SHAPES = {
     "circle": "Circle_Thick",
     "square": "Square_Thick",
@@ -120,10 +122,16 @@ def library_shapes():
 AVAILABLE_SHAPES = library_shapes()
 
 
-def shape_for(kind):
+def shape_for(kind, line_width=None):
+    """The library shape for a hive shape: the thick one, or below a line width
+    of 1 the thin one where the library has it."""
     name = SHAPES.get(kind, FALLBACK_SHAPE)
     if AVAILABLE_SHAPES is not None and name not in AVAILABLE_SHAPES:
-        return FALLBACK_SHAPE
+        name = FALLBACK_SHAPE
+    if line_width is not None and line_width < 1.0:
+        thin = name.replace("_Thick", "_Thin")
+        if AVAILABLE_SHAPES is None or thin in AVAILABLE_SHAPES:
+            return thin
     return name
 
 
@@ -350,7 +358,7 @@ def build():
             settings.animation_type = unreal.RigControlAnimationType.ANIMATION_CONTROL
         except AttributeError:
             pass
-        settings.shape_name = shape_for(c["shape"])
+        settings.shape_name = shape_for(c["shape"], c.get("line_width"))
         settings.shape_color = unreal.LinearColor(c["color"][0], c["color"][1], c["color"][2], 1.0)
         if moves_only:
             value = unreal.RigHierarchy.make_control_value_from_vector(unreal.Vector(0.0, 0.0, 0.0))

@@ -5,7 +5,8 @@
 //! [--lock BONE] [--bend DEGREES] [--bend-axis x|y|z] [--tools] [--vertices] [--hover] [--library] [--templates] [--export]
 //! [--select COMPONENT[,COMPONENT...]] [--pick NAME] [--pose BONE[=DEGREES[@x|y|z]]] [--shape NAME=WEIGHT]...
 //! [--corrective] [--inbetween WEIGHT] [--sculpt grab|smooth|relax|inflate|erase] [--all-bones]
-//! [--bone-filter TEXT] [--mode guides|skeleton|rig] [--joint-size SCALE] [--no-joint-xray] [--joints-menu] [--no-toast] [--no-outliner] [--view front|side|persp] [--zoom FACTOR] [--look X,Y,Z] [--xray] [--screenshot OUT.ppm]`
+//! [--bone-filter TEXT] [--add-demo [dog|bird|...]] [--build-all] [--character NAME]
+//! [--import-shape FILE] [--line-width WIDTH] [--draw-shape] [--mode guides|skeleton|rig] [--joint-size SCALE] [--no-joint-xray] [--joints-menu] [--no-toast] [--no-outliner] [--view front|side|persp] [--zoom FACTOR] [--look X,Y,Z] [--xray] [--screenshot OUT.ppm]`
 //! (the flags exist so the window can be checked automatically).
 
 // No console window behind the app on Windows.
@@ -88,6 +89,18 @@ struct Launch {
     look: Option<[f32; 3]>,
     /// See through the mesh.
     xray: bool,
+    /// `--add-demo [creature]`: add a demo character to the scene (repeatable).
+    add_demo: Vec<Option<hive_rig::demo::Creature>>,
+    /// Build every character of the scene.
+    build_all: bool,
+    /// `--character NAME`: edit this character of the scene.
+    character: Option<String>,
+    /// `--import-shape FILE`: import a control shape and put it on the `--pick` control.
+    import_shape: Option<PathBuf>,
+    /// `--line-width WIDTH`: the `--pick` control's line width.
+    line_width: Option<f32>,
+    /// Open the shape editor with a shape half drawn, for the `--pick` control.
+    draw_shape: bool,
     screenshot: Option<PathBuf>,
 }
 
@@ -177,6 +190,24 @@ fn parse_args() -> Launch {
                 })
             }
             Some("--view") => launch.view = args.next().map(|s| s.to_string_lossy().into_owned()),
+            Some("--add-demo") => {
+                let creature = args
+                    .peek()
+                    .and_then(|n| hive_rig::demo::Creature::from_name(n.to_str()?));
+                if creature.is_some() {
+                    args.next();
+                }
+                launch.add_demo.push(creature);
+            }
+            Some("--build-all") => launch.build_all = true,
+            Some("--character") => {
+                launch.character = args.next().map(|s| s.to_string_lossy().into_owned())
+            }
+            Some("--import-shape") => launch.import_shape = args.next().map(PathBuf::from),
+            Some("--line-width") => {
+                launch.line_width = args.next().and_then(|s| s.to_str()?.parse().ok())
+            }
+            Some("--draw-shape") => launch.draw_shape = true,
             Some("--shape") => launch
                 .shapes
                 .extend(args.next().map(|s| s.to_string_lossy().into_owned())),
@@ -240,6 +271,17 @@ fn main() -> eframe::Result {
     }
     if let Some(file) = &launch.file {
         studio.open(file);
+    }
+    for creature in &launch.add_demo {
+        studio.add_demo_character(*creature);
+    }
+    if launch.build_all {
+        studio.build_all();
+    }
+    if let Some(name) = &launch.character
+        && let Some(i) = studio.character_index(name)
+    {
+        studio.switch_character(i);
     }
     if launch.build {
         studio.build();
@@ -354,6 +396,35 @@ fn main() -> eframe::Result {
         } else {
             app::RigPick::Bone(name.clone())
         });
+    }
+    if let Some(app::RigPick::Control(name)) = studio.rig_pick.clone() {
+        if let Some(path) = &launch.import_shape {
+            studio.import_custom_shape(path, Some(&name));
+        }
+        if let Some(w) = launch.line_width {
+            studio.set_line_width(&name, w);
+        }
+        if launch.draw_shape {
+            // A crown drawn half way: the left half is the mirror image.
+            let mut draft = app::ShapeDraft::new(Some(name.clone()));
+            draft.name = "crown".into();
+            for p in [
+                [0.0, -0.5],
+                [0.75, -0.5],
+                [0.875, 0.5],
+                [0.5, 0.125],
+                [0.25, 0.625],
+                [0.0, 0.25],
+            ] {
+                draft.add_point(p);
+            }
+            studio.shape_draft = Some(draft);
+        }
+        if launch.build && (launch.import_shape.is_some() || launch.line_width.is_some()) {
+            studio.build();
+        }
+        studio.mode = app::Mode::Rig;
+        studio.rig_pick = Some(app::RigPick::Control(name));
     }
     for text in &launch.set {
         let (name, values) = text.split_once('=').unwrap_or((text, ""));
