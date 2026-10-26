@@ -17,6 +17,7 @@ use glam::{Mat4, Quat, Vec3};
 use serde::{Deserialize, Serialize};
 
 use crate::face_board::{self, BoardLink, Values};
+use crate::readers::Reader;
 use crate::rig::Rig;
 use crate::skeleton::Skeleton;
 use crate::skin::SkinWeights;
@@ -730,35 +731,61 @@ pub fn corrective_offsets(
         .collect()
 }
 
-/// Every shape's weight in a pose: driven shapes from their readers, the rest
-/// at their own weight. `bone_index` finds a reader's bone. Shapes the face
-/// board drives are off (the board at rest); see [`weights_with_board`].
+/// Every shape's weight in a pose: driven shapes from their readers (the
+/// single-axis ones on the shape, and the cone and RBF `readers`), the rest
+/// at their own weight. Shapes the face board drives are off (the board at
+/// rest); see [`weights_with_board`].
 pub fn weights_in_pose(
     shapes: &[Shape],
+    readers: &[Reader],
+    sk: &Skeleton,
     local: &[Quat],
-    bone_index: impl Fn(&str) -> Option<usize>,
 ) -> Vec<f32> {
-    weights_with_board(shapes, local, bone_index, &Values::new())
+    weights_with_board(shapes, readers, sk, local, &Values::new())
 }
 
 /// [`weights_in_pose`] with the face board's slider values for the shapes it
 /// drives.
 pub fn weights_with_board(
     shapes: &[Shape],
+    readers: &[Reader],
+    sk: &Skeleton,
     local: &[Quat],
-    bone_index: impl Fn(&str) -> Option<usize>,
     board: &Values,
 ) -> Vec<f32> {
+    let outputs = crate::readers::outputs_in_pose(readers, sk, local);
     shapes
         .iter()
-        .map(|s| match (&s.driver, &s.board) {
-            (Some(d), _) => bone_index(&d.bone)
-                .map(|i| d.weight(local.get(i).copied().unwrap_or(Quat::IDENTITY)))
-                .unwrap_or(0.0),
-            (None, Some(link)) => link.weight_at(board),
-            (None, None) => s.weight,
+        .map(|s| {
+            if let Some(w) = crate::readers::shape_weight(readers, &outputs, &s.name) {
+                return w;
+            }
+            match (&s.driver, &s.board) {
+                (Some(d), _) => sk
+                    .index_of(&d.bone)
+                    .map(|i| d.weight(local.get(i).copied().unwrap_or(Quat::IDENTITY)))
+                    .unwrap_or(0.0),
+                (None, Some(link)) => link.weight_at(board),
+                (None, None) => s.weight,
+            }
         })
         .collect()
+}
+
+/// Whether something other than its own weight sets the shape's weight: a
+/// pose reader (of any kind) or the face board.
+pub fn is_driven(rig_readers: &[Reader], s: &Shape) -> bool {
+    s.driver.is_some()
+        || s.board.is_some()
+        || crate::readers::reader_of(rig_readers, &s.name).is_some()
+}
+
+/// The skinning matrices of a pose of turned bones, with the pose readers'
+/// helper joints moved and scaled by their readers.
+pub fn driven_matrices(rig: &Rig, locals: &[Quat]) -> Vec<Mat4> {
+    let mut mats = skin_matrices(&rig.skeleton, locals);
+    crate::readers::drive_helpers(&rig.mesh.readers, &rig.skeleton, locals, &mut mats);
+    mats
 }
 
 // --------------------------------------------------------------------------- on a rig
@@ -879,7 +906,7 @@ pub fn parse_pose(rig: &Rig, text: &str) -> anyhow::Result<BonePose> {
 /// Where the skin puts each vertex in a pose, with the shapes at their
 /// weights in that pose (corrective shapes from their readers).
 pub fn posed_mesh(rig: &Rig, locals: &[Quat]) -> Vec<Vec3> {
-    posed_mesh_with(rig, locals, &skin_matrices(&rig.skeleton, locals))
+    posed_mesh_with(rig, locals, &driven_matrices(rig, locals))
 }
 
 /// [`posed_mesh`] with the skinning matrices given (a pose from the control
@@ -894,8 +921,9 @@ pub fn posed_mesh_with(rig: &Rig, locals: &[Quat], mats: &[Mat4]) -> Vec<Vec3> {
 pub fn posed_mesh_board(rig: &Rig, locals: &[Quat], mats: &[Mat4], board: &Values) -> Vec<Vec3> {
     let weights = weights_with_board(
         &rig.mesh.shapes,
+        &rig.mesh.readers,
+        &rig.skeleton,
         locals,
-        |n| rig.skeleton.index_of(n),
         board,
     );
     let base = apply(&rig.mesh.positions, &rig.mesh.shapes, &weights);
@@ -914,7 +942,7 @@ pub fn posed_target(
     mats: &[Mat4],
 ) -> Vec<Vec3> {
     let shapes = &rig.mesh.shapes;
-    let mut weights = weights_in_pose(shapes, locals, |n| rig.skeleton.index_of(n));
+    let mut weights = weights_in_pose(shapes, &rig.mesh.readers, &rig.skeleton, locals);
     if let Some(i) = shapes.iter().position(|s| s.name == name) {
         weights[i] = inbetween.unwrap_or(1.0);
     }
@@ -932,7 +960,7 @@ pub fn sculpt(
     locals: &[Quat],
     moves: &[(usize, Vec3)],
 ) -> anyhow::Result<usize> {
-    let mats = skin_matrices(&rig.skeleton, locals);
+    let mats = driven_matrices(rig, locals);
     sculpt_with(rig, name, locals, &mats, moves)
 }
 
@@ -969,7 +997,7 @@ pub fn sculpt_target(
         ),
         (Some(_), None) => anyhow::bail!("the rig has no shape '{name}'"),
     };
-    let mut weights = weights_in_pose(shapes, locals, |n| rig.skeleton.index_of(n));
+    let mut weights = weights_in_pose(shapes, &rig.mesh.readers, &rig.skeleton, locals);
     if let Some(i) = mine {
         // This target counts fully: the new offsets go on top of its own.
         weights[i] = target.map_or(1.0, |k| shapes[i].inbetweens[k].weight);
@@ -1354,6 +1382,7 @@ pub fn set_board(rig: &mut Rig, name: &str, link: Option<BoardLink>) -> anyhow::
         );
         anyhow::ensure!(l.weight.is_finite(), "the weight must be a number");
         rig.mesh.shapes[i].driver = None;
+        crate::readers::release_shape(&mut rig.mesh.readers, name);
     }
     rig.mesh.shapes[i].board = link;
     Ok(())
@@ -1367,7 +1396,10 @@ pub fn link_board(rig: &mut Rig) -> Vec<String> {
     };
     let mut linked = Vec::new();
     for s in &mut rig.mesh.shapes {
-        if s.driver.is_some() || s.board.is_some() {
+        if s.driver.is_some()
+            || s.board.is_some()
+            || crate::readers::reader_of(&rig.mesh.readers, &s.name).is_some()
+        {
             continue;
         }
         if let Some(link) = face_board::match_shape(&s.name)
@@ -1447,6 +1479,7 @@ pub fn set_driver(rig: &mut Rig, name: &str, reader: Option<PoseReader>) -> anyh
     }
     if reader.is_some() {
         rig.mesh.shapes[i].board = None;
+        crate::readers::release_shape(&mut rig.mesh.readers, name);
     }
     rig.mesh.shapes[i].driver = reader;
     Ok(())
@@ -1455,6 +1488,7 @@ pub fn set_driver(rig: &mut Rig, name: &str, reader: Option<PoseReader>) -> anyh
 pub fn remove(rig: &mut Rig, name: &str) -> anyhow::Result<()> {
     let i = index(rig, name)?;
     rig.mesh.shapes.remove(i);
+    crate::readers::release_shape(&mut rig.mesh.readers, name);
     Ok(())
 }
 
@@ -1462,6 +1496,7 @@ pub fn rename(rig: &mut Rig, name: &str, new: &str) -> anyhow::Result<()> {
     let i = index(rig, name)?;
     ensure_new(rig, new)?;
     rig.mesh.shapes[i].name = new.to_string();
+    crate::readers::rename_shape(&mut rig.mesh.readers, name, new);
     Ok(())
 }
 
@@ -1479,7 +1514,9 @@ pub fn carry_drivers(old: &Rig, new: &mut Rig) -> Vec<String> {
             );
         }
     }
-    let mut lost = Vec::new();
+    let mut lost = crate::readers::rename_bones(&mut new.mesh.readers, &renamed, |b| {
+        new.skeleton.index_of(b).is_some()
+    });
     for s in &mut new.mesh.shapes {
         let Some(d) = &mut s.driver else { continue };
         match renamed.get(&d.bone) {

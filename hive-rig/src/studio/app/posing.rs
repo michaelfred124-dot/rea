@@ -121,7 +121,8 @@ impl Studio {
     /// The rig run in the current pose.
     pub fn posed(&self) -> Option<Posed> {
         let (sk, rig) = self.pose_rig()?;
-        Some(pose::evaluate(sk, rig, &self.posing.pose))
+        let readers = &self.doc.as_ref()?.mesh.readers;
+        Some(pose::evaluate_with(sk, rig, &self.posing.pose, readers))
     }
 
     /// The skinning matrices of the shown pose, when the control rig poses it.

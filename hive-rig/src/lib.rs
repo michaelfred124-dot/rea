@@ -30,6 +30,7 @@ pub mod mesh;
 pub mod naming;
 pub mod orient;
 pub mod pose;
+pub mod readers;
 pub mod rig;
 pub mod scene;
 pub mod shapes;

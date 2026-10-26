@@ -126,6 +126,12 @@ enum Command {
         /// hive-rig's frame) to this JSON file.
         #[arg(long)]
         bones: Option<PathBuf>,
+        /// Also write what the cone and RBF readers read in the pose to this
+        /// JSON file: each reader's outputs, every shape's weight, each helper
+        /// joint's skinning matrix, and the pose as the builders' pose
+        /// libraries take it (`studio_pose`), for checking a DCC against.
+        #[arg(long)]
+        readers: Option<PathBuf>,
     },
     /// Turn a skinned mesh another program exported from the rig (an FBX
     /// written by Unreal's exporter, say) into the edits file that `weights
@@ -602,6 +608,127 @@ enum ShapeCommand {
         /// Only this shape (repeatable).
         #[arg(long)]
         only: Vec<String>,
+    },
+    /// Cone and RBF pose readers: weights from where a bone points or from
+    /// sample poses, driving shapes and helper joints.
+    Reader {
+        #[command(subcommand)]
+        action: ReaderCommand,
+    },
+}
+
+/// Where a reader command takes a pose of the bone from.
+#[derive(clap::Args, Clone, Default)]
+struct PoseFrom {
+    /// BONE=DEGREES or BONE=DEGREES@DIRECTION (as `sculpt --pose`).
+    #[arg(long, conflicts_with = "studio")]
+    pose: Option<String>,
+    /// The pose saved with the rig (`hive-rig pose`, or posed in the app).
+    #[arg(long)]
+    studio: bool,
+}
+
+#[derive(Subcommand)]
+enum ReaderCommand {
+    /// List the readers; with --pose or --studio, also their weights there.
+    List {
+        #[command(flatten)]
+        from: PoseFrom,
+    },
+    /// Make or change a cone reader: fully on while BONE points within
+    /// --angle degrees of its direction, easing off over --falloff more (with
+    /// --away: off inside, on once the bone swings away in any direction).
+    /// The direction is --direction, where the bone points in --pose or
+    /// --studio, or else its rest direction.
+    Cone {
+        name: String,
+        #[arg(long)]
+        bone: String,
+        /// The cone's centre, x,y,z or a word (up, forward, ...), in the
+        /// parent bone's rest frame.
+        #[arg(long, conflicts_with_all = ["pose", "studio"])]
+        direction: Option<String>,
+        #[command(flatten)]
+        from: PoseFrom,
+        #[arg(long, default_value_t = 15.0)]
+        angle: f32,
+        #[arg(long, default_value_t = 30.0)]
+        falloff: f32,
+        #[arg(long)]
+        away: bool,
+        /// A shape it drives (repeatable; made empty when the rig has none).
+        #[arg(long = "shape")]
+        shapes: Vec<String>,
+    },
+    /// Make an RBF reader on BONE; give it sample poses with `reader pose`.
+    Rbf {
+        name: String,
+        #[arg(long)]
+        bone: String,
+        /// Kernel width in degrees (default: from the samples' spacing).
+        #[arg(long, default_value_t = 0.0)]
+        radius: f32,
+        /// Tell poses apart by where the bone points, ignoring its twist.
+        #[arg(long)]
+        swing: bool,
+    },
+    /// Add the reader's bone as it is in a pose as a sample of RBF reader
+    /// NAME, with --set OUTPUT=VALUE for the shapes and helpers on there
+    /// (others are off; a shape it doesn't drive yet is added). --remove K
+    /// takes sample K off instead.
+    Pose {
+        name: String,
+        #[command(flatten)]
+        from: PoseFrom,
+        /// Take the sample from the rest pose.
+        #[arg(long, conflicts_with_all = ["pose", "studio", "remove"])]
+        rest: bool,
+        #[arg(long = "set")]
+        set: Vec<String>,
+        #[arg(long, conflicts_with_all = ["pose", "studio", "set"])]
+        remove: Option<usize>,
+    },
+    /// Drive another shape too (made empty when new), or stop with --remove.
+    Shape {
+        name: String,
+        shape: String,
+        #[arg(long)]
+        remove: bool,
+    },
+    /// Add or change a helper joint the reader moves and scales: skinned like
+    /// any other joint within --radius, and at full weight moved by --offset
+    /// (metres, in its parent's frame) and scaled --along and --across its
+    /// parent bone. New helpers sit at the read bone's head under its parent.
+    Helper {
+        name: String,
+        helper: String,
+        #[arg(long)]
+        parent: Option<String>,
+        /// Where it sits at rest (x,y,z metres).
+        #[arg(long)]
+        at: Option<String>,
+        #[arg(long, allow_hyphen_values = true)]
+        offset: Option<String>,
+        #[arg(long)]
+        along: Option<f32>,
+        #[arg(long)]
+        across: Option<f32>,
+        #[arg(long)]
+        radius: Option<f32>,
+        /// RBF samples (numbers from 1) where a new helper is fully on.
+        #[arg(long, value_delimiter = ',')]
+        on: Vec<usize>,
+        #[arg(long, conflicts_with_all = ["parent", "at", "offset", "along", "across", "radius", "on"])]
+        remove: bool,
+    },
+    /// Mirror a reader onto the other side (mirror its shapes first).
+    Mirror {
+        name: String,
+        #[arg(long = "as")]
+        new: Option<String>,
+    },
+    Remove {
+        name: String,
     },
 }
 
@@ -1803,7 +1930,17 @@ fn shape_command(path: &Path, action: ShapeCommand) -> Result<()> {
                 println!("{} has no shapes.", rig.name);
             }
             for s in &rig.mesh.shapes {
+                let reader = hive_rig::readers::reader_of(&rig.mesh.readers, &s.name);
                 let what = match &s.driver {
+                    _ if reader.is_some() => {
+                        let r = reader.unwrap();
+                        format!(
+                            "driven by {} reader '{}' on {}",
+                            r.kind_label(),
+                            r.name,
+                            r.bone
+                        )
+                    }
                     None if s.board.is_some() => {
                         let l = s.board.as_ref().unwrap();
                         format!(
@@ -2020,6 +2157,13 @@ fn shape_command(path: &Path, action: ShapeCommand) -> Result<()> {
                 )
             }
         }
+        ShapeCommand::Reader { action } => {
+            let said = reader_command(&mut rig, action)?;
+            if said.is_empty() {
+                return Ok(());
+            }
+            said
+        }
         ShapeCommand::Import { edits, only } => {
             let edits = hive_rig::edits::Edits::read(&edits)?;
             let r = hive_rig::edits::import_shapes(&mut rig, &edits, &only)?;
@@ -2049,6 +2193,298 @@ fn shape_command(path: &Path, action: ShapeCommand) -> Result<()> {
     Ok(())
 }
 
+/// The bones' local rotations in a pose given on the command line (rest when
+/// neither is given).
+fn pose_locals(rig: &hive_rig::Rig, from: &PoseFrom) -> Result<Vec<glam::Quat>> {
+    if from.studio {
+        let posed = hive_rig::pose::evaluate(&rig.skeleton, &rig.controls, &rig.pose);
+        return Ok(posed.locals());
+    }
+    match &from.pose {
+        Some(p) => Ok(hive_rig::shapes::parse_pose(rig, p)?.locals(rig)),
+        None => Ok(vec![glam::Quat::IDENTITY; rig.skeleton.bones.len()]),
+    }
+}
+
+/// `hive-rig shape <rig> reader ...`. An empty message means nothing changed.
+fn reader_command(rig: &mut hive_rig::Rig, action: ReaderCommand) -> Result<String> {
+    use hive_rig::readers::{self, Cone, Helper, Kind, Rbf, Reader};
+    let bone_rotation = |rig: &hive_rig::Rig, bone: &str, from: &PoseFrom| -> Result<glam::Quat> {
+        let i = rig
+            .skeleton
+            .index_of(bone)
+            .ok_or_else(|| anyhow::anyhow!("the rig has no bone '{bone}'"))?;
+        Ok(pose_locals(rig, from)?[i])
+    };
+    Ok(match action {
+        ReaderCommand::List { from } => {
+            let locals = pose_locals(rig, &from)?;
+            let outputs = readers::outputs_in_pose(&rig.mesh.readers, &rig.skeleton, &locals);
+            let posed = from.pose.is_some() || from.studio;
+            if rig.mesh.readers.is_empty() {
+                println!("{} has no cone or RBF readers.", rig.name);
+            }
+            for (r, out) in rig.mesh.readers.iter().zip(&outputs) {
+                let what = match &r.kind {
+                    Kind::Cone(c) => format!(
+                        "cone on {}: {} within {:.0} degrees of ({:.2}, {:.2}, {:.2}), falloff {:.0}",
+                        r.bone,
+                        if c.away { "off" } else { "on" },
+                        c.angle,
+                        c.direction.x,
+                        c.direction.y,
+                        c.direction.z,
+                        c.falloff
+                    ),
+                    Kind::Rbf(b) => format!(
+                        "RBF on {}: {} sample poses, radius {}{}",
+                        r.bone,
+                        b.poses.len(),
+                        if b.radius > 0.0 {
+                            format!("{:.0} degrees", b.radius)
+                        } else {
+                            "auto".into()
+                        },
+                        if b.swing { ", swing only" } else { "" }
+                    ),
+                };
+                println!("{:<24} {what}", r.name);
+                let names = r.shapes.iter().map(|s| format!("shape {s}")).chain(
+                    r.helpers
+                        .iter()
+                        .map(|h| format!("helper {} (under {})", h.name, h.parent)),
+                );
+                for (k, n) in names.enumerate() {
+                    if posed {
+                        println!("    {n}: {:.3}", out.get(k).copied().unwrap_or(0.0));
+                    } else {
+                        println!("    {n}");
+                    }
+                }
+            }
+            String::new()
+        }
+        ReaderCommand::Cone {
+            name,
+            bone,
+            direction,
+            from,
+            angle,
+            falloff,
+            away,
+            shapes,
+        } => {
+            let i = rig
+                .skeleton
+                .index_of(&bone)
+                .ok_or_else(|| anyhow::anyhow!("the rig has no bone '{bone}'"))?;
+            let rest = rig.skeleton.bones[i].direction();
+            let direction = match direction {
+                Some(d) => hive_rig::shapes::parse_direction(&d)?,
+                None if from.pose.is_some() || from.studio => {
+                    bone_rotation(rig, &bone, &from)? * rest
+                }
+                None => rest,
+            };
+            let old = rig.mesh.readers.iter().find(|r| r.name == name).cloned();
+            if let Some(o) = &old {
+                anyhow::ensure!(
+                    matches!(o.kind, Kind::Cone(_)),
+                    "'{name}' is an RBF reader; remove it first"
+                );
+            }
+            let before = rig.mesh.shapes.clone();
+            let mut made = Vec::new();
+            for s in &shapes {
+                if !rig.mesh.shapes.iter().any(|x| &x.name == s) {
+                    rig.mesh
+                        .shapes
+                        .push(hive_rig::shapes::Shape::from_dense(s, &[]));
+                    made.push(s.clone());
+                }
+            }
+            let mut out_shapes = old.as_ref().map(|r| r.shapes.clone()).unwrap_or_default();
+            for s in shapes {
+                if !out_shapes.contains(&s) {
+                    out_shapes.push(s);
+                }
+            }
+            let set = readers::set_reader(
+                rig,
+                Reader {
+                    name: name.clone(),
+                    bone: bone.clone(),
+                    kind: Kind::Cone(Cone {
+                        direction,
+                        angle,
+                        falloff,
+                        away,
+                    }),
+                    shapes: out_shapes,
+                    helpers: old.map(|r| r.helpers).unwrap_or_default(),
+                },
+            );
+            if let Err(e) = set {
+                rig.mesh.shapes = before;
+                return Err(e);
+            }
+            let made = if made.is_empty() {
+                String::new()
+            } else {
+                format!(" Made empty shapes to sculpt: {}.", made.join(", "))
+            };
+            format!(
+                "Cone reader '{name}' reads {bone}: {} within {angle} degrees of ({:.2}, {:.2}, {:.2}).{made}",
+                if away { "off" } else { "on" },
+                direction.x,
+                direction.y,
+                direction.z
+            )
+        }
+        ReaderCommand::Rbf {
+            name,
+            bone,
+            radius,
+            swing,
+        } => {
+            let old = rig.mesh.readers.iter().find(|r| r.name == name).cloned();
+            let (poses, shapes, helpers) = match old {
+                Some(Reader {
+                    kind: Kind::Rbf(r),
+                    shapes,
+                    helpers,
+                    ..
+                }) => (r.poses, shapes, helpers),
+                Some(_) => anyhow::bail!("'{name}' is a cone reader; remove it first"),
+                None => (Vec::new(), Vec::new(), Vec::new()),
+            };
+            readers::set_reader(
+                rig,
+                Reader {
+                    name: name.clone(),
+                    bone: bone.clone(),
+                    kind: Kind::Rbf(Rbf {
+                        poses,
+                        radius,
+                        swing,
+                    }),
+                    shapes,
+                    helpers,
+                },
+            )?;
+            format!("RBF reader '{name}' reads {bone}; add sample poses with `reader pose {name}`.")
+        }
+        ReaderCommand::Pose {
+            name,
+            from,
+            rest,
+            set,
+            remove,
+        } => {
+            if let Some(k) = remove {
+                readers::remove_sample(rig, &name, k)?;
+                return Ok(format!("Took sample pose {k} off '{name}'."));
+            }
+            let bone = readers::find(rig, &name)?.bone.clone();
+            anyhow::ensure!(
+                rest || from.pose.is_some() || from.studio,
+                "say which pose: --pose, --studio or --rest"
+            );
+            let q = if rest {
+                glam::Quat::IDENTITY
+            } else {
+                bone_rotation(rig, &bone, &from)?
+            };
+            anyhow::ensure!(
+                rest || readers::turn_between(q, glam::Quat::IDENTITY) > 0.5,
+                "{bone} isn't turned in that pose; pose {bone} itself (or use --rest)"
+            );
+            let mut values = Vec::new();
+            for s in &set {
+                let (out, v) = s.split_once('=').ok_or_else(|| {
+                    anyhow::anyhow!("--set takes OUTPUT=VALUE, such as elbow_fix_l=1")
+                })?;
+                let v: f32 = v
+                    .trim()
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("'{v}' isn't a number"))?;
+                values.push((out.trim().to_string(), v));
+            }
+            let k = readers::add_sample(rig, &name, q, &values)?;
+            format!("'{name}' has sample pose {k}.")
+        }
+        ReaderCommand::Shape {
+            name,
+            shape,
+            remove,
+        } => {
+            if remove {
+                readers::remove_shape(rig, &name, &shape)?;
+                format!("'{name}' no longer drives '{shape}'.")
+            } else {
+                let made = readers::add_shape(rig, &name, &shape, &[])?;
+                format!(
+                    "'{name}' drives '{shape}'{}.",
+                    if made {
+                        " (a new, empty shape to sculpt)"
+                    } else {
+                        ""
+                    }
+                )
+            }
+        }
+        ReaderCommand::Helper {
+            name,
+            helper,
+            parent,
+            at,
+            offset,
+            along,
+            across,
+            radius,
+            on,
+            remove,
+        } => {
+            if remove {
+                readers::remove_helper(rig, &name, &helper)?;
+                return Ok(format!(
+                    "Took helper '{helper}' off '{name}' (and off the skeleton)."
+                ));
+            }
+            let r = readers::find(rig, &name)?;
+            let mut h: Helper = match r.helpers.iter().find(|h| h.name == helper) {
+                Some(h) => h.clone(),
+                None => readers::default_helper(rig, r, &helper)?,
+            };
+            if let Some(p) = parent {
+                h.parent = p;
+            }
+            if let Some(a) = at {
+                h.head = vector(&a)?;
+            }
+            if let Some(o) = offset {
+                h.offset = vector(&o)?;
+            }
+            h.along = along.unwrap_or(h.along);
+            h.across = across.unwrap_or(h.across);
+            h.radius = radius.unwrap_or(h.radius);
+            let parent = h.parent.clone();
+            readers::set_helper(rig, &name, h, &on)?;
+            format!(
+                "'{name}' moves helper joint '{helper}' (under {parent}), skinned with the rest."
+            )
+        }
+        ReaderCommand::Mirror { name, new } => {
+            let made = readers::mirror_on_rig(rig, &name, new.as_deref())?;
+            format!("Mirrored '{name}' as '{made}'.")
+        }
+        ReaderCommand::Remove { name } => {
+            readers::remove_reader(rig, &name)?;
+            format!("Removed pose reader '{name}'.")
+        }
+    })
+}
+
 /// `hive-rig pose`: set channels and attributes on the rig's pose, write the
 /// rig again, and optionally where the pose puts the bones.
 fn pose_command(
@@ -2057,6 +2493,7 @@ fn pose_command(
     attr: &[String],
     reset: bool,
     bones: Option<&Path>,
+    readers: Option<&Path>,
 ) -> Result<()> {
     use anyhow::Context;
     let mut rig = load_rig(path)?;
@@ -2104,7 +2541,12 @@ fn pose_command(
         );
     }
     if let Some(out) = bones {
-        let posed = hive_rig::pose::evaluate(&rig.skeleton, &rig.controls, &rig.pose);
+        let posed = hive_rig::pose::evaluate_with(
+            &rig.skeleton,
+            &rig.controls,
+            &rig.pose,
+            &rig.mesh.readers,
+        );
         let at: serde_json::Map<String, serde_json::Value> = rig
             .skeleton
             .bones
@@ -2116,6 +2558,61 @@ fn pose_command(
             })
             .collect();
         std::fs::write(out, serde_json::to_vec_pretty(&at)?)
+            .with_context(|| format!("writing {}", out.display()))?;
+    }
+    if let Some(out) = readers {
+        let sk = &rig.skeleton;
+        let posed = hive_rig::pose::evaluate_with(sk, &rig.controls, &rig.pose, &rig.mesh.readers);
+        let locals = posed.locals();
+        let list = &rig.mesh.readers;
+        let outputs = hive_rig::readers::outputs_in_pose(list, sk, &locals);
+        let weights =
+            hive_rig::shapes::weights_with_board(&rig.mesh.shapes, list, sk, &locals, &posed.board);
+        let helpers: serde_json::Map<String, serde_json::Value> = hive_rig::readers::helpers(list)
+            .filter_map(|h| {
+                let i = sk.index_of(&h.name)?;
+                Some((
+                    h.name.clone(),
+                    serde_json::json!({ "matrix": posed.bones[i].to_cols_array(), "head": posed.head(sk, i) }),
+                ))
+            })
+            .collect();
+        // Where the skin puts the vertices the helpers move (some of them),
+        // with the helpers driven and with them left riding on their parents.
+        let mesh = hive_rig::shapes::posed_mesh_board(&rig, &locals, &posed.bones, &posed.board);
+        let still = hive_rig::pose::evaluate(sk, &rig.controls, &rig.pose);
+        let without = hive_rig::shapes::posed_mesh_board(&rig, &locals, &still.bones, &posed.board);
+        let moved: serde_json::Map<String, serde_json::Value> = (0..rig.skin.vertex_count())
+            .filter(|&v| {
+                rig.skin
+                    .influences(v)
+                    .any(|(j, w)| w > 0.05 && hive_rig::readers::is_helper_bone(sk, j))
+            })
+            .take(400)
+            .map(|v| {
+                (
+                    v.to_string(),
+                    serde_json::json!({ "with": mesh[v], "without": without[v] }),
+                )
+            })
+            .collect();
+        // The read bones' local rotations (x, y, z, w; model axes).
+        let read: serde_json::Map<String, serde_json::Value> = list
+            .iter()
+            .filter_map(|r| {
+                let q = locals[sk.index_of(&r.bone)?];
+                Some((r.bone.clone(), serde_json::json!([q.x, q.y, q.z, q.w])))
+            })
+            .collect();
+        let doc = serde_json::json!({
+            "locals": read,
+            "vertices": moved,
+            "readers": list.iter().zip(&outputs).map(|(r, o)| (r.name.clone(), serde_json::json!(o))).collect::<serde_json::Map<_, _>>(),
+            "shapes": rig.mesh.shapes.iter().zip(&weights).map(|(s, w)| (s.name.clone(), serde_json::json!(w))).collect::<serde_json::Map<_, _>>(),
+            "helpers": helpers,
+            "studio_pose": export::studio_pose(&rig, &rig.pose),
+        });
+        std::fs::write(out, serde_json::to_vec_pretty(&doc)?)
             .with_context(|| format!("writing {}", out.display()))?;
     }
     let dir = path.parent().unwrap_or(Path::new("."));
@@ -2421,14 +2918,19 @@ fn main() -> Result<()> {
             new.orientation = old.orientation;
             // The studio pose names controls; those the new rig lacks are ignored.
             new.pose = old.pose.clone();
+            for lost in hive_rig::shapes::carry_drivers(&old, &mut new) {
+                eprintln!("warning: '{lost}' lost its pose reader: its bone is gone");
+            }
+            // Helper joints whose parent was renamed go on now, under its new name.
+            if !hive_rig::readers::helpers_in_place(&new) {
+                hive_rig::readers::add_helper_bones(&new.mesh.readers, &mut new.skeleton);
+                new.skin = new.auto_weights(opts.skin);
+            }
             if keep_weights {
                 // The old rig's automatic weights tell its hand edits apart.
                 let base = old.auto_weights(opts.skin);
                 let kept = rig::keep_weights(&old, Some(&base), &mut new);
                 println!("Kept the hand-edited weights of {kept} vertices.");
-            }
-            for lost in hive_rig::shapes::carry_drivers(&old, &mut new) {
-                eprintln!("warning: shape '{lost}' lost its driver: its bone is gone");
             }
             write(&new, &out, &common.output)
         }
@@ -2439,7 +2941,15 @@ fn main() -> Result<()> {
             attr,
             reset,
             bones,
-        } => pose_command(&path, &set, &attr, reset, bones.as_deref()),
+            readers,
+        } => pose_command(
+            &path,
+            &set,
+            &attr,
+            reset,
+            bones.as_deref(),
+            readers.as_deref(),
+        ),
         Command::Edits {
             rig,
             mesh,

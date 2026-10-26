@@ -31,6 +31,8 @@ pub struct ShapeTools {
     /// Frames left in which Properties scrolls to the Blendshapes card (for
     /// screenshots of the sculpt tools).
     pub scroll_to: u8,
+    /// The pose reader picked in the Pose readers card.
+    pub reader: Option<String>,
 }
 
 impl Default for ShapeTools {
@@ -41,6 +43,7 @@ impl Default for ShapeTools {
             target: None,
             filter: String::new(),
             scroll_to: 0,
+            reader: None,
         }
     }
 }
@@ -90,6 +93,15 @@ impl Studio {
         locals
     }
 
+    /// Whether a pose reader (of any kind) sets the shape's weight.
+    pub fn shape_driven(&self, s: &Shape) -> bool {
+        s.driver.is_some()
+            || self
+                .doc
+                .as_ref()
+                .is_some_and(|d| hive_rig::readers::reader_of(&d.mesh.readers, &s.name).is_some())
+    }
+
     /// The shapes of the character.
     pub fn shapes(&self) -> &[Shape] {
         self.doc.as_ref().map_or(&[][..], |d| &d.mesh.shapes)
@@ -99,7 +111,7 @@ impl Studio {
     pub fn shapes_show(&self) -> bool {
         self.shapes()
             .iter()
-            .any(|s| s.driver.is_none() && s.weight != 0.0)
+            .any(|s| !self.shape_driven(s) && s.weight != 0.0)
     }
 
     /// The mesh as shown without a test pose: the shapes at their weights.
@@ -109,7 +121,15 @@ impl Studio {
             .mesh
             .shapes
             .iter()
-            .map(|s| if s.driver.is_some() { 0.0 } else { s.weight })
+            .map(|s| {
+                if s.driver.is_some()
+                    || hive_rig::readers::reader_of(&doc.mesh.readers, &s.name).is_some()
+                {
+                    0.0
+                } else {
+                    s.weight
+                }
+            })
             .collect();
         Some(shapes::apply(
             &doc.mesh.positions,
@@ -121,8 +141,19 @@ impl Studio {
     /// A shape's weight as it shows now: its slider, or what its reader gives
     /// in the test pose.
     pub fn shape_weight_now(&self, s: &Shape) -> f32 {
+        let Some(doc) = self.doc.as_ref() else {
+            return s.weight;
+        };
+        if let Some(r) = hive_rig::readers::reader_of(&doc.mesh.readers, &s.name) {
+            let Some(rig) = &doc.rig else { return 0.0 };
+            let out = self.reader_outputs_now(r, rig);
+            return r
+                .shape_index(&s.name)
+                .and_then(|k| out.get(k).copied())
+                .unwrap_or(0.0);
+        }
         let Some(d) = &s.driver else { return s.weight };
-        let Some(rig) = self.doc.as_ref().and_then(|d| d.rig.as_ref()) else {
+        let Some(rig) = doc.rig.as_ref() else {
             return 0.0;
         };
         let locals = self.pose_locals();
@@ -131,9 +162,10 @@ impl Studio {
         })
     }
 
-    fn push_shape_undo(&mut self) {
+    pub(super) fn push_shape_undo(&mut self) {
         let Some(doc) = &self.doc else { return };
-        self.shape_undo.push(doc.mesh.shapes.clone());
+        self.shape_undo
+            .push((doc.mesh.shapes.clone(), doc.mesh.readers.clone()));
         if self.shape_undo.len() > SHAPE_UNDO_LIMIT {
             self.shape_undo.remove(0);
         }
@@ -152,11 +184,12 @@ impl Studio {
         doc.exported = false;
     }
 
-    /// The built rig with the document's shapes, for a shape operation.
-    fn shape_rig(&self) -> Option<Rig> {
+    /// The built rig with the document's shapes and readers, for a shape operation.
+    pub(super) fn shape_rig(&self) -> Option<Rig> {
         let doc = self.doc.as_ref()?;
         let mut rig = doc.rig.as_ref()?.clone();
         rig.mesh.shapes = doc.mesh.shapes.clone();
+        rig.mesh.readers = doc.mesh.readers.clone();
         Some(rig)
     }
 
@@ -170,7 +203,7 @@ impl Studio {
         match f(&mut rig).and_then(|msg| rig.mesh.validate().map(|_| msg)) {
             Ok(msg) => {
                 self.push_shape_undo();
-                self.set_shapes(rig.mesh.shapes);
+                self.adopt_reader_rig(rig);
                 self.info(msg);
                 true
             }
@@ -182,8 +215,9 @@ impl Studio {
     }
 
     pub fn undo_shapes(&mut self) {
-        if let Some(list) = self.shape_undo.pop() {
+        if let Some((list, readers)) = self.shape_undo.pop() {
             self.set_shapes(list);
+            self.restore_readers(readers);
             self.check_target();
             self.info("Undid the last shape change.");
         }
@@ -230,7 +264,7 @@ impl Studio {
     /// it shows as it is sculpted.
     pub fn pick_target(&mut self, target: Option<f32>) {
         let Some(s) = self.picked_shape() else { return };
-        let (name, driven) = (s.name.clone(), s.driver.is_some());
+        let (name, driven) = (s.name.clone(), self.shape_driven(s));
         self.shape_tools.target = target;
         if !driven {
             self.set_shape_weight(&name, target.unwrap_or(1.0));
@@ -294,6 +328,11 @@ impl Studio {
             return false;
         };
         let Some(d) = s.driver.clone() else {
+            if self.shape_driven(s) {
+                self.warning(
+                    "A cone or RBF reader sets it: pose the bone by hand to see the target.",
+                );
+            }
             return false;
         };
         let w = self.shape_tools.target.unwrap_or(1.0);
@@ -689,7 +728,7 @@ impl Studio {
                 }
                 let free: Vec<String> = list
                     .iter()
-                    .filter(|s| s.driver.is_none() && s.weight > 0.0)
+                    .filter(|s| !self.shape_driven(s) && s.weight > 0.0)
                     .map(|s| s.name.clone())
                     .collect();
                 if free.len() >= 2
@@ -759,7 +798,19 @@ impl Studio {
             let name = RichText::new(label)
                 .size(12.5)
                 .color(if picked { ACCENT } else { TEXT });
+            let by_reader = self
+                .doc
+                .as_ref()
+                .and_then(|d| hive_rig::readers::reader_of(&d.mesh.readers, &s.name));
             let tip = match &s.driver {
+                _ if by_reader.is_some() => format!(
+                    "{} vertices, {} in-betweens. Driven by the {} reader '{}' on {}. Click to sculpt it.",
+                    s.vertices.len(),
+                    s.inbetweens.len(),
+                    by_reader.unwrap().kind_label(),
+                    by_reader.unwrap().name,
+                    by_reader.unwrap().bone
+                ),
                 Some(d) => format!(
                     "{} vertices, {} in-betweens. Driven by {}: off at {:.0}°, on at {:.0}°. Click to sculpt it.",
                     s.vertices.len(),
@@ -798,8 +849,8 @@ impl Studio {
                         }
                     }
                 });
-                match &s.driver {
-                    Some(_) => {
+                match self.shape_driven(s) {
+                    true => {
                         let mut shown = self.shape_weight_now(s);
                         ui.add_enabled(
                             false,
@@ -811,7 +862,7 @@ impl Studio {
                         ui.label(RichText::new("\u{21bb}").color(TEXT_DIM))
                             .on_hover_text("Driven by a pose reader");
                     }
-                    None => {
+                    false => {
                         let mut w = s.weight;
                         if ui
                             .add(
@@ -884,7 +935,7 @@ impl Studio {
         // where the target is fully on, which isn't what shows.
         let want = self.shape_tools.target.unwrap_or(1.0);
         let now = self.shape_weight_now(s);
-        if s.driver.is_some() && (now - want).abs() > 0.02 {
+        if self.shape_driven(s) && (now - want).abs() > 0.02 {
             ui.horizontal_wrapped(|ui| {
                 ui.label(
                     RichText::new(format!(

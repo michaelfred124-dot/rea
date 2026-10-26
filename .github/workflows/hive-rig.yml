@@ -408,6 +408,35 @@ jobs:
             --demo --build --weights upperarm_l --all-bones --vertices --bone-filter arm \
             --screenshot "$RUNNER_TEMP/hive-rig-skin-tools.ppm"
           test "$(head -c 2 "$RUNNER_TEMP/hive-rig-skin-tools.ppm")" = P6
+      - name: Cone and RBF pose readers with a helper joint; Maya and Unreal builders
+        run: |
+          s="$RUNNER_TEMP/readers"
+          cargo run --locked -q -- demo -o "$s" --targets blender,maya,unreal,fbx
+          r="$s/hive_demo.hive.json"
+          # A cone on the shoulder (on as the arm swings up, whichever way), sculpted there.
+          cargo run --locked -q -- shape "$r" reader cone shoulder_up_l --bone upperarm_l --pose upperarm_l=70@up --angle 10 --falloff 40 --shape shoulder_up_l
+          cargo run --locked -q -- shape "$r" sculpt shoulder_up_l --pose upperarm_l=70@up --at 0.2,1.45,0 --radius 0.08 --offset 0,0.02,0
+          # An RBF reader on the elbow from two studio poses, with a volume helper joint.
+          cargo run --locked -q -- shape "$r" reader rbf elbow_l --bone lowerarm_l
+          cargo run --locked -q -- pose "$r" --reset --set lowerarm_l_fk_ctrl=0,0,0,0,80,0 >/dev/null
+          cargo run --locked -q -- shape "$r" reader pose elbow_l --studio --set elbow_fix_l=1
+          cargo run --locked -q -- pose "$r" --reset --set lowerarm_l_fk_ctrl=0,0,0,0,40,30 >/dev/null
+          cargo run --locked -q -- shape "$r" reader pose elbow_l --studio --set elbow_fix_l=0.4
+          cargo run --locked -q -- shape "$r" reader helper elbow_l elbow_vol_l --offset 0,0,-0.02 --across 1.3 --along 0.9 --on 1
+          # A rebuild keeps the readers and puts the helper joint back.
+          cargo run --locked -q -- rebuild "$r" >/dev/null
+          cargo run --locked -q -- shape "$r" reader list --studio | tee "$s/log.txt"
+          grep -q "elbow_l" "$s/log.txt" && grep -q "shoulder_up_l" "$s/log.txt"
+          # Poses to check, each with hive-rig's answer (twist included).
+          cargo run --locked -q -- pose "$r" --reset --set lowerarm_l_fk_ctrl=0,0,0,0,80,0 --readers "$s/p1.json" >/dev/null
+          cargo run --locked -q -- pose "$r" --reset --set lowerarm_l_fk_ctrl=0,0,0,0,55,15 --set upperarm_l_fk_ctrl=0,0,0,0,0,50 --readers "$s/p2.json" >/dev/null
+          cargo run --locked -q -- pose "$r" --reset --set upperarm_l_fk_ctrl=0,0,0,30,0,60 --readers "$s/p3.json" >/dev/null
+          cargo run --locked -q -- pose "$r" --reset --set upperarm_l_fk_ctrl=0,0,0,0,-40,70 --set lowerarm_l_fk_ctrl=0,0,0,20,30,0 --readers "$s/p4.json" >/dev/null
+          cargo run --locked -q -- pose "$r" --reset >/dev/null
+          # Maya: the reader expressions, evaluated on hive-rig's local rotations,
+          # give hive-rig's outputs. Unreal: the reader and helper nodes are made.
+          python3 -I tests/dcc_stub_run.py maya "$s/hive_demo_maya.py" --answers "$s"/p?.json
+          python3 -I tests/dcc_stub_run.py unreal "$s/hive_demo_unreal.py"
       - name: Face board - sliders, lip zippers, sticky lips; Maya and Unreal builders
         run: |
           f="$RUNNER_TEMP/face_board"
@@ -793,6 +822,33 @@ jobs:
           cargo run -q -- shape "$r" weight brow_up 0.25
           python -I tests/blender_mesh_check.py "$s/hive_demo_blender.py" --corrective elbow_fix_r lowerarm_r_fk_ctrl --fbx "$s/hive_demo.fbx"
           python -I tests/blender_roundtrip_check.py "$s/hive_demo_blender.py" --corrective elbow_fix_r lowerarm_r_fk_ctrl --slider brow_up
+      - name: Cone and RBF pose readers with a helper joint, in Blender
+        run: |
+          s="$RUNNER_TEMP/readers"
+          cargo run -q -- demo -o "$s" --targets blender,maya,unreal,fbx
+          r="$s/hive_demo.hive.json"
+          # A cone on the shoulder (on as the arm swings up, whichever way), sculpted there.
+          cargo run -q -- shape "$r" reader cone shoulder_up_l --bone upperarm_l --pose upperarm_l=70@up --angle 10 --falloff 40 --shape shoulder_up_l
+          cargo run -q -- shape "$r" sculpt shoulder_up_l --pose upperarm_l=70@up --at 0.2,1.45,0 --radius 0.08 --offset 0,0.02,0
+          # An RBF reader on the elbow from two studio poses, with a volume helper joint.
+          cargo run -q -- shape "$r" reader rbf elbow_l --bone lowerarm_l
+          cargo run -q -- pose "$r" --reset --set lowerarm_l_fk_ctrl=0,0,0,0,80,0 >/dev/null
+          cargo run -q -- shape "$r" reader pose elbow_l --studio --set elbow_fix_l=1
+          cargo run -q -- pose "$r" --reset --set lowerarm_l_fk_ctrl=0,0,0,0,40,30 >/dev/null
+          cargo run -q -- shape "$r" reader pose elbow_l --studio --set elbow_fix_l=0.4
+          cargo run -q -- shape "$r" reader helper elbow_l elbow_vol_l --offset 0,0,-0.02 --across 1.3 --along 0.9 --on 1
+          # A rebuild keeps the readers and puts the helper joint back.
+          cargo run -q -- rebuild "$r" >/dev/null
+          cargo run -q -- shape "$r" reader list --studio | tee "$s/log.txt"
+          grep -q "elbow_l" "$s/log.txt" && grep -q "shoulder_up_l" "$s/log.txt"
+          # Poses to check, each with hive-rig's answer (twist included).
+          cargo run -q -- pose "$r" --reset --set lowerarm_l_fk_ctrl=0,0,0,0,80,0 --readers "$s/p1.json" >/dev/null
+          cargo run -q -- pose "$r" --reset --set lowerarm_l_fk_ctrl=0,0,0,0,55,15 --set upperarm_l_fk_ctrl=0,0,0,0,0,50 --readers "$s/p2.json" >/dev/null
+          cargo run -q -- pose "$r" --reset --set upperarm_l_fk_ctrl=0,0,0,30,0,60 --readers "$s/p3.json" >/dev/null
+          cargo run -q -- pose "$r" --reset --set upperarm_l_fk_ctrl=0,0,0,0,-40,70 --set lowerarm_l_fk_ctrl=0,0,0,20,30,0 --readers "$s/p4.json" >/dev/null
+          cargo run -q -- pose "$r" --reset >/dev/null
+          # The drivers give hive-rig's outputs, shape keys and helper moves.
+          python -I tests/blender_reader_check.py "$s/hive_demo_blender.py" "$s"/p?.json
       - name: Send to Hive from an exported FBX (Blender standing in for Unreal), and the studio pose
         run: |
           # Blender imports the .glb, repaints a vertex and moves a shape key point,

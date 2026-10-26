@@ -316,6 +316,111 @@ def build_shape_drivers(RIG, shape_nodes, joint_of):
             ).format(dot=dot, quat=quat, bs=bs, i=i, start=d["start"], span=span))
 
 
+# --------------------------------------------------------------------------- cone and RBF readers
+# hive-rig's readers module (docs/skinning.md has the maths). Each reader is one
+# expression on the joint's turn since rest, read as a quaternion (multMatrix
+# and decomposeMatrix, as the single-axis readers do): a cone reader eases
+# (smoothstep) from 1 within `angle` degrees of its direction to 0 at angle +
+# falloff (the other way with `away`); an RBF reader sums a Gaussian kernel of
+# the distance to each centre, weighted as hive-rig solved them, held to 0..1.
+# The expression sets the blendShape weights it drives and moves and scales
+# its helper joints. Directions and centres are turned into the joint's frame.
+def joint_frame(joint):
+    """Turns a model-space vector into the joint's rest frame (its world axes)."""
+    world = cmds.xform(joint, q=True, ws=True, matrix=True)
+
+    def local(v, unit=True):
+        out = [sum(v[k] * world[r * 4 + k] for k in range(3)) for r in range(3)]
+        n = math.sqrt(sum(x * x for x in out)) or 1.0
+        return [x / n for x in out] if unit else out
+    return local, world
+
+
+def turned_expression(d, c):
+    """MEL: the dot of `d` turned by the quaternion ($qw, $qx, $qy, $qz) with `c`."""
+    a, b, e = d
+    rows = [
+        "(1 - 2 * ($qy * $qy + $qz * $qz)) * %.9g + 2 * ($qx * $qy - $qw * $qz) * %.9g + 2 * ($qx * $qz + $qw * $qy) * %.9g",
+        "2 * ($qx * $qy + $qw * $qz) * %.9g + (1 - 2 * ($qx * $qx + $qz * $qz)) * %.9g + 2 * ($qy * $qz - $qw * $qx) * %.9g",
+        "2 * ($qx * $qz - $qw * $qy) * %.9g + 2 * ($qy * $qz + $qw * $qx) * %.9g + (1 - 2 * ($qx * $qx + $qy * $qy)) * %.9g",
+    ]
+    return " + ".join("%.9g * (%s)" % (c[i], rows[i] % (a, b, e)) for i in range(3))
+
+
+def build_pose_readers(RIG, shape_nodes, joint_of):
+    made = []
+    for r in RIG.get("pose_readers", []):
+        joint = joint_of.get(r["bone"])
+        if joint is None:
+            cmds.warning("hive-rig: reader %s reads joint %s, which the rig doesn't have" % (r["name"], r["bone"]))
+            continue
+        try:
+            cmds.loadPlugin("matrixNodes", quiet=True)
+        except RuntimeError:
+            pass
+        n = safe_node_name(r["name"])
+        rest = cmds.getAttr(joint + ".matrix")
+        rest = rest if isinstance(rest, (list, tuple)) and len(rest) == 16 else [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+        rows = [list(rest[i * 4 : i * 4 + 4]) for i in range(4)]
+        cols = [[rows[j][i] for j in range(4)] for i in range(4)]
+        inv = mat_inv(cols)
+        rel = cmds.createNode("multMatrix", name=n + "_pose_reader_rel")
+        cmds.connectAttr(joint + ".matrix", rel + ".matrixIn[0]", force=True)
+        cmds.setAttr(rel + ".matrixIn[1]", [inv[j][i] for i in range(4) for j in range(4)], type="matrix")
+        quat = cmds.createNode("decomposeMatrix", name=n + "_pose_reader_quat")
+        cmds.connectAttr(rel + ".matrixSum", quat + ".inputMatrix", force=True)
+        local, _ = joint_frame(joint)
+        lines = ["float $q%s = %s.outputQuat%s;" % (c.lower(), quat, c) for c in "WXYZ"]
+        outputs = len(r["shapes"]) + len(r["helpers"])
+        along = local(r["along"])
+        if r["kind"] == "cone":
+            lines.append("float $angle = rad_to_deg(acos(clamp(-1, 1, %s)));" % turned_expression(along, local(r["direction"])))
+            edge = "smoothstep(%.9g, %.9g, $angle)" % (r["angle"], r["angle"] + r["falloff"])
+            lines.append("float $cone = %s;" % (edge if r["away"] else "1 - " + edge))
+            values = ["$cone"] * outputs
+        else:
+            scale = 1.0 / math.radians(max(r["radius"], 1e-3))
+            for i, (c, d) in enumerate(zip(r["centres"], r["directions"])):
+                if r["swing"]:
+                    dist = "acos(clamp(-1, 1, %s))" % turned_expression(along, local(d))
+                else:
+                    v = local(c[:3], unit=False)
+                    dist = "2 * acos(min(1, abs($qw * %.9g + $qx * %.9g + $qy * %.9g + $qz * %.9g)))" % (c[3], v[0], v[1], v[2])
+                lines.append("float $k%d = exp(-pow(%s * %.9g, 2));" % (i, dist, scale))
+            values = []
+            for k in range(outputs):
+                terms = " + ".join("%.9g * $k%d" % (r["weights"][i][k], i) for i in range(len(r["centres"]))) or "0"
+                lines.append("float $out%d = clamp(0, 1, %s);" % (k, terms))
+                values.append("$out%d" % k)
+        for k, shape in enumerate(r["shapes"]):
+            for bs, i in shape_nodes.get(shape, []):
+                lines.append("%s.weight[%d] = %s;" % (bs, i, values[k]))
+        for k, h in enumerate(r["helpers"]):
+            helper, parent = joint_of.get(h["name"]), joint_of.get(h["parent"])
+            if helper is None or parent is None:
+                cmds.warning("hive-rig: helper joint %s isn't in the skeleton" % h["name"])
+                continue
+            w = values[len(r["shapes"]) + k]
+            # The move, in the parent's frame (cm), and the scale along the
+            # helper's own axes (which are its parent's).
+            to_parent, _ = joint_frame(parent)
+            offset = [x * SCALE for x in to_parent(h["offset"], unit=False)]
+            _, hw = joint_frame(helper)
+            dir_world = h["parent_dir"]
+            for i, axis in enumerate("XYZ"):
+                rest_t = cmds.getAttr("%s.translate%s" % (helper, axis))
+                rest_t = rest_t if isinstance(rest_t, (int, float)) else 0.0
+                lines.append("%s.translate%s = %.9g + %.9g * %s;" % (helper, axis, rest_t, offset[i], w))
+                ax = [hw[i * 4 + c] for c in range(3)]
+                length = math.sqrt(sum(x * x for x in ax)) or 1.0
+                a = abs(sum(ax[c] / length * dir_world[c] for c in range(3)))
+                s = h["across"] + (h["along"] - h["across"]) * a * a
+                lines.append("%s.scale%s = 1 + %.9g * %s;" % (helper, axis, s - 1.0, w))
+        cmds.expression(name=n + "_pose_reader_expr", string="\n".join(lines))
+        made.append(r["name"])
+    return made
+
+
 # --------------------------------------------------------------------------- face board
 # hive-rig's face_board module describes it: a slider's value is its move along
 # its track over its travel, held to the track; each face control it moves
@@ -497,6 +602,7 @@ def build(RIG, geos=None):
         comp_fn.addElements(list(range(n_verts)))
         fn_skin.setWeights(shape_path, comp, om.MIntArray(list(range(n_inf))), weights, False)
     build_shape_drivers(RIG, shape_nodes, joint_of)
+    build_pose_readers(RIG, shape_nodes, joint_of)
 
     # --------------------------------------------------------------------------- control shapes
     def outline_curves(c):

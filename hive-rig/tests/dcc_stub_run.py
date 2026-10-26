@@ -405,6 +405,28 @@ def run_scene(kind, script):
     print("%s scene builder ran %d characters and %d holds against stubs: ok" % (kind, len(names), len(data["holds"])))
 
 
+def mel_values(text, inputs):
+    """Run the `float $name = ...;` lines of a Maya expression as Python (the
+    small part of MEL the pose readers use) and return the variables."""
+    import math as m
+    import re
+
+    env = {"acos": m.acos, "exp": m.exp, "pow": pow, "abs": abs, "min": min, "max": max,
+           "rad_to_deg": m.degrees,
+           "clamp": lambda lo, hi, v: max(lo, min(hi, v)),
+           "smoothstep": lambda a, b, x: (lambda t: t * t * (3 - 2 * t))(max(0.0, min(1.0, (x - a) / ((b - a) or 1e-6))))}
+    env.update(inputs)
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("float $"):
+            continue
+        name, expr = line[len("float $"):].rstrip(";").split(" = ", 1)
+        if re.search(r"\b\w+\.output", expr):
+            continue  # an input, given in `inputs`
+        env[name] = eval(expr.replace("$", ""), {"__builtins__": {}}, env)
+    return env
+
+
 if __name__ == "__main__":
     import os
 
@@ -525,6 +547,34 @@ if __name__ == "__main__":
         assert calls.count("setWeights") == objects, (calls.count("setWeights"), objects)
         if shapes:
             print("maya blend shapes ran against stubs: %d shapes, %d readers: ok" % (len(shapes), len(readers)))
+        # Cone and RBF readers: one expression each, setting the weights of the
+        # shapes it drives and its helpers' translate and scale. The stub's
+        # joints have unturned frames, so feeding hive-rig's local rotations in
+        # must give hive-rig's outputs (the answers from `pose --readers`).
+        pose_readers = rig.get("pose_readers", [])
+        for r in pose_readers:
+            text = EXPRESSIONS.get(ns["safe_node_name"](r["name"]) + "_pose_reader_expr")
+            assert text, r["name"]
+            weights = [line for line in text.splitlines() if ".weight[" in line]
+            assert len(weights) >= len(r["shapes"]), (r["name"], weights)
+            for h in r["helpers"]:
+                assert "%s.translateX" % h["name"] in text and "%s.scaleY" % h["name"] in text, h["name"]
+        answers = sys_args[sys_args.index("--answers") + 1 :] if "--answers" in sys_args else []
+        checked = 0
+        for path in answers:
+            ans = json.load(open(path))
+            for r in pose_readers:
+                q = ans["locals"][r["bone"]]
+                got = mel_values(EXPRESSIONS[ns["safe_node_name"](r["name"]) + "_pose_reader_expr"],
+                                 {"qx": q[0], "qy": q[1], "qz": q[2], "qw": q[3]})
+                n = len(r["shapes"]) + len(r["helpers"])
+                values = [got["cone"]] * n if r["kind"] == "cone" else [got["out%d" % k] for k in range(n)]
+                want = ans["readers"][r["name"]]
+                assert all(abs(a - b) < 2e-3 for a, b in zip(values, want)), (r["name"], values, want)
+                checked += 1
+        if pose_readers:
+            print("maya pose readers ran against stubs: %d readers, %d checked against hive-rig's answers: ok"
+                  % (len(pose_readers), checked))
         # In-betweens are their own target items (5000 + 1000 * weight).
         for s in shapes:
             for b in s.get("inbetweens", []):
@@ -685,7 +735,8 @@ if __name__ == "__main__":
                     assert "Bend_" + joint in made, joint
         # Corrective shapes: a curve per driven shape, set from its pose reader.
         all_shapes = rig.get("shapes", [])
-        driven = [s["name"] for s in all_shapes if s.get("driver")]
+        driven = [s["name"] for s in all_shapes if s.get("driver")
+                  and s["name"] not in {x for r in rig.get("pose_readers", []) for x in r["shapes"]}]
         for name in driven:
             assert "Reader_%s_weight" % name in made, name
         # Every shape's curves: one per morph target (in-betweens first), set
@@ -700,7 +751,26 @@ if __name__ == "__main__":
             assert "Curve_" + target in made, target
         curves = [c.args[0] for c in vm_curves.call_args_list]
         assert sorted(curves) == sorted(expected), (curves, expected)
-        undriven = [s["name"] + "_shape" for s in all_shapes if not s.get("driver") and not s.get("board")]
+        # Cone and RBF readers: their nodes, a kernel per RBF centre, an output
+        # per shape and helper, and each helper moved and scaled.
+        pose_readers = rig.get("pose_readers", [])
+        by_reader = {s for r in pose_readers for s in r["shapes"]}
+        for r in pose_readers:
+            assert "PoseReader_%s_pointing" % r["name"] in made, r["name"]
+            if r["kind"] == "cone":
+                assert "PoseReader_%s_edge" % r["name"] in made, r["name"]
+            else:
+                for i in range(len(r["centres"])):
+                    assert "PoseReader_%s_%d_kernel" % (r["name"], i) in made, (r["name"], i)
+                for k in range(len(r["shapes"]) + len(r["helpers"])):
+                    assert "PoseReader_%s_out%d" % (r["name"], k) in made, (r["name"], k)
+            for h in r["helpers"]:
+                assert {"PoseHelper_%s_move" % h["name"], "PoseHelper_%s_scale" % h["name"]} <= made, h["name"]
+        if pose_readers:
+            print("unreal pose readers ran against stubs: %d readers, %d helpers: ok"
+                  % (len(pose_readers), sum(len(r["helpers"]) for r in pose_readers)))
+        undriven = [s["name"] + "_shape" for s in all_shapes
+                    if not s.get("driver") and not s.get("board") and s["name"] not in by_reader]
         shape_floats = {str(c.args[0]) for c in hc.add_control.call_args_list}
         assert all(u in shape_floats for u in undriven), (undriven, sorted(shape_floats)[:5])
         if all_shapes:

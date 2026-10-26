@@ -102,8 +102,21 @@ impl Doc {
         doc
     }
 
+    /// Put the pose readers' helper joints on the preview skeleton as the
+    /// built rig has them (after its own bones), so the two line up bone for bone.
+    pub fn place_helpers(&mut self) {
+        if let Ok(built) = &mut self.preview {
+            built
+                .skeleton
+                .bones
+                .retain(|b| b.component != hive_rig::readers::HELPER_COMPONENT);
+            hive_rig::readers::add_helper_bones(&self.mesh.readers, &mut built.skeleton);
+        }
+    }
+
     fn refresh(&mut self) {
         self.preview = components::build(&self.guides).map_err(|e| format!("{e:#}"));
+        self.place_helpers();
         self.checks = checks::check_built(
             &self.guides,
             self.preview.as_ref().map_err(String::as_str),
@@ -314,7 +327,7 @@ pub struct Studio {
     stroke: Option<Vec3>,
     weight_colors: Option<(String, Vec<Color32>)>,
     /// Shape lists before each shape edit, newest last.
-    shape_undo: Vec<Vec<hive_rig::shapes::Shape>>,
+    shape_undo: Vec<(Vec<hive_rig::shapes::Shape>, Vec<hive_rig::readers::Reader>)>,
     /// The shape the sculpt brush edits.
     pub shape_pick: Option<String>,
     /// The sculpt brush is on: dragging on the mesh moves vertices into `shape_pick`.
@@ -1000,7 +1013,12 @@ impl Studio {
             mesh: None,
         };
         if self.pose_shows() {
-            let posed = hive_rig::pose::evaluate(sk, &built.controls, &self.posing.pose);
+            let posed = hive_rig::pose::evaluate_with(
+                sk,
+                &built.controls,
+                &self.posing.pose,
+                &doc.mesh.readers,
+            );
             frame.bones = (0..sk.bones.len())
                 .map(|i| (posed.head(sk, i), posed.tail(sk, i)))
                 .collect();
@@ -1054,12 +1072,14 @@ impl Studio {
                 frame.control_axes[i] = turn_about(Vec3::ZERO, axis, radians, c.axis);
             }
         }
-        frame.mesh = Some(if rig.mesh.shapes.is_empty() {
-            skin::deform_turn(&doc.mesh.positions, &rig.skin, &moved, pivot, axis, radians)
-        } else {
-            // Shapes (and correctives driven by the pose) go on before the skin.
-            hive_rig::shapes::posed_mesh(rig, &self.pose_locals())
-        });
+        frame.mesh = Some(
+            if rig.mesh.shapes.is_empty() && rig.mesh.readers.is_empty() {
+                skin::deform_turn(&doc.mesh.positions, &rig.skin, &moved, pivot, axis, radians)
+            } else {
+                // Shapes (and correctives driven by the pose) go on before the skin.
+                hive_rig::shapes::posed_mesh(rig, &self.pose_locals())
+            },
+        );
         Some(frame)
     }
 
@@ -2139,6 +2159,7 @@ fn push_undo(undo: &mut Vec<Guides>, g: &Guides) {
 mod cast;
 mod control_shapes;
 mod posing;
+mod readers;
 mod shapes;
 mod skin_edit;
 mod ui;
@@ -2945,6 +2966,84 @@ mod tests {
         let flat = outliner_rows(&broken, built.ok().as_ref());
         assert_eq!(flat.len(), broken.components.len());
         assert!(flat.iter().all(|&(_, d)| d == 0));
+    }
+
+    /// Cone and RBF readers made from the test pose: their weights follow the
+    /// pose, a helper joint is added to the skeleton and skin, and undo and a
+    /// rebuild keep everything in step.
+    #[test]
+    fn readers_from_the_pose_with_a_helper() {
+        let mut s = demo_studio();
+        assert!(s.build(), "{}", s.status);
+        s.pose = Some(Pose {
+            bone: "upperarm_l".into(),
+            axis: 2,
+            degrees: 60.0,
+        });
+        assert!(s.new_cone_reader(), "{}", s.status);
+        assert_eq!(s.shape_tools.reader.as_deref(), Some("upperarm_l_cone"));
+        assert_eq!(s.shape_pick.as_deref(), Some("upperarm_l_cone_fix"));
+        let weight = |s: &Studio, name: &str| {
+            let rig = s.doc.as_ref().unwrap().rig.clone().unwrap();
+            let r = s
+                .doc
+                .as_ref()
+                .unwrap()
+                .mesh
+                .readers
+                .iter()
+                .find(|r| r.name == name)
+                .unwrap();
+            s.reader_outputs_now(r, &rig)
+        };
+        assert!((weight(&s, "upperarm_l_cone")[0] - 1.0).abs() < 1e-4);
+        s.pose.as_mut().unwrap().degrees = 0.0;
+        assert!(weight(&s, "upperarm_l_cone")[0] < 1e-4);
+
+        // An RBF reader on the elbow with two poses, each with its shape.
+        s.pose = Some(Pose {
+            bone: "lowerarm_l".into(),
+            axis: 1,
+            degrees: 90.0,
+        });
+        assert!(s.new_rbf_reader(), "{}", s.status);
+        s.pose.as_mut().unwrap().degrees = 45.0;
+        assert!(s.add_pose_to_reader(), "{}", s.status);
+        let w = weight(&s, "lowerarm_l_rbf");
+        assert!(w[0] < 1e-3 && (w[1] - 1.0).abs() < 1e-3, "{w:?}");
+        s.pose.as_mut().unwrap().degrees = 90.0;
+        let w = weight(&s, "lowerarm_l_rbf");
+        assert!((w[0] - 1.0).abs() < 1e-3 && w[1] < 1e-3, "{w:?}");
+        // The pose a sample already has is refused at rest.
+        s.pose.as_mut().unwrap().degrees = 0.0;
+        assert!(!s.add_pose_to_reader());
+
+        // A helper joint: a deforming bone of the rig with skin of its own,
+        // moved by the reader in the pose.
+        s.pose.as_mut().unwrap().degrees = 90.0;
+        assert!(s.add_reader_helper(), "{}", s.status);
+        let helper = "lowerarm_l_vol";
+        let has_helper = |s: &Studio| {
+            let rig = s.doc.as_ref().unwrap().rig.as_ref().unwrap();
+            rig.skeleton.index_of(helper).is_some_and(|h| {
+                (0..rig.skin.joints.len()).any(|v| rig.skin.influences(v).any(|(j, _)| j == h))
+            })
+        };
+        assert!(has_helper(&s));
+        let w = weight(&s, "lowerarm_l_rbf");
+        assert_eq!(w.len(), 3);
+        assert!((w[2] - 1.0).abs() < 1e-3, "{w:?}");
+        assert!(s.frame().unwrap().mesh.is_some());
+        s.undo_shapes();
+        assert!(!has_helper(&s));
+        s.undo_shapes();
+        assert_eq!(s.doc.as_ref().unwrap().mesh.readers.len(), 2);
+        assert!(s.add_reader_helper(), "{}", s.status);
+        assert!(s.build(), "{}", s.status);
+        assert!(has_helper(&s));
+        assert_eq!(s.doc.as_ref().unwrap().mesh.readers.len(), 2);
+        assert!(s.remove_reader("lowerarm_l_rbf"), "{}", s.status);
+        assert!(!has_helper(&s));
     }
 
     #[test]

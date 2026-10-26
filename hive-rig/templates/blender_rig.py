@@ -348,14 +348,152 @@ def rig_bone_names(RIG):
     return {c["name"] for c in RIG["controls"]["controls"]}
 
 
-def build_shapes(RIG, geos, rig):
+def prop_var(drv, name, owner, prop):
+    """A driver variable reading the custom property `prop` of `owner`."""
+    var = drv.variables.new()
+    var.name = name
+    var.type = "SINGLE_PROP"
+    var.targets[0].id = owner
+    var.targets[0].data_path = '["%s"]' % prop
+    return var
+
+
+# --------------------------------------------------------------------------- cone and RBF readers
+# hive-rig's readers module (docs/skinning.md has the maths). A cone reader's
+# weight is 1 while the bone points within `angle` degrees of its direction,
+# easing (smoothstep) to 0 at angle + falloff, or the other way round with
+# `away`. An RBF reader sums a Gaussian kernel of the distance to each of its
+# centres, weighted as hive-rig solved them, held to 0..1. The bone's local
+# rotation (w, x, y, z) is in the bone's own frame, where it points along +Y,
+# so the directions and centres are turned into that frame here. Each value is
+# a property on the armature (`hive_reader_<name>`); shapes and helper joints
+# read it.
+READER_TERMS = 8  # terms per sum, to stay inside Blender's 256-character expressions
+
+
+def reader_prop(reader, k=None):
+    base = "hive_reader_" + reader["name"]
+    return base if k is None else "%s_%d" % (base, k)
+
+
+def float_prop(owner, name, description):
+    owner[name] = 0.0
+    owner.id_properties_ui(name).update(description=description)
+
+
+def bone_frame(rig, bone_name):
+    """Turns a model-space vector (hive-rig's axes) into the bone's rest frame."""
+    m = rig.data.bones[bone_name].matrix_local.to_3x3().normalized().inverted()
+    return lambda v: m @ to_blender(v)
+
+
+def pointing_expression(d):
+    """Where the bone points now (+Y turned by w, x, y, z) dotted with d."""
+    return "(%.6f*2*(x*y-w*z)+%.6f*(1-2*(x*x+z*z))+%.6f*2*(y*z+w*x))" % tuple(d)
+
+
+def sum_driver(rig, prop, terms, held, description):
+    """rig[prop] = the sum of coefficient * rig[source] over `terms`, split
+    into partial sums when there are many; `held` keeps it in 0..1."""
+    if len(terms) > READER_TERMS:
+        parts = []
+        for c in range(0, len(terms), READER_TERMS):
+            part = "%s_part%d" % (prop, c // READER_TERMS)
+            sum_driver(rig, part, terms[c : c + READER_TERMS], False, description)
+            parts.append((part, 1.0))
+        return sum_driver(rig, prop, parts, held, description)
+    float_prop(rig, prop, description)
+    rig.driver_remove('["%s"]' % prop)
+    drv = board_driver(rig, '["%s"]' % prop)
+    body = []
+    for i, (source, coefficient) in enumerate(terms):
+        prop_var(drv, "k%d" % i, rig, source)
+        body.append("%.7g*k%d" % (coefficient, i))
+    body = "+".join(body) or "0"
+    drv.expression = "clamp(%s, 0, 1)" % body if held else body
+
+
+def drive_helper(rig, h, prop):
+    """A helper joint's location and scale from its reader's value `w`: moved
+    w * offset in its parent's frame, scaled along and across its parent bone
+    by 1 + (s - 1) * w."""
+    pb = rig.pose.bones.get(h["name"])
+    if pb is None:
+        print("hive-rig: helper joint %s isn't in the armature" % h["name"])
+        return
+    m = pb.bone.matrix_local.to_3x3().normalized()
+    offset = m.inverted() @ to_blender(h["offset"])
+    along = to_blender(h["parent_dir"]).normalized()
+    for i in range(3):
+        a = abs(m.col[i].normalized().dot(along))
+        s = h["across"] + (h["along"] - h["across"]) * a * a
+        for path, expression in (("location", "%.7g*w" % offset[i]), ("scale", "1+%.7g*w" % (s - 1.0))):
+            pb.driver_remove(path, i)
+            drv = board_driver(pb, path, i)
+            prop_var(drv, "w", rig, prop)
+            drv.expression = expression
+
+
+def build_readers(RIG, rig):
+    """Drivers for the cone and RBF readers (and the helper joints they move).
+    Returns, per shape a reader drives, the armature property with its weight."""
+    out = {}
+    for r in RIG.get("pose_readers", []):
+        if r["bone"] not in rig.data.bones:
+            print("hive-rig: reader %s reads bone %s, which the rig doesn't have" % (r["name"], r["bone"]))
+            continue
+        local = bone_frame(rig, r["bone"])
+        n = len(r["shapes"]) + len(r["helpers"])
+        about = "Pose reader %s (%s on %s)" % (r["name"], r["kind"], r["bone"])
+        if r["kind"] == "cone":
+            prop = reader_prop(r)
+            float_prop(rig, prop, about)
+            rig.driver_remove('["%s"]' % prop)
+            drv = board_driver(rig, '["%s"]' % prop)
+            add_reader_vars(drv, rig, r["bone"])
+            theta = "degrees(acos(clamp(%s, -1, 1)))" % pointing_expression(local(r["direction"]).normalized())
+            edge = "smoothstep(%.6f, %.6f, %s)" % (r["angle"], r["angle"] + r["falloff"], theta)
+            drv.expression = edge if r["away"] else "1-" + edge
+            props = [prop] * n
+        else:
+            scale = 1.0 / math.radians(max(r["radius"], 1e-3))
+            kernels = []
+            for i, (c, d) in enumerate(zip(r["centres"], r["directions"])):
+                kp = "%s_k%d" % (reader_prop(r), i)
+                float_prop(rig, kp, about + ": kernel %d" % i)
+                rig.driver_remove('["%s"]' % kp)
+                drv = board_driver(rig, '["%s"]' % kp)
+                add_reader_vars(drv, rig, r["bone"])
+                if r["swing"]:
+                    dist = "acos(clamp(%s, -1, 1))" % pointing_expression(local(d).normalized())
+                else:
+                    v = local(c[:3])  # the centre's axis part, turned like any vector
+                    dist = "2*acos(min(abs(w*%.6f+x*%.6f+y*%.6f+z*%.6f), 1))" % (c[3], v[0], v[1], v[2])
+                drv.expression = "exp(-pow(%s*%.6f, 2))" % (dist, scale)
+                kernels.append(kp)
+            props = []
+            for k in range(n):
+                p = reader_prop(r, k)
+                sum_driver(rig, p, [(kp, r["weights"][i][k]) for i, kp in enumerate(kernels)], True,
+                           about + ": output %d" % k)
+                props.append(p)
+        for k, shape in enumerate(r["shapes"]):
+            out[shape] = props[k]
+        for k, h in enumerate(r["helpers"]):
+            drive_helper(rig, h, props[len(r["shapes"]) + k])
+    return out
+
+
+def build_shapes(RIG, geos, rig, reader_props=None):
     """Shape keys for hive-rig's blendshapes on the objects they move, at their
-    weights; corrective shapes get a driver reading their bone's rotation.
+    weights; corrective shapes get a driver reading their bone's rotation, or
+    their cone or RBF reader's weight (`reader_props`, from build_readers).
 
     A shape with in-betweens becomes a key per target (`<shape>_ib50`, then
     `<shape>`), each driven to blend through them in order: from its pose
     reader, or from a slider on the armature (`hive_shape_<shape>`) when
     nothing drives it."""
+    reader_props = reader_props or {}
     shapes = RIG["mesh"].get("shapes", [])
     if not shapes:
         return
@@ -383,6 +521,11 @@ def build_shapes(RIG, geos, rig):
             drv.type = "SCRIPTED"
             add_reader_vars(drv, rig, reader["bone"])
             drv.expression = turn_expression(axis, reader["start"], reader["end"])
+        if s["name"] in reader_props:
+            rig.driver_remove('["%s"]' % prop)
+            drv = board_driver(rig, '["%s"]' % prop)
+            prop_var(drv, "weight", rig, reader_props[s["name"]])
+            drv.expression = "weight"
     for k, geo in enumerate(geos):
         start = geo.get("hive_first_vertex", 0)
         n = len(geo.data.vertices)
@@ -403,6 +546,10 @@ def build_shapes(RIG, geos, rig):
                 print("hive-rig: shape %s reads bone %s, which the rig doesn't have" % (s["name"], reader["bone"]))
                 reader = None
             link = None if reader else board_link(RIG, s)
+            # A cone or RBF reader's weight, read from the armature.
+            driven = reader_props.get(s["name"])
+            if driven:
+                reader = link = None
             for t, (key_name, _, vertices, offsets) in enumerate(targets):
                 kb = geo.data.shape_keys.key_blocks.get(key_name) or geo.shape_key_add(name=key_name, from_mix=False)
                 co = [0.0] * (3 * n)
@@ -421,7 +568,7 @@ def build_shapes(RIG, geos, rig):
                 else:
                     kb.slider_min = 0.0
                     kb.value = hat_value(points, t, s.get("weight", 0.0))
-                if reader is None and link is None and len(targets) == 1:
+                if reader is None and link is None and not driven and len(targets) == 1:
                     continue
                 drv = kb.driver_add("value").driver
                 drv.type = "SCRIPTED"
@@ -434,11 +581,8 @@ def build_shapes(RIG, geos, rig):
                     add_reader_vars(drv, rig, reader["bone"])
                     weight = turn_expression(axis, reader["start"], reader["end"])
                 else:
-                    var = drv.variables.new()
-                    var.name = "weight"
-                    var.type = "SINGLE_PROP"
-                    var.targets[0].id = rig
-                    var.targets[0].data_path = '["%s"]' % shape_property(s["name"])
+                    prop_var(drv, "weight", rig,
+                             driven if driven and len(targets) == 1 else shape_property(s["name"]))
                     weight = "weight"
                 drv.expression = weight if len(targets) == 1 else hat_expression(points, t, weight)
 
@@ -1308,7 +1452,7 @@ def build(RIG, geos=None):
         mod = geo.modifiers.new("Armature", "ARMATURE")
         mod.object = rig
         geo.parent = rig
-    build_shapes(RIG, geos, rig)
+    build_shapes(RIG, geos, rig, build_readers(RIG, rig))
 
     # What the Hive panel needs to edit guides and rebuild, kept with the rig so it
     # survives saving and reopening the file.

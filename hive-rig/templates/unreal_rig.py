@@ -1239,12 +1239,175 @@ def build():
             chain_exec(set_curve)
 
 
+    # Cone and RBF readers (hive-rig's readers module; docs/skinning.md has the
+    # maths). Each reads its bone's own turn since rest (as above) and points
+    # the bone's rest direction with it. A cone reader eases (smoothstep) from
+    # 1 within `angle` of its direction to 0 at angle + falloff (the other way
+    # with `away`). An RBF reader sums a Gaussian kernel of the distance to each
+    # centre, weighted as hive-rig solved them, held to 0..1: the distance is
+    # the angle between pointing directions (`swing`), or the angle of the turn
+    # between the two rotations, from how far they carry three axes apart
+    # (cos = (sum of dots - 1) / 2), which needs only directions in Unreal's
+    # frame. Their values set the curves of the shapes they drive and move and
+    # scale their helper joints after the rest of the rig has run.
+    POSE_READERS = RIG.get("pose_readers", [])
+    E = 2.718281828459045
+    reader_turns = {}  # bone -> its turn's pin, shared by the readers on it
+
+
+    def ue_unit(v):
+        u = to_ue_dir(v)
+        n = (u.x * u.x + u.y * u.y + u.z * u.z) ** 0.5 or 1.0
+        return unreal.Vector(u.x / n, u.y / n, u.z / n)
+
+
+    def quat_rotate(q, v):
+        """hive-rig's quaternion (x, y, z, w) turning the vector v."""
+        x, y, z, w = q
+        t = [2 * (y * v[2] - z * v[1]), 2 * (z * v[0] - x * v[2]), 2 * (x * v[1] - y * v[0])]
+        return [v[0] + w * t[0] + (y * t[2] - z * t[1]),
+                v[1] + w * t[1] + (z * t[0] - x * t[2]),
+                v[2] + w * t[2] + (x * t[1] - y * t[0])]
+
+
+    def global_turn(bone, tag):
+        """The bone's turn since rest in Unreal's global frame (now * rest^-1)."""
+        def get(initial_pose):
+            node = unit("RigUnit_GetTransform", "PoseReader_%s_%s_%s" % (tag, bone, "rest" if initial_pose else "now"),
+                        {"Item": item_pin("Bone", bone), "Space": "GlobalSpace",
+                         "bInitial": "True" if initial_pose else "False"})
+            return node + ".Transform.Rotation"
+        inverse = math("QuaternionInverse", "PoseReader_%s_%s_rest_inv" % (tag, bone), {})
+        vm.add_link(get(True), inverse + ".Value")
+        delta = math("QuaternionMul", "PoseReader_%s_%s_turn" % (tag, bone), {})
+        vm.add_link(get(False), delta + ".A")
+        vm.add_link(inverse + ".Result", delta + ".B")
+        return delta + ".Result"
+
+
+    def turned(turn, v, name):
+        node = math("QuaternionRotateVector", name, {"Vector": vector_text(v)})
+        vm.add_link(turn, node + ".Transform")
+        return node + ".Result"
+
+
+    def angle_between(a, b_vector, name):
+        node = math("VectorAngle", name, {"B": vector_text(b_vector)})
+        vm.add_link(a, node + ".A")
+        return node + ".Result"
+
+
+    def build_pose_reader(r):
+        """The reader's nodes; returns one value pin per output (shapes, then helpers)."""
+        if not any(b["name"] == r["bone"] for b in BONES):
+            unreal.log_warning("hive-rig: reader %s reads bone %s, which the rig doesn't have" % (r["name"], r["bone"]))
+            return None
+        name = r["name"]
+        if r["bone"] not in reader_turns:
+            reader_turns[r["bone"]] = bone_turn(r["bone"])
+        turn = reader_turns[r["bone"]]
+        pointing = turned(turn, ue_unit(r["along"]), "PoseReader_%s_pointing" % name)
+        n = len(r["shapes"]) + len(r["helpers"])
+        if r["kind"] == "cone":
+            angle = angle_between(pointing, ue_unit(r["direction"]), "PoseReader_%s_angle" % name)
+            t = math("FloatRemap", "PoseReader_%s_edge" % name, {
+                "SourceMinimum": str(_math.radians(r["angle"])),
+                "SourceMaximum": str(_math.radians(r["angle"] + r["falloff"])),
+                "TargetMinimum": "0.0", "TargetMaximum": "1.0", "bClamp": "True"})
+            vm.add_link(angle, t + ".Value")
+            t = t + ".Result"
+            # smoothstep: t * t * (3 - 2t)
+            smooth = op("FloatMul", "PoseReader_%s_smooth" % name, op("FloatMul", "PoseReader_%s_sq" % name, t, t),
+                        op("FloatSub", "PoseReader_%s_lin" % name, 3.0, op("FloatMul", "PoseReader_%s_2t" % name, t, 2.0)))
+            value = smooth if r["away"] else op("FloatSub", "PoseReader_%s_weight" % name, 1.0, smooth)
+            return [value] * n
+        scale = 1.0 / _math.radians(max(r["radius"], 1e-3))
+        axes = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        kernels = []
+        for i, (c, d) in enumerate(zip(r["centres"], r["directions"])):
+            tag = "PoseReader_%s_%d" % (name, i)
+            if r["swing"]:
+                dist = angle_between(pointing, ue_unit(d), tag + "_dist")
+            else:
+                dots = []
+                for k, e in enumerate(axes):
+                    now = turned(turn, ue_unit(e), "%s_axis%d" % (tag, k))
+                    dot = math("VectorDot", "%s_dot%d" % (tag, k), {"B": vector_text(ue_unit(quat_rotate(c, e)))})
+                    vm.add_link(now, dot + ".A")
+                    dots.append(dot + ".Result")
+                total = op("FloatAdd", tag + "_sum", op("FloatAdd", tag + "_sum01", dots[0], dots[1]), dots[2])
+                cos = op("FloatMul", tag + "_cos", op("FloatSub", tag + "_less", total, 1.0), 0.5)
+                held = math("FloatClamp", tag + "_held", {"Minimum": "-1.0", "Maximum": "1.0"})
+                feed(held, "Value", cos)
+                acos = math("FloatAcos", tag + "_dist", {})
+                feed(acos, "Value", held + ".Result")
+                dist = acos + ".Result"
+            x = op("FloatMul", tag + "_scaled", dist, scale)
+            power = op("FloatMul", tag + "_neg", op("FloatMul", tag + "_sq", x, x), -1.0)
+            kernels.append(op("FloatPow", tag + "_kernel", E, power))
+        values = []
+        for k in range(n):
+            total = 0.0
+            for i, kp in enumerate(kernels):
+                term = op("FloatMul", "PoseReader_%s_w%d_%d" % (name, i, k), kp, r["weights"][i][k])
+                total = term if i == 0 else op("FloatAdd", "PoseReader_%s_sum%d_%d" % (name, i, k), total, term)
+            held = math("FloatClamp", "PoseReader_%s_out%d" % (name, k), {"Minimum": "0.0", "Maximum": "1.0"})
+            feed(held, "Value", total)
+            values.append(held + ".Result")
+        return values
+
+
+    def drive_helper(h, w):
+        """Move the helper w * offset (in its parent's frame, turned with it) and
+        scale it along and across its parent bone by 1 + (s - 1) * w."""
+        if not any(b["name"] == h["name"] for b in BONES):
+            unreal.log_warning("hive-rig: helper joint %s isn't in the skeleton" % h["name"])
+            return
+        tag = "PoseHelper_" + h["name"]
+        offset = turned(global_turn(h["parent"], "helper"), to_ue_dir(h["offset"]), tag + "_offset")
+        moved = math("VectorScale", tag + "_share", {})
+        vm.add_link(offset, moved + ".Value")
+        feed(moved, "Factor", w)
+        here = unit("RigUnit_GetTransform", tag + "_now",
+                    {"Item": item_pin("Bone", h["name"]), "Space": "GlobalSpace"})
+        place = math("VectorAdd", tag + "_place", {})
+        vm.add_link(here + ".Transform.Translation", place + ".A")
+        vm.add_link(moved + ".Result", place + ".B")
+        put = unit("RigUnit_SetTranslation", tag + "_move",
+                   {"Item": item_pin("Bone", h["name"]), "Space": "GlobalSpace", "bPropagateToChildren": "False"})
+        vm.add_link(place + ".Result", put + ".Value")
+        chain_exec(put)
+        # Its local axes are its parent's, which at rest are the global ones.
+        along = ue_unit(h["parent_dir"])
+        size = math("VectorMake", tag + "_size", {})
+        for axis, a in zip("XYZ", (along.x, along.y, along.z)):
+            s = h["across"] + (h["along"] - h["across"]) * a * a
+            feed(size, axis, op("FloatAdd", "%s_%s" % (tag, axis), 1.0,
+                                op("FloatMul", "%s_%s_share" % (tag, axis), w, s - 1.0)))
+        grow = unit("RigUnit_SetScale", tag + "_scale",
+                    {"Item": item_pin("Bone", h["name"]), "Space": "LocalSpace", "bPropagateToChildren": "False"})
+        vm.add_link(size + ".Result", grow + ".Scale")
+        chain_exec(grow)
+
+
+    reader_pins = {}
+    for r in POSE_READERS:
+        values = build_pose_reader(r)
+        if values is None:
+            continue
+        for k, shape in enumerate(r["shapes"]):
+            reader_pins[shape] = values[k]
+        for k, h in enumerate(r["helpers"]):
+            drive_helper(h, values[len(r["shapes"]) + k])
+
     # Shapes nothing drives get a float control (`<shape>_shape`, at the weight
     # hive-rig gave them) that sets their curves, so they can be keyed here too.
     shape_owner = control_key(CONTROLS[0]["name"]) if CONTROLS else None
     for shape in BLEND_SHAPES:
         link = shape.get("board")
-        if shape.get("driver"):
+        if shape["name"] in reader_pins:
+            pin = reader_pins[shape["name"]]
+        elif shape.get("driver"):
             pin = build_reader(shape)
         elif link and (link["part"], link["dir"]) in board_amounts:
             pin = math("FloatClamp", "BoardShape_" + shape["name"], {"Minimum": "0.0", "Maximum": "1.0"})

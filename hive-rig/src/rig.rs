@@ -116,6 +116,10 @@ pub fn build_rig(mesh: Mesh, name: &str, guides: Guides, opts: RigOptions) -> an
         .naming
         .apply(&mut built.skeleton, &mut built.controls)?;
     guides.skin.validate()?;
+    // Pose readers' helper joints go on before the skin, which weights them
+    // like any other joint. Those whose parent this skeleton lacks wait for
+    // `readers::rename_bones` (a rebuild that renamed the bones).
+    crate::readers::add_helper_bones(&mesh.readers, &mut built.skeleton);
     let skin = skin::compute(&mesh, &built.skeleton, opts.skin, guides.skin);
     let mut rig = Rig {
         format: FORMAT.into(),
@@ -205,9 +209,25 @@ impl Rig {
     /// any convention), so rigs with different naming can be matched. Falls back
     /// to the exported names when the guides no longer build the same bones.
     pub fn internal_bone_names(&self) -> Vec<String> {
+        // Pose readers' helper joints aren't built from the guides; they keep
+        // their own names among the built bones.
+        let own = |i: &usize| !crate::readers::is_helper_bone(&self.skeleton, *i);
+        let n_own = (0..self.skeleton.bones.len()).filter(own).count();
         match components::build(&self.guides) {
-            Ok(b) if b.skeleton.bones.len() == self.skeleton.bones.len() => {
-                b.skeleton.bones.into_iter().map(|b| b.name).collect()
+            Ok(b) if b.skeleton.bones.len() == n_own => {
+                let mut built = b.skeleton.bones.into_iter().map(|b| b.name);
+                self.skeleton
+                    .bones
+                    .iter()
+                    .enumerate()
+                    .map(|(i, bone)| {
+                        if own(&i) {
+                            built.next().unwrap_or_else(|| bone.name.clone())
+                        } else {
+                            bone.name.clone()
+                        }
+                    })
+                    .collect()
             }
             _ => self.skeleton.bones.iter().map(|b| b.name.clone()).collect(),
         }

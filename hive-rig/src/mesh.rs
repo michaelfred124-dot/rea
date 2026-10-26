@@ -55,6 +55,10 @@ pub struct Mesh {
     /// Blendshapes (morph targets): the source file's and the ones made in hive-rig.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shapes: Vec<Shape>,
+    /// Cone and RBF pose readers: what they read, the shapes they drive and
+    /// the helper joints they move (see [`crate::readers`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub readers: Vec<crate::readers::Reader>,
 }
 
 /// One piece of the mesh: a run of vertices and triangles of one object with
@@ -537,6 +541,9 @@ impl Mesh {
         }
         for s in &self.shapes {
             s.validate(n)?;
+        }
+        for r in &self.readers {
+            r.validate()?;
         }
         Ok(())
     }

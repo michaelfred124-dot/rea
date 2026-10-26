@@ -412,6 +412,22 @@ pub fn evaluate(sk: &Skeleton, rig: &ControlRig, pose: &Pose) -> Posed {
     }
 }
 
+/// [`evaluate`], with the cone and RBF pose readers' helper joints moved and
+/// scaled by what their readers read in the pose.
+pub fn evaluate_with(
+    sk: &Skeleton,
+    rig: &ControlRig,
+    pose: &Pose,
+    readers: &[crate::readers::Reader],
+) -> Posed {
+    let mut posed = evaluate(sk, rig, pose);
+    if readers.iter().any(|r| !r.helpers.is_empty()) {
+        let locals = posed.locals();
+        crate::readers::drive_helpers(readers, sk, &locals, &mut posed.bones);
+    }
+    posed
+}
+
 /// A posed bone: where its head went, how it turned, and its scale in rest
 /// axes (stretch, squash, or a scaled control).
 #[derive(Debug, Clone, Copy)]

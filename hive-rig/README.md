@@ -32,7 +32,7 @@ a joint; with Symmetry on, its twin on the other side follows.
 * **The outliner** (left) lists the components as their attachment tree: each
   component sits under the one owning the bone it hangs from (a leg hung from
   the head is listed under the head). **Properties** (right)
-  shows the rig summary, the pre-build [checks](#checks-before-building), [blendshapes](#blendshapes-and-corrective-shapes) (a searchable shape list with a slider each, correctives, in-betweens and the sculpt brushes), [skin weights](#skin-weights-in-the-app) (the mesh tool, a searchable bone list, the paint brush, mirror and copy, the vertex inspector, locks, fixes and the vertex selection) and naming, or, with a component
+  shows the rig summary, the pre-build [checks](#checks-before-building), [blendshapes](#blendshapes-and-corrective-shapes) (a searchable shape list with a slider each, correctives, in-betweens and the sculpt brushes), [pose readers](#cone-and-rbf-readers-and-helper-joints) (cone and RBF, with helper joints), [skin weights](#skin-weights-in-the-app) (the mesh tool, a searchable bone list, the paint brush, mirror and copy, the vertex inspector, locks, fixes and the vertex selection) and naming, or, with a component
   selected, its attachment, options (the spine's joint count and **Spline (curve)**
   toggle, a tentacle's joint and curve-control counts), exact guide positions and the names its
   bones will export as. Click a panel's title to fold it away.
@@ -246,6 +246,67 @@ hive-rig shape out/hero.hive.json remove grin
 bone (forearm, shin) bends the way its IK bends without one. `--from` takes a
 mesh with the same vertices, sculpted in that pose (or at rest). A rebuild keeps
 the shapes and moves their drivers onto the renamed bones.
+
+#### Cone and RBF readers, and helper joints
+
+An angle reader reads one turn about one axis. For a shoulder, hip or wrist,
+which swing every way and twist too, there are two more readers (the maths is
+in [docs/skinning.md](docs/skinning.md#cone-and-rbf-readers)):
+
+* A **cone reader** is fully on while its bone points within `--angle`
+  degrees of a direction and eases off over `--falloff` more (`--away` turns
+  it inside out). It reads only where the bone points, so twist doesn't
+  change it.
+* An **RBF reader** learns from sample poses of its bone, each giving every
+  output a value; between them a Gaussian over the angle between rotations
+  (or, with `--swing`, between pointing directions) blends, solved at export
+  so every sample gives back exactly its values, and off at rest.
+* Either reader can drive **helper joints** as well as shapes: a joint under
+  the bone's parent, skinned like any other, that the reader moves
+  (`--offset`) and scales (`--along` and `--across` the parent bone) to keep
+  volume at a bend. Adding one redoes the automatic weights, keeping painted
+  edits.
+
+Readers are kept with the shapes (`"readers"` on the mesh), so a rebuild keeps
+them and puts their helper joints back. In the app the **Pose readers** card
+under Blendshapes makes them from the pose that shows: **Cone from pose** (a
+cone centred where the posed bone points, with a shape to sculpt), **RBF from
+pose**, then **Add pose to reader** for each further pose (each with a new
+shape fully on there) and **Add helper joint**. Every output's weight shows
+live as you pose the test pose or the controls, and the picked reader's angle,
+falloff, radius, sample values and helper move and scale are sliders. Reader
+edits are undone with **Undo shape**.
+
+```bash
+# A cone on the shoulder, on as the arm swings up (whichever way it turns)
+hive-rig shape out/hero.hive.json reader cone shoulder_up_l --bone upperarm_l \
+  --pose upperarm_l=70@up --angle 10 --falloff 40 --shape shoulder_up_l
+# An RBF reader on the elbow, its samples taken from the studio pose
+hive-rig shape out/hero.hive.json reader rbf elbow_l --bone lowerarm_l
+hive-rig pose out/hero.hive.json --reset --set lowerarm_l_fk_ctrl=0,0,0,0,80,0
+hive-rig shape out/hero.hive.json reader pose elbow_l --studio --set elbow_fix_l=1
+hive-rig pose out/hero.hive.json --reset --set lowerarm_l_fk_ctrl=0,0,0,0,40,30
+hive-rig shape out/hero.hive.json reader pose elbow_l --studio --set elbow_fix_l=0.4
+# A volume joint at the elbow, swelling as the first sample comes on
+hive-rig shape out/hero.hive.json reader helper elbow_l elbow_vol_l \
+  --offset 0,0,-0.02 --across 1.3 --along 0.9 --on 1
+hive-rig shape out/hero.hive.json reader list --studio      # weights in the studio pose
+hive-rig shape out/hero.hive.json reader mirror elbow_l     # elbow_r (mirror its shapes first)
+hive-rig shape out/hero.hive.json reader pose elbow_l --remove 2
+hive-rig shape out/hero.hive.json reader remove elbow_l
+# Each reader's outputs, the shapes' weights and the helpers' matrices in a pose
+hive-rig pose out/hero.hive.json --set lowerarm_l_fk_ctrl=0,0,0,0,55,15 --readers out/readers.json
+```
+
+In Blender the readers are drivers on armature properties
+(`hive_reader_<name>`, in simple expressions, so no Python auto-run is
+needed) that the shape keys and the helper bones' location and scale read;
+checked in real Blender against hive-rig over several poses. In Maya each
+reader is one expression node fed by a multMatrix and decomposeMatrix (no
+plug-ins), setting blendShape weights and the helper joints; in Unreal it is a
+Control Rig graph setting the shape curves and the helpers. Maya and Unreal
+only against stubs (the Maya expression is evaluated against hive-rig's
+answers there; the Unreal graph is checked for its nodes only).
 
 How each target carries shapes, in-betweens and drivers:
 
@@ -1318,6 +1379,9 @@ python3 tests/dcc_stub_run.py unreal out/hive_demo_unreal.py --send     # Unreal
 python -I tests/blender_fbx_edits_check.py out/hive_demo.hive.json out/hive_demo.glb target/debug/hive-rig /tmp/work
 hive-rig pose out/hive_demo.hive.json --set head_ctrl=,,,0,-30,5 --bones out/posed.json
 python -I tests/blender_studio_pose_check.py out/hive_demo_blender.py out/posed.json   # the studio pose in Blender
+# Cone and RBF readers (made as in the README's reader example), with answers from `pose --readers`:
+python -I tests/blender_reader_check.py out/hive_demo_blender.py out/p1.json out/p2.json
+python3 tests/dcc_stub_run.py maya out/hive_demo_maya.py --answers out/p1.json out/p2.json
 # A face board: add eyes, jaw and face to the demo's guides, rebuild, then the
 # Blender check above checks the sliders, zippers and sticky lips against hive-rig.
 python tests/blender_guides_check.py out/hive_demo_blender.py           # guides and rebuild

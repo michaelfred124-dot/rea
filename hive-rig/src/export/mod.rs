@@ -150,10 +150,20 @@ fn basis_bones(rig: &Rig) -> Vec<String> {
 /// its attribute values, for the builders' pose libraries. A move rather than
 /// channels, since each program's controls have their own local axes.
 fn with_studio_pose(rig: &Rig) -> Result<String> {
-    if rig.pose.is_rest() {
-        return Ok(serde_json::to_string(rig)?);
+    let mut v = serde_json::to_value(rig)?;
+    // Cone and RBF readers, solved: what they read, drive and move.
+    v["pose_readers"] = crate::readers::export(rig);
+    if !rig.pose.is_rest() {
+        v["studio_pose"] = studio_pose(rig, &rig.pose);
     }
-    let posed = crate::pose::evaluate(&rig.skeleton, &rig.controls, &rig.pose);
+    Ok(serde_json::to_string(&v)?)
+}
+
+/// Where `pose` puts each control, as a move of model space (column-major
+/// 4x4 from rest to posed, metres, Y up), and its attribute values: the
+/// `studio_pose` the builders' pose libraries take.
+pub fn studio_pose(rig: &Rig, pose: &crate::pose::Pose) -> serde_json::Value {
+    let posed = crate::pose::evaluate(&rig.skeleton, &rig.controls, pose);
     let moves: serde_json::Map<String, serde_json::Value> = rig
         .controls
         .controls
@@ -161,9 +171,25 @@ fn with_studio_pose(rig: &Rig) -> Result<String> {
         .zip(&posed.controls)
         .map(|(c, m)| (c.name.clone(), json!(m.to_cols_array())))
         .collect();
-    let mut v = serde_json::to_value(rig)?;
-    v["studio_pose"] = json!({ "controls": moves, "attributes": rig.pose.attributes });
-    Ok(serde_json::to_string(&v)?)
+    json!({ "controls": moves, "attributes": pose.attributes })
+}
+
+/// The `<name>.hive.json` text. With cone or RBF readers it also carries them
+/// solved (`pose_readers`, as the builder scripts take them), so the Blender
+/// and Maya Rebuild buttons, which read this file, find them; reading the
+/// file back ignores it.
+pub fn rig_file(rig: &Rig) -> Result<Vec<u8>> {
+    let mut text = serde_json::to_vec_pretty(rig)?;
+    if !rig.mesh.readers.is_empty() && text.ends_with(b"}") {
+        text.pop();
+        while text.last().is_some_and(|c| c.is_ascii_whitespace()) {
+            text.pop();
+        }
+        text.extend_from_slice(b",\n  \"pose_readers\": ");
+        text.extend(serde_json::to_vec(&crate::readers::export(rig))?);
+        text.extend_from_slice(b"\n}");
+    }
+    Ok(text)
 }
 
 /// Generate the builder script for one DCC.
@@ -201,6 +227,8 @@ pub fn script(rig: &Rig, target: Target, glb_path: &Path) -> Result<String> {
                 "mirror_pairs": rig.controls.mirror_pairs,
                 "basis": basis,
                 "shapes": shapes,
+                // Cone and RBF readers, solved: what they read, drive and move.
+                "pose_readers": crate::readers::export(rig),
                 // The face board's sliders, the face controls they move and the lip seal.
                 "face_board": rig.controls.face_board,
             });
@@ -245,7 +273,7 @@ pub fn write_all(rig: &Rig, out_dir: &Path, targets: &[Target]) -> Result<Vec<Pa
     written.push(glb_path.clone());
 
     let json_path = out_dir.join(format!("{}.hive.json", rig.name));
-    std::fs::write(&json_path, serde_json::to_vec_pretty(rig)?)?;
+    std::fs::write(&json_path, rig_file(rig)?)?;
     written.push(json_path);
 
     let guides_path = out_dir.join(format!("{}.guides.json", rig.name));

@@ -164,10 +164,11 @@ Weights alone can't fix every pose: an elbow bent past 90 degrees still loses
 volume and a shoulder raised overhead still folds. Production rigs add
 *corrective shapes* (blendshapes sculpted for a pose, faded in by the joint
 angle through a pose reader such as an RBF or cone reader) or *helper joints*
-that push skin out as the joint bends. hive-rig builds angle-driven
-correctives (see the README's blendshapes section and `docs/hive-gaps.md`,
-item 9); the bent-joint thickness measured below is pure linear blend skinning,
-without them.
+that push skin out as the joint bends. hive-rig builds correctives driven by
+angle, cone and RBF readers, and helper joints those readers move (see "Cone
+and RBF readers" below, the README's blendshapes section and
+`docs/hive-gaps.md`, item 9); the bent-joint thickness measured below is pure
+linear blend skinning, without them.
 
 **Sculpting through the skin.** A shape's offsets are stored at rest, but a
 corrective is sculpted in its pose. Each sculpt step takes the moves made on
@@ -198,6 +199,155 @@ shape's slider through a hat expression, Unreal's Control Rig builds the hats
 from two clamped remaps and a min per target, and Maya's blendShape does the
 same blend natively. In flat formats (glTF, FBX) each target becomes its own
 morph target named `<shape>_ib<percent>`; hive-rig folds them back on import.
+
+## Cone and RBF readers
+
+An angle reader looks at one turn of a bone about one axis. That is enough
+for an elbow, which bends one way, but not for a shoulder, a hip or a wrist,
+which swing in any direction and twist as well. hive-rig has two more readers
+for those, and both can drive helper joints as well as shapes. Everything here
+is worked out from the definitions below; `src/readers.rs` is the reference.
+
+**What a reader reads.** A reader watches one bone's *local* rotation `q`: its
+turn relative to its parent, the rotation the animator keys. hive-rig's bones
+carry no rest rotation, so a bone's rest frame is the model's axes, and the
+bone points along its rest direction `a` (head to tail, unit length). Posed,
+it points along `d = q a`, expressed in its parent's rest frame.
+
+### Cone readers
+
+A cone reader has a direction `c`, a half-angle `alpha` and a falloff `phi`
+(degrees). The bone's swing away from `c` is
+
+    theta = acos(clamp(d . c, -1, 1))
+
+and its weight is
+
+    w = 1 - smoothstep(alpha, alpha + phi, theta)
+    smoothstep(e0, e1, x) = t^2 (3 - 2t),  t = clamp((x - e0) / (e1 - e0), 0, 1)
+
+so it is fully on inside the cone, off past `alpha + phi`, and eases between
+with zero slope at both ends (no visible kink when a shape starts to move).
+With `away` set the weight is `smoothstep(...)` itself: off inside the cone,
+on once the bone has swung out of it in *any* direction.
+
+*Why twist doesn't count.* Split `q` into a twist `t` about `a` and a swing
+`s` after it: `q = s t`. Then `d = s t a = s a`, because a turn about `a`
+leaves `a` where it is. The weight depends on `d` only, so twisting the bone
+in place never changes it, which is what a shoulder or hip corrective wants.
+
+*Making one.* "Cone from pose" (and `shape reader cone ... --pose`) sets `c`
+to where the bone points in the pose that shows, so the reader is fully on in
+the pose the shape is sculpted in.
+
+### RBF readers
+
+An RBF (radial basis function) reader is taught by example. It holds sample
+poses `q_1 ... q_n` of its bone, each with the value `v_ik` that every output
+`k` should take there (a shape's weight, a helper's amount). Between the
+samples it blends smoothly.
+
+*Distance between poses.* A unit quaternion and its negative are the same
+rotation, so the distance has to treat them alike. The turn taking `p` to `q`
+is `q p^-1`, whose real part is `q . p` (the 4D dot product), and a turn of
+angle `delta` has real part `cos(delta/2)`. So
+
+    delta(q, p) = 2 acos |q . p|        (0 to 180 degrees)
+
+which is the angle of the smallest turn between the two poses, and the same
+for `q` and `-q` because of the absolute value. With `swing` set (ignore
+twist), the distance is instead the angle between where the bone points,
+`acos(q a . p a)`, for the reason given for cones.
+
+*Kernel.* Each sample spreads its influence with a Gaussian of the distance,
+
+    k(delta) = exp(-(delta / sigma)^2)
+
+1 at the sample and falling off smoothly, a little over a third (`e^-1`) at
+`sigma` degrees. `sigma` is the reader's `radius`; at 0 hive-rig picks it from
+the samples as the mean distance from each to its nearest neighbour (45
+degrees when there are fewer than two centres), so neighbouring samples
+overlap enough to blend but don't swamp each other.
+
+*Rest is a sample too.* Correctives should be off at rest, so rest (the
+identity) is added as a centre with every output 0, unless a sample lies
+within 1 degree of rest already (then that sample's values hold at rest).
+
+*Solving for exact hits.* Summing kernels times sample values would blur the
+samples into each other: at a sample, its neighbours' kernels still add some.
+Instead each centre `i` gets a weight `W_ik` per output, chosen so that the
+sum gives back every sample's values exactly. With `Phi_ij = k(delta(q_i,
+q_j))` that is the linear system
+
+    (Phi + epsilon I) W = V,   epsilon = 1e-6
+
+solved at export by Gaussian elimination with partial pivoting in double
+precision. The Gaussian of the distance between points is positive definite
+for points in a plane; on rotations it isn't guaranteed to be, so the small
+`epsilon` keeps nearly-equal samples from making the system singular, and
+samples closer than 1 degree to each other are refused (they can't be told
+apart). Live, for the bone at `q`, each output is
+
+    out_k(q) = clamp( sum_i W_ik k(delta(q, q_i)), 0, 1 )
+
+The clamp is needed because exact interpolation can overshoot between
+samples (the weights may be negative); weights outside 0 to 1 would push a
+shape past its sculpt or reverse it.
+
+### Helper joints
+
+A helper joint (a volume joint) is an ordinary deforming bone that a reader
+moves and scales: a short bone at a joint, under the bone above it, pushing
+the skin out where it folds. It has a rest head `h`, an `offset` (in its
+parent's rest frame), and scales `along` and `across` its parent bone's rest
+direction `u`. At reader weight `w` its skinning matrix is
+
+    M = M_parent T(h + w offset) S(w) T(-h)
+    S(w) = s_x I + (s_a - s_x) u u^T,   s_a = 1 + (along - 1) w,  s_x = 1 + (across - 1) w
+
+which reads right to left: move the skin to the helper's head, scale it there
+(by `s_a` along `u`, by `s_x` in the plane across it), put it back moved by
+`w offset`, then carry it with the parent. At `w = 0` it is just its parent's
+matrix, so a helper does nothing until its reader comes on. Being a real
+joint, it is skinned by the automatic weights like any other (a short bone
+along its parent's direction whose reach is its `radius`), its weights can be
+painted, and adding or removing one redoes the automatic weights while
+keeping hand-painted edits. A rebuild from edited guides puts the helper
+joints back on the new skeleton.
+
+### In each application
+
+Every target evaluates the same formulas from values solved at export
+(`pose_readers` in the rig data: cone directions, RBF centres, their pointing
+directions, `sigma` and `W`), so the applications never run the solve.
+
+* **Blender** has no reader node, so each value is a driver on a custom
+  property of the armature (`hive_reader_<name>`, one per kernel and per
+  output), using only functions Blender's simple-expression evaluator accepts
+  (`acos`, `exp`, `pow`, `smoothstep`, `clamp`), so they run without Python
+  auto-run. A Blender bone's local rotation is in its own rest frame `B`,
+  not the model's, so its quaternion is `B^-1 q B`; the real part of a dot
+  product is unchanged, and the centres' vector parts and the cone direction
+  are turned into `B` at build time. Shape keys read the output properties
+  and the helper pose bones get location and scale drivers.
+* **Maya** gets one expression node per reader (no plug-ins): the bone's
+  local quaternion comes from a `multMatrix` of its world matrix and its
+  parent's inverse into a `decomposeMatrix`, then the expression works out
+  the distances, kernels and sums above and sets the blendShape weights and
+  the helper joints' translate and scale.
+* **Unreal** gets the same maths as Control Rig nodes. For the quaternion
+  distance it uses the trace of the relative turn: turning the three axes by
+  both rotations and summing the dot products gives `1 + 2 cos delta`, so
+  `cos delta = (sum - 1) / 2`. The Gaussian is a power of `e`, the outputs
+  set curves (and through them morph targets), and helpers are set with a
+  global translation and a local scale. The local scale puts `along` on the
+  helper bone's own length axis, which matches `S(w)` exactly while the
+  helper points along its parent (as hive-rig makes it).
+
+Checked: hive-rig's evaluator against real Blender over several poses (reader
+outputs, shape keys and the skin the helpers move); the Maya expression by
+evaluating it against hive-rig's outputs in the stub run; the Unreal graph
+only for its nodes in the stub run.
 
 ## Measured on real characters
 

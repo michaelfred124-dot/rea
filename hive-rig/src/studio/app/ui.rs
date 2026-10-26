@@ -1483,6 +1483,8 @@ impl Studio {
 
         ui.add_space(8.0);
         self.shapes_card(ui);
+        ui.add_space(8.0);
+        self.readers_card(ui);
 
         ui.add_space(8.0);
         theme::label_caps(ui, "Skin weights");

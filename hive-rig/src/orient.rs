@@ -305,6 +305,7 @@ pub fn turn_mesh(mesh: &mut Mesh, m: Mat3) {
             d.axis = m * d.axis;
         }
     }
+    crate::readers::turn(&mut mesh.readers, m);
 }
 
 /// Turn joints in place by `m`.
