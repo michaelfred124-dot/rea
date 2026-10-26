@@ -674,6 +674,24 @@ impl Studio {
         ));
     }
 
+    /// A demo creature with `count` feathers a row in `rows` rows on its wings
+    /// (or arms), and a vane on every feather in its mesh so they skin.
+    pub fn load_feathered_creature(&mut self, c: demo::Creature, count: usize, rows: usize) {
+        let mut guides = c.guides();
+        if let Err(e) = components::set_feathers(&mut guides, None, count, rows) {
+            self.fail(format!("Couldn't add feathers: {e:#}"));
+            return self.load_creature(c);
+        }
+        let mesh = demo::with_feathers(c.mesh(), &guides);
+        let mut doc = Doc::new(c.rig_name(), mesh, guides, demo_out_dir());
+        doc.origin = Some(format!("demo:{}", c.name()));
+        self.set_doc(doc);
+        self.info(format!(
+            "Demo {} loaded with {count} feathers a row on each wing.",
+            c.name()
+        ));
+    }
+
     pub fn save_guides(&mut self, path: &Path) {
         let Some(doc) = &self.doc else { return };
         match doc.guides.save(path) {
@@ -1341,6 +1359,37 @@ impl Studio {
     /// its counts change in Properties.
     pub fn add_tentacle(&mut self) {
         self.add(Preset::Tentacle, AddOptions::default());
+    }
+
+    /// Forking FK chains on each side of the head; more forks come from Properties.
+    pub fn add_antlers(&mut self) {
+        self.add(Preset::Antlers, AddOptions::default());
+    }
+
+    /// Fork chain `id` at its guide `from` with a branch of `joints` (and its twin).
+    pub fn add_branch(&mut self, id: &str, from: &str, joints: usize) {
+        let (id, from) = (id.to_string(), from.to_string());
+        self.edit("add a branch", |g| {
+            let names = components::add_branch(g, &id, &from, joints)?;
+            Ok(format!("{id} forks at {from}: {} new guides.", names.len()))
+        });
+    }
+
+    /// Feathers on a wing and its twin: `count` a row in `rows` rows (0 off).
+    pub fn set_feathers(&mut self, id: &str, count: usize, rows: usize) {
+        let id = id.to_string();
+        self.edit("change the feathers", |g| {
+            let ids = components::set_feathers(g, Some(&id), count, rows)?;
+            Ok(if count == 0 {
+                format!("No feathers on {}.", ids.join(" and "))
+            } else {
+                format!(
+                    "{}: {count} feathers a row in {}.",
+                    ids.join(" and "),
+                    self::count(rows, "row")
+                )
+            })
+        });
     }
 
     pub fn add_chain(&mut self) {
@@ -2050,6 +2099,7 @@ fn chain(
             .map(|k| Guide {
                 name: format!("j{}", k + 1),
                 position: start + dir * (length * k as f32 / joints as f32),
+                from: None,
             })
             .collect(),
         options: Options::default(),

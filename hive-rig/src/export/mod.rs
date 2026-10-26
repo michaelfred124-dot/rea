@@ -231,6 +231,8 @@ pub fn script(rig: &Rig, target: Target, glb_path: &Path) -> Result<String> {
                 "pose_readers": crate::readers::export(rig),
                 // The face board's sliders, the face controls they move and the lip seal.
                 "face_board": rig.controls.face_board,
+                // Feathered wings: the fan control and each feather's offset.
+                "feathers": rig.controls.feathers,
             });
             fill(UNREAL_TEMPLATE, &serde_json::to_string(&data)?, &glb)
         }
@@ -534,6 +536,28 @@ mod tests {
             let end = start + s[start..].find("\"\"\"").unwrap();
             let v: serde_json::Value = serde_json::from_str(&s[start..end]).unwrap();
             assert_eq!(v["name"], "demo");
+        }
+    }
+
+    #[test]
+    fn feathers_reach_every_script() {
+        use crate::demo::Creature;
+        let mut guides = Creature::Bird.guides();
+        components::set_feathers(&mut guides, None, 3, 1).unwrap();
+        let mesh = crate::demo::with_feathers(Creature::Bird.mesh(), &guides);
+        let r = rig::build_rig(mesh, "bird", guides, Default::default()).unwrap();
+        for t in Target::SCRIPTS {
+            let s = script(&r, t, Path::new("/tmp/bird.glb")).unwrap();
+            let start = s.find("r\"\"\"").unwrap() + 4;
+            let end = start + s[start..].find("\"\"\"").unwrap();
+            let v: serde_json::Value = serde_json::from_str(&s[start..end]).unwrap();
+            let fans = v["feathers"]
+                .as_array()
+                .or_else(|| v["controls"]["feathers"].as_array())
+                .unwrap_or_else(|| panic!("{t:?} has no feathers"));
+            assert_eq!(fans.len(), 2, "{t:?}");
+            assert_eq!(fans[0]["feathers"].as_array().unwrap().len(), 3);
+            assert!(s.contains("spread"), "{t:?} drives the spread");
         }
     }
 

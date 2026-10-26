@@ -534,6 +534,24 @@ if __name__ == "__main__":
         assert ("rowLayout" in calls or not anim["limbs"]) and "confirmDialog" not in calls
         assert "textScrollList" in calls, "the window has the pose library"
         print("maya animator tools ran against stubs: ok")
+        # Slide: on every spline's settings control, driving its handle's offset.
+        for sp in splines:
+            settings = sp["settings"]
+            assert ns["cmds"].attributeQuery("slide", node=settings), sp["name"]
+            assert ("connectAttr", (settings + ".slide", sp["name"] + "_spline_ikHandle.offset")) in calls, sp["name"]
+            assert anim["defaults"][settings]["slide"] == sp.get("default_slide", 0.0), sp["name"]
+        # Feathers: spread on each fan control turns every feather's fan group.
+        fans = rig["controls"].get("feathers", [])
+        for fan in fans:
+            assert ns["cmds"].attributeQuery("spread", node=fan["control"]), fan["control"]
+            assert anim["defaults"][fan["control"]]["spread"] == 0.0, fan["control"]
+            for f in fan["feathers"]:
+                c = f["control"]
+                assert ("connectAttr", (fan["control"] + ".spread", c + "_fan_turn.input1")) in calls, c
+                assert ("connectAttr", (c + "_fan_turn.output", c + "_fan.rotateX")) in calls, c
+        if fans:
+            print("maya feathers ran against stubs: %d fans, %d feathers: ok"
+                  % (len(fans), sum(len(f["feathers"]) for f in fans)))
         # Blend shapes: every shape lands on a blendShape target with its
         # offsets and vertices; every corrective gets a reader network.
         shapes = rig["mesh"].get("shapes", [])
@@ -819,8 +837,27 @@ if __name__ == "__main__":
                 assert [p.name for p in hock_parent] == [n + "_spring_follow"], (n, hock_parent)
         for sp in splines:
             assert sp["name"] + "_volume" in floats, sp["name"]
+            assert sp["name"] + "_slide" in floats and sp["name"] + "_slide" in ns["ANIM"]["floats"], sp["name"]
             for b in sp["bones"][:-1]:
                 assert "Volume_" + b in made, b
+        # Slide: each spline reads its slide float (into both Fit Chain on Curve units).
+        minimum = [n for n in made if n.startswith("Get_") and n.endswith("_slide")]
+        assert len(minimum) == len(splines), minimum
+        # Feathers: a spread float on each fan control, a null under every
+        # feather's first control, turned by the graph before the FK.
+        fans = rig.get("feathers") or []
+        if fans:
+            nulls = {str(c.args[0]) for c in hc.add_null.call_args_list}
+            parents = {str(c.args[0]): c.args[1] for c in hc.add_control.call_args_list}
+            order = [c.args[3] for c in vm.add_unit_node_from_struct_path.call_args_list]
+            feathers = [f for fan in fans for f in fan["feathers"]]
+            for fan in fans:
+                assert fan["name"] + "_spread" in floats and fan["name"] + "_spread" in ns["ANIM"]["floats"], fan
+            for f in feathers:
+                assert f["control"] + "_fan" in nulls, f["control"]
+                assert parents[f["control"]].name == f["control"] + "_fan", f["control"]
+                assert order.index("FanTurn_" + f["control"]) < order.index("Set_" + f["bone"]), f["control"]
+            print("unreal feathers ran against stubs: %d fans, %d feathers: ok" % (len(fans), len(feathers)))
         # Animator tools: IK/FK matching both ways on the current frame and over
         # the playback range, keyed on each frame, and a menu entry for each.
         lib = sys.modules["unreal"].ControlRigSequencerLibrary

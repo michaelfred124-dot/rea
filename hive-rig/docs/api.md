@@ -111,8 +111,12 @@ script; `hive-rig rebuild`, `hive-rig rig --guides` and the Rust
   a face's extra lip joints), `twist` (twist helper bones, default on),
   `spline` (spline spine), `controls` (curve controls on a spline), `bendy`,
   `soft` (0 to 1), `spring` (quad leg hock spring, 0 to 1), `board` (face
-  board), `knee_up` (splayed legs whose knee folds up) and the others in
-  `Options` in `src/components.rs`, each documented there.
+  board), `knee_up` (splayed legs whose knee folds up), `feathers` and
+  `feather_rows` (feathers a row and rows on an arm, 0 to 24 and 1 to 3) and
+  the others in `Options` in `src/components.rs`, each documented there.
+- On a `chain`, a guide can carry `"from": "<earlier guide name>"`: its bone
+  grows from that guide instead of the guide before it, so the chain forks
+  (antlers, branches). Forked chains need unique guide names.
 - `naming`: patterns using `{name}`, `{side}` and `{desc}`, or set from a
   preset with `hive-rig naming <guides> game|prefix|suffix|unity|mixamo`.
 - `control_styles`: per-control look by internal control name (`shape`,
@@ -403,6 +407,8 @@ hive-rig demo [OPTIONS]
 - `--bendy`: Make the arms and legs (and quad legs) bendy: bend controls and an elbow or knee pin
 - `--soft <SOFT>`: Default soft IK (0 to 1) on the arms and legs (and quad legs) (default `0`)
 - `--spring <SPRING>`: Default hock spring (0 to 1) on the quad legs: at 1 the hock swings with the thigh as the paw moves. The horse starts at 1, the others at 0
+- `--feathers <FEATHERS>`: Feathers a row on the wings (the bird's) or arms, fanned by a spread control on each
+- `--feather-rows <FEATHER_ROWS>`: Rows of feathers with --feathers (default `1`)
 - `-t, --targets <TARGETS>` (repeatable): What to write besides the .glb: builder scripts for blender, maya and unreal, and fbx for a binary .fbx (mesh, skeleton, skin, bind pose) for game engines such as Unreal and Unity (default `blender,maya,unreal`)
 - `--max-influences <MAX_INFLUENCES>`: Most bones that may influence one vertex (1 to 12). glTF writes them in sets of four
 - `--engine <ENGINE>`: Set max influences for an engine: unreal (8), unreal12 (12), unity (4) or gltf (4)
@@ -847,7 +853,7 @@ hive-rig add [OPTIONS] <GUIDES> <PRESET>
 ```
 
 - `<GUIDES>`
-- `<PRESET>` (one of `fingers`, `tail`, `chain`, `eyes`, `jaw`, `face`, `face_board`, `toes`, `quad_legs`, `tentacle`)
+- `<PRESET>` (one of `fingers`, `tail`, `chain`, `eyes`, `jaw`, `face`, `face_board`, `toes`, `quad_legs`, `tentacle`, `antlers`)
 - `--side <SIDE>`: Which hands get fingers (default: both) (one of `left`, `right`)
 - `--parent <PARENT>`: Bone to attach a tail or chain to
 - `--joints <JOINTS>`: Bones in a tail or chain; for a face or face board, the extra lip joints on each lip between its middle and each corner (0 to 3)
@@ -866,6 +872,32 @@ hive-rig spine [OPTIONS] <GUIDES>
 - `--joints <JOINTS>`: Spine joints (1 to 16)
 - `--spline <SPLINE>`: Drive the spine with a curve (one of `true`, `false`)
 - `--controls <CONTROLS>`: Curve controls of a spline spine (ends included, default 3)
+
+### `hive-rig feathers`
+
+Put feathers on wings (arm components): rows of feather chains along the forearm and hand with an FK control on every joint, fanned open and closed by the wing's spread control
+
+```
+hive-rig feathers [OPTIONS] <GUIDES>
+```
+
+- `<GUIDES>`
+- `--id <ID>`: The wing (its twin changes too); every arm when left out
+- `--count <COUNT>`: Feathers a row (0 takes them off)
+- `--rows <ROWS>`: Rows of feathers: the flight feathers, then shorter coverts (default `1`)
+
+### `hive-rig branch`
+
+Fork a chain: add a branch growing from one of its guides, with an FK control on every joint (and the same on its twin)
+
+```
+hive-rig branch [OPTIONS] <GUIDES> <ID>
+```
+
+- `<GUIDES>`
+- `<ID>`: The chain's component id
+- `--from <FROM>`: The guide the branch grows from
+- `--joints <JOINTS>`: Joints in the branch (default `2`)
 
 ### `hive-rig attach`
 

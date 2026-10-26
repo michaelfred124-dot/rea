@@ -491,11 +491,11 @@ A rig is a list of components, each placed by a few guide points:
 | root | root | `root` bone, `root_ctrl` |
 | spine | pelvis, chest | `pelvis`, `spine_01`… (3 joints by default), COG, pelvis and spine controls |
 | head | neck, head, head_top | `neck_01`, `head`, controls with space switching |
-| arm | clavicle, shoulder, elbow, wrist, hand_tip | clavicle, IK/FK arm, stretch, soft IK, spaces, twist bones; bend and pin controls with `bendy` |
+| arm | clavicle, shoulder, elbow, wrist, hand_tip | clavicle, IK/FK arm, stretch, soft IK, spaces, twist bones; bend and pin controls with `bendy`; feather rows and a spread control with `feathers` |
 | leg | hip, knee, ankle, ball, toe, heel | IK/FK leg, reverse foot, stretch, soft IK, spaces, twist bones; bend and pin controls with `bendy` |
 | quad_leg | hip, knee, hock, ankle, ball, toe, heel | three-segment hind leg (`thigh`, `calf`, `hock`, `foot`, `ball`): IK with a hock control, reverse paw roll, FK, stretch, spaces, twist bones; `knee_up` for a spider's leg |
-| chain | two or more | an FK chain: fingers, tails, ears, hair, props |
-| spline | two or more (`j1`…) | a curve-driven chain (tentacle): curve controls, an FK layer, `stretch` and `volume` |
+| chain | two or more (any can grow from an earlier one) | an FK chain: fingers, tails, ears, hair, props; forks for antlers, branches and tendrils |
+| spline | two or more (`j1`…) | a curve-driven chain (tentacle): curve controls, an FK layer, `stretch`, `volume` and `slide` |
 | eyes | eye_l, eye_r, target | `eye_l`, `eye_r` aimed by a look-at control that follows the head or stays in the world |
 | jaw | jaw, chin | `jaw` with a rotate control |
 | face | brows (3 a side), upper and lower lids, cheeks, nose, upper and lower lip, lip corners | 17 face joints on the head (plus `--joints` 0 to 3 extra lip joints a side, 1 by default), each with a small control that moves and rotates it; lids pivot on the eye, the lower lip rides on the jaw; a face board beside the head (see below) |
@@ -540,6 +540,10 @@ otherwise.
   curve's length; 0 keeps their length so they slide along it.
 * **`volume`** on the end control: 0 (the default) to 1, thins stretched joints
   and thickens squashed ones to keep their volume.
+* **`slide`** on the end control: 0 (the default) to 1, runs the joints along
+  the curve. Unstretched, the chain starts that far along its own length and
+  keeps its joint lengths, running on straight past the curve's end; stretched,
+  it fills the curve from that point to the end.
 
 `hive-rig spine <guides> --spline true` (or **Spline (curve)** in the spine's
 Properties) gives the spine the same rig: `hips_ctrl` drives the pelvis and
@@ -555,16 +559,63 @@ How each program builds it:
 
 * **Blender:** a Bézier curve hooked to a bone per curve point, which follows
   the curve controls through an Armature constraint (their weights); a hidden
-  copy of the joints rides the curve with **Spline IK** (stretch switches its Y
-  scale mode, volume drives its bulge) and the deform joints copy it.
+  copy of the joints rides the curve with **Spline IK** and the deform joints
+  copy it. The joints keep their own scale on the curve: drivers on the curve's
+  posed length scale them for stretch and volume, and a tiny lead bone ahead
+  of the chain (`MCH_<name>_slide`) grows to push it along for slide.
 * **Maya:** a curve skinned to a joint under each curve control with the same
   weights, an **ikSplineHandle** with advanced twist from the start and end
-  controls, and stretch and volume from the curve's length (`curveInfo`).
+  controls, stretch and volume from the curve's length (`curveInfo`), and
+  slide on the handle's `offset`.
 * **Unreal:** Control Rig's **Fit Chain on Curve** on the closest four-point
   Bézier (exact up to four controls), once keeping lengths and again stretched
-  by `<name>_stretch`. `<name>_volume` thins each joint by 1 / sqrt(stretch)
-  across its length. Fit Chain on Curve takes one cubic Bézier, so with more
-  than four controls the curve is an approximation.
+  by `<name>_stretch`, starting at `<name>_slide` along the curve.
+  `<name>_volume` thins each joint by 1 / sqrt(stretch) across its length. Fit
+  Chain on Curve takes one cubic Bézier, so with more than four controls the
+  curve is an approximation.
+
+### Forking chains: antlers, branches and tendrils
+
+A chain can fork: each of its guides can grow from any earlier guide (`from`
+in the guides file) instead of the one before it, so one component holds a
+tree of joints with an FK control on every bone, each under the control of
+the bone it grows from.
+
+```bash
+hive-rig add out/hero.guides.json antlers                       # a beam with two tines a side, on the head
+hive-rig branch out/hero.guides.json antler_l --from j4 --joints 2   # another fork (mirrored onto antler_r)
+hive-rig add out/hero.guides.json chain --parent head --joints 3 --id vine
+hive-rig branch out/hero.guides.json vine --from j2             # a tendril off the vine's second joint
+```
+
+`branch` adds guides `b1_1`, `b1_2`… angled 40 degrees out from the bone that
+ends at the fork, on the chain's twin too when it has the same guides. In the
+app, a chain's Properties say where it forks and **Add a branch at …** forks
+it at the picked guide; the parts library has **Antlers**. The bones are
+ordinary FK bones in every exporter. Spline chains don't fork.
+
+### Wing feathers
+
+`feathers` on an arm (a wing) adds rows of feather chains along the forearm
+and hand, each two joints long with an FK control on each joint:
+
+```bash
+hive-rig demo --creature bird --feathers 7 --feather-rows 2   # flight feathers and a row of coverts
+hive-rig feathers out/hive_bird.guides.json --count 9 --rows 2   # both wings (--id wing_l: one and its twin)
+hive-rig feathers out/hive_bird.guides.json --count 0         # take them off
+```
+
+Up to 24 feathers a row and 3 rows. The first row points back from the wing,
+sweeping toward the tip over the hand; later rows are shorter and sit above.
+Each wing gets a **spread** control (`wing_feathers_l_ctrl`, a quarter circle
+behind the wrist) whose `spread` attribute, -1 to 1, fans the feathers: at 1
+the tip feathers swing up to 30 degrees out and the inner ones in, at -1 they
+fold together. The feather FK controls work on top of the spread. In the app
+the arm's Properties have **Feathers** and **rows**, and the spread is in the
+picked fan control's Properties. Blender turns a helper bone between each
+feather and its parent with a driver on `spread`; Maya puts a driven group
+over each feather's first control; Unreal turns a null over it from the
+`<wing>_spread` float.
 
 ### Quadrupeds: the dog layout and hind legs
 
@@ -641,7 +692,9 @@ any character, scaled to its height. They use the existing components only:
   back), so they get IK/FK, a pole, stretch and the arm's animator tools. The
   legs are `quad_leg` components, whose forward knee and backward hock are how
   a bird's legs fold; the thighs sit inside the body, so the leg skin starts
-  below the belly.
+  below the belly. `--feathers N` (with `--feather-rows`) gives the wings
+  feathers and the demo body a flat vane on each (see
+  [Wing feathers](#wing-feathers)); `HiveRig --demo bird --feathers 7,2` in the app.
 * **Spider** (`components::spider`, 0.4 m to the top of the knees): a spine
   through the cephalothorax, a head with the fangs along the head bone, an
   abdomen chain and **eight IK legs** (`leg1_l` to `leg4_r`), each a
@@ -1264,6 +1317,15 @@ have an **Animation** section and a **Pose Library**:
   frame whatever auto key says, so a stretch of animation changes between IK
   and FK without a pop. Each frame reads the keys the frames before it were
   given.
+* **Proximity controls** (Blender only; a switch on the Hive tab): controls
+  stay hidden until the mouse comes near them in the 3D view. Within about
+  220 pixels a control's outline is drawn faintly over the view, growing
+  stronger as the mouse nears; within about 70 pixels the control itself
+  shows, ready to click. Selected controls always show, and turning the switch
+  off shows every control again. It is an opt-in pass-through modal operator
+  (`hive.proximity`), so clicking and the other tools work as usual. Maya has no clean equivalent: its
+  viewport has no per-object hover event or fade short of a custom draw
+  override, so the Maya window leaves it out (as does Unreal).
 
 With auto key on, the tools key what they changed. Which controls make up each
 limb and which controls are left/right twins come from hive-rig (`ik_chains` and
@@ -1478,7 +1540,10 @@ hand's space with the chest turned, and resets the rig back to its rest mesh.
 Every IK limb gets those checks, however many legs a side (the spider's eight).
 A rig without both arms and legs (the spider, the snake) mirrors its posed left
 controls onto the right and checks each limb's chain mirrors too, switches the
-space of the first control that has spaces, and resets.
+space of the first control that has spaces, and resets. On a feathered wing it
+checks that `spread` turns each feather by its angle and -1 folds them the
+other way, and it checks the proximity controls: the fade, hiding and showing
+controls, the faint outlines, show all, and the Hive tab's switch.
 
 `blender_quad_check.py` builds the dog in real Blender. It checks that the paws
 reach their IK goals with the hock joined to the paw, the knee folds forward
@@ -1493,7 +1558,9 @@ rest and stay on it when the middle curve controls bend it, that the chain
 bends smoothly with its base in place, that with `stretch` on the chain reaches
 a far end control and with it off the joints keep their length, that `volume`
 thins stretched joints, that the first FK control swings the chain, and that
-the end control turns the last joint. On the spine it checks that the chest
+the end control turns the last joint. With `slide` at 0.3 the unstretched
+chain starts 0.3 of its length along the curve with its joint lengths kept,
+and the stretched one starts 0.3 along and reaches the curve's end. On the spine it checks that the chest
 control carries the head and arms with the feet planted, that the hips turn the
 pelvis, and that the IK hand can follow the chest. A bent tentacle deforms the
 mesh, reset brings it back to rest, and the `.glb` re-imports with every joint.

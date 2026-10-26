@@ -7,7 +7,10 @@ vectors on each limb, and an `<limb>_ik_fk` float control blending IK and FK.
 Bendy limbs are an approximation here: the bend joints slide onto the curve the
 bend and pin controls describe but don't turn along it. Soft IK eases the reach
 near full extension like the Blender and Maya builds (the `<limb>_soft` float),
-and spline chains thin as they stretch with their `<chain>_volume` float.
+and spline chains thin as they stretch with their `<chain>_volume` float and
+slide along their curve with `<chain>_slide`. Feathered wings fan open and
+closed with `<wing>_spread`: each feather's first control hangs under a
+`<control>_fan` null the graph turns.
 A hind leg with a hock gets a `<leg>_spring` float: a helper two-bone solve
 from the hip to the ankle turns the hock control's parent, so the hock swings
 with the thigh as the paw moves (0 keeps the hock control's own angle).
@@ -370,6 +373,15 @@ def build():
             board_null[c["name"]] = (hc.add_null(c["name"] + "_board", parent, at, True, True, False),
                                      at, rest.rotation, rest.translation)
             parent = board_null[c["name"]][0]
+        if c["name"] in FAN_OF:
+            # A feather's first control hangs under a null at its root that the
+            # wing's spread turns (see build_fan_graph).
+            fan, feather = FAN_OF[c["name"]]
+            rest = initial(parent) if parent.name != "None" else unreal.Transform()
+            at = unreal.Transform(location=to_ue(feather["pivot"]), rotation=rest.rotation.rotator())
+            fan_null[c["name"]] = (hc.add_null(c["name"] + "_fan", parent, at, True, True, False),
+                                   rest.rotation, fan, feather)
+            parent = fan_null[c["name"]][0]
         k = add_control(c["name"], parent, settings, value)
         world = target_transform(c)
         parent_world = initial(parent) if parent.name != "None" else unreal.Transform()
@@ -382,6 +394,9 @@ def build():
     BOARD = RIG.get("face_board")
     BOARD_PIVOT = {o["control"]: o["pivot"] for o in (BOARD or {}).get("offsets", [])}
     board_null = {}  # face control -> (its board null, its rest transform, its parent's rest turn and place)
+    FANS = RIG.get("feathers") or []
+    FAN_OF = {f["control"]: (fan, f) for fan in FANS for f in fan["feathers"]}
+    fan_null = {}  # feather control -> (its fan null, its parent's rest turn, the fan, the feather)
     for c in CONTROLS:
         # Hock controls hang from the reverse-foot ankle null, made below.
         if c["kind"] != "hock":
@@ -409,6 +424,9 @@ def build():
     for sp in SPLINES:
         add_float(sp["name"] + "_stretch", control_key(sp["settings"]), 0.0, 1.0, sp["default_stretch"])
         add_float(sp["name"] + "_volume", control_key(sp["settings"]), 0.0, 1.0, sp["default_volume"])
+        add_float(sp["name"] + "_slide", control_key(sp["settings"]), 0.0, 1.0, sp.get("default_slide", 0.0))
+    for fan in FANS:
+        add_float(fan["name"] + "_spread", control_key(fan["control"]), -1.0, 1.0, 0.0)
 
     # Space switching uses Control Rig's own "available spaces" (UE 5.4+), which
     # animators switch from the Sequencer with automatic compensation.
@@ -809,6 +827,9 @@ def build():
         first = initial(bone_key(bones[0]))
         primary = first.inverse_transform_direction((rest_pts[1] - rest_pts[0]).normal())
         stretch = get_float(n + "_stretch")
+        # Slide: the chain starts that share of the way along the curve (and,
+        # stretched, fills the rest of it).
+        slide = get_float(n + "_slide")
         for alignment in ("Front", "Stretched"):
             fit = unit("RigUnit_FitChainToCurvePerItem", "Spline_%s_%s" % (n, alignment), {
                 "Alignment": alignment,
@@ -817,6 +838,7 @@ def build():
                 "bPropagateToChildren": "True",
             })
             vm.add_link(chain + ".Collection", fit + ".Items")
+            vm.add_link(slide + ".FloatValue", fit + ".Minimum")
             for label, point in zip("ABCD", points):
                 vm.add_link(point + ".Result", fit + ".Bezier." + label)
             if alignment == "Stretched":
@@ -871,6 +893,19 @@ def build():
 
 
     board_amounts = build_board_graph() if BOARD else {}
+    # Feathers: each fan null turns about its feather's axis (in its parent's
+    # frame) by spread * the feather's angle, before the FK reads the controls.
+    fan_sign = turn_sign()
+    for name, (null, turn, fan, feather) in fan_null.items():
+        spread = get_float(fan["name"] + "_spread")
+        quat = math("QuaternionFromAxisAndAngle", "Fan_%s" % name,
+                    {"Axis": vector_text(turn.unrotate_vector(to_ue_dir(feather["axis"]).normal()))})
+        feed(quat, "Angle", op("FloatMul", "Fan_%s_angle" % name, spread + ".FloatValue",
+                               fan_sign * math_pi * float(feather["angle"]) / 180.0))
+        node = unit("RigUnit_SetRotation", "FanTurn_" + name,
+                    {"Item": item_pin("Null", null.name), "Space": "LocalSpace", "bPropagateToChildren": "True"})
+        vm.add_link(quat + ".Result", node + ".Value")
+        chain_exec(node)
     for c in CONTROLS:
         solve_ready_splines()
         passed.add(c["name"])
@@ -1458,7 +1493,8 @@ def animator_data():
         })
     floats = [f for l in limbs for f in l["floats"]]
     for sp in SPLINES:
-        floats += [sp["name"] + "_stretch", sp["name"] + "_volume"]
+        floats += [sp["name"] + "_stretch", sp["name"] + "_volume", sp["name"] + "_slide"]
+    floats += [fan["name"] + "_spread" for fan in RIG.get("feathers") or []]
     moves_only = [c["name"] for c in CONTROLS if c["kind"] in ("bend", "pin", "slider")]
     euler = [c["name"] for c in CONTROLS if c["name"] not in moves_only]
     return {"limbs": limbs, "floats": floats, "positions": moves_only, "transforms": euler}

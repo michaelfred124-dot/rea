@@ -421,6 +421,7 @@ mod tests {
             .map(|(k, &i)| components::Guide {
                 name: format!("j{}", k + 1),
                 position: tail.guides[i].position,
+                from: None,
             })
             .collect();
         let src = build_rig(

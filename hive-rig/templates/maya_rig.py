@@ -16,6 +16,13 @@ It also opens a "Hive Rig" window for editing the rig's guides, adding or
 removing components (fingers, tails) and rebuilding. Rebuilding keeps your skin
 weights except where new bones were added. Running the script again when the rig
 is already in the scene only reopens the window.
+
+Feathered wings get a `spread` attribute on their fan control (each feather's
+first control sits under a `<control>_fan` group it turns), and spline chains a
+`slide` attribute (the ikSplineHandle's offset). Blender's "Proximity Controls"
+(controls fading in near the mouse) have no equivalent here: Maya's viewport
+offers no per-control fade, so hide and show controls with isolate select or
+display layers instead.
 """
 
 import json
@@ -661,6 +668,21 @@ def build(RIG, geos=None):
         board_helper[name] = helper
         return zero
 
+    # Feathered wings: each feather's first control sits under a group at the
+    # feather's root whose X is the fan axis; the fan control's `spread` turns
+    # its child `<control>_fan` about X by spread * the feather's angle.
+    FANS = RIG["controls"].get("feathers", [])
+    fan_of = {f["control"]: (fan, f) for fan in FANS for f in fan["feathers"]}
+    fan_helper = {}  # feather control -> (its fan group, the fan control, degrees at spread 1)
+
+    def fan_zero(name, offset, feather):
+        up = cmds.listRelatives(offset, parent=True)[0]
+        zero = cmds.group(empty=True, name=name + "_fan_zero", parent=up)
+        cmds.xform(zero, worldSpace=True, matrix=axis_matrix(feather["axis"], feather["pivot"]))
+        helper = cmds.group(empty=True, name=name + "_fan", parent=zero)
+        cmds.parent(offset, helper)
+        return zero, helper
+
     ctrl_of = {}
     offset_of = {}
     for c in CONTROLS:
@@ -690,6 +712,10 @@ def build(RIG, geos=None):
         # The outline sits at the control's position (clavicle shape at the shoulder).
         place_outline(shapes, c["outline"])
         follow = board_zero(c["name"], offset, board_pivot[c["name"]]) if c["name"] in board_pivot else offset
+        if c["name"] in fan_of:
+            fan, feather = fan_of[c["name"]]
+            follow, helper = fan_zero(c["name"], offset, feather)
+            fan_helper[c["name"]] = (helper, fan["control"], float(feather["angle"]))
         if parent["type"] == "bone" and c["kind"] != "bend":  # bend offsets follow their curve (below)
             cmds.parentConstraint(joint_of[parent["name"]], follow, maintainOffset=True)
         if c.get("spaces"):
@@ -720,8 +746,20 @@ def build(RIG, geos=None):
             cmds.setAttr(ctrl + ".tz", lock=True, keyable=False, channelBox=False)
             cmds.transformLimits(ctrl, translationX=(sl["x"][0] * k, sl["x"][1] * k), enableTranslationX=(True, True),
                                  translationY=(sl["y"][0] * k, sl["y"][1] * k), enableTranslationY=(True, True))
+        if c["kind"] == "fan":
+            # Only its spread does anything.
+            for attr in ("tx", "ty", "tz", "rx", "ry", "rz"):
+                cmds.setAttr(ctrl + "." + attr, lock=True, keyable=False, channelBox=False)
+            cmds.addAttr(ctrl, longName="spread", attributeType="double", min=-1, max=1, defaultValue=0,
+                         keyable=True)
         for attr in ("sx", "sy", "sz", "v"):
             cmds.setAttr(ctrl + "." + attr, lock=True, keyable=False, channelBox=False)
+
+    for name, (helper, fan_ctrl, degrees) in fan_helper.items():
+        turn = cmds.createNode("multDoubleLinear", name=name + "_fan_turn")
+        cmds.connectAttr(ctrl_of[fan_ctrl] + ".spread", turn + ".input1")
+        cmds.setAttr(turn + ".input2", degrees)
+        cmds.connectAttr(turn + ".output", helper + ".rotateX")
 
     # --------------------------------------------------------------------------- FK for non-limb bones
     sealed_bones = set()
@@ -1136,9 +1174,17 @@ def build(RIG, geos=None):
         cmds.setAttr(amount + ".input[0]", 1)
         cmds.connectAttr(ratio + ".outputX", amount + ".input[1]")
         cmds.connectAttr(settings + ".stretch", amount + ".attributesBlender")
+        # Slide: the chain starts that share of the way along the curve; stretched,
+        # the joints shrink to fill the (1 - slide) of the curve that is left.
+        cmds.addAttr(settings, longName="slide", attributeType="double", min=0, max=1,
+                     defaultValue=sp.get("default_slide", 0.0), keyable=True)
+        cmds.connectAttr(settings + ".slide", handle + ".offset")
+        squeeze = math_node("multDoubleLinear", n + "_spline_slide_stretch", settings + ".slide", settings + ".stretch")
+        left = math_node("plusMinusAverage", n + "_spline_slide_left", 1.0, squeeze, operation=2)
+        fitted = math_node("multDoubleLinear", n + "_spline_slide_fit", amount + ".output", left)
         for j in ik_chain[1:]:
             length = cmds.createNode("multiplyDivide", name=j + "_len")
-            cmds.connectAttr(amount + ".output", length + ".input1X")
+            cmds.connectAttr(fitted, length + ".input1X")
             cmds.setAttr(length + ".input2X", cmds.getAttr(j + ".translateX"))
             cmds.connectAttr(length + ".outputX", j + ".translateX")
         thin = cmds.createNode("multiplyDivide", name=n + "_spline_thin")
@@ -1195,7 +1241,10 @@ def build(RIG, geos=None):
             d["roll"] = 0.0
     for sp in SPLINES:
         defaults.setdefault(ctrl_of[sp["settings"]], {}).update(
-            stretch=float(sp["default_stretch"]), volume=float(sp["default_volume"]))
+            stretch=float(sp["default_stretch"]), volume=float(sp["default_volume"]),
+            slide=float(sp.get("default_slide", 0.0)))
+    for fan in FANS:
+        defaults.setdefault(ctrl_of[fan["control"]], {})["spread"] = 0.0
     spaces = {}
     for c in CONTROLS:
         if c.get("spaces"):
@@ -1228,7 +1277,7 @@ def build(RIG, geos=None):
 # switching. The limbs and the left/right twins come from hive-rig (ik_chains and
 # mirror_pairs), kept on the rig as `hiveAnim` with the bind frames. Matrices here are 4x4 lists of rows acting on
 # column vectors; Maya's flat worldMatrix is the transpose.
-ANIM_ATTRS = ("ikFk", "stretch", "soft", "roll", "space", "volume", "spring")
+ANIM_ATTRS = ("ikFk", "stretch", "soft", "roll", "space", "volume", "spring", "slide", "spread")
 CHANNELS = ("tx", "ty", "tz", "rx", "ry", "rz")
 
 
@@ -1628,17 +1677,23 @@ def add_studio_pose(rig_data, name="Studio pose"):
         parent = controls[n]["parent"]
         return 1 + depth(parent["name"]) if parent["type"] == "control" and parent["name"] in controls else 0
 
+    def put_settings():
+        for n, values in studio.get("attributes", {}).items():
+            for attr, v in values.items():
+                attr = {"ik_fk": "ikFk"}.get(attr, attr)
+                if cmds.objExists(n) and cmds.attributeQuery(attr, node=n, exists=True):
+                    cmds.setAttr(n + "." + attr, v)
+
+    # Settings first: some move a control's parent (a space, a feather fan's
+    # spread), and the moves below are where the controls end up.
+    put_settings()
     for n in sorted((n for n in studio["controls"] if n in data["bind"]), key=depth):
         flat = studio["controls"][n]
         move = [[flat[col * 4 + row] for col in range(4)] for row in range(4)]
         for i in range(3):  # metres to centimetres
             move[i][3] *= SCALE
         set_world(n, mat_mul(move, from_maya(data["bind"][n])))
-    for n, values in studio.get("attributes", {}).items():
-        for attr, v in values.items():
-            attr = {"ik_fk": "ikFk"}.get(attr, attr)
-            if cmds.objExists(n) and cmds.attributeQuery(attr, node=n, exists=True):
-                cmds.setAttr(n + "." + attr, v)
+    put_settings()
     count = save_pose(name)
     reset_pose()
     return count

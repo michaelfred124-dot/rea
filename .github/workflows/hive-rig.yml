@@ -323,6 +323,28 @@ jobs:
           cargo run --locked -q -- rebuild "$sp/hive_demo.hive.json"
           python3 -I tests/dcc_stub_run.py maya "$sp/hive_demo_maya.py" --guides
           python3 -I tests/dcc_stub_run.py unreal "$sp/hive_demo_unreal.py"
+      - name: Wing feathers, forking chains and spline slide, Maya and Unreal builders
+        run: |
+          f="$RUNNER_TEMP/feathers"
+          cargo run --locked -q -- demo --creature bird --feathers 5 --feather-rows 2 -o "$f" --targets maya,unreal
+          cargo run --locked -q -- add "$f/hive_bird.guides.json" antlers
+          cargo run --locked -q -- branch "$f/hive_bird.guides.json" antler_l --from j4 --joints 2
+          cargo run --locked -q -- feathers "$f/hive_bird.guides.json" --id wing_l --count 6 --rows 2
+          cargo run --locked -q -- components "$f/hive_bird.guides.json" | tee "$f/log.txt"
+          grep -q "6 feathers a row" "$f/log.txt" && grep -q "forking" "$f/log.txt"
+          cargo run --locked -q -- rebuild "$f/hive_bird.hive.json"
+          cargo run --locked -q -- pose "$f/hive_bird.hive.json" --attr wing_feathers_l_ctrl.spread=0.7
+          python3 -I tests/dcc_stub_run.py maya "$f/hive_bird_maya.py" | tee "$f/maya.txt"
+          grep -q "maya feathers ran against stubs" "$f/maya.txt"
+          python3 -I tests/dcc_stub_run.py unreal "$f/hive_bird_unreal.py" | tee "$f/unreal.txt"
+          grep -q "unreal feathers ran against stubs" "$f/unreal.txt"
+          t="$RUNNER_TEMP/slide"
+          cargo run --locked -q -- demo -o "$t" --targets maya,unreal
+          cargo run --locked -q -- add "$t/hive_demo.guides.json" tentacle
+          cargo run --locked -q -- rebuild "$t/hive_demo.hive.json"
+          cargo run --locked -q -- pose "$t/hive_demo.hive.json" --attr tentacle_ik_04_ctrl.slide=0.4
+          python3 -I tests/dcc_stub_run.py maya "$t/hive_demo_maya.py"
+          python3 -I tests/dcc_stub_run.py unreal "$t/hive_demo_unreal.py"
       - name: Bendy limbs and soft IK, Maya and Unreal builders
         run: |
           b="$RUNNER_TEMP/bendy"
@@ -751,6 +773,34 @@ jobs:
           cargo run -q -- rebuild "$sp/hive_demo.hive.json"
           python tests/blender_spline_check.py "$sp/hive_demo_blender.py" "$sp/hive_demo.glb"
           python tests/blender_guides_check.py "$sp/hive_demo_blender.py"
+          # Slide: the tentacle runs along its curve as hive-rig's evaluator has it.
+          sl="$RUNNER_TEMP/slide"
+          cargo run -q -- demo -o "$sl" --targets blender
+          cargo run -q -- add "$sl/hive_demo.guides.json" tentacle
+          cargo run -q -- rebuild "$sl/hive_demo.hive.json"
+          for case in "slide=0.3 stretch=0" "slide=0.3 stretch=1" "slide=0.6 stretch=0"; do
+            set --
+            for kv in $case; do set -- "$@" --attr "tentacle_ik_04_ctrl.$kv"; done
+            cargo run -q -- pose "$sl/hive_demo.hive.json" --reset "$@" --set tentacle_ik_03_ctrl=0,0.1,0.05 \
+              --bones "$sl/posed.json"
+            python -I tests/blender_studio_pose_check.py "$sl/hive_demo_blender.py" "$sl/posed.json" 0.01
+          done
+      - name: Wing feathers, forking chains and proximity controls in Blender
+        run: |
+          f="$RUNNER_TEMP/feathers"
+          cargo run -q -- demo --creature bird --feathers 6 --feather-rows 2 -o "$f" --targets blender
+          cargo run -q -- add "$f/hive_bird.guides.json" antlers
+          cargo run -q -- branch "$f/hive_bird.guides.json" antler_l --from j4 --joints 2
+          cargo run -q -- rebuild "$f/hive_bird.hive.json"
+          # Spread, feather FK, proximity: the anim check runs on a rig at rest.
+          python tests/blender_anim_check.py "$f/hive_bird_blender.py"
+          for spread in 1 -1 0.5; do
+            cargo run -q -- pose "$f/hive_bird.hive.json" --reset --attr wing_feathers_l_ctrl.spread=$spread \
+              --attr wing_feathers_r_ctrl.spread=-0.4 --set wing_feather1_04_01_l_ctrl=,,,10,20,5 \
+              --set wing_feather1_04_02_l_ctrl=,,,0,15,0 --set antler_03_l_ctrl=,,,20,0,10 \
+              --set antler_06_r_ctrl=,,,0,30,0 --set lowerarm_l_fk_ctrl=,,,0,25,0 --bones "$f/posed.json"
+            python -I tests/blender_studio_pose_check.py "$f/hive_bird_blender.py" "$f/posed.json"
+          done
       - name: Bendy limbs and soft IK in Blender
         run: |
           b="$RUNNER_TEMP/bendy"

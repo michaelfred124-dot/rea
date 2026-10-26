@@ -180,7 +180,7 @@ struct LibraryPart {
     once: Option<Kind>,
 }
 
-const LIBRARY: [LibraryPart; 12] = [
+const LIBRARY: [LibraryPart; 13] = [
     LibraryPart {
         art: Art::Face,
         title: "Face",
@@ -211,6 +211,14 @@ const LIBRARY: [LibraryPart; 12] = [
         text: "A two-bone chain on each side of the head.",
         category: Category::Face,
         add: Studio::add_ears,
+        once: None,
+    },
+    LibraryPart {
+        art: Art::Antlers,
+        title: "Antlers",
+        text: "Forking FK chains on the head, a control on every branch.",
+        category: Category::Face,
+        add: Studio::add_antlers,
         once: None,
     },
     LibraryPart {
@@ -2039,6 +2047,54 @@ impl Studio {
                     }
                 });
                 self.limb_options(ui, &comp);
+                if comp.kind == Kind::Arm {
+                    let mut feathers = comp.options.feathers;
+                    let mut rows = comp.options.feather_rows.max(1);
+                    let before = (feathers, rows);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Feathers").color(TEXT_DIM));
+                        ui.add(
+                            egui::DragValue::new(&mut feathers).range(0..=components::MAX_FEATHERS),
+                        )
+                        .on_hover_text(
+                            "Feather chains a row along the forearm and hand, fanned by a \
+                                 spread control (0 = none)",
+                        );
+                        if feathers > 0 {
+                            ui.label(RichText::new("rows").color(TEXT_DIM));
+                            ui.add(
+                                egui::DragValue::new(&mut rows)
+                                    .range(1..=components::MAX_FEATHER_ROWS),
+                            )
+                            .on_hover_text("The flight feathers, then shorter coverts above them");
+                        }
+                    });
+                    if (feathers, rows) != before {
+                        self.set_feathers(&comp.id, feathers, rows);
+                    }
+                }
+            }
+            Kind::Chain => {
+                let forks = components::is_branched(&comp);
+                ui.label(
+                    RichText::new(if forks {
+                        "Forks: every branch has FK controls."
+                    } else {
+                        "Pick a guide to fork the chain there."
+                    })
+                    .size(12.5)
+                    .color(TEXT_FAINT),
+                );
+                if let Some(gi) = guide.filter(|&gi| gi < comp.guides.len()) {
+                    let from = comp.guides[gi].name.clone();
+                    if ui
+                        .button(format!("Add a branch at {from}"))
+                        .on_hover_text("Two more joints growing from this guide, on the twin too")
+                        .clicked()
+                    {
+                        self.add_branch(&comp.id, &from, 2);
+                    }
+                }
             }
             Kind::Face => {
                 let mut board = comp.options.board;
@@ -3641,9 +3697,15 @@ impl Studio {
             } else if c.kind != Kind::Face {
                 // Face guides are separate joints, not a chain. Links run from
                 // ring to ring, so the rings stay open.
-                for (k, w) in pts.windows(2).enumerate() {
-                    if let [Some(a), Some(b)] = w {
-                        let (ra, rb) = (radii[k], radii[k + 1]);
+                // A forking chain links each guide to the one it grows from.
+                for j in 1..pts.len() {
+                    let k = if c.kind == Kind::Chain {
+                        components::guide_from(c, j)
+                    } else {
+                        j - 1
+                    };
+                    if let (Some(a), Some(b)) = (&pts[k], &pts[j]) {
+                        let (ra, rb) = (radii[k], radii[j]);
                         let d = *b - *a;
                         let len = d.length();
                         if len > ra + rb + 2.0 {
@@ -4225,6 +4287,7 @@ enum Art {
     Fingers,
     Tail,
     Tentacle,
+    Antlers,
     Ponytail,
     Prop,
     Chain,
@@ -4551,7 +4614,9 @@ fn hot_chain(painter: &egui::Painter, pts: &[Pos2], width: f32, hot: bool) {
 /// parts, with the part the component adds picked out in honey.
 fn illustration(painter: &egui::Painter, r: Rect, art: Art, hot: bool) {
     match art {
-        Art::Face | Art::Eyes | Art::Jaw | Art::Ears | Art::Ponytail => bust(painter, r, art, hot),
+        Art::Face | Art::Eyes | Art::Jaw | Art::Ears | Art::Antlers | Art::Ponytail => {
+            bust(painter, r, art, hot)
+        }
         Art::Fingers
         | Art::Toes
         | Art::HindLegs
@@ -4902,6 +4967,20 @@ fn bust(painter: &egui::Painter, r: Rect, art: Art, hot: bool) {
                     1.6,
                     hot,
                 );
+            }
+        }
+        Art::Antlers => {
+            // A beam rising from each side of the head, a tine forking off it.
+            for sx in [-1.0f32, 1.0] {
+                let beam = [
+                    p(0.45 * sx, -0.9),
+                    p(0.8 * sx, -1.35),
+                    p(1.0 * sx, -1.8),
+                    p(1.05 * sx, -2.25),
+                ];
+                hot_chain(painter, &beam, 1.6, hot);
+                hot_chain(painter, &[beam[1], p(0.5 * sx, -1.75)], 1.6, hot);
+                hot_chain(painter, &[beam[2], p(1.45 * sx, -2.1)], 1.6, hot);
             }
         }
         Art::Ponytail => {
@@ -5366,6 +5445,7 @@ fn kind_word(kind: ControlKind) -> &'static str {
         ControlKind::Pin => "Pin",
         ControlKind::Board => "Face board",
         ControlKind::Slider => "Face board slider",
+        ControlKind::Fan => "Feather spread",
         _ => "Animator",
     }
 }

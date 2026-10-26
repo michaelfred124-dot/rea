@@ -479,6 +479,14 @@ impl Naming {
             s.fk_controls.iter_mut().for_each(ctrl);
             ctrl(&mut s.settings);
         }
+        for fan in &mut controls.feathers {
+            ctrl(&mut fan.control);
+            for f in &mut fan.feathers {
+                ctrl(&mut f.control);
+                bone(&mut f.bone);
+                bone(&mut f.parent);
+            }
+        }
         if let Some(fb) = &mut controls.face_board {
             fb.rename(ctrl, bone);
         }
@@ -567,6 +575,29 @@ mod tests {
             for b in &sk.bones {
                 if let Some(t) = &b.twist {
                     assert!(bones.contains(&t.source));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn presets_rename_feathers() {
+        let mut guides = crate::demo::Creature::Bird.guides();
+        components::set_feathers(&mut guides, None, 3, 2).unwrap();
+        let built = components::build(&guides).unwrap();
+        for preset in [Preset::Prefix, Preset::Suffix] {
+            let naming = preset.naming();
+            let (mut sk, mut ct) = (built.skeleton.clone(), built.controls.clone());
+            naming.apply(&mut sk, &mut ct).unwrap();
+            let bones: HashSet<_> = sk.bones.iter().map(|b| b.name.clone()).collect();
+            let ctrls: HashSet<_> = ct.controls.iter().map(|c| c.name.clone()).collect();
+            assert_eq!(ct.feathers.len(), 2);
+            for (fan, old) in ct.feathers.iter().zip(&built.controls.feathers) {
+                assert!(ctrls.contains(&fan.control), "{preset:?}: {}", fan.control);
+                assert_eq!(fan.control, naming.control(&old.control));
+                for f in &fan.feathers {
+                    assert!(ctrls.contains(&f.control), "{}", f.control);
+                    assert!(bones.contains(&f.bone) && bones.contains(&f.parent));
                 }
             }
         }

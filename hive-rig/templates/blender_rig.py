@@ -10,7 +10,10 @@ of the bone it reads, with a simple expression.
 
 It also adds a "Hive" tab to the 3D view sidebar (press N) for editing the rig's
 guides, adding or removing components (fingers, tails) and rebuilding the rig.
-Rebuilding keeps your skin weights except where new bones were added.
+Rebuilding keeps your skin weights except where new bones were added. Its
+"Proximity Controls" switch hides the controls far from the mouse and fades
+them in as it comes near (Blender's own control shapes can't fade, so the
+fading ones are drawn over the view until they're close enough to click).
 
 Run inside Blender 3.6+ (Scripting tab > Open > Run Script), or headless:
     blender --background --python <this file> -- --save out.blend
@@ -988,10 +991,20 @@ def build(RIG, geos=None):
         n = sp["name"]
         points = [mch("MCH_%s_point_%02d" % (n, i), head=to_blender(p)) for i, p in enumerate(sp["points"])]
         first = bone_by_name[sp["bones"][0]]
+        # Slide: a tiny lead bone ahead of the chain, whose length the `slide`
+        # sets through its Y scale, pushes the joints along the curve.
+        lead = mch("MCH_%s_slide" % n, like=sp["bones"][0], parent=BONES[first["parent"]]["name"])
+        # The rest length along the curve points (the joints' heads), as the
+        # posed curve's length is measured.
+        rest_length = sum((to_blender(b) - to_blender(a)).length for a, b in zip(sp["points"], sp["points"][1:]))
+        lead_length = max(rest_length * 1e-5, 1e-7)
+        head0 = edit[lead].head.copy()
+        edit[lead].tail = head0 + (edit[lead].tail - head0).normalized() * lead_length
         chain = []
         for b in sp["bones"][:-1]:
-            chain.append(mch("MCH_%s_spline" % b, like=b,
-                             parent=chain[-1] if chain else BONES[first["parent"]]["name"]))
+            chain.append(mch("MCH_%s_spline" % b, like=b, parent=chain[-1] if chain else lead))
+        for b in chain:
+            edit[b].inherit_scale = "NONE"  # each takes the length its own scale gives it
         tip = mch("MCH_%s_tip" % n, like=sp["bones"][-1], parent=sp["controls"][-1])
         # Twist: Spline IK only aims the joints along the curve, so their roll
         # comes from the chain's parent. Each end gets a pair of helpers turned
@@ -1011,7 +1024,7 @@ def build(RIG, geos=None):
         for b in BONES:
             if b["parent"] is not None and BONES[b["parent"]]["name"] in inside and b["name"] not in inside:
                 edit[b["name"]].inherit_scale = "NONE"
-        spline_parts.append((sp, points, chain, tip, twist))
+        spline_parts.append((sp, points, chain, tip, twist, lead, rest_length, lead_length))
 
 
     def signed_angle(u, v, normal):
@@ -1059,6 +1072,19 @@ def build(RIG, geos=None):
             seal_rig.append(dict(pair, seam=seam,
                                  up=mch("MCH_%s_sealed" % pair["upper"], head=up, parent=seam),
                                  low=mch("MCH_%s_sealed" % pair["lower"], head=low, parent=seam)))
+
+    # Feathered wings: each feather's first control hangs under a helper at
+    # the feather's root, turned like the feather; the fan control's `spread`
+    # turns the helper about the fan axis by spread * angle.
+    FANS = RIG["controls"].get("feathers", [])
+    fan_rig = []
+    for fan in FANS:
+        for f in fan["feathers"]:
+            if f["control"] not in edit or f["bone"] not in edit:
+                continue
+            helper = mch("MCH_%s_fan" % f["control"], like=f["bone"], parent=f["parent"])
+            edit[f["control"]].parent = edit[helper]
+            fan_rig.append((fan, f, helper))
 
     pole_angles = {
         c["name"]: pole_angle(edit[c["upper"]], edit[c["lower"]], edit[c["pole_control"]].head)
@@ -1108,6 +1134,12 @@ def build(RIG, geos=None):
             pb.lock_rotation_w = True
         if c["kind"] == "slider":
             pb.lock_location[2] = True
+        if c["kind"] == "fan":
+            # Only its `spread` does anything.
+            pb.lock_location = (True, True, True)
+            pb.lock_rotation = (True, True, True)
+            pb.lock_rotation_w = True
+            pb.lock_scale = (True, True, True)
         if has_collections:
             ctrl_coll.assign(arm_data.bones[c["name"]])
         if hasattr(pb, "color"):
@@ -1161,6 +1193,19 @@ def build(RIG, geos=None):
         except AttributeError:
             pass
 
+
+    # Feathers: spread turns each fan helper about its axis (in the helper's
+    # own frame) by spread * the feather's angle.
+    for fan in FANS:
+        add_property(pose[fan["control"]], "spread", 0.0, -1.0, 1.0,
+                     "1 = fan the feathers open, -1 = fold them together")
+    for fan, f, helper in fan_rig:
+        pb = pose[helper]
+        pb.rotation_mode = "AXIS_ANGLE"
+        local = (arm_data.bones[helper].matrix_local.to_3x3().inverted() @ to_blender(f["axis"])).normalized()
+        pb.rotation_axis_angle = (0.0, local.x, local.y, local.z)
+        add_driver(pb, "rotation_axis_angle", fan["control"], "spread",
+                   "max(-1, min(spread, 1)) * %.9g" % math.radians(f["angle"]), index=0)
 
     for c in CONTROLS:
         if c["kind"] in ("fk", "root") and c["bone"]:
@@ -1285,7 +1330,7 @@ def build(RIG, geos=None):
             follow.subtarget = chain["_flat"]
             add_blend_driver(follow, chain["ik_control"])
 
-    for sp, points, chain, tip, twist in spline_parts:
+    for sp, points, chain, tip, twist, lead, rest_length, lead_length in spline_parts:
         settings = pose[sp["settings"]]
         add_property(settings, "stretch", float(sp["default_stretch"]), 0.0, 1.0,
                      "1 = the joints stretch to the curve, 0 = they keep their length")
@@ -1321,13 +1366,55 @@ def build(RIG, geos=None):
         ik = pose[chain[-1]].constraints.new("SPLINE_IK")
         ik.name = "Spline IK"
         ik.target = curve_obj
-        ik.chain_count = len(chain)
+        ik.chain_count = len(chain) + 1  # and the slide lead
         ik.use_curve_radius = False
         ik.use_even_divisions = False
         ik.use_chain_offset = False
-        ik.xz_scale_mode = "VOLUME_PRESERVE"
-        add_driver(ik, "y_scale_mode", sp["settings"], "stretch", "floor(min(stretch, 1) + 0.5)")
-        add_driver(ik, "bulge", sp["settings"], "volume", "volume")
+        # The joints take the lengths their scale gives them (hive-rig's
+        # SplineChain): with `t` the stretch, `s` the slide, C the chain's rest
+        # length and L the length of the posed curve (through its point bones),
+        # the lead is s * ((1 - t) * C + t * L) long and every joint scales by
+        # (1 - t) + t * L * (1 - s) / C, thinning by that ** (-volume / 2).
+        ik.y_scale_mode = "BONE_ORIGINAL"
+        ik.xz_scale_mode = "BONE_ORIGINAL"
+        add_property(settings, "slide", float(sp.get("default_slide", 0.0)), 0.0, 1.0,
+                     "Slide the joints along the curve toward the tip")
+        pairs = list(zip(points, points[1:]))
+
+        def curve_driver(owner, path, index, expression):
+            drv = owner.driver_add(path, index).driver
+            drv.type = "SCRIPTED"
+            for name in ("stretch", "slide", "volume"):
+                var = drv.variables.new()
+                var.name = name
+                var.type = "SINGLE_PROP"
+                var.targets[0].id = rig
+                var.targets[0].data_path = 'pose.bones["%s"]["%s"]' % (sp["settings"], name)
+            for i, ends in enumerate(pairs):
+                var = drv.variables.new()
+                var.name = "d%d" % i
+                var.type = "LOC_DIFF"
+                for t, bone in zip(var.targets, ends):
+                    t.id = rig
+                    t.bone_target = bone
+            var = drv.variables.new()
+            var.name = "w"
+            var.type = "TRANSFORMS"
+            var.targets[0].id = rig
+            var.targets[0].transform_type = "SCALE_AVG"
+            drv.expression = expression
+
+        length = "(%s) / w" % " + ".join("d%d" % i for i in range(len(pairs)))
+        t, s = "min(max(stretch, 0), 1)", "min(max(slide, 0), 1)"
+        scale = "(1 - {t} + {t} * {L} * (1 - {s}) / {C:.9g})".format(t=t, s=s, L=length, C=rest_length)
+        lead_pb = pose[lead]
+        curve_driver(lead_pb, "scale", 1, "max(1, {s} * ((1 - {t}) * {C:.9g} + {t} * {L}) / {e:.9g})".format(
+            s=s, t=t, C=rest_length, L=length, e=lead_length))
+        for b in chain:
+            curve_driver(pose[b], "scale", 1, "max(0.001, %s)" % scale)
+            for axis in (0, 2):
+                curve_driver(pose[b], "scale", axis,
+                             "exp(-0.5 * min(max(volume, 0), 1) * log(max(0.001, %s)))" % scale)
         for i, (bone, src) in enumerate(zip(sp["bones"], chain)):
             con = pose[bone].constraints.new("COPY_TRANSFORMS")
             con.name = "Spline"
@@ -1472,7 +1559,7 @@ def build(RIG, geos=None):
 # switching. Which controls make up each limb and which controls are left/right
 # twins come from hive-rig (the rig's ik_chains and mirror_pairs), kept on the
 # armature as `hive_anim`.
-ANIM_PROPS = ("ik_fk", "stretch", "soft", "roll", "space", "volume", "spring")
+ANIM_PROPS = ("ik_fk", "stretch", "soft", "roll", "space", "volume", "spring", "slide", "spread")
 
 
 def animator_data(RIG, goals, hock_targets, soft_rig):
@@ -1506,7 +1593,10 @@ def animator_data(RIG, goals, hock_targets, soft_rig):
             d["roll"] = 0.0
     for sp in controls.get("splines", []):
         defaults.setdefault(sp["settings"], {}).update(
-            stretch=float(sp["default_stretch"]), volume=float(sp["default_volume"]))
+            stretch=float(sp["default_stretch"]), volume=float(sp["default_volume"]),
+            slide=float(sp.get("default_slide", 0.0)))
+    for fan in controls.get("feathers", []):
+        defaults.setdefault(fan["control"], {})["spread"] = 0.0
     spaces = {}
     for c in controls["controls"]:
         if c.get("spaces"):
@@ -1841,6 +1931,13 @@ def add_studio_pose(rig, RIG, name="Studio pose"):
         return 0 if pb.parent is None else 1 + depth(pb.parent)
 
     names = sorted((n for n in studio["controls"] if n in pose), key=lambda n: depth(pose[n]))
+    # Settings first: some move a control's parent (a space, a feather fan's
+    # spread), and the moves below are where the controls end up.
+    for n, values in studio.get("attributes", {}).items():
+        for prop, v in values.items():
+            if n in pose and prop in pose[n].keys():
+                pose[n][prop] = type(pose[n][prop])(v)
+    refresh(rig)
     for n in names:
         flat = studio["controls"][n]
         move = Matrix([[flat[col * 4 + row] for col in range(4)] for row in range(4)])
@@ -1889,6 +1986,123 @@ def switch_space(rig, control, index):
     pb.matrix = keep
     refresh(rig)
     key_controls(rig, [control])
+
+
+# --------------------------------------------------------------------------- proximity controls
+# Opt in with "Proximity Controls" on the Hive tab: in the 3D view, controls
+# far from the mouse are hidden, fade in (drawn over the view) as it comes
+# near and show for real, ready to click, once it is close. Selected controls
+# always show. A modal operator follows the mouse while the switch is on;
+# turning it off shows every control again.
+PROXIMITY_NEAR = 70.0  # pixels: closer than this a control shows and can be clicked
+PROXIMITY_FAR = 220.0  # pixels: further than this it is hidden
+_proximity = {"rig": None, "fades": {}, "handler": None}
+
+
+def proximity_fade(distance, near=PROXIMITY_NEAR, far=PROXIMITY_FAR):
+    """How much a control shows (0 to 1) at `distance` pixels from the mouse:
+    all of it within `near`, none beyond `far`, easing in between."""
+    if distance <= near:
+        return 1.0
+    if distance >= far:
+        return 0.0
+    t = (far - distance) / (far - near)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def bone_hidden(pb):
+    return pb.hide if "hide" in pb.bl_rna.properties else pb.bone.hide
+
+
+def set_bone_hidden(pb, value):
+    if "hide" in pb.bl_rna.properties:  # Blender 5: visibility lives on the pose bone
+        pb.hide = value
+    else:
+        pb.bone.hide = value
+
+
+def proximity_fades(rig, to_screen, mouse):
+    """Each control's fade for the mouse at `mouse` (region pixels); `to_screen`
+    takes a world point to region pixels (or None when it is off screen)."""
+    fades = {}
+    for name in anim_data(rig)["controls"]:
+        pb = rig.pose.bones.get(name)
+        if pb is None:
+            continue
+        p = to_screen(rig.matrix_world @ pb.matrix.translation)
+        fades[name] = 0.0 if p is None else proximity_fade(((p[0] - mouse[0]) ** 2 + (p[1] - mouse[1]) ** 2) ** 0.5)
+    return fades
+
+
+def apply_proximity(rig, fades):
+    """Show the controls the mouse is close to (and the selected ones) and hide
+    the rest. Returns how many are hidden."""
+    hidden = 0
+    for name, fade in fades.items():
+        pb = rig.pose.bones[name]
+        hide = fade < 0.999 and not bone_selected(pb)
+        if bone_hidden(pb) != hide:
+            set_bone_hidden(pb, hide)
+        hidden += hide
+    return hidden
+
+
+def show_all_controls(rig):
+    for name in anim_data(rig)["controls"]:
+        pb = rig.pose.bones.get(name)
+        if pb is not None and bone_hidden(pb):
+            set_bone_hidden(pb, False)
+
+
+def proximity_lines(rig, fades):
+    """(fade, [world points in pairs]) for each hidden control that is fading
+    in: its widget's edges where the control is posed."""
+    out = []
+    for name, fade in fades.items():
+        pb = rig.pose.bones[name]
+        if fade <= 0.0 or not bone_hidden(pb) or pb.custom_shape is None:
+            continue
+        m = rig.matrix_world @ pb.matrix
+        me = pb.custom_shape.data
+        points = []
+        for e in me.edges:
+            points.extend(m @ me.vertices[i].co for i in e.vertices)
+        out.append((fade, points))
+    return out
+
+
+def draw_proximity():
+    rig = bpy.data.objects.get(_proximity["rig"] or "")
+    if rig is None or not _proximity["fades"]:
+        return
+    import gpu
+    from gpu_extras.batch import batch_for_shader
+    shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+    gpu.state.blend_set("ALPHA")
+    for fade, points in proximity_lines(rig, _proximity["fades"]):
+        batch = batch_for_shader(shader, "LINES", {"pos": points})
+        shader.bind()
+        shader.uniform_float("color", (0.9, 0.9, 0.9, 0.85 * fade))
+        batch.draw(shader)
+    gpu.state.blend_set("NONE")
+
+
+def stop_proximity():
+    rig = bpy.data.objects.get(_proximity["rig"] or "")
+    if rig is not None and rig.get("hive_anim"):
+        show_all_controls(rig)
+    if _proximity["handler"] is not None:
+        bpy.types.SpaceView3D.draw_handler_remove(_proximity["handler"], "WINDOW")
+    _proximity.update(rig=None, fades={}, handler=None)
+
+
+def toggle_proximity(wm, context):
+    if wm.hive_proximity:
+        bpy.ops.hive.proximity("INVOKE_DEFAULT")
+    else:
+        stop_proximity()
+        for area in context.screen.areas if context.screen else []:
+            area.tag_redraw()
 
 
 # --------------------------------------------------------------------------- guides
@@ -2394,6 +2608,47 @@ class HIVE_OT_switch_space(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class HIVE_OT_proximity(bpy.types.Operator):
+    bl_idname = "hive.proximity"
+    bl_label = "Proximity Controls"
+    bl_description = "Hide the controls far from the mouse and fade them in as it comes near"
+
+    def invoke(self, context, event):
+        rig = find_rig(context)
+        if rig is None or not rig.get("hive_anim"):
+            context.window_manager.hive_proximity = False
+            self.report({"WARNING"}, "No Hive rig to show controls of")
+            return {"CANCELLED"}
+        stop_proximity()
+        _proximity.update(rig=rig.name, fades={})
+        _proximity["handler"] = bpy.types.SpaceView3D.draw_handler_add(draw_proximity, (), "WINDOW", "POST_VIEW")
+        context.window_manager.modal_handler_add(self)
+        return {"RUNNING_MODAL"}
+
+    def modal(self, context, event):
+        wm = context.window_manager
+        rig = bpy.data.objects.get(_proximity["rig"] or "")
+        if not wm.hive_proximity or rig is None:
+            stop_proximity()
+            return {"CANCELLED"}
+        if event.type == "MOUSEMOVE":
+            from bpy_extras.view3d_utils import location_3d_to_region_2d
+            for area in context.window.screen.areas:
+                if area.type != "VIEW_3D":
+                    continue
+                region = next((r for r in area.regions if r.type == "WINDOW"), None)
+                if region is None or not (region.x <= event.mouse_x < region.x + region.width
+                                          and region.y <= event.mouse_y < region.y + region.height):
+                    continue
+                rv3d = area.spaces.active.region_3d
+                mouse = (event.mouse_x - region.x, event.mouse_y - region.y)
+                _proximity["fades"] = proximity_fades(
+                    rig, lambda p: location_3d_to_region_2d(region, rv3d, p), mouse)
+                apply_proximity(rig, _proximity["fades"])
+                area.tag_redraw()
+        return {"PASS_THROUGH"}
+
+
 class HIVE_PT_panel(bpy.types.Panel):
     bl_label = "Hive Rig"
     bl_space_type = "VIEW_3D"
@@ -2457,6 +2712,9 @@ class HIVE_PT_panel(bpy.types.Panel):
         row.operator("hive.reset_pose", text="Reset All", icon="LOOP_BACK").selected = False
         row.operator("hive.reset_pose", text="Reset Selected").selected = True
         box.operator("hive.select_controls", icon="RESTRICT_SELECT_OFF")
+        wm = getattr(context, "window_manager", None)
+        if wm is not None and hasattr(wm, "hive_proximity"):
+            box.prop(wm, "hive_proximity", text="Proximity Controls", icon="HIDE_OFF")
         active = context.active_pose_bone
         if active is not None and active.id_data == rig and active.name in data["spaces"]:
             col = box.column(align=True)
@@ -2492,6 +2750,7 @@ CLASSES = (
     HIVE_OT_reset_pose,
     HIVE_OT_select_controls,
     HIVE_OT_switch_space,
+    HIVE_OT_proximity,
     HIVE_PT_panel,
 )
 
@@ -2501,6 +2760,9 @@ def register():
         if hasattr(bpy.types, cls.__name__):
             bpy.utils.unregister_class(getattr(bpy.types, cls.__name__))
         bpy.utils.register_class(cls)
+    bpy.types.WindowManager.hive_proximity = bpy.props.BoolProperty(
+        name="Proximity Controls", default=False, update=toggle_proximity,
+        description="Hide the controls far from the mouse in the 3D view and fade them in as it comes near")
 
 
 def main():

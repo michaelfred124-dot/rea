@@ -457,4 +457,62 @@ if has_limbs:
                              SimpleNamespace(active_object=rig, active_pose_bone=None, mode="POSE"))
     check(any(c.args[:1] == (rig,) for c in layout.mock_calls if c.args), "range: the Hive tab shows the range switch")
     rig["hive_match_range"] = False
+
+# Feathered wings: spread fans each feather about its root by its angle, the
+# mirror and reset tools carry it.
+RIG_DATA = ns["RIG_DATA"]
+for fan in RIG_DATA["controls"].get("feathers", []):
+    ctrl = pose[fan["control"]]
+    check(ctrl.get("spread") == 0.0 and all(ctrl.lock_rotation) and all(ctrl.lock_location),
+          "%s: spread starts at 0 and the fan control only carries it" % fan["control"])
+    update()
+    closed = {f["bone"]: (pose[f["bone"]].tail - pose[f["bone"]].head).normalized() for f in fan["feathers"]}
+    ctrl["spread"] = 1.0
+    update()
+    for f in fan["feathers"]:
+        rest = closed[f["bone"]]
+        now = (pose[f["bone"]].tail - pose[f["bone"]].head).normalized()
+        turned = math.degrees(rest.angle(now))
+        check(abs(turned - abs(f["angle"])) < 0.05, "%s: spread 1 turns %s by %.1f degrees (want %.1f)"
+              % (fan["control"], f["bone"], turned, abs(f["angle"])))
+    outer = max(fan["feathers"], key=lambda f: f["angle"])
+    ctrl["spread"] = -1.0
+    update()
+    folded = (pose[outer["bone"]].tail - pose[outer["bone"]].head).normalized()
+    ctrl["spread"] = 1.0
+    update()
+    opened = (pose[outer["bone"]].tail - pose[outer["bone"]].head).normalized()
+    check(folded.angle(opened) > math.radians(1.9 * abs(outer["angle"])), "%s: -1 folds the way 1 opens" % fan["control"])
+    ns["reset_pose"](rig)
+    check(pose[fan["control"]]["spread"] == 0.0, "%s: reset puts spread back to 0" % fan["control"])
+
+# Proximity controls: the fade, and hiding all but the near and selected controls.
+fade = ns["proximity_fade"]
+check(fade(0) == 1.0 and fade(ns["PROXIMITY_NEAR"]) == 1.0 and fade(ns["PROXIMITY_FAR"]) == 0.0
+      and 0.0 < fade(0.5 * (ns["PROXIMITY_NEAR"] + ns["PROXIMITY_FAR"])) < 1.0, "proximity: controls fade in between near and far")
+names = data["controls"]
+near_one, picked = names[0], names[-1]
+for n in names:
+    ns["set_bone_selected"](pose[n], n == picked)
+fades = {n: (1.0 if n == near_one else 0.3) for n in names}
+hidden = ns["apply_proximity"](rig, fades)
+check(hidden == len(names) - 2 and not ns["bone_hidden"](pose[near_one]) and not ns["bone_hidden"](pose[picked]),
+      "proximity: only the near and the selected controls show (%d hidden)" % hidden)
+lines = ns["proximity_lines"](rig, fades)
+check(len(lines) > 0 and all(abs(f - 0.3) < 1e-6 and len(p) % 2 == 0 for f, p in lines),
+      "proximity: the fading controls are drawn as lines (%d)" % len(lines))
+# Distances from a projection: straight down the view, the root sits under the mouse.
+at = ns["proximity_fades"](rig, lambda p: (p.x * 1000.0, p.y * 1000.0), (0.0, 0.0))
+check(set(at) == set(names) and max(at.values()) == 1.0, "proximity: fades come from screen distance")
+ns["show_all_controls"](rig)
+check(not any(ns["bone_hidden"](pose[n]) for n in names), "proximity: turning it off shows every control")
+check(hasattr(bpy.types.WindowManager, "hive_proximity") and hasattr(bpy.types, "HIVE_OT_proximity"),
+      "proximity: the Hive tab's switch and its operator are registered")
+layout = mock.MagicMock()
+ns["HIVE_PT_panel"].draw(SimpleNamespace(layout=layout),
+                         SimpleNamespace(active_object=rig, active_pose_bone=None, mode="POSE",
+                                         window_manager=bpy.context.window_manager))
+check(any("hive_proximity" in c.args for c in layout.mock_calls if c.args), "proximity: the Hive tab has the switch")
+for n in names:
+    ns["set_bone_selected"](pose[n], False)
 print("blender animator tools check passed")

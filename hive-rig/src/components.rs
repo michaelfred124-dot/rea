@@ -13,8 +13,8 @@ use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
 use crate::controls::{
-    BendSegment, Bendy, Control, ControlKind, ControlParent, ControlRig, FaceBoard, FootRoll,
-    HockSegment, IkChain, SOFT_ZONE, Shape, SplineChain, ctrl_name, fk_name,
+    BendSegment, Bendy, Control, ControlKind, ControlParent, ControlRig, FaceBoard, FanFeather,
+    FeatherFan, FootRoll, HockSegment, IkChain, SOFT_ZONE, Shape, SplineChain, ctrl_name, fk_name,
 };
 use crate::custom_shapes::{CustomShape, NamedShape};
 use crate::face_board::{self, Dir};
@@ -215,6 +215,23 @@ pub struct Component {
 pub struct Guide {
     pub name: String,
     pub position: Vec3,
+    /// Chains: the earlier guide this one grows from, which makes the chain
+    /// fork there (antlers, branches, tendrils). Unset, it grows from the
+    /// guide before it. The bone ending at this guide hangs from the bone
+    /// ending at `from` (or from the component's parent when `from` is the
+    /// first guide), and its FK control from that bone's control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+}
+
+impl Guide {
+    pub fn new(name: impl Into<String>, position: Vec3) -> Guide {
+        Guide {
+            name: name.into(),
+            position,
+            from: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,7 +278,29 @@ pub struct Options {
     /// quad leg's hock) to bend up.
     #[serde(default, skip_serializing_if = "is_false")]
     pub knee_up: bool,
+    /// Arms (wings): feathers in each row along the forearm and hand, each a
+    /// chain of [`FEATHER_JOINTS`] joints with FK controls, fanned open and
+    /// closed by the wing's spread control (0 = no feathers).
+    #[serde(default, skip_serializing_if = "is_zero_count")]
+    pub feathers: usize,
+    /// Rows of feathers (1 to [`MAX_FEATHER_ROWS`]; 1 when unset): the flight
+    /// feathers, then shorter coverts above them.
+    #[serde(default, skip_serializing_if = "is_zero_count")]
+    pub feather_rows: usize,
 }
+
+fn is_zero_count(n: &usize) -> bool {
+    *n == 0
+}
+
+/// Joints in each feather.
+pub const FEATHER_JOINTS: usize = 2;
+/// Most feathers a row.
+pub const MAX_FEATHERS: usize = 24;
+/// Most rows of feathers on a wing.
+pub const MAX_FEATHER_ROWS: usize = 3;
+/// Degrees the outermost and innermost feathers turn at full spread.
+pub const FEATHER_FAN_DEGREES: f32 = 30.0;
 
 fn is_zero(v: &f32) -> bool {
     *v == 0.0
@@ -287,6 +326,8 @@ impl Default for Options {
             spring: 0.0,
             board: false,
             knee_up: false,
+            feathers: 0,
+            feather_rows: 0,
         }
     }
 }
@@ -320,10 +361,7 @@ impl Component {
     }
 
     fn guide(mut self, name: impl Into<String>, position: Vec3) -> Self {
-        self.guides.push(Guide {
-            name: name.into(),
-            position,
-        });
+        self.guides.push(Guide::new(name, position));
         self
     }
 
@@ -1018,6 +1056,10 @@ pub enum Preset {
     /// A curve-driven tentacle: curve controls with stretch, volume and an FK
     /// layer, from the pelvis or any bone (`--parent`).
     Tentacle,
+    /// A forking FK chain on each side of the head (`--parent` for another
+    /// bone): a beam of three joints with a tine off each of its first two,
+    /// an FK control on every joint. `branch` adds more forks.
+    Antlers,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1341,6 +1383,42 @@ pub fn add_preset(g: &mut Guides, preset: Preset, opts: &AddOptions) -> Result<V
             }
             g.components.push(c);
             added.push(id);
+        }
+        Preset::Antlers => {
+            let parent = opts.parent.clone().unwrap_or_else(|| "head".into());
+            let head = sk
+                .bone(&parent)
+                .with_context(|| format!("no bone named {parent} to grow antlers from"))?
+                .clone();
+            let seg = (head.length() * 0.45).max(0.03 * h);
+            let base_id = opts.id.clone().unwrap_or_else(|| "antler".into());
+            for side in [Side::Left, Side::Right] {
+                let id = format!("{base_id}{}", side.suffix());
+                ensure!(g.component(&id).is_none(), "{id} already exists");
+                let out = Vec3::X * side.sign();
+                let base = head.head.lerp(head.tail, 0.8) + out * 0.25 * seg;
+                // The beam rises out and back, bending up; a tine forks
+                // forward off its first two joints.
+                let beam = [
+                    (out * 0.8 + Vec3::Y - Vec3::Z * 0.2).normalize(),
+                    (out * 0.5 + Vec3::Y - Vec3::Z * 0.4).normalize(),
+                    (out * 0.2 + Vec3::Y - Vec3::Z * 0.3).normalize(),
+                ];
+                let mut c = Component::new(&id, Kind::Chain, side, Some(&parent)).guide("j1", base);
+                let mut at = base;
+                for (k, d) in beam.iter().enumerate() {
+                    at += *d * seg;
+                    c = c.guide(format!("j{}", k + 2), at);
+                }
+                for (t, from) in ["j2", "j3"].into_iter().enumerate() {
+                    let root = c.position(from).unwrap();
+                    let tip = root + (Vec3::Z + Vec3::Y * 0.7 + out * 0.2).normalize() * seg * 0.8;
+                    c = c.guide(format!("tine{}", t + 1), tip);
+                    c.guides.last_mut().unwrap().from = Some(from.to_string());
+                }
+                g.components.push(c);
+                added.push(id);
+            }
         }
         Preset::Tail | Preset::Chain => {
             let joints = opts
@@ -1842,6 +1920,137 @@ pub fn set_limb_options(g: &mut Guides, bendy: bool, soft: f32) {
     }
 }
 
+/// Feathers on a wing (an arm component) and its twin, or on every arm when
+/// `id` is `None`: `count` a row (0 takes them off) in `rows` rows. Returns
+/// the ids changed. Nothing changes when the result wouldn't build.
+pub fn set_feathers(
+    g: &mut Guides,
+    id: Option<&str>,
+    count: usize,
+    rows: usize,
+) -> Result<Vec<String>> {
+    ensure!(
+        count <= MAX_FEATHERS,
+        "a wing takes 0 to {MAX_FEATHERS} feathers a row"
+    );
+    ensure!(
+        (1..=MAX_FEATHER_ROWS).contains(&rows),
+        "a wing takes 1 to {MAX_FEATHER_ROWS} rows of feathers"
+    );
+    let mut ids: Vec<String> = match id {
+        Some(id) => {
+            let c = g
+                .component(id)
+                .with_context(|| format!("no component named {id}"))?;
+            ensure!(c.kind == Kind::Arm, "{id} isn't an arm or wing");
+            let mut ids = vec![id.to_string()];
+            ids.extend(twin_id(c).filter(|t| g.component(t).is_some()));
+            ids
+        }
+        None => g
+            .components
+            .iter()
+            .filter(|c| c.kind == Kind::Arm)
+            .map(|c| c.id.clone())
+            .collect(),
+    };
+    ensure!(!ids.is_empty(), "this layout has no arms or wings");
+    ids.sort();
+    let mut next = g.clone();
+    for c in next.components.iter_mut().filter(|c| ids.contains(&c.id)) {
+        c.options.feathers = count;
+        c.options.feather_rows = if count == 0 || rows == 1 { 0 } else { rows };
+    }
+    build(&next)?;
+    *g = next;
+    Ok(ids)
+}
+
+/// Fork a chain: add a branch of `joints` guides growing from its guide
+/// `from`, angled off the bone that ends there, and the same (mirrored) on
+/// its twin when it has one with the same guides. Returns the new guides' names.
+pub fn add_branch(g: &mut Guides, id: &str, from: &str, joints: usize) -> Result<Vec<String>> {
+    ensure!((1..=16).contains(&joints), "a branch takes 1 to 16 joints");
+    let ci = g
+        .components
+        .iter()
+        .position(|c| c.id == id)
+        .with_context(|| format!("no component named {id}"))?;
+    let c = &g.components[ci];
+    ensure!(
+        c.kind == Kind::Chain,
+        "{id} isn't a chain, so it can't fork"
+    );
+    let k = c
+        .guides
+        .iter()
+        .position(|x| x.name == from)
+        .with_context(|| format!("{id} has no guide named {from}"))?;
+    let at = c.guides[k].position;
+    // The bone ending at `from` (or the first bone, from the chain's root).
+    let (a, b) = if k == 0 {
+        (at, c.guides[1].position)
+    } else {
+        (c.guides[guide_from(c, k)].position, at)
+    };
+    let along = (b - a).try_normalize().unwrap_or(Vec3::Y);
+    let mean = (1..c.guides.len())
+        .map(|j| {
+            c.guides[guide_from(c, j)]
+                .position
+                .distance(c.guides[j].position)
+        })
+        .sum::<f32>()
+        / (c.guides.len() - 1) as f32;
+    // Off to the outside (or forward on the centre line), 40 degrees from the bone.
+    let side_dir = match c.side {
+        Side::Center => Vec3::Z,
+        s => Vec3::X * s.sign(),
+    };
+    let mut off = side_dir - along * along.dot(side_dir);
+    if off.length() < 1e-3 {
+        off = along.any_orthonormal_vector();
+    }
+    let dir =
+        glam::Quat::from_axis_angle(along.cross(off.normalize()).normalize(), 40f32.to_radians())
+            * along;
+    let n = (1..)
+        .find(|n| c.guides.iter().all(|x| x.name != format!("b{n}_1")))
+        .unwrap();
+    let names: Vec<String> = (1..=joints).map(|j| format!("b{n}_{j}")).collect();
+    let mut added: Vec<Guide> = Vec::new();
+    for (j, name) in names.iter().enumerate() {
+        let mut guide = Guide::new(name, at + dir * (0.7 * mean * (j + 1) as f32));
+        if j == 0 {
+            guide.from = Some(from.to_string());
+        }
+        added.push(guide);
+    }
+    let mut next = g.clone();
+    let twin = twin_id(&next.components[ci]).and_then(|t| {
+        let tj = next.components.iter().position(|o| o.id == t)?;
+        let same = next.components[tj]
+            .guides
+            .iter()
+            .map(|x| &x.name)
+            .eq(next.components[ci].guides.iter().map(|x| &x.name));
+        same.then_some(tj)
+    });
+    if let Some(tj) = twin {
+        let cx = next.body.center_x;
+        next.components[tj]
+            .guides
+            .extend(added.iter().map(|x| Guide {
+                position: mirror(x.position, cx),
+                ..x.clone()
+            }));
+    }
+    next.components[ci].guides.extend(added);
+    build(&next)?;
+    *g = next;
+    Ok(names)
+}
+
 /// Set the default hock `spring` on every quad leg; returns how many there are.
 pub fn set_hock_spring(g: &mut Guides, spring: f32) -> usize {
     let legs = g.components.iter_mut().filter(|c| c.kind == Kind::QuadLeg);
@@ -2275,6 +2484,50 @@ fn validate(g: &Guides) -> Result<()> {
                 c.id
             );
         }
+        for (k, guide) in c.guides.iter().enumerate() {
+            if let Some(from) = &guide.from {
+                ensure!(
+                    c.kind == Kind::Chain,
+                    "component {}: only chains fork (guide {} grows from {from})",
+                    c.id,
+                    guide.name
+                );
+                ensure!(
+                    c.guides[..k].iter().any(|g| &g.name == from),
+                    "component {}: guide {} grows from {from}, which isn't a guide before it",
+                    c.id,
+                    guide.name
+                );
+            }
+        }
+        if is_branched(c) {
+            let mut names = HashSet::new();
+            for guide in &c.guides {
+                ensure!(
+                    names.insert(guide.name.as_str()),
+                    "component {}: two guides are called {} (a forking chain needs its guide names unique)",
+                    c.id,
+                    guide.name
+                );
+            }
+        }
+        ensure!(
+            c.options.feathers == 0 || c.kind == Kind::Arm,
+            "component {}: only arms (wings) have feathers",
+            c.id
+        );
+        ensure!(
+            c.options.feathers <= MAX_FEATHERS,
+            "component {}: a wing takes 0 to {MAX_FEATHERS} feathers a row (got {})",
+            c.id,
+            c.options.feathers
+        );
+        ensure!(
+            c.options.feather_rows <= MAX_FEATHER_ROWS,
+            "component {}: a wing takes 1 to {MAX_FEATHER_ROWS} rows of feathers (got {})",
+            c.id,
+            c.options.feather_rows
+        );
         for guide in &c.guides {
             ensure!(
                 guide.position.is_finite(),
@@ -2522,6 +2775,128 @@ fn build_arm(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
             ..Limb::default()
         },
     );
+    build_feathers(
+        b,
+        c,
+        &names[1],
+        &names[2],
+        [p("elbow"), p("wrist"), p("hand_tip")],
+    )
+}
+
+/// A wing's feathers (see [`Options::feathers`]): rows of feather chains
+/// along the forearm and hand, each pointing back from the wing and sweeping
+/// toward the tip over the hand, longer toward the tip; the rows above the
+/// first are shorter coverts. Each joint has an FK control; the first hangs
+/// under a fan offset turned by the spread control's `spread`.
+fn build_feathers(
+    b: &mut Builder,
+    c: &Component,
+    forearm: &str,
+    hand: &str,
+    [elbow, wrist, tip]: [Vec3; 3],
+) -> Result<()> {
+    let count = c.options.feathers;
+    if count == 0 {
+        return Ok(());
+    }
+    let rows = c.options.feather_rows.clamp(1, MAX_FEATHER_ROWS);
+    let (side, s) = (c.side, c.side.suffix());
+    let base = id_base(&c.id, side);
+    let color = side_color(side);
+    let fore = elbow.distance(wrist);
+    let span = fore + wrist.distance(tip);
+    // Back from the wing (the body faces +Z), square to a segment.
+    let back_of = |d: Vec3| (-Vec3::Z + d * d.z).try_normalize().unwrap_or(Vec3::NEG_Y);
+    let up_of = |d: Vec3, back: Vec3| {
+        let n = d.cross(back).normalize();
+        if n.y < 0.0 { -n } else { n }
+    };
+    let fan_ctrl = format!("{base}_feathers{s}_ctrl");
+    let hand_dir = (tip - wrist).normalize();
+    let hand_back = back_of(hand_dir);
+    b.control(
+        fan_ctrl.clone(),
+        ControlKind::Fan,
+        ControlParent::Bone(hand.to_string()),
+        None,
+        wrist + hand_back * 0.3 * span,
+        up_of(hand_dir, hand_back),
+        Shape::QuarterCircle,
+        0.12 * span,
+        color,
+    );
+    let mut feathers = Vec::new();
+    for row in 0..rows {
+        for i in 0..count {
+            // Along the wing from just past the elbow to the tip; each row
+            // above the first sits half a feather further out.
+            let mut u = if count == 1 {
+                0.5
+            } else {
+                i as f32 / (count - 1) as f32
+            };
+            if row % 2 == 1 {
+                u = (u + 0.5 / count as f32).min(1.0);
+            }
+            let at = span * (0.08 + 0.92 * u);
+            let (parent, root, d) = if at < fore {
+                let d = (wrist - elbow).normalize();
+                (forearm, elbow + d * at, d)
+            } else {
+                (hand, wrist + hand_dir * (at - fore), hand_dir)
+            };
+            let back = back_of(d);
+            let up = up_of(d, back);
+            // The hand's feathers sweep toward the tip, up to 60 degrees there.
+            let sweep = (60f32).to_radians() * ((at - fore) / (span - fore).max(1e-6)).max(0.0);
+            let dir = (back * sweep.cos() + d * sweep.sin()).normalize();
+            let length = span * (0.32 + 0.18 * u) * 0.6f32.powi(row as i32);
+            let root = root + up * (0.012 * b.h * row as f32);
+            let mut prev = parent.to_string();
+            let mut prev_ctrl = b.parent_control(parent);
+            let mut first = None;
+            for j in 0..FEATHER_JOINTS {
+                let bone = format!("{base}_feather{}_{:02}_{:02}{s}", row + 1, i + 1, j + 1);
+                let a = root + dir * (length * j as f32 / FEATHER_JOINTS as f32);
+                let e = root + dir * (length * (j + 1) as f32 / FEATHER_JOINTS as f32);
+                b.bone(&bone, &prev, a, e, side, limb_region(Kind::Arm, side))?;
+                let ctrl = ctrl_name(&bone);
+                b.control(
+                    ctrl.clone(),
+                    ControlKind::Fk,
+                    prev_ctrl,
+                    Some(&bone),
+                    a,
+                    dir,
+                    Shape::Circle,
+                    (length / FEATHER_JOINTS as f32 * 0.35).clamp(0.006 * b.h, 0.04 * b.h),
+                    color,
+                );
+                first.get_or_insert((bone.clone(), ctrl.clone()));
+                prev = bone;
+                prev_ctrl = ControlParent::Control(ctrl);
+            }
+            let (bone, control) = first.unwrap();
+            feathers.push(FanFeather {
+                control,
+                bone,
+                parent: parent.to_string(),
+                pivot: root,
+                axis: dir.cross(d).normalize(),
+                angle: if count == 1 {
+                    0.0
+                } else {
+                    FEATHER_FAN_DEGREES * (2.0 * u - 1.0)
+                },
+            });
+        }
+    }
+    b.rig.feathers.push(FeatherFan {
+        name: c.id.clone(),
+        control: fan_ctrl,
+        feathers,
+    });
     Ok(())
 }
 
@@ -2918,28 +3293,57 @@ fn limb_controls(
     });
 }
 
+/// The guide that guide `k` (from 1) of a chain grows from: the one its
+/// `from` names among the guides before it, else the guide before it.
+pub fn guide_from(c: &Component, k: usize) -> usize {
+    c.guides[k]
+        .from
+        .as_ref()
+        .and_then(|f| c.guides[..k].iter().position(|g| &g.name == f))
+        .unwrap_or(k - 1)
+}
+
+/// Whether a chain forks: a guide grows from one other than the guide before it.
+pub fn is_branched(c: &Component) -> bool {
+    c.kind == Kind::Chain && (1..c.guides.len()).any(|k| guide_from(c, k) != k - 1)
+}
+
+/// An FK chain, forking wherever a guide grows from an earlier guide than
+/// the one before it: bone `k` runs from guide `from(k)` to guide `k` and
+/// hangs from the bone ending at `from(k)`, its control from that bone's.
 fn build_chain(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
     let region =
         b.sk.bone(parent)
             .map(|p| p.region)
             .unwrap_or(Region::Center);
     let (names, _) = id_names(c);
-    let mut prev = parent.to_string();
+    let froms: Vec<usize> = (1..c.guides.len()).map(|k| guide_from(c, k)).collect();
+    let bone_at = |guide: usize| {
+        if guide == 0 {
+            parent.to_string()
+        } else {
+            names[guide - 1].clone()
+        }
+    };
     for (i, name) in names.iter().enumerate() {
+        let from = froms[i];
         b.bone(
             name,
-            &prev,
-            c.guides[i].position,
+            &bone_at(from),
+            c.guides[from].position,
             c.guides[i + 1].position,
             c.side,
             region,
         )?;
-        prev = name.clone();
     }
-    let mut parent_ctrl = b.parent_control(parent);
-    for name in &names {
+    let base_ctrl = b.parent_control(parent);
+    for (i, name) in names.iter().enumerate() {
         let bone = b.sk.bone(name).unwrap().clone();
         let size = (bone.length() * 0.6).clamp(0.008 * b.h, 0.06 * b.h);
+        let parent_ctrl = match froms[i] {
+            0 => base_ctrl.clone(),
+            from => ControlParent::Control(ctrl_name(&names[from - 1])),
+        };
         b.control(
             ctrl_name(name),
             ControlKind::Fk,
@@ -2951,7 +3355,6 @@ fn build_chain(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
             size,
             side_color(c.side),
         );
-        parent_ctrl = ControlParent::Control(ctrl_name(name));
     }
     Ok(())
 }
@@ -3085,6 +3488,7 @@ fn spline_controls(b: &mut Builder, s: Spline) {
         weights,
         default_stretch: 1.0,
         default_volume: 0.0,
+        default_slide: 0.0,
     });
 }
 
@@ -3245,6 +3649,7 @@ fn build_face(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
         .map(|j| Guide {
             name: j.name,
             position: j.position,
+            from: None,
         })
         .collect();
     for g in c.guides.iter().chain(&extras) {
@@ -5413,5 +5818,156 @@ mod tests {
             .options
             .knee_up = true;
         assert!(build(&d).is_err());
+    }
+
+    #[test]
+    fn wings_grow_rows_of_feathers_under_a_spread_control() {
+        let mut g = crate::demo::Creature::Bird.guides();
+        let ids = set_feathers(&mut g, Some("wing_l"), 5, 2).unwrap();
+        assert_eq!(ids, ["wing_l", "wing_r"], "the twin gets them too");
+        let b = build(&g).unwrap();
+        let sk = &b.skeleton;
+        assert_eq!(b.controls.feathers.len(), 2);
+        let feather_bones = sk
+            .bones
+            .iter()
+            .filter(|x| x.name.contains("_feather"))
+            .count();
+        assert_eq!(feather_bones, 2 * 2 * 5 * FEATHER_JOINTS);
+        for fan in &b.controls.feathers {
+            assert_eq!(fan.feathers.len(), 10, "{}", fan.name);
+            assert_eq!(
+                b.controls.control(&fan.control).unwrap().kind,
+                ControlKind::Fan
+            );
+            for f in &fan.feathers {
+                let bone = sk.bone(&f.bone).unwrap();
+                assert_eq!(sk.bones[bone.parent.unwrap()].name, f.parent);
+                let ctrl = b.controls.control(&f.control).unwrap();
+                assert_eq!(ctrl.kind, ControlKind::Fk);
+                assert_eq!(ctrl.bone.as_deref(), Some(f.bone.as_str()));
+                assert!(f.angle.abs() <= FEATHER_FAN_DEGREES + 1e-4);
+                assert!((f.axis.length() - 1.0).abs() < 1e-4);
+                // A feather's turn is about its own root.
+                let m = f.matrix(1.0);
+                assert!(m.transform_point3(f.pivot).distance(f.pivot) < 1e-5);
+                assert!(f.matrix(0.0).abs_diff_eq(glam::Mat4::IDENTITY, 1e-6));
+            }
+            // Each row fans from closing in at the elbow to opening at the tip.
+            let row = &fan.feathers[..5];
+            assert!(row[0].angle < 0.0 && row[4].angle > 0.0);
+            assert!(row.windows(2).all(|w| w[0].angle < w[1].angle));
+            // The second row of feathers on each feather is shorter.
+            let len = |f: &FanFeather| sk.bone(&f.bone).unwrap().length();
+            assert!(len(&fan.feathers[5]) < len(&fan.feathers[0]));
+        }
+        // The wings mirror.
+        let cx = g.body.center_x;
+        let l = sk.bone("wing_feather1_03_01_l").unwrap();
+        let r = sk.bone("wing_feather1_03_01_r").unwrap();
+        assert!(mirror(l.head, cx).distance(r.head) < 1e-4);
+        assert!(mirror(l.tail, cx).distance(r.tail) < 1e-4);
+
+        // Out of range or on the wrong part: refused, and nothing changes.
+        let before = serde_json::to_string(&g).unwrap();
+        assert!(set_feathers(&mut g, Some("wing_l"), MAX_FEATHERS + 1, 1).is_err());
+        assert!(set_feathers(&mut g, Some("wing_l"), 3, 0).is_err());
+        assert!(set_feathers(&mut g, Some("wing_l"), 3, MAX_FEATHER_ROWS + 1).is_err());
+        assert!(set_feathers(&mut g, Some("leg_l"), 3, 1).is_err());
+        assert_eq!(serde_json::to_string(&g).unwrap(), before);
+        let mut legs = g.clone();
+        for c in legs.components.iter_mut().filter(|c| c.kind != Kind::Arm) {
+            c.options.feathers = 2;
+        }
+        assert!(build(&legs).is_err(), "only arms take feathers");
+
+        // The feathers survive a save, and come off again.
+        let back: Guides = serde_json::from_str(&before).unwrap();
+        assert_eq!(build(&back).unwrap().controls.feathers.len(), 2);
+        assert_eq!(set_feathers(&mut g, None, 0, 1).unwrap().len(), 2);
+        let bare = build(&g).unwrap();
+        assert!(bare.controls.feathers.is_empty());
+        assert!(!serde_json::to_string(&g).unwrap().contains("feather"));
+    }
+
+    #[test]
+    fn chains_fork_with_fk_on_every_branch() {
+        let mut g = crate::demo::Creature::Bird.guides();
+        add_preset(&mut g, Preset::Antlers, &AddOptions::default()).unwrap();
+        let b = build(&g).unwrap();
+        let sk = &b.skeleton;
+        for id in ["antler_l", "antler_r"] {
+            let c = g.component(id).unwrap();
+            assert!(is_branched(c), "{id}");
+            let (names, ctrls) = id_names(c);
+            assert_eq!(names.len(), c.guides.len() - 1);
+            for k in 1..c.guides.len() {
+                let bone = sk.bone(&names[k - 1]).unwrap();
+                let from = guide_from(c, k);
+                // Each bone starts where its fork guide is, under the bone
+                // that ends there, and so does its control.
+                assert!(bone.head.distance(c.guides[from].position) < 1e-5);
+                let parent = &sk.bones[bone.parent.unwrap()].name;
+                let ctrl = b.controls.control(&ctrls[k - 1]).unwrap();
+                if from == 0 {
+                    assert_eq!(parent, "head");
+                } else {
+                    assert_eq!(parent, &names[from - 1]);
+                    assert_eq!(ctrl.parent, ControlParent::Control(ctrls[from - 1].clone()));
+                }
+            }
+            // Two tines hang off the beam's second and third joints.
+            let tine = |n: &str| c.guides.iter().position(|x| x.name == n).unwrap();
+            assert_eq!(c.guides[guide_from(c, tine("tine1"))].name, "j2");
+            assert_eq!(c.guides[guide_from(c, tine("tine2"))].name, "j3");
+        }
+        assert!(add_preset(&mut g, Preset::Antlers, &AddOptions::default()).is_err());
+
+        // A new branch goes on both antlers, mirrored.
+        let names = add_branch(&mut g, "antler_l", "j4", 2).unwrap();
+        assert_eq!(names, ["b1_1", "b1_2"]);
+        let b = build(&g).unwrap();
+        let (l, r) = (
+            g.component("antler_l").unwrap(),
+            g.component("antler_r").unwrap(),
+        );
+        let cx = g.body.center_x;
+        for (gl, gr) in l.guides.iter().zip(&r.guides) {
+            assert_eq!((&gl.name, &gl.from), (&gr.name, &gr.from));
+            assert!(mirror(gl.position, cx).distance(gr.position) < 1e-4);
+        }
+        let first = l.guides.iter().position(|x| x.name == "b1_1").unwrap();
+        assert_eq!(l.guides[guide_from(l, first)].name, "j4");
+        assert_eq!(guide_from(l, first + 1), first, "b1_2 runs on from b1_1");
+        let (bones, _) = id_names(l);
+        let tip = b.skeleton.bone(&bones[first]).unwrap();
+        assert_eq!(b.skeleton.bones[tip.parent.unwrap()].name, bones[first - 1]);
+        // The forks survive a save.
+        let back: Guides = serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
+        assert_eq!(
+            build(&back).unwrap().skeleton.bones.len(),
+            b.skeleton.bones.len()
+        );
+
+        // Forks only on chains, from guides the chain has, back up the chain.
+        assert!(add_branch(&mut g, "antler_l", "nope", 2).is_err());
+        assert!(add_branch(&mut g, "wing_l", "elbow", 2).is_err());
+        assert!(add_branch(&mut g, "antler_l", "j2", 0).is_err());
+        let mut bad = g.clone();
+        let c = bad
+            .components
+            .iter_mut()
+            .find(|c| c.id == "antler_l")
+            .unwrap();
+        c.guides[1].from = Some("tine2".into());
+        assert!(build(&bad).is_err(), "a fork from a later guide");
+        let mut bad = g.clone();
+        let c = bad
+            .components
+            .iter_mut()
+            .find(|c| c.id == "wing_l")
+            .unwrap();
+        c.guides[1].from = Some(c.guides[0].name.clone());
+        assert!(build(&bad).is_err(), "a fork on a wing");
     }
 }

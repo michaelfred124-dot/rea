@@ -192,6 +192,30 @@ for name, sp in SPLINES.items():
     gap, _ = on_curve(sp)
     check(gap < 0.002 * rest_len + 1e-4, "%s: unstretched joints still ride the curve" % name)
 
+    # Slide: unstretched, the joints keep their lengths and move toward the tip
+    # by that share of the chain's length; stretched, they fill the rest of the curve.
+    check("slide" in settings.keys() and settings["slide"] == 0.0, "%s: slide starts at 0" % name)
+    settings["slide"] = 0.3
+    update()
+    moved = (head(bones[0]) - rest_heads[0]).length
+    check(abs(moved - 0.3 * rest_len) < 0.005 * rest_len,
+          "%s: sliding 0.3 moves the base joint 0.3 of the chain along (%.3f of %.3f m)" % (name, moved, rest_len))
+    check(abs(chain_length(sp) - rest_len) < 1e-3 * rest_len + 1e-5, "%s: sliding keeps the joints' lengths" % name)
+    gap, _ = on_curve(sp)
+    check(gap < 0.002 * rest_len + 1e-4, "%s: slid joints still ride the curve (%.4f m off)" % (name, gap))
+    settings["stretch"] = 1.0
+    update()
+    curve_len = sum((b - a).length for a, b in zip(curve_points(sp), curve_points(sp)[1:]))
+    moved = (head(bones[0]) - rest_heads[0]).length
+    check(abs(moved - 0.3 * curve_len) < 0.01 * curve_len,
+          "%s: stretched, the slid chain starts 0.3 of the curve along (%.3f of %.3f m)" % (name, moved, curve_len))
+    check((head(bones[-1]) - curve_points(sp)[-1]).length < 0.01 * rest_len + 1e-4,
+          "%s: stretched, the slid chain still reaches the end of the curve (%.4f m off)"
+          % (name, (head(bones[-1]) - curve_points(sp)[-1]).length))
+    settings["slide"] = 0.0
+    settings["stretch"] = 0.0
+    update()
+
     # The FK layer: turning the first FK control swings the rest of the chain.
     reset()
     tip0 = tail(bones[-1])

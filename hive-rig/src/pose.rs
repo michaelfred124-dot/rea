@@ -194,8 +194,8 @@ pub struct Attribute {
 
 /// Every custom attribute of the rig: on each IK control `ik_fk` (1 = IK),
 /// `stretch`, `soft` (two-bone limbs) and `roll` (feet); on each spline's
-/// settings control `stretch` and `volume`; and `space` on every control with
-/// space switching.
+/// settings control `stretch`, `volume` and `slide`; `spread` on each feathered
+/// wing's fan control; and `space` on every control with space switching.
 pub fn attributes(rig: &ControlRig) -> Vec<Attribute> {
     let mut out = Vec::new();
     let mut add = |control: &str, name: &str, default: f32, min: f32, max: f32| {
@@ -221,6 +221,10 @@ pub fn attributes(rig: &ControlRig) -> Vec<Attribute> {
     for sp in &rig.splines {
         add(&sp.settings, "stretch", sp.default_stretch, 0.0, 1.0);
         add(&sp.settings, "volume", sp.default_volume, 0.0, 1.0);
+        add(&sp.settings, "slide", sp.default_slide, 0.0, 1.0);
+    }
+    for fan in &rig.feathers {
+        add(&fan.control, "spread", 0.0, -1.0, 1.0);
     }
     for c in &rig.controls {
         if c.spaces.len() > 1 {
@@ -273,6 +277,7 @@ fn attribute_default(rig: &ControlRig, control: &str, name: &str) -> f32 {
             match name {
                 "stretch" => return sp.default_stretch,
                 "volume" => return sp.default_volume,
+                "slide" => return sp.default_slide,
                 _ => {}
             }
         }
@@ -289,7 +294,8 @@ pub struct Locks {
 }
 
 /// FK controls that only turn their bone (and the FK layer of a spline, and
-/// the hock control) can't move; bend and pin controls can't turn; only the
+/// the hock control) can't move; bend and pin controls can't turn; a feather
+/// fan control neither moves nor turns (its `spread` fans the feathers); only the
 /// root and FK controls with a bone scale.
 pub fn locks(c: &Control, sk: &Skeleton) -> Locks {
     let bone = c.bone.as_deref().and_then(|b| sk.bone(b));
@@ -297,12 +303,12 @@ pub fn locks(c: &Control, sk: &Skeleton) -> Locks {
     Locks {
         translate: match c.kind {
             ControlKind::Fk => !moves_bone,
-            ControlKind::Hock => true,
+            ControlKind::Hock | ControlKind::Fan => true,
             _ => false,
         },
         rotate: matches!(
             c.kind,
-            ControlKind::Bend | ControlKind::Pin | ControlKind::Slider
+            ControlKind::Bend | ControlKind::Pin | ControlKind::Slider | ControlKind::Fan
         ),
         scale: !(c.kind == ControlKind::Root || (c.kind == ControlKind::Fk && bone.is_some())),
     }
@@ -509,6 +515,44 @@ struct Eval<'a> {
     sealed: Vec<Option<(usize, bool)>>,
 }
 
+/// The point `distance` along a polyline from its first point, running on
+/// straight past either end along the end segment.
+fn along_polyline(points: &[Vec3], distance: f32) -> Vec3 {
+    let Some(&first) = points.first() else {
+        return Vec3::ZERO;
+    };
+    if points.len() < 2 {
+        return first;
+    }
+    let mut travelled = 0.0;
+    let last = points.len() - 2;
+    for (i, w) in points.windows(2).enumerate() {
+        let len = w[0].distance(w[1]);
+        if i == last || travelled + len >= distance {
+            let dir = (w[1] - w[0]).try_normalize().unwrap_or(Vec3::Y);
+            return w[0] + dir * (distance - travelled);
+        }
+        travelled += len;
+    }
+    first
+}
+
+/// The point at `t` on a polyline whose points sit at `params` (rising, 0 to 1).
+fn at_param(points: &[Vec3], params: &[f32], t: f32) -> Vec3 {
+    let n = points.len().min(params.len());
+    if n == 0 {
+        return Vec3::ZERO;
+    }
+    for i in 0..n.saturating_sub(1) {
+        if t <= params[i + 1] || i + 2 == n {
+            let span = (params[i + 1] - params[i]).max(1e-9);
+            let f = ((t - params[i]) / span).clamp(0.0, 1.0);
+            return points[i].lerp(points[i + 1], f);
+        }
+    }
+    points[n - 1]
+}
+
 fn rot_of(m: Mat4) -> Quat {
     let (_, r, _) = m.to_scale_rotation_translation();
     r.normalize()
@@ -672,6 +716,16 @@ impl<'a> Eval<'a> {
                     if let Some(i) = sk.index_of(bone) {
                         sealed[i] = Some((k, upper));
                     }
+                }
+            }
+        }
+        // Feathers: the fan turns each feather's first control about its root.
+        for fan in &rig.feathers {
+            let spread = pose.attribute(rig, &fan.control, "spread").clamp(-1.0, 1.0);
+            for f in &fan.feathers {
+                if let Some(&i) = control_index.get(f.control.as_str()) {
+                    let m = f.matrix(spread);
+                    board_offsets[i] = Some(board_offsets[i].map_or(m, |o| o * m));
                 }
             }
         }
@@ -1192,30 +1246,24 @@ impl<'a> Eval<'a> {
                 if total > 0.0 { p / total } else { sp.points[j] }
             })
             .collect();
-        // Without stretch the joints keep their lengths and slide along the curve.
-        let mut sliding = vec![curve.first().copied().unwrap_or(Vec3::ZERO)];
-        let mut seg = 0;
-        let mut travelled = 0.0;
-        let mut wanted = 0.0;
+        // Without stretch the joints keep their lengths along the curve, from
+        // `slide` of the chain's rest length in (running on past its end).
+        // Stretched, they fill the curve from `slide` of the way along it.
+        let slide = self.attr(&sp.settings, "slide").clamp(0.0, 1.0);
+        let mut rest_along = vec![0.0f32; n];
         for j in 1..n {
-            wanted += sp.points[j - 1].distance(sp.points[j]);
-            loop {
-                let (a, b) = if seg + 1 < n {
-                    (curve[seg], curve[seg + 1])
-                } else {
-                    (curve[n.saturating_sub(2)], curve[n - 1])
-                };
-                let len = a.distance(b);
-                if seg + 2 >= n || travelled + len >= wanted {
-                    let dir = (b - a).try_normalize().unwrap_or(Vec3::Y);
-                    sliding.push(a + dir * (wanted - travelled));
-                    break;
-                }
-                travelled += len;
-                seg += 1;
-            }
+            rest_along[j] = rest_along[j - 1] + sp.points[j - 1].distance(sp.points[j]);
         }
-        let heads: Vec<Vec3> = (0..n).map(|j| sliding[j].lerp(curve[j], stretch)).collect();
+        let total = rest_along.last().copied().unwrap_or(0.0);
+        let params = &sp.params[..n.min(sp.params.len())];
+        let heads: Vec<Vec3> = (0..n)
+            .map(|j| {
+                let kept = along_polyline(&curve, slide * total + rest_along[j]);
+                let u = params.get(j).copied().unwrap_or(0.0);
+                let fitted = at_param(&curve, params, slide + (1.0 - slide) * u);
+                kept.lerp(fitted, stretch)
+            })
+            .collect();
         let blend = |w: &[f32]| {
             let mut q = Quat::from_xyzw(0.0, 0.0, 0.0, 0.0);
             for (r, &wk) in rots.iter().zip(w) {
@@ -1916,5 +1964,106 @@ mod tests {
         slide(&mut wide, &b, "sticky", [1.0, 0.0]);
         let w = evaluate(&b.skeleton, &b.controls, &wide);
         assert!(gap(&w, middle) > middle.rest_gap + 0.01);
+    }
+
+    #[test]
+    fn slide_runs_a_spline_chain_along_its_curve() {
+        let (mut g, _) = biped();
+        components::add_preset(&mut g, Preset::Tentacle, &AddOptions::default()).unwrap();
+        let b = components::build(&g).unwrap();
+        let sk = &b.skeleton;
+        let sp = &b.controls.splines[0];
+        assert!(
+            attributes(&b.controls)
+                .iter()
+                .any(|a| a.control == sp.settings && a.name == "slide" && a.default == 0.0)
+        );
+        let idx: Vec<usize> = sp.bones.iter().map(|n| sk.index_of(n).unwrap()).collect();
+        let length: f32 = sp.points.windows(2).map(|w| w[0].distance(w[1])).sum();
+        let posed = |slide: f32, stretch: f32| {
+            let mut pose = Pose::default();
+            pose.set_attribute(&b.controls, &sp.settings, "slide", slide);
+            pose.set_attribute(&b.controls, &sp.settings, "stretch", stretch);
+            evaluate(sk, &b.controls, &pose)
+        };
+        // Nothing slid: the rest pose.
+        let rest = posed(0.0, 0.0);
+        for &i in &idx {
+            assert_near(rest.head(sk, i), sk.bones[i].head, 1e-4, &sk.bones[i].name);
+        }
+        // The tentacle starts 0.3 of its length out, keeping its lengths.
+        let p = posed(0.3, 0.0);
+        let along = along_polyline(&sp.points, 0.3 * length);
+        assert_near(p.head(sk, idx[0]), along, 1e-3, "base slides along");
+        for &i in &idx {
+            let l = p.head(sk, i).distance(p.tail(sk, i));
+            assert!(
+                (l - sk.bones[i].length()).abs() < 1e-3,
+                "{}",
+                sk.bones[i].name
+            );
+        }
+        // Stretched, it fills the rest of the curve instead.
+        let p = posed(0.3, 1.0);
+        let last = idx.len() - 1;
+        let fitted = at_param(&sp.points, &sp.params, 0.3 + 0.7 * sp.params[last]);
+        assert_near(
+            p.head(sk, idx[last]),
+            fitted,
+            1e-3,
+            "the joints fill the curve",
+        );
+        assert_near(p.head(sk, idx[0]), along, 0.05 * length, "base near 0.3");
+        assert!(p.head(sk, idx[0]).distance(sp.points[0]) > 0.2 * length);
+        // Out of range values are held to 0..1.
+        let mut pose = Pose::default();
+        pose.set_attribute(&b.controls, &sp.settings, "slide", 2.0);
+        assert!(pose.attribute(&b.controls, &sp.settings, "slide") <= 1.0);
+    }
+
+    #[test]
+    fn spread_fans_the_feathers() {
+        let mut g = crate::demo::Creature::Bird.guides();
+        components::set_feathers(&mut g, None, 4, 1).unwrap();
+        let b = components::build(&g).unwrap();
+        let sk = &b.skeleton;
+        let fan = &b.controls.feathers[0];
+        assert!(
+            attributes(&b.controls)
+                .iter()
+                .any(|a| a.control == fan.control && a.name == "spread" && a.min == -1.0)
+        );
+        let l = locks(b.controls.control(&fan.control).unwrap(), sk);
+        assert!(l.translate && l.rotate, "the fan only spreads");
+        let at = |spread: f32| {
+            let mut pose = Pose::default();
+            assert!(pose.set_attribute(&b.controls, &fan.control, "spread", spread));
+            evaluate(sk, &b.controls, &pose)
+        };
+        let (closed, rest, open) = (at(-1.0), at(0.0), at(1.0));
+        for f in &fan.feathers {
+            let i = sk.index_of(&f.bone).unwrap();
+            assert_near(rest.tail(sk, i), sk.bones[i].tail, 1e-4, &f.bone);
+            // Opened, each feather turns by its angle about its root.
+            let dir = |p: &Posed| (p.tail(sk, i) - p.head(sk, i)).normalize();
+            let angle = dir(&open)
+                .angle_between(sk.bones[i].direction())
+                .to_degrees();
+            assert!((angle - f.angle.abs()).abs() < 0.05, "{}: {angle}", f.bone);
+            assert_near(open.head(sk, i), sk.bones[i].head, 1e-4, &f.bone);
+            // Closing turns the other way.
+            let back = dir(&closed).angle_between(dir(&open)).to_degrees();
+            assert!((back - 2.0 * f.angle.abs()).abs() < 0.1, "{}", f.bone);
+            // The feather's own FK still works on top.
+            let mut pose = Pose::default();
+            pose.set_attribute(&b.controls, &fan.control, "spread", 1.0);
+            pose.set_channels(&f.control, turned(Vec3::splat(25.0)));
+            let p = evaluate(sk, &b.controls, &pose);
+            assert!(dir(&p).angle_between(dir(&open)).to_degrees() > 10.0);
+        }
+        // The other wing's feathers don't move.
+        let other = &b.controls.feathers[1].feathers[1];
+        let i = sk.index_of(&other.bone).unwrap();
+        assert_near(open.tail(sk, i), sk.bones[i].tail, 1e-4, &other.bone);
     }
 }

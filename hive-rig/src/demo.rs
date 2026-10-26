@@ -418,6 +418,72 @@ pub fn demo_bird() -> Mesh {
     m
 }
 
+/// `mesh` with a flat vane along every feather the guides' wings have (see
+/// [`crate::components::Options::feathers`]), so the feather joints have
+/// something to skin. Unchanged when no wing has feathers or the guides
+/// don't build.
+pub fn with_feathers(mut mesh: Mesh, guides: &crate::components::Guides) -> Mesh {
+    let Ok(built) = crate::components::build(guides) else {
+        return mesh;
+    };
+    let h = guides.body.height;
+    for fan in &built.controls.feathers {
+        for f in &fan.feathers {
+            let Some(root) = built.skeleton.bone(&f.bone) else {
+                continue;
+            };
+            // The feather's joints run on from its root to its tip.
+            let mut tip = root.tail;
+            let mut name = f.bone.clone();
+            while let Some(child) = built.skeleton.bones.iter().find(|b| {
+                b.parent
+                    .is_some_and(|p| built.skeleton.bones[p].name == name)
+            }) {
+                tip = child.tail;
+                name = child.name.clone();
+            }
+            let dir = (tip - root.head).normalize();
+            let across = f.axis.cross(dir).normalize();
+            let width = (0.2 * root.head.distance(tip)).max(0.01 * h);
+            mesh.append(&vane(root.head, tip, across, width, f.axis, 0.004 * h));
+        }
+    }
+    mesh
+}
+
+/// A flat feather vane from `a` to `b`: `width` across (along `across`),
+/// `thick` through (along `normal`), widest a third of the way and coming to
+/// a point at `b`.
+fn vane(a: Vec3, b: Vec3, across: Vec3, width: f32, normal: Vec3, thick: f32) -> Mesh {
+    const RINGS: usize = 8;
+    const SIDES: usize = 8;
+    let mut positions = Vec::new();
+    let mut indices = Vec::new();
+    for r in 0..=RINGS {
+        let t = r as f32 / RINGS as f32;
+        let c = a.lerp(b, t);
+        let w = width
+            * (if t < 0.33 {
+                0.4 + 0.6 * t / 0.33
+            } else {
+                (1.0 - t) / 0.67
+            })
+            .max(0.02);
+        for s in 0..SIDES {
+            let k = s as f32 / SIDES as f32 * std::f32::consts::TAU;
+            positions.push(c + across * k.cos() * w + normal * k.sin() * thick);
+        }
+    }
+    let ring = |r: usize, s: usize| (r * SIDES + s % SIDES) as u32;
+    for r in 0..RINGS {
+        for s in 0..SIDES {
+            indices.extend_from_slice(&[ring(r, s), ring(r + 1, s), ring(r + 1, s + 1)]);
+            indices.extend_from_slice(&[ring(r, s), ring(r + 1, s + 1), ring(r, s + 1)]);
+        }
+    }
+    Mesh::new(positions, indices)
+}
+
 /// A procedural spider facing +Z, built around `components::spider(SPIDER_HEIGHT)`:
 /// a rounded cephalothorax and head with fangs, a big abdomen and eight
 /// tapering legs.

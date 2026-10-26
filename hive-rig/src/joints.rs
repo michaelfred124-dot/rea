@@ -672,6 +672,7 @@ pub fn quad_guides_from_joints(
             .map(|(k, position)| Guide {
                 name: format!("j{}", k + 1),
                 position,
+                from: None,
             })
             .collect();
         for &i in &m.tail {

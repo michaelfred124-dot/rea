@@ -78,6 +78,13 @@ enum Command {
         /// with the thigh as the paw moves. The horse starts at 1, the others at 0.
         #[arg(long)]
         spring: Option<f32>,
+        /// Feathers a row on the wings (the bird's) or arms, fanned by a
+        /// spread control on each.
+        #[arg(long)]
+        feathers: Option<usize>,
+        /// Rows of feathers with --feathers.
+        #[arg(long, default_value_t = 1, requires = "feathers")]
+        feather_rows: usize,
         #[command(flatten)]
         common: Common,
     },
@@ -201,6 +208,34 @@ enum Command {
         /// Curve controls of a spline spine (ends included, default 3).
         #[arg(long)]
         controls: Option<usize>,
+    },
+    /// Put feathers on wings (arm components): rows of feather chains along
+    /// the forearm and hand with an FK control on every joint, fanned open
+    /// and closed by the wing's spread control.
+    Feathers {
+        guides: PathBuf,
+        /// The wing (its twin changes too); every arm when left out.
+        #[arg(long)]
+        id: Option<String>,
+        /// Feathers a row (0 takes them off).
+        #[arg(long)]
+        count: usize,
+        /// Rows of feathers: the flight feathers, then shorter coverts.
+        #[arg(long, default_value_t = 1)]
+        rows: usize,
+    },
+    /// Fork a chain: add a branch growing from one of its guides, with an FK
+    /// control on every joint (and the same on its twin).
+    Branch {
+        guides: PathBuf,
+        /// The chain's component id.
+        id: String,
+        /// The guide the branch grows from.
+        #[arg(long)]
+        from: String,
+        /// Joints in the branch.
+        #[arg(long, default_value_t = 2)]
+        joints: usize,
     },
     /// Hang a component from another bone (its guides stay where they are).
     Attach {
@@ -2854,6 +2889,8 @@ fn main() -> Result<()> {
             bendy,
             soft,
             spring,
+            feathers,
+            feather_rows,
             common,
             ..
         } if quadruped || creature.is_some() => {
@@ -2865,8 +2902,11 @@ fn main() -> Result<()> {
             {
                 anyhow::bail!("the {} has no quad legs for --spring", c.name());
             }
+            if let Some(n) = feathers {
+                components::set_feathers(&mut guides, None, n, feather_rows)?;
+            }
             run(
-                c.mesh(),
+                demo::with_feathers(c.mesh(), &guides),
                 &c.rig_name(),
                 guides,
                 &out,
@@ -2880,6 +2920,8 @@ fn main() -> Result<()> {
             bendy,
             soft,
             spring,
+            feathers,
+            feather_rows,
             common,
             ..
         } => {
@@ -2890,8 +2932,11 @@ fn main() -> Result<()> {
             let mesh = demo::humanoid(arm_drop);
             let mut guides = detect(&mesh);
             components::set_limb_options(&mut guides, bendy, soft);
+            if let Some(n) = feathers {
+                components::set_feathers(&mut guides, None, n, feather_rows)?;
+            }
             run(
-                mesh,
+                demo::with_feathers(mesh, &guides),
                 "hive_demo",
                 guides,
                 &out,
@@ -3029,6 +3074,38 @@ fn main() -> Result<()> {
             println!("Added {}", added.join(", "));
             Ok(())
         }
+        Command::Feathers {
+            guides,
+            id,
+            count,
+            rows,
+        } => {
+            let mut g = Guides::load(&guides)?;
+            let ids = components::set_feathers(&mut g, id.as_deref(), count, rows)?;
+            g.save(&guides)?;
+            if count == 0 {
+                println!("No feathers on {}", ids.join(", "));
+            } else {
+                println!(
+                    "{}: {count} feathers a row in {rows} row{}",
+                    ids.join(", "),
+                    if rows == 1 { "" } else { "s" }
+                );
+            }
+            Ok(())
+        }
+        Command::Branch {
+            guides,
+            id,
+            from,
+            joints,
+        } => {
+            let mut g = Guides::load(&guides)?;
+            let names = components::add_branch(&mut g, &id, &from, joints)?;
+            g.save(&guides)?;
+            println!("{id} forks at {from}: added guides {}", names.join(", "));
+            Ok(())
+        }
         Command::Spine {
             guides,
             joints,
@@ -3094,7 +3171,15 @@ fn main() -> Result<()> {
                 let kind = format!("{:?}", c.kind).to_lowercase();
                 let parent = c.parent.as_deref().unwrap_or("-");
                 let extra = match c.kind {
+                    Kind::Chain if components::is_branched(c) => {
+                        format!("{} bones, forking", c.guides.len() - 1)
+                    }
                     Kind::Chain => format!("{} bones", c.guides.len() - 1),
+                    Kind::Arm if c.options.feathers > 0 => format!(
+                        "{} feathers a row, {} row(s)",
+                        c.options.feathers,
+                        c.options.feather_rows.max(1)
+                    ),
                     Kind::Spline => format!(
                         "{} bones, {} curve controls",
                         c.options.joints.unwrap_or(c.guides.len() - 1),

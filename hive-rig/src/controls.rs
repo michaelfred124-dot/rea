@@ -442,6 +442,9 @@ pub enum ControlKind {
     Board,
     /// A face board slider: its move along its track poses the face.
     Slider,
+    /// A feathered wing's fan control: its `spread` attribute fans the
+    /// feathers open and closed (see [`FeatherFan`]); it doesn't move or turn.
+    Fan,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -796,6 +799,64 @@ pub struct SplineChain {
     /// Initial `volume`: 0 = no squash, 1 = the joints thin as they stretch and
     /// thicken as they squash, keeping their volume.
     pub default_volume: f32,
+    /// Initial `slide` (0 to 1): how far along the curve the chain starts.
+    /// Unstretched, the joints keep their lengths and slide toward the tip by
+    /// that share of the chain's rest length, running straight on past the
+    /// curve's end; stretched, they fill the curve from that share of its
+    /// length to its end (joint `j` at `slide + (1 - slide) * params[j]` of
+    /// the way along it).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub default_slide: f32,
+}
+
+fn is_zero(v: &f32) -> bool {
+    *v == 0.0
+}
+
+/// A wing's feathers fanned by one control's `spread` attribute (-1 to 1):
+/// each feather's first FK control hangs under an offset at the feather's
+/// root that turns about `axis` by `spread * angle` degrees, so at 1 the
+/// feathers fan open (the outer ones toward the wing tip, the inner ones
+/// toward the body) and at -1 they fold together. Their FK controls turn
+/// each feather further on top.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FeatherFan {
+    /// The component id (the wing).
+    pub name: String,
+    /// The control that carries `spread`.
+    pub control: String,
+    pub feathers: Vec<FanFeather>,
+}
+
+/// One feather of a [`FeatherFan`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FanFeather {
+    /// The feather's first FK control: it hangs under the fan offset.
+    pub control: String,
+    /// The feather's root bone.
+    pub bone: String,
+    /// The bone the root hangs from (the forearm or the hand).
+    pub parent: String,
+    /// Where the offset turns: the feather's root (model space).
+    pub pivot: Vec3,
+    /// What it turns about (unit, model space): positive turns the feather
+    /// toward the wing tip.
+    pub axis: Vec3,
+    /// Degrees it turns at `spread` 1.
+    pub angle: f32,
+}
+
+impl FanFeather {
+    /// The offset at `spread`, as a model-space transform about the pivot.
+    pub fn matrix(&self, spread: f32) -> glam::Mat4 {
+        let turn = (self.angle * spread).to_radians();
+        if turn == 0.0 {
+            return glam::Mat4::IDENTITY;
+        }
+        glam::Mat4::from_translation(self.pivot)
+            * glam::Mat4::from_axis_angle(self.axis, turn)
+            * glam::Mat4::from_translation(-self.pivot)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -813,6 +874,9 @@ pub struct ControlRig {
     /// The face board: sliders beside the head posing the face, and the lip seal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub face_board: Option<FaceBoard>,
+    /// Feathered wings: each wing's feathers and the control that fans them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub feathers: Vec<FeatherFan>,
 }
 
 impl ControlRig {

@@ -446,6 +446,7 @@ pub fn add_prop_socket(g: &mut Guides, hand: &str, id: &str) -> Result<String> {
             .map(|k| Guide {
                 name: format!("j{}", k + 1),
                 position: start + Vec3::Z * (length * k as f32),
+                from: None,
             })
             .collect(),
         options: Options::default(),

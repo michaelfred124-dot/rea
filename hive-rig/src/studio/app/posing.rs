@@ -284,6 +284,17 @@ impl Studio {
         self.posing.pose.set_channels(control, ch);
     }
 
+    /// Set one of a control's attributes (`spread`, `slide`, `ik_fk`...).
+    /// Returns false when the built rig has no such attribute.
+    pub fn set_control_attribute(&mut self, control: &str, name: &str, value: f32) -> bool {
+        let Some(Ok(built)) = self.doc.as_ref().map(|d| &d.preview) else {
+            return false;
+        };
+        self.posing
+            .pose
+            .set_attribute(&built.controls, control, name, value)
+    }
+
     /// Put the picked controls (or every control) back at rest.
     pub fn reset_pose(&mut self, selected_only: bool) {
         if self.posing.pose.is_rest() {

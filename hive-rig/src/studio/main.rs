@@ -3,10 +3,10 @@
 //!
 //! `HiveRig [character, rig or guides file] [--demo [dog|bird|spider|snake|horse|dinosaur]] [--build] [--weights BONE] [--paint] [--dab add|subtract|replace|scale|smooth|mend]
 //! [--lock BONE] [--bend DEGREES] [--bend-axis x|y|z] [--tools] [--vertices] [--hover] [--library] [--templates] [--export]
-//! [--select COMPONENT[,COMPONENT...]] [--pick NAME] [--pose BONE[=DEGREES[@x|y|z]]] [--shape NAME=WEIGHT]...
+//! [--select COMPONENT[,COMPONENT...]] [--pick NAME] [--pose BONE[=DEGREES[@x|y|z]]] [--set CONTROL=TX,TY,TZ,RX,RY,RZ]... [--attr CONTROL.NAME=VALUE]... [--shape NAME=WEIGHT]... [--feathers COUNT[,ROWS]]
 //! [--corrective] [--inbetween WEIGHT] [--sculpt grab|smooth|relax|inflate|erase] [--all-bones]
 //! [--bone-filter TEXT] [--add-demo [dog|bird|...]] [--build-all] [--character NAME]
-//! [--import-shape FILE] [--line-width WIDTH] [--draw-shape] [--mode guides|skeleton|rig] [--joint-size SCALE] [--no-joint-xray] [--joints-menu] [--no-toast] [--no-outliner] [--view front|side|persp] [--zoom FACTOR] [--look X,Y,Z] [--xray] [--screenshot OUT.ppm]`
+//! [--import-shape FILE] [--line-width WIDTH] [--draw-shape] [--mode guides|skeleton|rig] [--joint-size SCALE] [--no-joint-xray] [--joints-menu] [--no-toast] [--no-outliner] [--view front|side|top|persp] [--zoom FACTOR] [--look X,Y,Z] [--xray] [--screenshot OUT.ppm]`
 //! (the flags exist so the window can be checked automatically).
 
 // No console window behind the app on Windows.
@@ -29,6 +29,8 @@ struct Launch {
     demo: bool,
     /// `--demo dog|bird|spider|snake|horse|dinosaur`: open that creature as the demo.
     creature: Option<hive_rig::demo::Creature>,
+    /// `--feathers COUNT[,ROWS]`: feathers on the demo creature's wings.
+    feathers: Option<(usize, usize)>,
     build: bool,
     weights: Option<String>,
     /// Turn the weight brush on and show it over the `--weights` bone.
@@ -55,6 +57,8 @@ struct Launch {
     pose: Option<String>,
     /// `--set CONTROL=tx,ty,tz,rx,ry,rz`: pose a control and pick it (repeatable).
     set: Vec<String>,
+    /// `--attr CONTROL.NAME=VALUE`: set a control's attribute (repeatable).
+    attrs: Vec<String>,
     /// `--tool move|rotate|scale`: the manipulator shown on the picked controls.
     tool: Option<String>,
     /// `--shape NAME=WEIGHT`: set a shape's weight and pick it (repeatable).
@@ -81,7 +85,7 @@ struct Launch {
     no_toast: bool,
     /// `--no-outliner`: start with the outliner folded away.
     no_outliner: bool,
-    /// `--view front|side|persp`: turn the camera as the camera pill does.
+    /// `--view front|side|top|persp`: turn the camera as the camera pill does.
     view: Option<String>,
     /// `--zoom FACTOR`: move the camera in by this factor after framing.
     zoom: Option<f32>,
@@ -119,6 +123,13 @@ fn parse_args() -> Launch {
                     args.next();
                 }
             }
+            Some("--feathers") => {
+                launch.feathers = args.next().and_then(|s| {
+                    let s = s.to_str()?.to_string();
+                    let (n, rows) = s.split_once(',').unwrap_or((&s, "1"));
+                    Some((n.trim().parse().ok()?, rows.trim().parse().ok()?))
+                })
+            }
             Some("--build") => launch.build = true,
             Some("--weights") => {
                 launch.weights = args.next().map(|s| s.to_string_lossy().into_owned())
@@ -155,6 +166,9 @@ fn parse_args() -> Launch {
             Some("--pose") => launch.pose = args.next().map(|s| s.to_string_lossy().into_owned()),
             Some("--set") => launch
                 .set
+                .extend(args.next().map(|s| s.to_string_lossy().into_owned())),
+            Some("--attr") => launch
+                .attrs
                 .extend(args.next().map(|s| s.to_string_lossy().into_owned())),
             Some("--tool") => launch.tool = args.next().map(|s| s.to_string_lossy().into_owned()),
             Some("--screenshot") => launch.screenshot = args.next().map(PathBuf::from),
@@ -265,7 +279,10 @@ fn main() -> eframe::Result {
     let mut studio = app::Studio::default();
     // `--demo layout.guides.json` opens the demo, then the guides onto it.
     match launch.creature {
-        Some(c) => studio.load_creature(c),
+        Some(c) => match launch.feathers {
+            Some((n, rows)) => studio.load_feathered_creature(c, n, rows),
+            None => studio.load_creature(c),
+        },
         None if launch.demo => studio.load_demo(),
         None => {}
     }
@@ -438,6 +455,15 @@ fn main() -> eframe::Result {
         studio.set_control_channels(name, ch);
         studio.select_control(name, true);
     }
+    for text in &launch.attrs {
+        let (target, value) = text.split_once('=').unwrap_or((text, "1"));
+        if let Some((control, name)) = target.rsplit_once('.')
+            && let Ok(v) = value.trim().parse()
+            && !studio.set_control_attribute(control, name, v)
+        {
+            eprintln!("no attribute {name} on {control}");
+        }
+    }
     if let Some(tool) = &launch.tool {
         studio.mode = app::Mode::Rig;
         studio.posing.tool = match tool.as_str() {
@@ -465,6 +491,7 @@ fn main() -> eframe::Result {
         let (yaw, pitch) = match view.as_str() {
             "front" => (0.0, 0.05),
             "side" => (std::f32::consts::FRAC_PI_2, 0.05),
+            "top" => (0.35, 1.1),
             _ => (0.55, 0.22),
         };
         studio.camera.yaw = yaw;
