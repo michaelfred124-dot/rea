@@ -256,6 +256,12 @@ pub fn write_all(rig: &Rig, out_dir: &Path, targets: &[Target]) -> Result<Vec<Pa
         let path = if t == Target::Fbx {
             let path = out_dir.join(format!("{}.fbx", rig.name));
             std::fs::write(&path, fbx::write(&source))?;
+            // A biped's FBX comes with its Unity avatar mapping.
+            if let Some(ht) = human_template(rig) {
+                let ht_path = out_dir.join(format!("{}.ht", rig.name));
+                std::fs::write(&ht_path, ht)?;
+                written.push(ht_path);
+            }
             path
         } else {
             let path = out_dir.join(format!("{}_{}.py", rig.name, t.key()));
@@ -265,6 +271,69 @@ pub fn write_all(rig: &Rig, out_dir: &Path, targets: &[Target]) -> Result<Vec<Pa
         written.push(path);
     }
     Ok(written)
+}
+
+/// Unity's human bones every Humanoid avatar needs.
+const UNITY_REQUIRED: [&str; 15] = [
+    "Hips",
+    "Spine",
+    "Head",
+    "LeftUpperArm",
+    "LeftLowerArm",
+    "LeftHand",
+    "RightUpperArm",
+    "RightLowerArm",
+    "RightHand",
+    "LeftUpperLeg",
+    "LeftLowerLeg",
+    "LeftFoot",
+    "RightUpperLeg",
+    "RightLowerLeg",
+    "RightFoot",
+];
+
+/// Unity human bone -> the rig's bone, for every human bone the rig has, in
+/// the order [`crate::naming::human_bones`] lists them. Empty unless the rig
+/// is a biped (legs and arms) with every bone Unity's Humanoid needs.
+pub fn humanoid_map(rig: &Rig) -> Vec<(String, String)> {
+    if crate::orient::layout_name(&rig.guides) != "biped" {
+        return Vec::new();
+    }
+    let map: Vec<(String, String)> = crate::naming::human_bones()
+        .filter_map(|internal| {
+            let human = crate::naming::unity_human_bone(&internal)?;
+            let bone = rig.guides.naming.bone(&internal);
+            rig.skeleton.bone(&bone).is_some().then_some((human, bone))
+        })
+        .collect();
+    let complete = UNITY_REQUIRED
+        .iter()
+        .all(|r| map.iter().any(|(h, _)| h == r));
+    if complete { map } else { Vec::new() }
+}
+
+/// A Unity Human Template (`<name>.ht`): the rig's Humanoid bone mapping, which
+/// the avatar's Configure window loads with Mapping > Load, so any naming
+/// convention maps in one step. `None` for rigs that aren't a full biped.
+pub fn human_template(rig: &Rig) -> Option<String> {
+    let map = humanoid_map(rig);
+    if map.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1105 &110500000\nHumanTemplate:\n  m_ObjectHideFlags: 0\n  m_CorrespondingSourceObject: {fileID: 0}\n  m_PrefabInstance: {fileID: 0}\n  m_PrefabAsset: {fileID: 0}\n",
+    );
+    out.push_str(&format!("  m_Name: {}\n  m_BoneTemplate:\n", rig.name));
+    for (human, bone) in map {
+        // Bone names are letters, digits, underscores and Mixamo's colon,
+        // which a quoted YAML scalar keeps.
+        if bone.contains(':') {
+            out.push_str(&format!("    {human}: '{bone}'\n"));
+        } else {
+            out.push_str(&format!("    {human}: {bone}\n"));
+        }
+    }
+    Some(out)
 }
 
 /// The folder the rig's texture images are written to, next to the rig.
@@ -341,7 +410,7 @@ pub fn place_images(rig: &Rig, out_dir: &Path) -> Result<(Vec<crate::mesh::Image
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{demo::demo_humanoid, rig};
+    use crate::{components, demo::demo_humanoid, rig};
 
     #[test]
     fn images_go_next_to_the_rig_and_load_back() {
@@ -469,6 +538,62 @@ mod tests {
                 "{}",
                 c["name"]
             );
+        }
+    }
+
+    #[test]
+    fn a_biped_fbx_comes_with_a_unity_human_template() {
+        use crate::naming::Preset;
+        let mut guides = rig::detect_guides(&demo_humanoid()).0;
+        components::add_preset(
+            &mut guides,
+            components::Preset::Fingers,
+            &Default::default(),
+        )
+        .unwrap();
+        for (preset, hips, thumb) in [
+            (
+                Preset::Game,
+                "Hips: pelvis",
+                "Left Thumb Proximal: thumb_01_l",
+            ),
+            (
+                Preset::Unity,
+                "Hips: Hips",
+                "Left Thumb Proximal: LeftThumbProximal",
+            ),
+            (
+                Preset::Mixamo,
+                "Hips: 'mixamorig:Hips'",
+                "Left Thumb Proximal: 'mixamorig:LeftHandThumb1'",
+            ),
+        ] {
+            let mut g = guides.clone();
+            g.naming = preset.naming();
+            let r = rig::build_rig(demo_humanoid(), "demo", g, Default::default()).unwrap();
+            let ht = human_template(&r).unwrap();
+            assert!(ht.starts_with("%YAML 1.1\n"), "{ht}");
+            assert!(ht.contains("HumanTemplate:\n") && ht.contains("  m_BoneTemplate:\n"));
+            assert!(ht.contains(&format!("    {hips}\n")), "{preset:?}: {ht}");
+            assert!(ht.contains(&format!("    {thumb}\n")), "{preset:?}: {ht}");
+            // Every human bone Unity needs is mapped to a bone the rig has.
+            let map = humanoid_map(&r);
+            for need in UNITY_REQUIRED {
+                let (_, bone) = map.iter().find(|(h, _)| h == need).unwrap();
+                assert!(r.skeleton.bone(bone).is_some(), "{need}");
+            }
+            assert!(map.iter().any(|(h, _)| h == "UpperChest"));
+            assert!(map.iter().any(|(h, _)| h == "Right Little Distal"));
+        }
+        // Written next to the FBX, and only for bipeds.
+        let dir = std::env::temp_dir().join(format!("hive_ht_{}", std::process::id()));
+        let r = rig::build_rig(demo_humanoid(), "demo", guides, Default::default()).unwrap();
+        let files = write_all(&r, &dir, &[Target::Fbx]).unwrap();
+        assert!(files.contains(&dir.join("demo.ht")) && dir.join("demo.ht").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+        for c in crate::demo::Creature::ALL {
+            let r = rig::build_rig(c.mesh(), "c", c.guides(), Default::default()).unwrap();
+            assert!(human_template(&r).is_none(), "{c:?}");
         }
     }
 }

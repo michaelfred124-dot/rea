@@ -62,7 +62,7 @@ enum Command {
         quadruped: bool,
         /// Rig a built-in creature instead, written as `hive_<creature>`: a dog
         /// (four legs with three-segment hind legs), a bird (wings, two legs
-        /// with hocks, tail), a spider (eight FK legs), a snake (spline spine
+        /// with hocks, tail), a spider (eight IK/FK legs), a snake (spline spine
         /// and tail with a head), a horse (long legs, spring hocks) or a
         /// dinosaur (a theropod: three-segment legs, short arms, spline tail).
         #[arg(long, value_enum)]
@@ -173,7 +173,9 @@ enum Command {
         /// joints on each lip between its middle and each corner (0 to 3).
         #[arg(long)]
         joints: Option<usize>,
-        /// Component id for a tail or chain.
+        /// Component id for a tail or chain, or for quad legs added to a side
+        /// that has a leg already (`leg2` adds `leg2_l` and `leg2_r` with IK
+        /// of their own; hang them with --parent).
         #[arg(long)]
         id: Option<String>,
         /// Curve controls on a tentacle (ends included, default 4).
@@ -273,7 +275,8 @@ enum Command {
     /// Show or set how a guides file names joints and controls on export.
     Naming {
         guides: PathBuf,
-        /// game (Unreal mannequin), prefix (L_arm_jnt) or suffix (arm_L_JNT).
+        /// game (Unreal mannequin), prefix (L_arm_jnt), suffix (arm_L_JNT),
+        /// unity (Unity Humanoid: Hips, LeftUpperArm) or mixamo (mixamorig:Hips).
         preset: Option<String>,
         /// Joint pattern using {name}, {side} and {desc}.
         #[arg(long)]
@@ -676,6 +679,12 @@ struct Common {
     /// Skin weight smoothing passes.
     #[arg(long, default_value_t = 3)]
     smooth: usize,
+    /// Name the exported joints and controls with this convention and keep
+    /// it in the guides: game (Unreal mannequin), prefix, suffix, unity
+    /// (Unity Humanoid bone names) or mixamo (mixamorig:Hips and so on).
+    /// Unset, the guides' own naming is used.
+    #[arg(long)]
+    naming: Option<naming::Preset>,
 }
 
 impl Common {
@@ -695,6 +704,9 @@ fn run(
     orientation: Orientation,
 ) -> Result<()> {
     common.skin.apply(&mut guides.skin)?;
+    if let Some(p) = common.naming {
+        guides.naming = p.naming();
+    }
     print_warnings(&guides, &mesh);
     let mut rig = build_rig(mesh, name, guides, common.options())?;
     rig.orientation = orientation;
@@ -1096,6 +1108,7 @@ fn guided_rig(dropped: Option<PathBuf>) -> Result<()> {
         },
         skin: SkinFlags::default(),
         smooth: 3,
+        naming: None,
     };
     let out = match input {
         Some(input) => {
@@ -1877,6 +1890,9 @@ fn main() -> Result<()> {
             let mut guides = load_guides(&guides_path)?;
             let out = out.unwrap_or_else(|| dir.to_path_buf());
             common.skin.apply(&mut guides.skin)?;
+            if let Some(p) = common.naming {
+                guides.naming = p.naming();
+            }
             if !keep_weights {
                 print_warnings(&guides, &old.mesh);
             }

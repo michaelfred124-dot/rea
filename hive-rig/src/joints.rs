@@ -939,6 +939,11 @@ fn finger_joints(look: &mut Lookup, finger: &str, side: Side) -> Vec<Vec3> {
                     format!("hand{a}{k}"),
                     format!("finger_{a}_{k:02}"),
                 ];
+                // Unity Humanoid's names: LeftIndexProximal, Left Index Distal.
+                if let Some(part) = ["proximal", "intermediate", "distal"].get(k - 1) {
+                    v.push(format!("{a}{part}"));
+                    v.push(format!("{a}_{part}"));
+                }
                 if k == 4 {
                     v.push(format!("{a}_end"));
                     v.push(format!("{a}_03_end"));

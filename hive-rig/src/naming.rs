@@ -10,6 +10,12 @@
 //! `{name}` and the tokens after it the `{desc}` (`fk`, `ik`, `pole`, `aim`, a
 //! chain index). Patterns place `{name}`, `{side}` and `{desc}`; empty tokens and
 //! the underscores around them are dropped.
+//!
+//! A naming can also carry an engine's skeleton map ([`BoneMap`]): the bones
+//! an engine knows (hips, spine, arms, legs, hands, fingers, head) take that
+//! engine's own names, Unity Humanoid's or Mixamo's, so its avatar or
+//! animations find them; every other bone and every control still follows the
+//! patterns.
 
 use std::collections::{HashMap, HashSet};
 
@@ -30,6 +36,129 @@ pub struct Naming {
     /// Side token for centre parts. Empty leaves it out.
     #[serde(default)]
     pub center: String,
+    /// An engine's bone names for the bones it knows; the rest follow `joint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skeleton: Option<BoneMap>,
+}
+
+/// An engine's names for the humanoid bones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoneMap {
+    /// Unity's Humanoid bone names (`Hips`, `LeftUpperArm`,
+    /// `LeftIndexProximal`), which Unity's avatar setup maps on its own.
+    Unity,
+    /// Mixamo's names (`mixamorig:Hips`, `mixamorig:LeftArm`,
+    /// `mixamorig:LeftHandIndex1`), so Mixamo animations play by name. Bones
+    /// Mixamo has no name for keep the `joint` pattern under the same
+    /// `mixamorig:` prefix.
+    Mixamo,
+}
+
+/// The humanoid bones an engine map names: (internal name, ending `_l` for a
+/// sided bone, whose `_r` twin is named too; Unity's human bone; Mixamo's
+/// bone), with the side written `Left` or `Right` in front of the engine names.
+const HUMAN_BONES: [(&str, &str, Option<&str>); 31] = [
+    ("pelvis", "Hips", Some("Hips")),
+    ("spine_01", "Spine", Some("Spine")),
+    ("spine_02", "Chest", Some("Spine1")),
+    ("spine_03", "UpperChest", Some("Spine2")),
+    ("neck_01", "Neck", Some("Neck")),
+    ("head", "Head", Some("Head")),
+    ("jaw", "Jaw", None),
+    ("eye_l", "Eye", Some("Eye")),
+    ("clavicle_l", "Shoulder", Some("Shoulder")),
+    ("upperarm_l", "UpperArm", Some("Arm")),
+    ("lowerarm_l", "LowerArm", Some("ForeArm")),
+    ("hand_l", "Hand", Some("Hand")),
+    ("thigh_l", "UpperLeg", Some("UpLeg")),
+    ("calf_l", "LowerLeg", Some("Leg")),
+    ("foot_l", "Foot", Some("Foot")),
+    ("ball_l", "Toes", Some("ToeBase")),
+    ("thumb_01_l", "Thumb Proximal", Some("HandThumb1")),
+    ("thumb_02_l", "Thumb Intermediate", Some("HandThumb2")),
+    ("thumb_03_l", "Thumb Distal", Some("HandThumb3")),
+    ("index_01_l", "Index Proximal", Some("HandIndex1")),
+    ("index_02_l", "Index Intermediate", Some("HandIndex2")),
+    ("index_03_l", "Index Distal", Some("HandIndex3")),
+    ("middle_01_l", "Middle Proximal", Some("HandMiddle1")),
+    ("middle_02_l", "Middle Intermediate", Some("HandMiddle2")),
+    ("middle_03_l", "Middle Distal", Some("HandMiddle3")),
+    ("ring_01_l", "Ring Proximal", Some("HandRing1")),
+    ("ring_02_l", "Ring Intermediate", Some("HandRing2")),
+    ("ring_03_l", "Ring Distal", Some("HandRing3")),
+    ("pinky_01_l", "Little Proximal", Some("HandPinky1")),
+    ("pinky_02_l", "Little Intermediate", Some("HandPinky2")),
+    ("pinky_03_l", "Little Distal", Some("HandPinky3")),
+];
+
+/// The prefix Mixamo puts on every bone.
+pub const MIXAMO_PREFIX: &str = "mixamorig:";
+
+/// Unity's human bone name for an internal bone name (`thigh_l` ->
+/// `LeftUpperLeg`, `index_01_r` -> `Right Index Proximal`), as Unity's avatar
+/// and Human Template files spell it. `None` for bones Unity has no slot for.
+pub fn unity_human_bone(internal: &str) -> Option<String> {
+    human_entry(internal).map(|(side, unity, _)| sided(side, unity))
+}
+
+/// Every internal bone name an engine map knows, both sides.
+pub fn human_bones() -> impl Iterator<Item = String> {
+    HUMAN_BONES
+        .iter()
+        .flat_map(|(name, _, _)| match name.strip_suffix("_l") {
+            Some(base) => vec![name.to_string(), format!("{base}_r")],
+            None => vec![name.to_string()],
+        })
+}
+
+/// (side word, Unity name, Mixamo name) of an internal bone.
+fn human_entry(internal: &str) -> Option<(&'static str, &'static str, Option<&'static str>)> {
+    HUMAN_BONES.iter().find_map(|&(name, unity, mixamo)| {
+        let Some(base) = name.strip_suffix("_l") else {
+            return (name == internal).then_some(("", unity, mixamo));
+        };
+        match internal.strip_prefix(base)? {
+            "_l" => Some(("Left", unity, mixamo)),
+            "_r" => Some(("Right", unity, mixamo)),
+            _ => None,
+        }
+    })
+}
+
+/// `Left` + `UpperArm` -> `LeftUpperArm`; `Left` + `Thumb Proximal` -> `Left Thumb Proximal`.
+fn sided(side: &str, name: &str) -> String {
+    match (side, name.contains(' ')) {
+        ("", _) => name.to_string(),
+        (_, true) => format!("{side} {name}"),
+        (_, false) => format!("{side}{name}"),
+    }
+}
+
+impl BoneMap {
+    pub fn key(self) -> &'static str {
+        match self {
+            BoneMap::Unity => "unity",
+            BoneMap::Mixamo => "mixamo",
+        }
+    }
+
+    /// The engine's name for an internal bone, if it has one.
+    pub fn name(self, internal: &str) -> Option<String> {
+        let (side, unity, mixamo) = human_entry(internal)?;
+        Some(match self {
+            BoneMap::Unity => sided(side, unity).replace(' ', ""),
+            BoneMap::Mixamo => format!("{MIXAMO_PREFIX}{side}{}", mixamo?),
+        })
+    }
+
+    /// What every bone name starts with.
+    pub fn prefix(self) -> &'static str {
+        match self {
+            BoneMap::Unity => "",
+            BoneMap::Mixamo => MIXAMO_PREFIX,
+        }
+    }
 }
 
 /// The built-in conventions.
@@ -41,16 +170,31 @@ pub enum Preset {
     Prefix,
     /// Side last, upper-case type: `upperarm_L_JNT`, `upperarm_L_fk_CTRL`, `spine_01_M_JNT`.
     Suffix,
+    /// Unity Humanoid bone names (`Hips`, `LeftUpperArm`) with the game names
+    /// for every other bone and the controls: Unity maps the avatar itself.
+    Unity,
+    /// Mixamo bone names (`mixamorig:Hips`, `mixamorig:LeftArm`), so Mixamo
+    /// animations play on the rig by name; other bones keep the game names
+    /// under the same prefix.
+    Mixamo,
 }
 
 impl Preset {
-    pub const ALL: [Preset; 3] = [Preset::Game, Preset::Prefix, Preset::Suffix];
+    pub const ALL: [Preset; 5] = [
+        Preset::Game,
+        Preset::Prefix,
+        Preset::Suffix,
+        Preset::Unity,
+        Preset::Mixamo,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Preset::Game => "Game (Unreal)",
             Preset::Prefix => "Side first",
             Preset::Suffix => "Side last",
+            Preset::Unity => "Unity Humanoid",
+            Preset::Mixamo => "Mixamo",
         }
     }
 
@@ -59,6 +203,8 @@ impl Preset {
             Preset::Game => "game",
             Preset::Prefix => "prefix",
             Preset::Suffix => "suffix",
+            Preset::Unity => "unity",
+            Preset::Mixamo => "mixamo",
         }
     }
 
@@ -69,8 +215,15 @@ impl Preset {
             left: left.into(),
             right: right.into(),
             center: center.into(),
+            skeleton: None,
+        };
+        let mapped = |map: BoneMap| Naming {
+            skeleton: Some(map),
+            ..Preset::Game.naming()
         };
         match self {
+            Preset::Unity => mapped(BoneMap::Unity),
+            Preset::Mixamo => mapped(BoneMap::Mixamo),
             Preset::Game => n(
                 "{name}_{side}_{desc}",
                 "{name}_{side}_{desc}_ctrl",
@@ -103,7 +256,9 @@ impl std::str::FromStr for Preset {
             .into_iter()
             .find(|p| p.key() == s.trim().to_ascii_lowercase())
             .ok_or_else(|| {
-                anyhow::anyhow!("unknown naming '{s}' (expected game, prefix or suffix)")
+                anyhow::anyhow!(
+                    "unknown naming '{s}' (expected game, prefix, suffix, unity or mixamo)"
+                )
             })
     }
 }
@@ -158,14 +313,20 @@ impl Naming {
             None => &self.center,
         };
         let pattern = if control { &self.control } else { &self.joint };
-        pattern
+        let map = self.skeleton.filter(|_| !control);
+        if let Some(name) = map.and_then(|m| m.name(internal)) {
+            return name;
+        }
+        let prefix = map.map_or("", BoneMap::prefix);
+        let name = pattern
             .replace("{name}", &p.name)
             .replace("{side}", side)
             .replace("{desc}", &p.desc)
             .split('_')
             .filter(|t| !t.is_empty())
             .collect::<Vec<_>>()
-            .join("_")
+            .join("_");
+        format!("{prefix}{name}")
     }
 
     /// Final name of an internal bone name.
@@ -249,7 +410,8 @@ impl Naming {
         // Maya and Unreal keep joints and controls in one namespace.
         let mut seen = HashSet::new();
         for (internal, name) in bones.iter().chain(ctrls.iter()) {
-            if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
+            let bare = name.strip_prefix(MIXAMO_PREFIX).unwrap_or(name);
+            if bare.is_empty() || bare.starts_with(|c: char| c.is_ascii_digit()) {
                 bail!("'{internal}' would be named '{name}', which isn't a valid name");
             }
             if !seen.insert(name.as_str()) {
@@ -427,5 +589,128 @@ mod tests {
         let built = components::build(&rig::detect_guides(&demo_humanoid()).0).unwrap();
         let (mut sk, mut ct) = (built.skeleton, built.controls);
         assert!(n.apply(&mut sk, &mut ct).is_err());
+    }
+
+    /// The demo biped with fingers, eyes, a jaw and a tail.
+    fn full_biped() -> components::Built {
+        let mesh = demo_humanoid();
+        let (mut guides, _) = rig::detect_guides(&mesh);
+        for preset in [
+            components::Preset::Fingers,
+            components::Preset::Eyes,
+            components::Preset::Jaw,
+            components::Preset::Tail,
+        ] {
+            components::add_preset(&mut guides, preset, &Default::default()).unwrap();
+        }
+        components::build(&guides).unwrap()
+    }
+
+    #[test]
+    fn unity_and_mixamo_name_the_humanoid_bones() {
+        let unity = Preset::Unity.naming();
+        assert_eq!(unity.bone("pelvis"), "Hips");
+        assert_eq!(unity.bone("spine_03"), "UpperChest");
+        assert_eq!(unity.bone("upperarm_l"), "LeftUpperArm");
+        assert_eq!(unity.bone("calf_r"), "RightLowerLeg");
+        assert_eq!(unity.bone("ball_l"), "LeftToes");
+        assert_eq!(unity.bone("index_01_l"), "LeftIndexProximal");
+        assert_eq!(unity.bone("pinky_03_r"), "RightLittleDistal");
+        assert_eq!(unity.bone("eye_r"), "RightEye");
+        // Bones Unity has no slot for, and every control, keep the game names.
+        assert_eq!(unity.bone("upperarm_twist_01_l"), "upperarm_twist_01_l");
+        assert_eq!(unity.bone("tail_01"), "tail_01");
+        assert_eq!(unity.control("hand_l_ik_ctrl"), "hand_l_ik_ctrl");
+        assert_eq!(
+            unity_human_bone("thumb_02_l").unwrap(),
+            "Left Thumb Intermediate"
+        );
+        assert_eq!(unity_human_bone("thigh_r").unwrap(), "RightUpperLeg");
+        assert_eq!(unity_human_bone("spine_04"), None);
+        assert_eq!(unity_human_bone("leg2_thigh_l"), None);
+
+        let mixamo = Preset::Mixamo.naming();
+        assert_eq!(mixamo.bone("pelvis"), "mixamorig:Hips");
+        assert_eq!(mixamo.bone("spine_02"), "mixamorig:Spine1");
+        assert_eq!(mixamo.bone("upperarm_l"), "mixamorig:LeftArm");
+        assert_eq!(mixamo.bone("lowerarm_r"), "mixamorig:RightForeArm");
+        assert_eq!(mixamo.bone("thigh_l"), "mixamorig:LeftUpLeg");
+        assert_eq!(mixamo.bone("ball_r"), "mixamorig:RightToeBase");
+        assert_eq!(mixamo.bone("middle_02_l"), "mixamorig:LeftHandMiddle2");
+        // Mixamo has no jaw: it keeps its game name in the same namespace.
+        assert_eq!(mixamo.bone("jaw"), "mixamorig:jaw");
+        assert_eq!(mixamo.bone("calf_twist_01_r"), "mixamorig:calf_twist_01_r");
+        assert_eq!(mixamo.control("thigh_l_fk_ctrl"), "thigh_l_fk_ctrl");
+        for p in [Preset::Unity, Preset::Mixamo] {
+            assert_eq!(p.key().parse::<Preset>().unwrap(), p);
+            assert_eq!(p.naming().preset(), Some(p));
+            assert!(!p.naming().is_default());
+        }
+
+        // A whole rig renames cleanly: every humanoid bone mapped, no collisions,
+        // and the mapping survives the guides file.
+        let built = full_biped();
+        for (preset, hips, hand) in [
+            (Preset::Unity, "Hips", "LeftHand"),
+            (Preset::Mixamo, "mixamorig:Hips", "mixamorig:LeftHand"),
+        ] {
+            let naming = preset.naming();
+            let (mut sk, mut ct) = (built.skeleton.clone(), built.controls.clone());
+            naming.apply(&mut sk, &mut ct).unwrap();
+            assert!(sk.bone(hips).is_some() && sk.bone(hand).is_some());
+            let arm = ct.ik_chains.iter().find(|k| k.name == "arm_l").unwrap();
+            assert_eq!(arm.end, hand);
+            let json = serde_json::to_string(&naming).unwrap();
+            assert!(json.contains(&format!("\"skeleton\":\"{}\"", preset.key())));
+            assert_eq!(serde_json::from_str::<Naming>(&json).unwrap(), naming);
+        }
+        // Older files without the field read as no map.
+        let old: Naming = serde_json::from_str(
+            r#"{"joint":"{name}_{side}_{desc}","control":"{name}_{side}_{desc}_ctrl","left":"l","right":"r"}"#,
+        )
+        .unwrap();
+        assert!(old.is_default());
+    }
+
+    #[test]
+    fn mixamo_names_read_back_as_guides() {
+        // A rig exported with Mixamo names becomes the same guides again.
+        let mesh = demo_humanoid();
+        let (mut guides, _) = rig::detect_guides(&mesh);
+        for p in [components::Preset::Fingers, components::Preset::Eyes] {
+            components::add_preset(&mut guides, p, &Default::default()).unwrap();
+        }
+        let built = components::build(&guides).unwrap();
+        for preset in [Preset::Mixamo, Preset::Unity] {
+            let (mut sk, mut ct) = (built.skeleton.clone(), built.controls.clone());
+            preset.naming().apply(&mut sk, &mut ct).unwrap();
+            let joints: Vec<crate::joints::Joint> = sk
+                .bones
+                .iter()
+                .map(|b| crate::joints::Joint {
+                    name: b.name.clone(),
+                    position: b.head,
+                    parent: b.parent,
+                })
+                .collect();
+            let (fresh, _) = rig::detect_guides(&mesh);
+            let (g, _) = crate::joints::guides_from_joints(fresh, &joints).unwrap();
+            for (id, guide, bone) in [
+                ("arm_l", "shoulder", "upperarm_l"),
+                ("arm_r", "elbow", "lowerarm_r"),
+                ("leg_l", "knee", "calf_l"),
+                ("leg_r", "ankle", "foot_r"),
+                ("index_l", "j2", "index_02_l"),
+                ("eyes", "eye_l", "eye_l"),
+            ] {
+                let at = g
+                    .component(id)
+                    .unwrap_or_else(|| panic!("{preset:?}: no {id}"))
+                    .position(guide)
+                    .unwrap();
+                let want = built.skeleton.bone(bone).unwrap().head;
+                assert!(at.distance(want) < 1e-4, "{preset:?} {id}.{guide}");
+            }
+        }
     }
 }

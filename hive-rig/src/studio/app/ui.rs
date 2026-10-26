@@ -2669,16 +2669,12 @@ impl Studio {
                     _ => NamingChoice::Custom,
                 };
                 let before = choice;
-                theme::segmented(
-                    ui,
-                    &mut choice,
-                    &[
-                        (NamingChoice::Preset(Preset::Game), Preset::Game.label()),
-                        (NamingChoice::Preset(Preset::Prefix), Preset::Prefix.label()),
-                        (NamingChoice::Preset(Preset::Suffix), Preset::Suffix.label()),
-                        (NamingChoice::Custom, "Custom"),
-                    ],
-                );
+                let choices: Vec<(NamingChoice, &str)> = Preset::ALL
+                    .into_iter()
+                    .map(|p| (NamingChoice::Preset(p), p.label()))
+                    .chain([(NamingChoice::Custom, "Custom")])
+                    .collect();
+                theme::segmented(ui, &mut choice, &choices);
                 if choice != before {
                     match choice {
                         NamingChoice::Preset(p) => {
@@ -2702,6 +2698,14 @@ impl Studio {
                         }
                         NamingChoice::Preset(Preset::Suffix) => {
                             "Side after the name, upper-case type: easy to sort and search."
+                        }
+                        NamingChoice::Preset(Preset::Unity) => {
+                            "Unity Humanoid bone names (Hips, LeftUpperArm): Unity maps the avatar by itself. \
+                             Export FBX also writes a Human Template (.ht) for the avatar's Load button."
+                        }
+                        NamingChoice::Preset(Preset::Mixamo) => {
+                            "Mixamo bone names (mixamorig:Hips, mixamorig:LeftArm), so Mixamo animations \
+                             play on the rig by name in Blender, Maya and Unity."
                         }
                         NamingChoice::Custom => {
                             "Use {name}, {side} and {desc} (fk, ik, pole, chain numbers)."

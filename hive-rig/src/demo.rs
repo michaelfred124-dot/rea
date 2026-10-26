@@ -217,7 +217,7 @@ pub enum Creature {
     Dog,
     /// Wings (arm components), two legs with hocks, a neck, head and tail.
     Bird,
-    /// A head, an abdomen and eight legs (FK chains).
+    /// A head, an abdomen and eight IK/FK legs whose knees fold up.
     Spider,
     /// A spline spine with a raised head and a spline tail.
     Snake,
@@ -261,7 +261,7 @@ impl Creature {
             Creature::Bird => {
                 "Wings with IK/FK like arms, two legs with hocks, a neck, head and tail."
             }
-            Creature::Spider => "Eight four-bone FK legs, a head and an abdomen.",
+            Creature::Spider => "Eight IK/FK legs with knees folding up, a head and an abdomen.",
             Creature::Snake => "A spline spine and spline tail with a raised neck and head.",
             Creature::Horse => {
                 "Long front legs and three-segment hind legs with spring hocks, a neck, head and tail."
@@ -440,8 +440,19 @@ pub fn demo_spider() -> Mesh {
         for n in 1..=crate::components::SPIDER_LEGS {
             tube(
                 &mut m,
-                &points(&g, &format!("leg{n}{s}"), &[]),
-                &[0.035 * h, 0.03 * h, 0.022 * h, 0.015 * h, 0.01 * h],
+                &points(
+                    &g,
+                    &format!("leg{n}{s}"),
+                    &["hip", "knee", "hock", "ankle", "ball", "toe"],
+                ),
+                &[
+                    0.035 * h,
+                    0.03 * h,
+                    0.022 * h,
+                    0.015 * h,
+                    0.012 * h,
+                    0.01 * h,
+                ],
                 step,
             );
         }

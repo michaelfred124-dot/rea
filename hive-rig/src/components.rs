@@ -244,6 +244,12 @@ pub struct Options {
     /// each corner (0 to 3; none when unset).
     #[serde(default, skip_serializing_if = "is_false")]
     pub board: bool,
+    /// Legs and quad legs splayed out to the side with the knee folding up
+    /// over the foot, as a spider's or insect's: the IK pole sits above the
+    /// knee instead of in front of it, and the checks expect the knee (and a
+    /// quad leg's hock) to bend up.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub knee_up: bool,
 }
 
 fn is_zero(v: &f32) -> bool {
@@ -269,6 +275,7 @@ impl Default for Options {
             soft: 0.0,
             spring: 0.0,
             board: false,
+            knee_up: false,
         }
     }
 }
@@ -702,9 +709,14 @@ pub const SPIDER_LEGS: usize = 4;
 /// The built-in spider layout for a spider `height` metres tall (floor to the
 /// top of its knees), facing +Z: a spine through the cephalothorax, a head with
 /// the fangs along the head bone, an abdomen chain behind and four legs a side.
-/// Each leg is a four-bone FK chain (coxa and femur up to the knee, then patella
-/// and tibia, metatarsus and tarsus down to the floor) hung from the spine bone
-/// it grows from, with the front legs reaching forward and the back legs back.
+/// Each leg is a [`Kind::QuadLeg`] with its knee folding up (`knee_up`): the
+/// coxa and femur rise to the knee as the thigh, the patella and tibia come
+/// down to the hock as the calf, the metatarsus is the hock bone and the
+/// tarsus the paw, touching the floor. Every leg has IK and FK with a pole
+/// above its knee; the first leg a side takes the mannequin leg names
+/// (`thigh_l`, IK chain `leg_l`) and the others their own (`leg2_thigh_l`,
+/// `leg2_l`). Each hangs from the spine bone it grows from, the front legs
+/// reaching forward and the back legs back.
 pub fn spider(height: f32) -> Guides {
     let h = height;
     let v = |x: f32, y: f32, z: f32| Vec3::new(x, y, z) * h;
@@ -746,18 +758,28 @@ pub fn spider(height: f32) -> Guides {
             let (sin, cos) = sweep.to_radians().sin_cos();
             // (distance out from the body's mid-line, height above the floor)
             let at = |out: f32, up: f32| v(sx * out * cos, up, z + out * sin);
-            components.push(chain(
+            let mut leg = Component::new(
                 format!("leg{}{}", n + 1, side.suffix()),
+                Kind::QuadLeg,
                 side,
-                &spine_name(bone),
-                [
-                    at(0.07, 0.44),
-                    at(0.34, 0.95),
-                    at(0.62, 0.48),
-                    at(0.8, 0.12),
-                    at(0.88, 0.0),
-                ],
-            ));
+                Some(&spine_name(bone)),
+            );
+            // In QUAD_LEG_GUIDES order: the hock arcs up off the line from the
+            // knee to the tarsus, so the leg bows like a spider's.
+            let points = [
+                at(0.07, 0.44), // hip: where the coxa leaves the body
+                at(0.34, 0.95), // knee, high
+                at(0.64, 0.58), // hock: tibia to metatarsus
+                at(0.8, 0.12),  // ankle: the tarsus starts here
+                at(0.85, 0.035),
+                at(0.88, 0.0), // tip on the floor
+                at(0.76, 0.0), // heel, under the ankle toward the body
+            ];
+            for (name, p) in QUAD_LEG_GUIDES.iter().zip(points) {
+                leg = leg.guide(*name, p);
+            }
+            leg.options.knee_up = true;
+            components.push(leg);
         }
     }
     // A low body with legs spread wide: no skin is cut off as a leg or an
@@ -993,7 +1015,8 @@ pub struct AddOptions {
     pub parent: Option<String>,
     /// Bones in a tail or chain.
     pub joints: Option<usize>,
-    /// Component id for a tail or chain.
+    /// Component id for a tail or chain, or for hind legs added beside the
+    /// legs a side already has (without its side: `leg2` makes `leg2_l`).
     pub id: Option<String>,
     /// Curve controls on a tentacle.
     pub controls: Option<usize>,
@@ -1119,13 +1142,23 @@ pub fn add_preset(g: &mut Guides, preset: Preset, opts: &AddOptions) -> Result<V
                 "{parent} is too close to the floor for a hind leg"
             );
             for side in sides {
-                ensure!(
-                    !g.components
-                        .iter()
-                        .any(|c| matches!(c.kind, Kind::Leg | Kind::QuadLeg) && c.side == side),
-                    "the rig already has a {side:?} leg; remove it first"
-                );
-                let id = format!("hind_leg{}", side.suffix());
+                let s = side.suffix();
+                let has_leg = g
+                    .components
+                    .iter()
+                    .any(|c| matches!(c.kind, Kind::Leg | Kind::QuadLeg) && c.side == side);
+                // A side with a leg takes another only under its own id: an
+                // extra IK leg named after it (leg2_l -> leg2_thigh_l).
+                let id = match &opts.id {
+                    Some(id) => format!("{}{s}", id_base(id, side)),
+                    None => {
+                        ensure!(
+                            !has_leg,
+                            "the rig already has a {side:?} leg; remove it first, or give the new one an --id (such as leg2) to add another leg"
+                        );
+                        format!("hind_leg{s}")
+                    }
+                };
                 ensure!(g.component(&id).is_none(), "{id} already exists");
                 let len = pelvis.y - floor;
                 let hip = Vec3::new(
@@ -1844,6 +1877,9 @@ struct Builder {
     blended: HashSet<String>,
     /// Arm IK chain -> the control of the bone its clavicle hangs from (the chest).
     arm_chest: HashMap<String, String>,
+    /// The (arm or leg, side) limbs built so far: the first of each takes the
+    /// mannequin names, later ones their component's.
+    limbs: HashSet<(&'static str, Side)>,
     head_chest: Option<String>,
     /// Bones without an FK control that a control stands in for as a space: a
     /// spline spine's top joint -> its chest control.
@@ -1943,6 +1979,26 @@ impl Builder {
         self.rig.control(name).is_some()
     }
 
+    /// The bone-name prefix and IK chain name of an arm (`group` "arm") or leg
+    /// ("leg", for legs and quad legs alike). The first arm and the first leg
+    /// on each side take the mannequin names (`thigh_l`, chain `leg_l`); every
+    /// later one is named after its component (`leg2_l` gives `leg2_thigh_l`,
+    /// `leg2_foot_l_ik_ctrl` and chain `leg2_l`), so a creature can have any
+    /// number of IK legs a side.
+    fn limb_names(&mut self, c: &Component, group: &'static str) -> Result<(String, String)> {
+        let s = c.side.suffix();
+        if self.limbs.insert((group, c.side)) {
+            return Ok((String::new(), format!("{group}{s}")));
+        }
+        let base = id_base(&c.id, c.side);
+        ensure!(
+            base != group,
+            "component {}: a second {group} on this side needs another id (such as {group}2{s}), since {group}{s} names the first one's IK",
+            c.id
+        );
+        Ok((format!("{base}_"), format!("{base}{s}")))
+    }
+
     /// The control a part hung from `parent` (its parent control) offers as its
     /// chest space: the parent control itself, or the control standing in for
     /// a bone that has none (a spline spine's chest).
@@ -1965,6 +2021,7 @@ pub fn build(g: &Guides) -> Result<Built> {
         ctrl_of: HashMap::new(),
         blended: HashSet::new(),
         arm_chest: HashMap::new(),
+        limbs: HashSet::new(),
         head_chest: None,
         chest_space: HashMap::new(),
         component: String::new(),
@@ -2118,6 +2175,11 @@ fn validate(g: &Guides) -> Result<()> {
             "component {}: spring must be 0 to 1 (got {})",
             c.id,
             c.options.spring
+        );
+        ensure!(
+            !c.options.knee_up || matches!(c.kind, Kind::Leg | Kind::QuadLeg),
+            "component {}: only legs and quad legs fold their knee up",
+            c.id
         );
         ensure!(
             !c.options.board || c.kind == Kind::Face,
@@ -2334,7 +2396,8 @@ fn build_arm(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
     let planted =
         b.rules.planted_front_legs && p("elbow").y < b.crotch_y && p("wrist").y < b.crotch_y;
     let region = limb_region(if planted { Kind::Leg } else { Kind::Arm }, side);
-    let clav = format!("clavicle{s}");
+    let (pre, chain) = b.limb_names(c, "arm")?;
+    let clav = format!("{pre}clavicle{s}");
     b.bone(
         &clav,
         parent,
@@ -2346,9 +2409,9 @@ fn build_arm(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
     b.link(&clav, region);
     b.link(parent, region);
     let names = [
-        format!("upperarm{s}"),
-        format!("lowerarm{s}"),
-        format!("hand{s}"),
+        format!("{pre}upperarm{s}"),
+        format!("{pre}lowerarm{s}"),
+        format!("{pre}hand{s}"),
     ];
     let points = [p("shoulder"), p("elbow"), p("wrist"), p("hand_tip")];
     let bend = limb_bones(b, &names, &clav, &points, side, region, &c.options)?;
@@ -2356,7 +2419,7 @@ fn build_arm(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
     let color = side_color(side);
     let clav_parent = b.parent_control(parent);
     if let Some(chest) = b.chest_of(&clav_parent) {
-        b.arm_chest.insert(format!("arm{s}"), chest);
+        b.arm_chest.insert(chain.clone(), chest);
     }
     let cb = b.sk.bone(&clav).unwrap().clone();
     b.control(
@@ -2377,6 +2440,7 @@ fn build_arm(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
         &names,
         ControlParent::Control(ctrl_name(&clav)),
         Limb {
+            name: chain,
             blend: if planted { 1.0 } else { 0.0 },
             upright_ik: planted,
             soft: c.options.soft,
@@ -2393,10 +2457,15 @@ fn build_leg(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
     let region = limb_region(Kind::Leg, side);
     let p = |n: &str| c.position(n).unwrap();
     b.link(parent, region);
-    let names = [format!("thigh{s}"), format!("calf{s}"), format!("foot{s}")];
+    let (pre, chain) = b.limb_names(c, "leg")?;
+    let names = [
+        format!("{pre}thigh{s}"),
+        format!("{pre}calf{s}"),
+        format!("{pre}foot{s}"),
+    ];
     let points = [p("hip"), p("knee"), p("ankle"), p("ball")];
     let bend = limb_bones(b, &names, parent, &points, side, region, &c.options)?;
-    let ball = format!("ball{s}");
+    let ball = format!("{pre}ball{s}");
     b.bone(&ball, &names[2], p("ball"), p("toe"), side, region)?;
 
     let fk_parent = b.parent_control(parent);
@@ -2415,11 +2484,13 @@ fn build_leg(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
         &names,
         fk_parent,
         Limb {
+            name: chain,
             blend: 1.0,
             upright_ik: true,
             foot: Some(foot),
             soft: c.options.soft,
             bend,
+            knee_up: c.options.knee_up,
             ..Limb::default()
         },
     );
@@ -2456,12 +2527,17 @@ fn build_quad_leg(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
     let region = limb_region(Kind::Leg, side);
     let p = |n: &str| c.position(n).unwrap();
     b.link(parent, region);
-    let segments = [format!("thigh{s}"), format!("calf{s}"), format!("hock{s}")];
+    let (pre, chain) = b.limb_names(c, "leg")?;
+    let segments = [
+        format!("{pre}thigh{s}"),
+        format!("{pre}calf{s}"),
+        format!("{pre}hock{s}"),
+    ];
     let points = [p("hip"), p("knee"), p("hock"), p("ankle")];
     let bend = limb_bones(b, &segments, parent, &points, side, region, &c.options)?;
-    let foot = format!("foot{s}");
+    let foot = format!("{pre}foot{s}");
     b.bone(&foot, &segments[2], p("ankle"), p("ball"), side, region)?;
-    let ball = format!("ball{s}");
+    let ball = format!("{pre}ball{s}");
     b.bone(&ball, &foot, p("ball"), p("toe"), side, region)?;
 
     let fk_parent = b.parent_control(parent);
@@ -2481,6 +2557,7 @@ fn build_quad_leg(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
         &names,
         fk_parent,
         Limb {
+            name: chain,
             blend: 1.0,
             upright_ik: true,
             foot: Some(roll),
@@ -2488,6 +2565,7 @@ fn build_quad_leg(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
             soft: c.options.soft,
             spring: c.options.spring,
             bend,
+            knee_up: c.options.knee_up,
         },
     );
     toe_control(b, side, &foot, ball);
@@ -2579,6 +2657,8 @@ fn limb_bones(
 /// How a limb's IK is set up.
 #[derive(Default)]
 struct Limb {
+    /// The IK chain's name (`arm_l`, `leg_l`, `leg2_l`).
+    name: String,
     /// Initial IK/FK blend: 1 = IK.
     blend: f32,
     /// The IK control stands upright (feet, paws) instead of following the upper bone.
@@ -2592,6 +2672,8 @@ struct Limb {
     spring: f32,
     /// Bend joints of the upper and lower segments, for a bendy limb.
     bend: Option<[Vec<String>; 2]>,
+    /// The knee folds up (a splayed spider leg): the pole goes above it.
+    knee_up: bool,
 }
 
 fn limb_controls(
@@ -2604,11 +2686,12 @@ fn limb_controls(
 ) {
     let h = b.h;
     let color = side_color(side);
-    let s = side.suffix();
     let [up, lo, end] = names.clone().map(|n| b.sk.bone(&n).unwrap().clone());
     let hock = limb.hock.as_ref().map(|n| b.sk.bone(n).unwrap().clone());
     let (size, bend_fallback) = if kind == "arm" {
         (0.045 * h, -Vec3::Z)
+    } else if limb.knee_up {
+        (0.06 * h, Vec3::Y)
     } else {
         (0.06 * h, Vec3::Z)
     };
@@ -2744,7 +2827,7 @@ fn limb_controls(
     });
 
     b.rig.ik_chains.push(IkChain {
-        name: format!("{kind}{s}"),
+        name: limb.name,
         upper: up.name.clone(),
         lower: lo.name.clone(),
         end: end.name.clone(),
@@ -5013,5 +5096,165 @@ mod tests {
             .unwrap();
         assert_eq!(sp.controls[0], "L_tentacle_ik_01_ctrl");
         assert_eq!(built.controls.splines[0].controls[0], "C_hips_ctrl");
+    }
+
+    #[test]
+    fn every_spider_leg_has_ik_with_its_own_names() {
+        use crate::pose::{Channels, Pose, evaluate};
+        let g = spider(0.4);
+        let built = build(&g).unwrap();
+        assert_controls_consistent(&built);
+        let (sk, rig) = (&built.skeleton, &built.controls);
+        assert_eq!(rig.ik_chains.len(), 2 * SPIDER_LEGS);
+        let chains: HashSet<&str> = rig.ik_chains.iter().map(|k| k.name.as_str()).collect();
+        assert_eq!(chains.len(), 2 * SPIDER_LEGS, "{chains:?}");
+        for name in ["leg_l", "leg_r", "leg2_l", "leg3_r", "leg4_l", "leg4_r"] {
+            assert!(chains.contains(name), "{name}: {chains:?}");
+        }
+        let leg2 = rig.ik_chains.iter().find(|k| k.name == "leg2_l").unwrap();
+        assert_eq!(leg2.ik_control, "leg2_foot_l_ik_ctrl");
+        assert_eq!(leg2.pole_control, "leg2_calf_l_pole_ctrl");
+        assert_eq!(leg2.upper, "leg2_thigh_l");
+        assert_eq!(leg2.hock.as_ref().unwrap().control, "leg2_hock_l_ik_ctrl");
+        assert_eq!(leg2.foot.as_ref().unwrap().ball_control, "leg2_ball_l_ctrl");
+        for k in &rig.ik_chains {
+            // Every control of every leg is its own, and the left ones pair
+            // with the right leg's.
+            let mut own = vec![k.ik_control.clone(), k.pole_control.clone()];
+            own.extend(k.fk_controls.iter().cloned());
+            for o in rig.ik_chains.iter().filter(|o| o.name != k.name) {
+                assert!(!own.contains(&o.ik_control) && !own.contains(&o.pole_control));
+            }
+            if k.name.ends_with("_l") {
+                for c in own {
+                    let r = c.replace("_l_", "_r_");
+                    assert!(
+                        rig.mirror_pairs.contains(&[c.clone(), r.clone()]),
+                        "{c} pairs with {r}"
+                    );
+                }
+            }
+            // The knee folds up, so the pole sits above it.
+            let knee = sk.bone(&k.lower).unwrap().head;
+            let pole = rig.control(&k.pole_control).unwrap().position;
+            assert!(pole.y > knee.y + 0.05 * g.body.height, "{}", k.name);
+        }
+
+        // At rest the IK legs hold the guides' pose; moving one leg's goal
+        // moves that leg alone.
+        let rest = evaluate(sk, rig, &Pose::default());
+        for (i, m) in rest.bones.iter().enumerate() {
+            assert!(
+                m.abs_diff_eq(glam::Mat4::IDENTITY, 1e-4),
+                "{} moves at rest",
+                sk.bones[i].name
+            );
+        }
+        let mut pose = Pose::default();
+        pose.set_channels(
+            &leg2.ik_control,
+            Channels {
+                translate: Vec3::new(0.02, 0.05, 0.03),
+                ..Channels::default()
+            },
+        );
+        let posed = evaluate(sk, rig, &pose);
+        let moved = |bone: &str| {
+            let i = sk.index_of(bone).unwrap();
+            posed.head(sk, i).distance(sk.bones[i].head)
+        };
+        assert!(moved("leg2_foot_l") > 0.03, "{}", moved("leg2_foot_l"));
+        assert!(moved("leg2_calf_l") > 1e-3);
+        for other in ["foot_l", "leg3_foot_l", "leg2_foot_r", "leg4_calf_l"] {
+            assert!(moved(other) < 1e-5, "{other} moved {}", moved(other));
+        }
+
+        // The checks know the knees and hocks fold up.
+        let issues = crate::checks::check(&g, None);
+        assert!(issues.is_empty(), "{issues:?}");
+    }
+
+    #[test]
+    fn extra_limbs_take_their_component_names() {
+        // A second pair of hind legs on a dog, with an id of their own.
+        let mut g = quadruped(0.8);
+        let spine = spine_name(1);
+        let opts = AddOptions {
+            id: Some("mid_leg".into()),
+            parent: Some(spine.clone()),
+            ..AddOptions::default()
+        };
+        assert!(add_preset(&mut g, Preset::QuadLegs, &AddOptions::default()).is_err());
+        let ids = add_preset(&mut g, Preset::QuadLegs, &opts).unwrap();
+        assert_eq!(ids, ["mid_leg_l", "mid_leg_r"]);
+        let built = build(&g).unwrap();
+        assert_controls_consistent(&built);
+        let names: Vec<&str> = built
+            .controls
+            .ik_chains
+            .iter()
+            .map(|k| k.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["arm_l", "arm_r", "leg_l", "leg_r", "mid_leg_l", "mid_leg_r"]
+        );
+        let mid = &built.controls.ik_chains[4];
+        assert_eq!(
+            (
+                mid.upper.as_str(),
+                mid.end.as_str(),
+                mid.ik_control.as_str()
+            ),
+            (
+                "mid_leg_thigh_l",
+                "mid_leg_foot_l",
+                "mid_leg_foot_l_ik_ctrl"
+            )
+        );
+        let sk = &built.skeleton;
+        let thigh = sk.bone("mid_leg_thigh_l").unwrap();
+        assert_eq!(sk.bones[thigh.parent.unwrap()].name, spine);
+        let pair = ["mid_leg_foot_l_ik_ctrl", "mid_leg_foot_r_ik_ctrl"].map(String::from);
+        assert!(built.controls.mirror_pairs.contains(&pair));
+        // The extra legs follow the naming convention like the rest.
+        let (mut sk, mut ct) = (built.skeleton.clone(), built.controls.clone());
+        crate::naming::Preset::Prefix
+            .naming()
+            .apply(&mut sk, &mut ct)
+            .unwrap();
+        assert!(sk.bone("L_mid_leg_thigh_jnt").is_some());
+        assert!(ct.control("L_mid_leg_foot_ik_ctrl").is_some());
+
+        // An extra arm, too.
+        let mut b = demo_guides();
+        let mut arm = b.component("arm_l").unwrap().clone();
+        arm.id = "arm2_l".into();
+        for guide in &mut arm.guides {
+            guide.position.y -= 0.15;
+        }
+        b.components.push(arm);
+        let built = build(&b).unwrap();
+        assert_controls_consistent(&built);
+        assert!(built.skeleton.bone("arm2_upperarm_l").is_some());
+        assert!(built.controls.ik_chains.iter().any(|k| k.name == "arm2_l"));
+
+        // A second limb that would reuse the first one's IK name is refused
+        // with a hint.
+        let mut c = demo_guides();
+        let mut leg = c.component("leg_l").unwrap().clone();
+        leg.id = "hind_leg_l".into();
+        c.components.insert(3, leg);
+        let err = build(&c).err().unwrap().to_string();
+        assert!(err.contains("needs another id"), "{err}");
+        // Only legs fold their knees up.
+        let mut d = demo_guides();
+        d.components
+            .iter_mut()
+            .find(|x| x.id == "arm_l")
+            .unwrap()
+            .options
+            .knee_up = true;
+        assert!(build(&d).is_err());
     }
 }

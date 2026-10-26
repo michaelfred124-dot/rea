@@ -353,9 +353,12 @@ app's export window or with the command line:
 | `game` (default) | `upperarm_l`, `spine_01` | `hand_l_ik_ctrl`, `root_ctrl` |
 | `prefix` | `L_upperarm_jnt`, `C_spine_01_jnt` | `L_hand_ik_ctrl`, `C_root_ctrl` |
 | `suffix` | `upperarm_L_JNT`, `spine_01_M_JNT` | `hand_L_ik_CTRL`, `root_M_CTRL` |
+| `unity` | `Hips`, `Spine`, `LeftUpperArm`, `LeftIndexProximal`, others as `game` | as `game` |
+| `mixamo` | `mixamorig:Hips`, `mixamorig:LeftArm`, `mixamorig:LeftHandIndex1`, others `mixamorig:` + the `game` name | as `game` |
 
 ```bash
 hive-rig naming out/hero.guides.json prefix
+hive-rig demo -o out --naming unity --targets blender,fbx   # --naming on rig, demo and rebuild too
 hive-rig naming out/hero.guides.json --joint "{side}_{name}_{desc}_bnd" --left Lf --right Rt --center Ct
 hive-rig rebuild out/hero.hive.json
 ```
@@ -365,6 +368,29 @@ Patterns place `{name}` (the part, such as `upperarm` or `index`), `{side}` and
 underscores drop out. The convention is stored in the guides file, so rebuilds
 from Blender, Maya or the command line keep it, and the guides themselves keep
 the internal names. Names that would collide are refused.
+
+**Engine presets.** `unity` and `mixamo` carry a skeleton map (`"skeleton":
+"unity"` in the naming): the humanoid bones (hips, the first three spine joints,
+neck, head, jaw, eyes, clavicles, arms, hands, the three joints of each finger,
+legs, feet and the balls of the feet) take that engine's names, and every other
+bone (twist and bend joints, extra spine joints, tails, the face) and every
+control keeps the game names. With `unity` Unity's Humanoid avatar setup finds
+every bone by itself; with `mixamo` animations downloaded from Mixamo play on
+the rig by bone name in Blender and Unity (the rig should stand in Mixamo's
+T-pose; the demo does). Spine joints past the third, a quad leg's hock and any
+extra limbs have no engine slot. Mixamo's colon puts Maya's joints in a
+`mixamorig` namespace, which the Maya builder creates; for Unreal keep `game`,
+the mannequin's own names.
+
+**Unity avatar mapping.** With **Export FBX** (`--targets fbx`), a biped (legs
+and arms with every bone Unity's Humanoid needs) also gets `<name>.ht`, a Unity
+Human Template: in the model's Rig tab pick Humanoid, Configure, then Mapping >
+Load and choose the file, and every human bone maps to the rig's bone whatever
+the naming convention. It is written from the template format Unity saves and
+checked in `cargo test`, not yet loaded in Unity. The skeleton maps are checked
+in real Blender: the builder, the animator tools and the FBX through Blender's
+importer, with `unity` and `mixamo` names (Maya and Unreal only against stubs),
+and a rig with either set of names reads back as the same guides.
 
 ### Running the builder scripts
 
@@ -388,7 +414,7 @@ A rig is a list of components, each placed by a few guide points:
 | head | neck, head, head_top | `neck_01`, `head`, controls with space switching |
 | arm | clavicle, shoulder, elbow, wrist, hand_tip | clavicle, IK/FK arm, stretch, soft IK, spaces, twist bones; bend and pin controls with `bendy` |
 | leg | hip, knee, ankle, ball, toe, heel | IK/FK leg, reverse foot, stretch, soft IK, spaces, twist bones; bend and pin controls with `bendy` |
-| quad_leg | hip, knee, hock, ankle, ball, toe, heel | three-segment hind leg (`thigh`, `calf`, `hock`, `foot`, `ball`): IK with a hock control, reverse paw roll, FK, stretch, spaces, twist bones |
+| quad_leg | hip, knee, hock, ankle, ball, toe, heel | three-segment hind leg (`thigh`, `calf`, `hock`, `foot`, `ball`): IK with a hock control, reverse paw roll, FK, stretch, spaces, twist bones; `knee_up` for a spider's leg |
 | chain | two or more | an FK chain: fingers, tails, ears, hair, props |
 | spline | two or more (`j1`…) | a curve-driven chain (tentacle): curve controls, an FK layer, `stretch` and `volume` |
 | eyes | eye_l, eye_r, target | `eye_l`, `eye_r` aimed by a look-at control that follows the head or stays in the world |
@@ -494,6 +520,19 @@ layout's.
   shoulder blade and the elbow points back. An arm whose elbow and wrist sit
   below the belly line (`crotch_y`) skins as a leg, starts in IK and gets an
   upright IK control.
+* **More legs a side**: any number of arms, legs and quad legs a side get IK.
+  The first arm and the first leg (or quad leg) on each side take the
+  mannequin names (`thigh_l`, IK chain `leg_l`); every later one is named after
+  its component, so `mid_leg_l` builds `mid_leg_thigh_l`,
+  `mid_leg_foot_l_ik_ctrl`, `mid_leg_calf_l_pole_ctrl` and IK chain
+  `mid_leg_l`, and its twin `mid_leg_r` mirrors it. A later limb whose id
+  would reuse the first one's IK name (a second `leg_l`) is refused with a
+  hint. Add a pair with `hive-rig add <guides> quad_legs --id mid_leg --parent
+  spine_02`. IK/FK matching, mirror, flip and the pose library in Blender,
+  Maya and Unreal work per IK chain, so they cover every leg.
+* **Knees that fold up** (`knee_up` on a leg or quad leg): for a spider's or
+  insect's leg splayed out to the side, the pole sits above the knee instead
+  of in front of it, and the checks expect the knee and hock to bend up.
 
 A four-legged character is recognised when it is opened or rigged: by four
 limb ends on the floor under a skeleton with two pairs of legs, or, with no
@@ -526,9 +565,15 @@ any character, scaled to its height. They use the existing components only:
   below the belly.
 * **Spider** (`components::spider`, 0.4 m to the top of the knees): a spine
   through the cephalothorax, a head with the fangs along the head bone, an
-  abdomen chain and **eight legs**, each a four-bone FK chain (`leg1_l` to
-  `leg4_r`) hung from the spine bone it grows from; front legs reach forward,
-  back legs back. FK chains have no IK, so a spider is posed leg by leg.
+  abdomen chain and **eight IK legs** (`leg1_l` to `leg4_r`), each a
+  `quad_leg` with `knee_up`: the coxa and femur rise to the knee, the tibia
+  comes down to the hock, the metatarsus is the hock bone and the tarsus the
+  paw on the floor, hung from the spine bone it grows from; front legs reach
+  forward, back legs back. Each has IK and FK, a pole above its knee, a hock
+  control and a foot roll; the first leg a side takes the mannequin names
+  (`thigh_l`, IK chain `leg_l`) and the others their own (`leg2_thigh_l`,
+  `leg2_l`). Checked in real Blender: IK to FK and FK to IK on all eight legs,
+  mirror and flip (Maya and Unreal only against stubs).
 * **Snake** (`components::snake`, a 0.5 m size unit; about 2 m long): a
   **spline spine** of ten joints driven by five curve controls, a raised neck
   and head, and a spline (`tentacle`) tail of eight joints and four curve
@@ -1244,9 +1289,10 @@ the IK pose; then poses each FK limb and checks FK to IK leaves every bone in
 place, including a straight limb. It mirrors a posed left side and checks the
 right side is its mirror image, mirrors one selected control, switches the IK
 hand's space with the chest turned, and resets the rig back to its rest mesh.
-A rig without arms and legs (the spider, the snake) skips the limb checks: it
-mirrors its posed left controls (the spider's FK legs) onto the right, switches
-the space of the first control that has spaces (the head), and resets.
+Every IK limb gets those checks, however many legs a side (the spider's eight).
+A rig without both arms and legs (the spider, the snake) mirrors its posed left
+controls onto the right and checks each limb's chain mirrors too, switches the
+space of the first control that has spaces, and resets.
 
 `blender_quad_check.py` builds the dog in real Blender. It checks that the paws
 reach their IK goals with the hock joined to the paw, the knee folds forward
@@ -1384,7 +1430,7 @@ glTF-to-Unreal import mirrors, which is untested in Unreal.
 ## Not yet included
 
 See [the gap list](docs/hive-gaps.md)
-for what's planned. In short: cone and RBF pose readers, IK legs beyond one
-arm and one leg a side (the spider's legs are FK chains), guide editing in Unreal (rebuild with the CLI and rerun the script),
+for what's planned. In short: cone and RBF pose readers, guide editing in Unreal (rebuild with the CLI and rerun the script),
+the Unity avatar template and Mixamo names tried in Unity and Unreal,
 the spring hock in the app's posing, the studio pose in Unreal, ASCII FBX input,
 FBX animation, and the mesh details listed under [Mesh fidelity](#mesh-fidelity).

@@ -214,6 +214,26 @@ jobs:
             cargo run --locked -q -- template apply "$t/hive_demo.guides.json" "$creature"
             cargo run --locked -q -- rebuild "$t/hive_demo.hive.json"
           done
+      - name: Engine presets - Unity Humanoid and Mixamo names, extra IK legs, Maya and Unreal builders
+        run: |
+          for n in unity mixamo; do
+            e="$RUNNER_TEMP/engine_$n"
+            cargo run --locked -q -- demo -o "$e" --naming "$n" --targets maya,unreal,fbx
+            test -s "$e/hive_demo.ht"
+            grep -q "m_BoneTemplate:" "$e/hive_demo.ht"
+            python3 -I tests/dcc_stub_run.py maya "$e/hive_demo_maya.py"
+            python3 -I tests/dcc_stub_run.py unreal "$e/hive_demo_unreal.py"
+          done
+          grep -q "    Hips: Hips" "$RUNNER_TEMP/engine_unity/hive_demo.ht"
+          grep -q "LeftUpperLeg: 'mixamorig:LeftUpLeg'" "$RUNNER_TEMP/engine_mixamo/hive_demo.ht"
+          cargo run --locked -q -- naming "$RUNNER_TEMP/engine_unity/hive_demo.guides.json" | grep -q "LeftUpperArm"
+          # A second pair of IK hind legs on the dog, hung from the spine.
+          x="$RUNNER_TEMP/extra_legs"
+          cargo run --locked -q -- demo --quadruped -o "$x" --targets maya,unreal
+          cargo run --locked -q -- add "$x/hive_dog.guides.json" quad_legs --id mid_leg --parent spine_02
+          cargo run --locked -q -- rebuild "$x/hive_dog.hive.json" --targets maya,unreal | grep -q "6 IK limbs"
+          python3 -I tests/dcc_stub_run.py maya "$x/hive_dog_maya.py"
+          python3 -I tests/dcc_stub_run.py unreal "$x/hive_dog_unreal.py"
       - name: Spline chains - a tentacle and a spline spine, Maya and Unreal builders
         run: |
           sp="$RUNNER_TEMP/spline"
@@ -553,10 +573,22 @@ jobs:
           # The dog's hind legs have a hock segment between calf and foot.
           cargo run -q -- demo --quadruped -o "$RUNNER_TEMP/anim_dog"
           python tests/blender_anim_check.py "$RUNNER_TEMP/anim_dog/hive_dog_blender.py"
-          # Wings and hocked legs (bird), eight FK legs (spider), spline spine and tail (snake).
+          # Wings and hocked legs (bird), eight IK legs (spider), spline spine and tail (snake).
           for creature in bird spider snake; do
             cargo run -q -- demo --creature "$creature" -o "$RUNNER_TEMP/anim_$creature"
-            python tests/blender_anim_check.py "$RUNNER_TEMP/anim_$creature/hive_${creature}_blender.py"
+            python tests/blender_anim_check.py "$RUNNER_TEMP/anim_$creature/hive_${creature}_blender.py" | tee "$RUNNER_TEMP/anim_$creature.log"
+          done
+          # Every spider leg was matched IK to FK and back.
+          grep -q "leg4_r: FK to IK keeps the pole in front of the joint" "$RUNNER_TEMP/anim_spider.log"
+          # Unity Humanoid and Mixamo bone names: the builder, the tools and the FBX in Blender.
+          for n in unity mixamo; do
+            e="$RUNNER_TEMP/anim_$n"
+            cargo run -q -- demo -o "$e" --naming "$n" --targets blender,fbx
+            cargo run -q -- add "$e/hive_demo.guides.json" fingers
+            cargo run -q -- rebuild "$e/hive_demo.hive.json" --targets blender,fbx
+            python tests/blender_check.py "$e/hive_demo_blender.py" "$e/hive_demo.glb"
+            python tests/blender_anim_check.py "$e/hive_demo_blender.py"
+            python tests/blender_fbx_check.py "$e/hive_demo.fbx" "$e/hive_demo.hive.json"
           done
       - name: Eyes, jaw, face joints and fingers in Blender
         run: |

@@ -440,6 +440,11 @@ def build(RIG, geos=None):
 
     # --------------------------------------------------------------------------- joints
     joints = []
+    # Mixamo names (mixamorig:Hips) put the joints in a namespace, which has to
+    # exist before a node can be named into it.
+    for ns in sorted({b["name"].rsplit(":", 1)[0] for b in BONES if ":" in b["name"]}):
+        if not cmds.namespace(exists=ns):
+            cmds.namespace(add=ns)
     for b in BONES:
         parent = joints[b["parent"]] if b["parent"] is not None else skel_grp
         j = cmds.createNode("joint", name=b["name"], parent=parent)

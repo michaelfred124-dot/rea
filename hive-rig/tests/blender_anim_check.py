@@ -95,76 +95,86 @@ rest = [v.co.copy() for v in geo.data.vertices]
 ns["reset_pose"](rig)
 check(max((a - b).length for a, b in zip(rest, deformed())) < 1e-4, "reset leaves the rest pose unchanged")
 
-# Creatures without arms or legs (a spider's FK legs, a snake's splines) skip
-# the limb checks and get the mirror and space checks on the controls they have.
+# Rigs without both arms and legs (a spider's eight legs, a snake's splines)
+# get the mirror and space checks on the controls they have; every IK limb,
+# however many legs a side, gets the matching checks.
 has_limbs = all(n in limbs for n in ("arm_l", "arm_r", "leg_l", "leg_r"))
 print("limbs:", ", ".join(sorted(limbs)) or "none")
+check(len({l["ik"] for l in limbs.values()}) == len(limbs), "every limb has its own IK control")
 
-for side in ("l", "r"):
-    for kind in ("arm", "leg"):
-        name = "%s_%s" % (kind, side)
-        if name not in limbs:
-            continue
-        limb = limbs[name]
 
-        # IK to FK: pose the IK limb, match, and the FK controls hold the IK pose.
-        ns["reset_pose"](rig)
-        ik = pose[limb["ik"]]
-        ik["ik_fk"] = 1.0
-        upper, end = bones[limb["upper"]].head_local, bones[limb["end"]].head_local
-        m = ik.matrix.copy()
-        m.translation += (upper - end) * 0.3 + Vector((0.0, -0.05, 0.03))
-        ik.matrix = m @ Matrix.Rotation(0.3, 4, "X") @ Matrix.Rotation(-0.2, 4, "Z")
-        pole = pose[limb["pole"]]
-        pm = pole.matrix.copy()
-        pm.translation += Vector((0.08 if side == "l" else -0.08, 0.0, 0.0))
-        pole.matrix = pm
-        if kind == "leg":
-            ik["roll"] = 15.0
-        if limb.get("hock"):
-            turn(limb["hock"]["control"], (0.25, 0.0, 0.1))  # swing the hock
-        update()
-        ik_pose = [world(b) for b in chain_bones(limb)]
-        check(differs(ik_pose[0], world(limb["fk"][0]))[1] > 0.05, "%s: IK pose differs from FK before matching" % name)
-        ns["ik_to_fk"](rig, name)
-        check(pose[limb["ik"]]["ik_fk"] == 0.0, "%s: IK to FK switches the limb to FK" % name)
-        for bone, ctrl, want in zip(chain_bones(limb), limb["fk"], ik_pose):
-            ok, how = same(world(ctrl), want)
-            check(ok, "%s: FK control %s matches the IK pose (%s)" % (name, ctrl, how))
-            ok, how = same(world(bone), want)
-            check(ok, "%s: %s does not pop switching to FK (%s)" % (name, bone, how))
+def limb_twin(name):
+    """leg2_l -> leg2_r: the same limb on the other side."""
+    base, side = name.rsplit("_", 1)
+    return "%s_%s" % (base, {"l": "r", "r": "l"}[side])
 
-        # FK to IK: pose the FK limb (bending the middle joint like a hinge), match.
-        ns["reset_pose"](rig)
-        pose[limb["ik"]]["ik_fk"] = 0.0
-        if kind == "leg":
-            pose[limb["ik"]]["roll"] = -20.0  # the IK goal sits off the control
-        turn(limb["fk"][0], (0.35, 0.2, -0.3))
-        turn(limb["fk"][-1], (0.2, -0.15, 0.25))
-        if limb.get("hock"):
-            turn(limb["fk"][2], (-0.3, 0.1, 0.15))  # the FK hock segment
-        pose[limb["fk"][1]].rotation_mode = "QUATERNION"
-        pose[limb["fk"][1]].rotation_quaternion = Quaternion(bend_axis(limb), 0.7)
-        pose[limb["fk"][1]].rotation_mode = "XYZ"
-        update()
-        fk_pose = [world(b) for b in chain_bones(limb)]
-        ns["fk_to_ik"](rig, name)
-        check(pose[limb["ik"]]["ik_fk"] == 1.0, "%s: FK to IK switches the limb to IK" % name)
-        for bone, want in zip(chain_bones(limb), fk_pose):
-            ok, how = same(world(bone), want)
-            check(ok, "%s: %s does not pop switching to IK (%s)" % (name, bone, how))
 
-        # A straight limb has no bend plane; the pole still lands in front of the joint.
-        ns["reset_pose"](rig)
-        pose[limb["ik"]]["ik_fk"] = 0.0
-        pose[limb["fk"][1]].rotation_mode = "QUATERNION"
-        pose[limb["fk"][1]].rotation_quaternion = Quaternion(bend_axis(limb), 0.0)
-        pose[limb["fk"][1]].rotation_mode = "XYZ"
-        update()
-        rest_bend = (bones[limb["pole"]].head_local - bones[limb["lower"]].head_local).normalized()
-        ns["fk_to_ik"](rig, name)
-        bend = (pose[limb["pole"]].head - pose[limb["lower"]].head).normalized()
-        check(bend.dot(rest_bend) > 0.99, "%s: FK to IK keeps the pole in front of the joint" % name)
+check(all(limb_twin(n) in limbs for n in limbs), "every limb has a twin on the other side")
+
+for name in sorted(limbs):
+    limb = limbs[name]
+    side = name.rsplit("_", 1)[1]
+    # Legs carry a foot roll; arms (and wings) don't.
+    kind = "leg" if "roll" in data["defaults"].get(limb["ik"], {}) else "arm"
+
+    # IK to FK: pose the IK limb, match, and the FK controls hold the IK pose.
+    ns["reset_pose"](rig)
+    ik = pose[limb["ik"]]
+    ik["ik_fk"] = 1.0
+    upper, end = bones[limb["upper"]].head_local, bones[limb["end"]].head_local
+    m = ik.matrix.copy()
+    m.translation += (upper - end) * 0.3 + Vector((0.0, -0.05, 0.03))
+    ik.matrix = m @ Matrix.Rotation(0.3, 4, "X") @ Matrix.Rotation(-0.2, 4, "Z")
+    pole = pose[limb["pole"]]
+    pm = pole.matrix.copy()
+    pm.translation += Vector((0.08 if side == "l" else -0.08, 0.0, 0.0))
+    pole.matrix = pm
+    if kind == "leg":
+        ik["roll"] = 15.0
+    if limb.get("hock"):
+        turn(limb["hock"]["control"], (0.25, 0.0, 0.1))  # swing the hock
+    update()
+    ik_pose = [world(b) for b in chain_bones(limb)]
+    check(differs(ik_pose[0], world(limb["fk"][0]))[1] > 0.05, "%s: IK pose differs from FK before matching" % name)
+    ns["ik_to_fk"](rig, name)
+    check(pose[limb["ik"]]["ik_fk"] == 0.0, "%s: IK to FK switches the limb to FK" % name)
+    for bone, ctrl, want in zip(chain_bones(limb), limb["fk"], ik_pose):
+        ok, how = same(world(ctrl), want)
+        check(ok, "%s: FK control %s matches the IK pose (%s)" % (name, ctrl, how))
+        ok, how = same(world(bone), want)
+        check(ok, "%s: %s does not pop switching to FK (%s)" % (name, bone, how))
+
+    # FK to IK: pose the FK limb (bending the middle joint like a hinge), match.
+    ns["reset_pose"](rig)
+    pose[limb["ik"]]["ik_fk"] = 0.0
+    if kind == "leg":
+        pose[limb["ik"]]["roll"] = -20.0  # the IK goal sits off the control
+    turn(limb["fk"][0], (0.35, 0.2, -0.3))
+    turn(limb["fk"][-1], (0.2, -0.15, 0.25))
+    if limb.get("hock"):
+        turn(limb["fk"][2], (-0.3, 0.1, 0.15))  # the FK hock segment
+    pose[limb["fk"][1]].rotation_mode = "QUATERNION"
+    pose[limb["fk"][1]].rotation_quaternion = Quaternion(bend_axis(limb), 0.7)
+    pose[limb["fk"][1]].rotation_mode = "XYZ"
+    update()
+    fk_pose = [world(b) for b in chain_bones(limb)]
+    ns["fk_to_ik"](rig, name)
+    check(pose[limb["ik"]]["ik_fk"] == 1.0, "%s: FK to IK switches the limb to IK" % name)
+    for bone, want in zip(chain_bones(limb), fk_pose):
+        ok, how = same(world(bone), want)
+        check(ok, "%s: %s does not pop switching to IK (%s)" % (name, bone, how))
+
+    # A straight limb has no bend plane; the pole still lands in front of the joint.
+    ns["reset_pose"](rig)
+    pose[limb["ik"]]["ik_fk"] = 0.0
+    pose[limb["fk"][1]].rotation_mode = "QUATERNION"
+    pose[limb["fk"][1]].rotation_quaternion = Quaternion(bend_axis(limb), 0.0)
+    pose[limb["fk"][1]].rotation_mode = "XYZ"
+    update()
+    rest_bend = (bones[limb["pole"]].head_local - bones[limb["lower"]].head_local).normalized()
+    ns["fk_to_ik"](rig, name)
+    bend = (pose[limb["pole"]].head - pose[limb["lower"]].head).normalized()
+    check(bend.dot(rest_bend) > 0.99, "%s: FK to IK keeps the pole in front of the joint" % name)
 
 def mirrored(p):
     return Vector((2 * center_x - p.x, p.y, p.z))
@@ -217,9 +227,12 @@ if has_limbs:
     moved = max((pose[bl].head - bones[bl].head_local).length for bl in chain_bones(arm))
     check(moved > 0.05, "the posed left arm moved (%.3f m)" % moved)
 else:
-    # Each pair of controls ends up mirror images.
+    # Each pair of controls ends up mirror images, and so does each limb's chain.
     for left, right in data["mirror"]:
         check_mirrored(left, right)
+    for kl in sorted(n for n in limbs if n.endswith("_l")):
+        for bl, br in zip(chain_bones(limbs[kl]), chain_bones(limbs[limb_twin(kl)])):
+            check_mirrored(bl, br)
     if data["mirror"]:
         moved = max((pose[l].tail - bones[l].tail_local).length for l in twin)
         check(moved > 0.01, "the posed left controls moved (%.3f m)" % moved)

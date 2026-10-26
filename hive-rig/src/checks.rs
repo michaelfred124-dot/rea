@@ -609,6 +609,12 @@ fn bends(g: &Guides, found: &mut Vec<Finding>) {
     for (ci, c) in g.components.iter().enumerate() {
         // (outer, middle, inner, the way the middle should point, its name for people)
         let joints: &[(&str, &str, &str, Vec3, &str)] = match c.kind {
+            // A splayed leg (a spider's) folds its knee, and hock, up.
+            Kind::Leg if c.options.knee_up => &[("hip", "knee", "ankle", Vec3::Y, "up")],
+            Kind::QuadLeg if c.options.knee_up => &[
+                ("hip", "knee", "hock", Vec3::Y, "up"),
+                ("knee", "hock", "ankle", Vec3::Y, "up"),
+            ],
             Kind::Arm => &[("shoulder", "elbow", "wrist", Vec3::NEG_Z, "back")],
             Kind::Leg => &[("hip", "knee", "ankle", Vec3::Z, "forward")],
             Kind::QuadLeg => &[
@@ -645,7 +651,11 @@ fn bends(g: &Guides, found: &mut Vec<Finding>) {
                     ),
                 ))
             } else if along < 0.0 {
-                let wrong = if way == "back" { "forward" } else { "backward" };
+                let wrong = match way {
+                    "back" => "forward",
+                    "up" => "down",
+                    _ => "backward",
+                };
                 Some((
                     Check::BendsWrongWay,
                     format!("the {m} bends {wrong}"),

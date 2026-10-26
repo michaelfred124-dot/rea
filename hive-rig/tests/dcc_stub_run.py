@@ -199,7 +199,7 @@ def stub_maya():
               "window", "deleteUI", "columnLayout", "rowLayout", "setParent", "button", "text", "separator",
               "checkBox", "showWindow", "confirmDialog", "skinPercent", "pointConstraint",
               "shadingNode", "uvLink", "blendShape", "aliasAttr", "loadPlugin", "currentTime",
-              "playbackOptions", "textScrollList", "promptDialog", "listConnections", "transformLimits"]:
+              "playbackOptions", "textScrollList", "promptDialog", "listConnections", "transformLimits", "namespace"]:
         setattr(cmds, n, generic(n))
 
     om = types.ModuleType("maya.api.OpenMaya")
