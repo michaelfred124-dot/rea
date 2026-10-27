@@ -25,6 +25,7 @@ use hive_rig::template::{self, Listed, Scope, Source, Template};
 use super::{
     Category, Doc, Drag, FingerSides, Mode, Pose, RigPick, Studio, Tool, count, push_undo,
 };
+use super::posing::Handle;
 use crate::joints;
 use crate::theme::{
     self, ACCENT, BORDER, CARD, CARD_HI, ERR, OK, TEXT, TEXT_DIM, TEXT_FAINT, WARN,
@@ -34,6 +35,8 @@ use crate::view::{self, Projector};
 mod skin_panel;
 
 const PICK_RADIUS: f32 = 10.0;
+/// How near a control's drawn curve the pointer has to be to pick it.
+const CONTROL_REACH: f32 = 8.0;
 /// Component handles are corner brackets around the first guide: their half
 /// size on screen, the guide's own centre inside them, and the reach of the ring.
 const HANDLE_HALF: f32 = 11.0;
@@ -3118,6 +3121,21 @@ impl Studio {
         {
             posing = self.begin_gizmo(&pr, h, p);
         }
+        // Dragging a control's curve picks it and carries it on the screen plane
+        // (Move) or about its centre (Scale), instead of orbiting the camera.
+        if !posing
+            && !stroking
+            && self.mode == Mode::Rig
+            && self.pose.is_none()
+            && response.drag_started_by(PointerButton::Primary)
+            && let Some(p) = press.or(pointer)
+            && let Some(RigPick::Control(name)) = self.pick_rig(&pr, p)
+        {
+            if !self.posing.selected.contains(&name) {
+                self.select_control(&name, shift);
+            }
+            posing = self.begin_gizmo(&pr, Handle::Center, p);
+        }
         if posing {
             if response.dragged_by(PointerButton::Primary)
                 && let Some(p) = pointer
@@ -3285,6 +3303,34 @@ impl Studio {
         self.pick_rig_in(pr, at, &frame)
     }
 
+    /// The control whose drawn lines (or pivot) pass under the pointer, with how
+    /// far off they are, as Maya picks a curve: anywhere along it, not just at
+    /// its centre. The nearest wins; Rig stage only.
+    fn control_at(&self, pr: &Projector, at: Pos2, frame: &super::Frame) -> Option<(usize, f32)> {
+        if self.mode != Mode::Rig {
+            return None;
+        }
+        let built = self.doc.as_ref()?.preview.as_ref().ok()?;
+        let mut best: Option<(usize, f32)> = None;
+        for (i, c) in built.controls.controls.iter().enumerate() {
+            let mut d = pr
+                .pos(frame.controls[i])
+                .map_or(f32::INFINITY, |s| s.distance(at));
+            for line in control_lines(c, i, Some(frame)) {
+                let pts: Vec<Option<Pos2>> = line.iter().map(|p| pr.pos(*p)).collect();
+                for w in pts.windows(2) {
+                    if let (Some(a), Some(b)) = (w[0], w[1]) {
+                        d = d.min(distance_to_segment(at, a, b));
+                    }
+                }
+            }
+            if d <= CONTROL_REACH && best.is_none_or(|b| d < b.1) {
+                best = Some((i, d));
+            }
+        }
+        best
+    }
+
     /// `pick_rig` on a frame already worked out.
     fn pick_rig_in(&self, pr: &Projector, at: Pos2, frame: &super::Frame) -> Option<RigPick> {
         if self.mode == Mode::Guides {
@@ -3299,17 +3345,10 @@ impl Studio {
         } else {
             &[]
         };
-        for (i, c) in controls.iter().enumerate() {
-            let Some(s) = pr.pos(frame.controls[i]) else {
-                continue;
-            };
-            let d = s.distance(at);
-            if d <= PICK_RADIUS && best.as_ref().is_none_or(|b| d < b.0) {
-                best = Some((d, RigPick::Control(c.name.clone())));
-            }
-        }
-        if best.is_some() {
-            return best.map(|b| b.1);
+        if !controls.is_empty()
+            && let Some((i, _)) = self.control_at(pr, at, frame)
+        {
+            return Some(RigPick::Control(controls[i].name.clone()));
         }
         // The joints and bones as drawn: the front-most ball or face under the
         // pointer, unless the mesh hides it.
@@ -3577,40 +3616,29 @@ impl Studio {
 
         // Controls over the skeleton, as animators pick them.
         if self.mode == Mode::Rig {
+            // The control under the pointer lights up before it is picked, as in Maya.
+            let hover_control = match (pointer, frame) {
+                (Some(p), Some(f)) if idle && pr.rect.contains(p) => {
+                    self.control_at(pr, p, f).map(|i| i.0)
+                }
+                _ => None,
+            };
             for (i, c) in built.controls.controls.iter().enumerate() {
-                let position = frame.map_or(c.position, |f| f.controls[i]);
-                let axis = frame.map_or(c.axis, |f| f.control_axes[i]);
                 let picked = self.rig_pick == Some(RigPick::Control(c.name.clone()))
                     || self.posing.selected.contains(&c.name);
-                // The same lines the Blender and Maya builders draw; a posed
-                // control turns and scales with its channels.
-                // The face board's panel draws its edge and tracks with it.
-                let outline = match frame.and_then(|f| f.control_mats.as_ref()) {
-                    Some(mats) => c
-                        .rest_lines()
-                        .into_iter()
-                        .map(|l| l.into_iter().map(|p| mats[i].transform_point3(p)).collect())
-                        .collect(),
-                    None => {
-                        let shift = position - c.position;
-                        let mut lines = c.outline_at(position, axis);
-                        lines.extend(
-                            c.extra
-                                .iter()
-                                .map(|l| l.iter().map(|p| *p + shift).collect::<Vec<_>>()),
-                        );
-                        lines
-                    }
+                let outline = control_lines(c, i, frame);
+                let width = if picked { 3.5 } else { 2.0 } * c.width().sqrt().max(0.5);
+                let color = if hover_control == Some(i) && !picked {
+                    rgb(c.color.map(|v| v + (1.0 - v) * 0.45))
+                } else {
+                    rgb(c.color)
                 };
-                view::strokes(
-                    painter,
-                    pr,
-                    &outline,
-                    Stroke::new(
-                        if picked { 3.5 } else { 2.0 } * c.width().sqrt().max(0.5),
-                        rgb(c.color),
-                    ),
-                );
+                let width = if hover_control == Some(i) {
+                    width + 1.0
+                } else {
+                    width
+                };
+                view::strokes(painter, pr, &outline, Stroke::new(width, color));
             }
         }
         if self.mode != Mode::Guides {
@@ -5550,6 +5578,35 @@ fn warning_marker(painter: &egui::Painter, at: Pos2, color: Color32) {
     painter.circle_filled(at + Vec2::new(0.0, s * 0.42), 0.9, ink.color);
 }
 
+/// A control's lines as drawn: the same lines the Blender and Maya builders
+/// draw. A posed control turns and scales with its channels; the face board's
+/// panel draws its edge and tracks with it.
+fn control_lines(
+    c: &hive_rig::controls::Control,
+    i: usize,
+    frame: Option<&super::Frame>,
+) -> Vec<Vec<Vec3>> {
+    match frame.and_then(|f| f.control_mats.as_ref()) {
+        Some(mats) => c
+            .rest_lines()
+            .into_iter()
+            .map(|l| l.into_iter().map(|p| mats[i].transform_point3(p)).collect())
+            .collect(),
+        None => {
+            let position = frame.map_or(c.position, |f| f.controls[i]);
+            let axis = frame.map_or(c.axis, |f| f.control_axes[i]);
+            let shift = position - c.position;
+            let mut lines = c.outline_at(position, axis);
+            lines.extend(
+                c.extra
+                    .iter()
+                    .map(|l| l.iter().map(|p| *p + shift).collect::<Vec<_>>()),
+            );
+            lines
+        }
+    }
+}
+
 /// An IK pole marker: a green plus in a thin ring.
 fn pole_marker(painter: &egui::Painter, at: Pos2) {
     let arm = 7.0;
@@ -5617,6 +5674,54 @@ mod tests {
         match s.pick_rig(pr, at) {
             Some(RigPick::Bone(b)) => Some(b),
             _ => None,
+        }
+    }
+
+    /// Every control picks from anywhere along its drawn curve, as in Maya,
+    /// not only from its centre.
+    #[test]
+    fn controls_pick_from_their_drawn_curves() {
+        let (s, pr) = studio(Mode::Rig);
+        let frame = s.frame().unwrap();
+        let built = s.doc.as_ref().unwrap().preview.as_ref().unwrap();
+        let mut checked = 0;
+        for (i, c) in built.controls.controls.iter().enumerate() {
+            let lines = control_lines(c, i, Some(&frame));
+            let centre = pr.pos(frame.controls[i]).unwrap();
+            // The drawn point farthest from the centre on screen.
+            let Some(far) = lines
+                .iter()
+                .flatten()
+                .filter_map(|p| pr.pos(*p))
+                .max_by(|a, b| a.distance(centre).total_cmp(&b.distance(centre)))
+            else {
+                continue;
+            };
+            if far.distance(centre) < 2.0 * PICK_RADIUS {
+                continue;
+            }
+            let (hit, _) = s.control_at(&pr, far, &frame).unwrap();
+            // Another control's curve may cross there; it must at least be as near.
+            if hit != i {
+                let mine = s.control_at(&pr, far, &frame).unwrap().1;
+                assert!(mine <= 1e-3, "{} hid {}", built.controls.controls[hit].name, c.name);
+            }
+            checked += 1;
+        }
+        assert!(checked > 10, "only {checked} controls drawn wider than their pick");
+        // Off the character, nothing.
+        assert!(s.control_at(&pr, Pos2::new(5.0, 5.0), &frame).is_none());
+        // And pick_rig hands back the control under the curve.
+        let i = built
+            .controls
+            .controls
+            .iter()
+            .position(|c| c.kind == ControlKind::Fk && c.bone.as_deref() == Some("lowerarm_l"))
+            .unwrap();
+        let on_curve = control_lines(&built.controls.controls[i], i, Some(&frame))[0][0];
+        match s.pick_rig(&pr, pr.pos(on_curve).unwrap()) {
+            Some(RigPick::Control(n)) => assert!(!n.is_empty()),
+            other => panic!("picked {other:?}"),
         }
     }
 
