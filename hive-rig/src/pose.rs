@@ -23,7 +23,9 @@ use std::collections::{BTreeMap, HashMap};
 use glam::{EulerRot, Mat3, Mat4, Quat, Vec3};
 use serde::{Deserialize, Serialize};
 
-use crate::controls::{Control, ControlKind, ControlParent, ControlRig, FootRoll, soft_reach};
+use crate::controls::{
+    Control, ControlKind, ControlParent, ControlRig, FootRoll, IkChain, soft_reach,
+};
 use crate::face_board::{LipSeal, Values};
 use crate::skeleton::Skeleton;
 
@@ -283,6 +285,164 @@ fn attribute_default(rig: &ControlRig, control: &str, name: &str) -> f32 {
         }
     }
     0.0
+}
+
+/// The controls an IK/FK limb shows in IK: the IK control, its pole and any
+/// hock control.
+pub fn ik_side(ch: &IkChain) -> Vec<&str> {
+    let mut out = vec![ch.ik_control.as_str(), ch.pole_control.as_str()];
+    if let Some(h) = &ch.hock {
+        out.push(&h.control);
+    }
+    out
+}
+
+/// The controls an IK/FK limb shows in FK, from the top down.
+pub fn fk_side(ch: &IkChain) -> Vec<&str> {
+    let mut out = vec![ch.fk_controls[0].as_str(), ch.fk_controls[1].as_str()];
+    if let Some(h) = &ch.hock {
+        out.push(&h.fk_control);
+    }
+    out.push(&ch.fk_controls[2]);
+    out
+}
+
+/// The IK/FK limb a control belongs to (either side), by index.
+pub fn limb_of(rig: &ControlRig, control: &str) -> Option<usize> {
+    rig.ik_chains
+        .iter()
+        .position(|ch| ik_side(ch).contains(&control) || fk_side(ch).contains(&control))
+}
+
+/// The controls hidden in this pose, as Zoo Hive and the Maya builder show
+/// them: a limb's FK controls only while some FK is on (`ik_fk` below 1) and
+/// its IK controls only while some IK is (`ik_fk` above 0).
+pub fn hidden_controls(rig: &ControlRig, pose: &Pose) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for ch in &rig.ik_chains {
+        let blend = pose.attribute(rig, &ch.ik_control, "ik_fk");
+        let hide = if blend >= 1.0 {
+            fk_side(ch)
+        } else if blend <= 0.0 {
+            ik_side(ch)
+        } else {
+            Vec::new()
+        };
+        out.extend(hide.into_iter().map(str::to_string));
+    }
+    out
+}
+
+/// The channels that put control `name` at the model-space transform `want`
+/// under the parent it has in `pose`, keeping its scale and any locked channels.
+fn place(sk: &Skeleton, rig: &ControlRig, pose: &mut Pose, name: &str, want: Mat4) {
+    let Some(i) = rig.controls.iter().position(|c| c.name == name) else {
+        return;
+    };
+    let c = &rig.controls[i];
+    let parent = evaluate(sk, rig, pose).parents[i];
+    let frame = Mat4::from_quat(rest_frame(c, sk));
+    let at = Mat4::from_translation(pivot(c, sk));
+    let inner = frame.inverse() * at.inverse() * parent.inverse() * want * at * frame;
+    let (_, rot, translate) = inner.to_scale_rotation_translation();
+    let locks = locks(c, sk);
+    let mut ch = pose.channels(name);
+    if !locks.rotate {
+        ch.set_rotation(rot);
+    }
+    if !locks.translate {
+        ch.translate = translate;
+    }
+    pose.set_channels(name, limit_channels(rig, name, ch));
+}
+
+/// Switch IK/FK limb `k` to IK (`to_ik`) or FK without the limb moving, as Zoo
+/// Hive's match does: to FK, each FK control takes its bone's turn; to IK, the
+/// IK control (and hock) go onto the end (and hock) bones, the foot roll goes
+/// back to 0 and the pole turns until the middle joint sits where it was.
+pub fn switch_limb(sk: &Skeleton, rig: &ControlRig, pose: &mut Pose, k: usize, to_ik: bool) {
+    let ch = &rig.ik_chains[k];
+    let Some(idx) = ch
+        .bones()
+        .iter()
+        .map(|n| sk.index_of(n))
+        .collect::<Option<Vec<usize>>>()
+    else {
+        return;
+    };
+    let was = evaluate(sk, rig, pose);
+    let rigid = |b: usize| {
+        Mat4::from_translation(was.head(sk, b))
+            * Mat4::from_quat(was.rotation(b))
+            * Mat4::from_translation(-sk.bones[b].head)
+    };
+    if !to_ik {
+        pose.set_attribute(rig, &ch.ik_control, "ik_fk", 0.0);
+        for (name, &b) in fk_side(ch).into_iter().zip(&idx) {
+            place(sk, rig, pose, name, rigid(b));
+        }
+        return;
+    }
+    let heads: Vec<Vec3> = idx.iter().map(|&b| was.head(sk, b)).collect();
+    let last = idx.len() - 1;
+    pose.set_attribute(rig, &ch.ik_control, "ik_fk", 1.0);
+    pose.set_attribute(rig, &ch.ik_control, "roll", 0.0);
+    place(sk, rig, pose, &ch.ik_control, rigid(idx[last]));
+    if let Some(h) = &ch.hock {
+        place(sk, rig, pose, &h.control, rigid(idx[2]));
+    }
+    // The pole: off the middle joint in the plane the three joints make, as far
+    // out as it sits at rest.
+    let pole_index = rig.controls.iter().position(|c| c.name == ch.pole_control);
+    if let Some(pi) = pole_index {
+        let (a, b, c) = (heads[0], heads[1], heads[2]);
+        let along = (c - a).normalize_or_zero();
+        let mut out = (b - a) - along * (b - a).dot(along);
+        if out.length() < 1e-5 {
+            // A straight limb: keep the pole's side, turned with the upper bone.
+            let rest_out = rig.controls[pi].position - sk.bones[idx[1]].head;
+            out = was.rotation(idx[0]) * rest_out;
+        }
+        let reach = rig.controls[pi]
+            .position
+            .distance(sk.bones[idx[1]].head)
+            .max(1e-3);
+        let target = b + out.normalize_or_zero() * reach;
+        let now = evaluate(sk, rig, pose).controls[pi];
+        let rest_at = rig.controls[pi].position;
+        let moved = Mat4::from_translation(target - now.transform_point3(rest_at)) * now;
+        place(sk, rig, pose, &ch.pole_control, moved);
+        // Turn the pole about the reach until the middle joint lands; then pull
+        // the IK control out until a softened or hocked end lands too.
+        for _ in 0..8 {
+            let p = evaluate(sk, rig, pose);
+            let flat = |v: Vec3| v - along * v.dot(along);
+            let (got, want) = (flat(p.head(sk, idx[1]) - a), flat(b - a));
+            let angle = got.cross(want).dot(along).atan2(got.dot(want));
+            let end_miss = heads[last] - p.head(sk, idx[last]);
+            if angle.abs() < 1e-4 && end_miss.length() < 1e-4 {
+                break;
+            }
+            let ik = p.controls[rig
+                .controls
+                .iter()
+                .position(|c| c.name == ch.ik_control)
+                .unwrap_or(pi)];
+            place(
+                sk,
+                rig,
+                pose,
+                &ch.ik_control,
+                Mat4::from_translation(end_miss) * ik,
+            );
+            let pole = evaluate(sk, rig, pose).controls[pi];
+            let turned = Mat4::from_translation(a)
+                * Mat4::from_quat(Quat::from_axis_angle(along, angle))
+                * Mat4::from_translation(-a)
+                * pole;
+            place(sk, rig, pose, &ch.pole_control, turned);
+        }
+    }
 }
 
 /// Which channels of a control are locked, as the builders lock them.
@@ -1351,6 +1511,65 @@ mod tests {
 
     fn assert_near(a: Vec3, b: Vec3, tol: f32, what: &str) {
         assert!(a.distance(b) < tol, "{what}: {a} vs {b}");
+    }
+
+    /// Switching a posed limb either way leaves its joints where they were,
+    /// and only the active side's controls show.
+    #[test]
+    fn switching_ik_fk_matches_and_shows_one_side() {
+        let mut built = vec![biped().1];
+        for creature in [crate::demo::Creature::Dog, crate::demo::Creature::Horse] {
+            built.push(components::build(&creature.guides()).unwrap());
+        }
+        for b in &built {
+            let (sk, rig) = (&b.skeleton, &b.controls);
+            for (k, ch) in rig.ik_chains.iter().enumerate() {
+                let joints = |p: &Posed| -> Vec<Vec3> {
+                    ch.bones()
+                        .iter()
+                        .map(|n| p.head(sk, sk.index_of(n).unwrap()))
+                        .chain([p.tail(sk, sk.index_of(&ch.end).unwrap())])
+                        .collect()
+                };
+                // Posed in IK, switched to FK.
+                let mut pose = Pose::default();
+                pose.set_attribute(rig, &ch.ik_control, "ik_fk", 1.0);
+                pose.set_channels(&ch.ik_control, moved(Vec3::new(0.06, 0.12, 0.05)));
+                pose.set_channels(&ch.pole_control, moved(Vec3::new(0.1, 0.0, 0.08)));
+                let hidden = hidden_controls(rig, &pose);
+                assert!(
+                    fk_side(ch).iter().all(|n| hidden.contains(*n)),
+                    "{}",
+                    ch.name
+                );
+                assert!(ik_side(ch).iter().all(|n| !hidden.contains(*n)));
+                let before = joints(&evaluate(sk, rig, &pose));
+                switch_limb(sk, rig, &mut pose, k, false);
+                assert_eq!(pose.attribute(rig, &ch.ik_control, "ik_fk"), 0.0);
+                for (a, b) in before.iter().zip(joints(&evaluate(sk, rig, &pose))) {
+                    assert_near(*a, b, 2e-3, &format!("{} to FK", ch.name));
+                }
+                let hidden = hidden_controls(rig, &pose);
+                assert!(ik_side(ch).iter().all(|n| hidden.contains(*n)));
+                // Turned in FK, switched back to IK.
+                let top = &fk_side(ch)[0].to_string();
+                let mut c = pose.channels(top);
+                c.rotate += Vec3::new(0.0, 15.0, 25.0);
+                pose.set_channels(top, c);
+                let mid = &fk_side(ch)[1].to_string();
+                let mut c = pose.channels(mid);
+                c.rotate += Vec3::new(0.0, 0.0, -30.0);
+                pose.set_channels(mid, c);
+                let before = joints(&evaluate(sk, rig, &pose));
+                switch_limb(sk, rig, &mut pose, k, true);
+                assert_eq!(pose.attribute(rig, &ch.ik_control, "ik_fk"), 1.0);
+                for (a, b) in before.iter().zip(joints(&evaluate(sk, rig, &pose))) {
+                    assert_near(*a, b, 5e-3, &format!("{} to IK", ch.name));
+                }
+                assert_eq!(limb_of(rig, top), Some(k));
+                assert_eq!(limb_of(rig, &ch.pole_control), Some(k));
+            }
+        }
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 Builds the mesh, an oriented joint skeleton with a skinCluster, and an animator
 control rig: NURBS controls with offset groups, FK chains, IK handles with pole
-vectors, and an `ikFk` blend attribute on every limb's IK control.
+vectors, and Zoo Hive's `ikfk` switch (0 = IK, 1 = FK) on every limb control.
 
 The mesh keeps the source's objects, UV sets, normals, vertex colours and
 materials (standardSurface with file textures from the folder next to the rig).
@@ -901,8 +901,10 @@ def build(RIG, geos=None):
     limb_nodes = {}  # chain name -> its helper joints and IK goal, for the animator tools
     for chain in CHAINS:
         ik_ctrl = ctrl_of[chain["ik_control"]]
-        cmds.addAttr(ik_ctrl, longName="ikFk", attributeType="double", min=0, max=1,
-                     defaultValue=chain["default_blend"], keyable=True)
+        # Zoo Hive's switch: `ikfk` 0 = IK, 1 = FK, on the IK control and proxied
+        # onto every other control of the limb (below), so it is always at hand.
+        cmds.addAttr(ik_ctrl, longName="ikfk", attributeType="double", min=0, max=1,
+                     defaultValue=1.0 - chain["default_blend"], keyable=True)
 
         fk_chain = duplicate_chain(chain, "_fk")
         ik_chain = duplicate_chain(chain, "_ik")
@@ -918,8 +920,10 @@ def build(RIG, geos=None):
         cmds.setAttr(handle + ".visibility", 0)
         cmds.poleVectorConstraint(ctrl_of[chain["pole_control"]], handle)
 
-        reverse = cmds.createNode("reverse", name=chain["name"] + "_ikFk_reverse")
-        cmds.connectAttr(ik_ctrl + ".ikFk", reverse + ".inputX")
+        # `ik_on` is how much of the limb follows IK, `fk_on` how much follows FK.
+        reverse = cmds.createNode("reverse", name=chain["name"] + "_ikfk_reverse")
+        cmds.connectAttr(ik_ctrl + ".ikfk", reverse + ".inputX")
+        ik_on, fk_on = reverse + ".outputX", ik_ctrl + ".ikfk"
 
         goal = ik_ctrl
         foot = chain.get("foot")
@@ -952,8 +956,8 @@ def build(RIG, geos=None):
             cmds.parentConstraint(flat, ball_offset, maintainOffset=True)
             con = cmds.parentConstraint(ball_offset, query=True, name=True)
             w_foot, w_flat = cmds.parentConstraint(con, query=True, weightAliasList=True)
-            cmds.connectAttr(reverse + ".outputX", con + "." + w_foot)
-            cmds.connectAttr(ik_ctrl + ".ikFk", con + "." + w_flat)
+            cmds.connectAttr(fk_on, con + "." + w_foot)
+            cmds.connectAttr(ik_on, con + "." + w_flat)
         hock = chain.get("hock")
         solve_to = goal
         if hock:
@@ -1034,15 +1038,20 @@ def build(RIG, geos=None):
             constrain = cmds.orientConstraint if k == 0 else cmds.parentConstraint
             con = constrain(ik_j, fk_j, joint_of[bone], maintainOffset=False)[0]
             w_ik, w_fk = constrain(con, query=True, weightAliasList=True)
-            cmds.connectAttr(ik_ctrl + ".ikFk", con + "." + w_ik)
-            cmds.connectAttr(reverse + ".outputX", con + "." + w_fk)
+            cmds.connectAttr(ik_on, con + "." + w_ik)
+            cmds.connectAttr(fk_on, con + "." + w_fk)
 
-        # Show only the controls of the active mode.
+        # Show only the controls of the active mode, as Zoo Hive does: the IK
+        # side while any IK is on, the FK side while any FK is.
+        ik_side = [chain["ik_control"], chain["pole_control"]] + ([hock["control"]] if hock else [])
         for name in chain_fk_controls(chain):
-            cmds.connectAttr(reverse + ".outputX", offset_of[name] + ".visibility")
-        cmds.connectAttr(ik_ctrl + ".ikFk", offset_of[chain["pole_control"]] + ".visibility")
-        if hock:
-            cmds.connectAttr(ik_ctrl + ".ikFk", offset_of[hock["control"]] + ".visibility")
+            cmds.connectAttr(fk_on, offset_of[name] + ".visibility")
+        for name in ik_side:
+            cmds.connectAttr(ik_on, offset_of[name] + ".visibility")
+        for name in chain_fk_controls(chain) + ik_side[1:]:
+            ctrl = ctrl_of[name]
+            if not cmds.attributeQuery("ikfk", node=ctrl, exists=True):
+                cmds.addAttr(ctrl, longName="ikfk", proxy=ik_ctrl + ".ikfk")
 
     # --------------------------------------------------------------------------- bendy limbs
     # Each segment's curve runs from its start to its end point (the upper one from
@@ -1232,7 +1241,7 @@ def build(RIG, geos=None):
                                        "zone": float(chain["soft_zone"])},
         })
         d = defaults.setdefault(ik_ctrl, {})
-        d.update(ikFk=float(chain["default_blend"]), stretch=float(chain["default_stretch"]))
+        d.update(ikfk=1.0 - float(chain["default_blend"]), stretch=float(chain["default_stretch"]))
         if not hock:
             d["soft"] = float(chain["default_soft"])
         else:
@@ -1277,7 +1286,7 @@ def build(RIG, geos=None):
 # switching. The limbs and the left/right twins come from hive-rig (ik_chains and
 # mirror_pairs), kept on the rig as `hiveAnim` with the bind frames. Matrices here are 4x4 lists of rows acting on
 # column vectors; Maya's flat worldMatrix is the transpose.
-ANIM_ATTRS = ("ikFk", "stretch", "soft", "roll", "space", "volume", "spring", "slide", "spread")
+ANIM_ATTRS = ("ikfk", "stretch", "soft", "roll", "space", "volume", "spring", "slide", "spread")
 CHANNELS = ("tx", "ty", "tz", "rx", "ry", "rz")
 
 
@@ -1400,14 +1409,14 @@ def ik_to_fk(name, force_key=False):
     """Snap the FK controls onto the IK pose, then switch the limb to FK."""
     limb = limb_of(name)
     offsets = anim_data()["offsets"]
-    cmds.setAttr(limb["ik"] + ".ikFk", 1)
+    cmds.setAttr(limb["ik"] + ".ikfk", 0)
     targets = [world(j) for j in limb["joints"]]
     for ctrl, target in zip(limb["fk"], targets):
         local = mat_mul(mat_inv(world(offsets[ctrl])), target)
         for ch, v in zip(("rx", "ry", "rz"), matrix_euler(local)):
             if settable(ctrl + "." + ch):
                 cmds.setAttr(ctrl + "." + ch, v)
-    cmds.setAttr(limb["ik"] + ".ikFk", 0)
+    cmds.setAttr(limb["ik"] + ".ikfk", 1)
     key_controls(limb["fk"] + [limb["ik"]], force_key)
 
 
@@ -1485,7 +1494,7 @@ def fk_to_ik(name, force_key=False):
             set_world(hock["control"], mat_mul(fk[2], mat_inv(carry)))
         pole = world(limb["pole"])
         set_world(limb["pole"], with_translation(pole, pole_position(limb, a, b, c, fk[0])))
-        cmds.setAttr(limb["ik"] + ".ikFk", 1)
+        cmds.setAttr(limb["ik"] + ".ikfk", 0)
         # Turn the pole about the reach until the middle joint lands on the FK one.
         for _ in range(8):
             got = sub(translation(world(limb["joints"][1])), a)
@@ -1680,7 +1689,8 @@ def add_studio_pose(rig_data, name="Studio pose"):
     def put_settings():
         for n, values in studio.get("attributes", {}).items():
             for attr, v in values.items():
-                attr = {"ik_fk": "ikFk"}.get(attr, attr)
+                if attr == "ik_fk":  # hive-rig's 1 = IK is Zoo's ikfk 0
+                    attr, v = "ikfk", 1.0 - v
                 if cmds.objExists(n) and cmds.attributeQuery(attr, node=n, exists=True):
                     cmds.setAttr(n + "." + attr, v)
 

@@ -295,6 +295,43 @@ impl Studio {
             .set_attribute(&built.controls, control, name, value)
     }
 
+    /// The controls the IK/FK switches hide in the current pose.
+    pub fn hidden_controls(&self) -> std::collections::HashSet<String> {
+        match self.pose_rig() {
+            Some((_, rig)) => pose::hidden_controls(rig, &self.posing.pose),
+            None => Default::default(),
+        }
+    }
+
+    /// Switch IK/FK limb `k` to IK or FK, matched so it doesn't move (one undo
+    /// step), and pick the control an animator reaches for next: the IK
+    /// control, or the top FK control.
+    pub fn switch_limb(&mut self, k: usize, to_ik: bool) {
+        let Some((sk, rig)) = self.pose_rig() else {
+            return;
+        };
+        let Some(ch) = rig.ik_chains.get(k) else {
+            return;
+        };
+        let (name, pick) = if to_ik {
+            (ch.name.clone(), ch.ik_control.clone())
+        } else {
+            (ch.name.clone(), pose::fk_side(ch)[0].to_string())
+        };
+        let mut next = self.posing.pose.clone();
+        pose::switch_limb(sk, rig, &mut next, k, to_ik);
+        self.begin_pose_edit();
+        self.posing.pose = next;
+        let hidden = self.hidden_controls();
+        self.posing.selected.retain(|n| !hidden.contains(n));
+        self.select_control(&pick, false);
+        self.info(format!(
+            "Switched {} to {}, matched to the pose.",
+            name.replace('_', " "),
+            if to_ik { "IK" } else { "FK" }
+        ));
+    }
+
     /// Put the picked controls (or every control) back at rest.
     pub fn reset_pose(&mut self, selected_only: bool) {
         if self.posing.pose.is_rest() {
@@ -599,12 +636,19 @@ impl Studio {
         let locks = pose::locks(c, sk);
         let attrs: Vec<pose::Attribute> = pose::attributes(rig)
             .into_iter()
-            .filter(|a| a.control == control)
+            .filter(|a| a.control == control && a.name != "ik_fk")
             .collect();
         let values: Vec<f32> = attrs
             .iter()
             .map(|a| self.posing.pose.attribute(rig, control, &a.name))
             .collect();
+        // Every control of an IK/FK limb carries its switch, as Zoo Hive's
+        // proxy attributes do: `ikfk`, 0 = IK, 1 = FK.
+        let limb = pose::limb_of(rig, control).map(|k| {
+            let ik = rig.ik_chains[k].ik_control.clone();
+            let ikfk = 1.0 - self.posing.pose.attribute(rig, &ik, "ik_fk");
+            (k, ik, ikfk)
+        });
 
         ui.horizontal_wrapped(|ui| {
             for tool in Tool::ALL {
@@ -629,8 +673,37 @@ impl Studio {
         });
         ui.add_space(4.0);
 
+        let mut blending = false;
+        if let Some((k, ik, ikfk)) = limb {
+            ui.horizontal(|ui| {
+                ui.label("IK / FK");
+                for (label, to_ik, on) in [("IK", true, ikfk <= 0.0), ("FK", false, ikfk >= 1.0)] {
+                    let tip = format!(
+                        "Switch to {label}, matched so the limb stays put (the other side's controls hide)"
+                    );
+                    if ui.selectable_label(on, label).on_hover_text(tip).clicked() && !on {
+                        self.switch_limb(k, to_ik);
+                    }
+                }
+            });
+            let mut v = ikfk;
+            let r = ui
+                .add(egui::Slider::new(&mut v, 0.0..=1.0).text("ikfk"))
+                .on_hover_text("Blend without matching: 0 = IK, 1 = FK (Zoo Hive's ikfk)");
+            if r.changed() {
+                self.start_channel_edit();
+                if let Some(Ok(built)) = self.doc.as_ref().map(|d| &d.preview) {
+                    self.posing
+                        .pose
+                        .set_attribute(&built.controls, &ik, "ik_fk", 1.0 - v);
+                }
+            }
+            blending = r.dragged() || r.has_focus();
+            ui.add_space(4.0);
+        }
+
         let mut ch = self.posing.pose.channels(control);
-        let mut editing = false;
+        let mut editing = blending;
         let mut changed = false;
         egui::Grid::new(("channels", control))
             .num_columns(4)
@@ -1013,6 +1086,35 @@ mod tests {
         s.end_gizmo();
         assert!(s.posing.pose.is_rest());
         assert_eq!(s.posing.undo.len(), undo);
+    }
+
+    #[test]
+    fn the_ik_fk_switch_hides_the_other_side_and_matches() {
+        let mut s = built();
+        let (_, rig) = s.pose_rig().unwrap();
+        let k = rig
+            .ik_chains
+            .iter()
+            .position(|c| c.name == "arm_l")
+            .unwrap();
+        let ch = rig.ik_chains[k].clone();
+        // The demo's arms start in FK: their IK controls are hidden.
+        assert!(s.hidden_controls().contains(&ch.ik_control));
+        assert!(!s.hidden_controls().contains(&ch.fk_controls[0]));
+        let hand = s.pose_rig().unwrap().0.index_of("hand_l").unwrap();
+        let fk = fk_on(&s, "lowerarm_l");
+        s.select_control(&fk, false);
+        let start = s.posing.pose.clone();
+        s.apply_gizmo(&start, GizmoOp::Rotate(Vec3::Y, 0.7));
+        let before = s.frame().unwrap().bones[hand].0;
+        s.switch_limb(k, true);
+        assert!(s.hidden_controls().contains(&ch.fk_controls[0]));
+        assert!(!s.hidden_controls().contains(&ch.ik_control));
+        assert_eq!(s.posing.selected, vec![ch.ik_control.clone()]);
+        assert!(s.frame().unwrap().bones[hand].0.distance(before) < 5e-3);
+        // One undo step takes the switch back.
+        s.undo();
+        assert!(s.hidden_controls().contains(&ch.ik_control));
     }
 
     #[test]

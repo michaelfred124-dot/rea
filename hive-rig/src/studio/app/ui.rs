@@ -1150,6 +1150,27 @@ impl Studio {
                     ui.separator();
                 }
                 Some(RigPick::Control(name)) => {
+                    // Zoo Hive's IK/FK menu: always offers the other side, matched.
+                    let limb = doc.preview.as_ref().ok().and_then(|b| {
+                        let k = hive_rig::pose::limb_of(&b.controls, &name)?;
+                        let ik = &b.controls.ik_chains[k].ik_control;
+                        Some((
+                            k,
+                            self.posing.pose.attribute(&b.controls, ik, "ik_fk") >= 0.5,
+                        ))
+                    });
+                    if let Some((k, in_ik)) = limb {
+                        let label = if in_ik {
+                            "Switch to FK (match)"
+                        } else {
+                            "Switch to IK (match)"
+                        };
+                        if ui.button(label).clicked() {
+                            self.switch_limb(k, !in_ik);
+                            ui.close();
+                        }
+                        ui.separator();
+                    }
                     if let Some(bone) = control_bone
                         && ui.button("Test pose on its bone").clicked()
                     {
@@ -3356,7 +3377,11 @@ impl Studio {
         }
         let built = self.doc.as_ref()?.preview.as_ref().ok()?;
         let mut best: Option<(f32, &str)> = None;
+        let hidden = self.hidden_controls();
         for (i, c) in built.controls.controls.iter().enumerate() {
+            if hidden.contains(&c.name) {
+                continue;
+            }
             let mut d = pr
                 .pos(frame.controls[i])
                 .map_or(f32::INFINITY, |s| s.distance(at));
@@ -3612,7 +3637,12 @@ impl Studio {
                 (Some(p), Some(f)) if self.posing.gizmo.is_none() => self.pick_control(pr, p, f),
                 _ => None,
             };
+            // The IK/FK switches show only the active side's controls.
+            let hidden = self.hidden_controls();
             for (i, c) in built.controls.controls.iter().enumerate() {
+                if hidden.contains(&c.name) {
+                    continue;
+                }
                 let picked = self.rig_pick == Some(RigPick::Control(c.name.clone()))
                     || self.posing.selected.contains(&c.name);
                 let hovered = hover.as_deref() == Some(c.name.as_str());
@@ -5711,10 +5741,19 @@ mod tests {
         // Every control can be picked at the point of its curve furthest from
         // its centre on screen, not only at the centre.
         let mut far_picks = 0;
+        let hidden = s.hidden_controls();
         for (i, c) in built.controls.controls.iter().enumerate() {
             let Some(centre) = pr.pos(frame.controls[i]) else {
                 continue;
             };
+            // The IK/FK switch hides the inactive side: it isn't drawn or picked.
+            if hidden.contains(&c.name) {
+                assert_ne!(
+                    s.pick_control(&pr, centre, &frame).as_deref(),
+                    Some(c.name.as_str())
+                );
+                continue;
+            }
             let far = control_lines(c, i, Some(&frame))
                 .into_iter()
                 .flatten()
