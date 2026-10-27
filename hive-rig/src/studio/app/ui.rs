@@ -44,6 +44,8 @@ const HANDLE_REACH: f32 = 2.0;
 const JOINT_SIZE: f32 = 0.0095;
 /// Reach, in pixels, around bones too thin to hit on screen.
 const BONE_REACH: f32 = 6.0;
+/// How near a control's curve the pointer has to be to pick it.
+const CURVE_REACH: f32 = 8.0;
 const HANDLE: Color32 = Color32::from_rgb(230, 52, 52);
 const JOINT: Color32 = Color32::from_rgb(255, 205, 60);
 /// Picked parts, Maya-style light blue.
@@ -2978,7 +2980,7 @@ impl Studio {
 
     // ----------------------------------------------------------------------- viewport
 
-    fn frame_camera(&mut self) {
+    pub(super) fn frame_camera(&mut self) {
         if let Some(doc) = &self.doc {
             let (min, max) = doc.mesh.bounds();
             self.camera.frame(min, max);
@@ -3117,6 +3119,22 @@ impl Studio {
             && let Some(h) = self.gizmo_handle(&pr, p)
         {
             posing = self.begin_gizmo(&pr, h, p);
+        }
+        // Pressing on a control's curve takes it and drags it with the tool in
+        // hand (Move in the view plane, Rotate about the view, Scale), as in
+        // Maya; it never turns the camera.
+        if !posing
+            && !stroking
+            && self.pose.is_none()
+            && response.drag_started_by(PointerButton::Primary)
+            && let Some(p) = press.or(pointer)
+            && let Some(frame) = self.frame()
+            && let Some(name) = self.pick_control(&pr, p, &frame)
+        {
+            if !self.posing.selected.contains(&name) {
+                self.select_control(&name, shift);
+            }
+            posing = self.begin_gizmo(&pr, super::posing::Handle::Center, p);
         }
         if posing {
             if response.dragged_by(PointerButton::Primary)
@@ -3292,25 +3310,10 @@ impl Studio {
         }
         let doc = self.doc.as_ref()?;
         let built = doc.preview.as_ref().ok()?;
+        if let Some(name) = self.pick_control(pr, at, frame) {
+            return Some(RigPick::Control(name));
+        }
         let mut best: Option<(f32, RigPick)> = None;
-        // Controls are only drawn, so only picked, in the controls stage.
-        let controls = if self.mode == Mode::Rig {
-            &built.controls.controls[..]
-        } else {
-            &[]
-        };
-        for (i, c) in controls.iter().enumerate() {
-            let Some(s) = pr.pos(frame.controls[i]) else {
-                continue;
-            };
-            let d = s.distance(at);
-            if d <= PICK_RADIUS && best.as_ref().is_none_or(|b| d < b.0) {
-                best = Some((d, RigPick::Control(c.name.clone())));
-            }
-        }
-        if best.is_some() {
-            return best.map(|b| b.1);
-        }
         // The joints and bones as drawn: the front-most ball or face under the
         // pointer, unless the mesh hides it.
         let (shown, specs) = self.bone_specs(Some(frame), None);
@@ -3343,6 +3346,33 @@ impl Studio {
             }
         }
         best.map(|b| b.1)
+    }
+
+    /// The control whose drawn curve (or centre) is under the pointer, as in
+    /// Maya: anywhere along the line picks it. Only the controls stage draws them.
+    fn pick_control(&self, pr: &Projector, at: Pos2, frame: &super::Frame) -> Option<String> {
+        if self.mode != Mode::Rig {
+            return None;
+        }
+        let built = self.doc.as_ref()?.preview.as_ref().ok()?;
+        let mut best: Option<(f32, &str)> = None;
+        for (i, c) in built.controls.controls.iter().enumerate() {
+            let mut d = pr
+                .pos(frame.controls[i])
+                .map_or(f32::INFINITY, |s| s.distance(at));
+            for line in control_lines(c, i, Some(frame)) {
+                let pts: Vec<Option<Pos2>> = line.iter().map(|p| pr.pos(*p)).collect();
+                for w in pts.windows(2) {
+                    if let [Some(a), Some(b)] = w {
+                        d = d.min(distance_to_segment(at, *a, *b));
+                    }
+                }
+            }
+            if d <= CURVE_REACH && best.is_none_or(|b| d < b.0) {
+                best = Some((d, &c.name));
+            }
+        }
+        best.map(|b| b.1.to_string())
     }
 
     /// The joints' size before any bone shortens it: a fraction of the
@@ -3575,41 +3605,35 @@ impl Studio {
             joints::paint(painter, &skeleton);
         }
 
-        // Controls over the skeleton, as animators pick them.
+        // Controls over the skeleton, as animators pick them. The one under the
+        // pointer brightens, so it is clear a click will take it.
         if self.mode == Mode::Rig {
+            let hover = match (pointer, frame) {
+                (Some(p), Some(f)) if self.posing.gizmo.is_none() => self.pick_control(pr, p, f),
+                _ => None,
+            };
             for (i, c) in built.controls.controls.iter().enumerate() {
-                let position = frame.map_or(c.position, |f| f.controls[i]);
-                let axis = frame.map_or(c.axis, |f| f.control_axes[i]);
                 let picked = self.rig_pick == Some(RigPick::Control(c.name.clone()))
                     || self.posing.selected.contains(&c.name);
-                // The same lines the Blender and Maya builders draw; a posed
-                // control turns and scales with its channels.
-                // The face board's panel draws its edge and tracks with it.
-                let outline = match frame.and_then(|f| f.control_mats.as_ref()) {
-                    Some(mats) => c
-                        .rest_lines()
-                        .into_iter()
-                        .map(|l| l.into_iter().map(|p| mats[i].transform_point3(p)).collect())
-                        .collect(),
-                    None => {
-                        let shift = position - c.position;
-                        let mut lines = c.outline_at(position, axis);
-                        lines.extend(
-                            c.extra
-                                .iter()
-                                .map(|l| l.iter().map(|p| *p + shift).collect::<Vec<_>>()),
-                        );
-                        lines
-                    }
+                let hovered = hover.as_deref() == Some(c.name.as_str());
+                let outline = control_lines(c, i, frame);
+                let width = if picked {
+                    3.5
+                } else if hovered {
+                    3.0
+                } else {
+                    2.0
+                };
+                let color = if hovered && !picked {
+                    lighten(rgb(c.color))
+                } else {
+                    rgb(c.color)
                 };
                 view::strokes(
                     painter,
                     pr,
                     &outline,
-                    Stroke::new(
-                        if picked { 3.5 } else { 2.0 } * c.width().sqrt().max(0.5),
-                        rgb(c.color),
-                    ),
+                    Stroke::new(width * c.width().sqrt().max(0.5), color),
                 );
             }
         }
@@ -5560,6 +5584,41 @@ fn pole_marker(painter: &egui::Painter, at: Pos2) {
     painter.circle_stroke(at, 9.0, Stroke::new(1.0, POLE.gamma_multiply(0.6)));
 }
 
+/// A control's lines in model space as drawn: posed with its channels when the
+/// frame has them, else carried to where the frame puts it.
+fn control_lines(
+    c: &hive_rig::controls::Control,
+    i: usize,
+    frame: Option<&super::Frame>,
+) -> hive_rig::controls::Strokes {
+    // The face board's panel draws its edge and tracks with it.
+    match frame.and_then(|f| f.control_mats.as_ref()) {
+        Some(mats) => c
+            .rest_lines()
+            .into_iter()
+            .map(|l| l.into_iter().map(|p| mats[i].transform_point3(p)).collect())
+            .collect(),
+        None => {
+            let position = frame.map_or(c.position, |f| f.controls[i]);
+            let axis = frame.map_or(c.axis, |f| f.control_axes[i]);
+            let shift = position - c.position;
+            let mut lines = c.outline_at(position, axis);
+            lines.extend(
+                c.extra
+                    .iter()
+                    .map(|l| l.iter().map(|p| *p + shift).collect::<Vec<_>>()),
+            );
+            lines
+        }
+    }
+}
+
+/// A brighter shade of a control's colour, for the one under the pointer.
+fn lighten(c: Color32) -> Color32 {
+    let up = |v: u8| v + (255 - v) / 2;
+    Color32::from_rgb(up(c.r()), up(c.g()), up(c.b()))
+}
+
 /// Screen distance from `p` to the segment `a`-`b`.
 fn distance_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
     let ab = b - a;
@@ -5642,6 +5701,43 @@ mod tests {
         // Hidden joints can't be picked.
         s.joints.show = false;
         assert_eq!(picks(&s, &pr, elbow), None);
+    }
+
+    #[test]
+    fn clicking_anywhere_on_a_control_curve_picks_it() {
+        let (s, pr) = studio(Mode::Rig);
+        let frame = s.frame().unwrap();
+        let built = s.doc.as_ref().unwrap().preview.as_ref().unwrap();
+        // Every control can be picked at the point of its curve furthest from
+        // its centre on screen, not only at the centre.
+        let mut far_picks = 0;
+        for (i, c) in built.controls.controls.iter().enumerate() {
+            let Some(centre) = pr.pos(frame.controls[i]) else {
+                continue;
+            };
+            let far = control_lines(c, i, Some(&frame))
+                .into_iter()
+                .flatten()
+                .filter_map(|p| pr.pos(p))
+                .max_by(|a, b| a.distance(centre).total_cmp(&b.distance(centre)))
+                .unwrap();
+            if far.distance(centre) <= 2.0 * PICK_RADIUS {
+                continue;
+            }
+            let picked = s.pick_control(&pr, far, &frame).unwrap();
+            // Where curves cross, the nearest one wins; it is still a control.
+            far_picks += usize::from(picked == c.name);
+            assert!(matches!(s.pick_rig(&pr, far), Some(RigPick::Control(_))));
+        }
+        assert!(
+            far_picks > 10,
+            "only {far_picks} controls picked on their curve"
+        );
+        // Out of the controls stage they aren't drawn, so aren't picked.
+        let (s, pr) = studio(Mode::Skeleton);
+        let frame = s.frame().unwrap();
+        let c0 = pr.pos(frame.controls[0]).unwrap();
+        assert_eq!(s.pick_control(&pr, c0, &frame), None);
     }
 
     #[test]

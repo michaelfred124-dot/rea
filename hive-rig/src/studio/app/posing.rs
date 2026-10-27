@@ -487,6 +487,16 @@ impl Studio {
                         GizmoOp::Rotate(n, n.dot(v0.cross(v1)).atan2(v0.dot(v1)))
                     })
             }
+            // A drag started on the control itself turns it about the view.
+            (Tool::Rotate, Handle::Center) => {
+                let n = -pr.forward;
+                on_plane(pr, g.start_pointer, at, n)
+                    .zip(on_plane(pr, pointer, at, n))
+                    .map(|(p0, p1)| {
+                        let (v0, v1) = (p0 - at, p1 - at);
+                        GizmoOp::Rotate(n, n.dot(v0.cross(v1)).atan2(v0.dot(v1)))
+                    })
+            }
             (Tool::Scale, Handle::Center) => {
                 let dx = pointer.x - g.start_pointer.x;
                 Some(GizmoOp::Scale(None, (dx / 150.0).exp()))
@@ -975,6 +985,34 @@ mod tests {
         // The lid closes in the viewport.
         let posed = s.frame().unwrap();
         assert!(posed.bones[lid].1.y < rest.bones[lid].1.y - 0.002);
+    }
+
+    /// Dragging from the control itself (not the manipulator) turns it about
+    /// the view with Rotate; with Select it only selects, leaving no undo step.
+    #[test]
+    fn dragging_a_control_itself_uses_the_tool_in_hand() {
+        let mut s = built();
+        s.frame_camera();
+        let pr = s.camera.projector(egui::Rect::from_min_size(
+            Pos2::ZERO,
+            egui::vec2(1400.0, 860.0),
+        ));
+        let name = fk_on(&s, "lowerarm_l");
+        s.select_control(&name, false);
+        let at = pr.pos(s.manip().unwrap().at).unwrap();
+        s.posing.tool = Tool::Rotate;
+        assert!(s.begin_gizmo(&pr, Handle::Center, at + egui::vec2(40.0, 0.0)));
+        s.drag_gizmo(&pr, at + egui::vec2(0.0, -40.0));
+        s.end_gizmo();
+        assert!(!s.posing.pose.is_rest());
+        s.reset_pose(false);
+        let undo = s.posing.undo.len();
+        s.posing.tool = Tool::Select;
+        assert!(s.begin_gizmo(&pr, Handle::Center, at));
+        s.drag_gizmo(&pr, at + egui::vec2(30.0, 30.0));
+        s.end_gizmo();
+        assert!(s.posing.pose.is_rest());
+        assert_eq!(s.posing.undo.len(), undo);
     }
 
     #[test]
