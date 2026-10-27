@@ -120,7 +120,7 @@ for name in sorted(limbs):
     # IK to FK: pose the IK limb, match, and the FK controls hold the IK pose.
     ns["reset_pose"](rig)
     ik = pose[limb["ik"]]
-    ik["ik_fk"] = 1.0
+    ik["ikfk"] = 0.0
     upper, end = bones[limb["upper"]].head_local, bones[limb["end"]].head_local
     m = ik.matrix.copy()
     m.translation += (upper - end) * 0.3 + Vector((0.0, -0.05, 0.03))
@@ -137,7 +137,7 @@ for name in sorted(limbs):
     ik_pose = [world(b) for b in chain_bones(limb)]
     check(differs(ik_pose[0], world(limb["fk"][0]))[1] > 0.05, "%s: IK pose differs from FK before matching" % name)
     ns["ik_to_fk"](rig, name)
-    check(pose[limb["ik"]]["ik_fk"] == 0.0, "%s: IK to FK switches the limb to FK" % name)
+    check(pose[limb["ik"]]["ikfk"] == 1.0, "%s: IK to FK switches the limb to FK" % name)
     for bone, ctrl, want in zip(chain_bones(limb), limb["fk"], ik_pose):
         ok, how = same(world(ctrl), want)
         check(ok, "%s: FK control %s matches the IK pose (%s)" % (name, ctrl, how))
@@ -146,7 +146,7 @@ for name in sorted(limbs):
 
     # FK to IK: pose the FK limb (bending the middle joint like a hinge), match.
     ns["reset_pose"](rig)
-    pose[limb["ik"]]["ik_fk"] = 0.0
+    pose[limb["ik"]]["ikfk"] = 1.0
     if kind == "leg":
         pose[limb["ik"]]["roll"] = -20.0  # the IK goal sits off the control
     turn(limb["fk"][0], (0.35, 0.2, -0.3))
@@ -159,14 +159,14 @@ for name in sorted(limbs):
     update()
     fk_pose = [world(b) for b in chain_bones(limb)]
     ns["fk_to_ik"](rig, name)
-    check(pose[limb["ik"]]["ik_fk"] == 1.0, "%s: FK to IK switches the limb to IK" % name)
+    check(pose[limb["ik"]]["ikfk"] == 0.0, "%s: FK to IK switches the limb to IK" % name)
     for bone, want in zip(chain_bones(limb), fk_pose):
         ok, how = same(world(bone), want)
         check(ok, "%s: %s does not pop switching to IK (%s)" % (name, bone, how))
 
     # A straight limb has no bend plane; the pole still lands in front of the joint.
     ns["reset_pose"](rig)
-    pose[limb["ik"]]["ik_fk"] = 0.0
+    pose[limb["ik"]]["ikfk"] = 1.0
     pose[limb["fk"][1]].rotation_mode = "QUATERNION"
     pose[limb["fk"][1]].rotation_quaternion = Quaternion(bend_axis(limb), 0.0)
     pose[limb["fk"][1]].rotation_mode = "XYZ"
@@ -287,7 +287,7 @@ def pose_some_of_everything():
             pb.location = (0.01 * (k % 3), -0.008 * (k % 2 + 1), 0.006)
     if has_limbs:
         pose[limbs["leg_l"]["ik"]]["roll"] = 20.0
-        pose[limbs["arm_r"]["ik"]]["ik_fk"] = 1.0
+        pose[limbs["arm_r"]["ik"]]["ikfk"] = 0.0
     update()
 
 
@@ -313,7 +313,7 @@ check(moved > 1e-3 or not any(before_pose[n] != Matrix.Identity(4) for n in data
 twin = {l: r for l, r in data["mirror"]}
 twin.update({r: l for l, r in data["mirror"]})
 check(all(ns["control_settings"](pose[twin.get(n, n)]) == settings_before[n] for n in data["controls"]),
-      "flip swaps ik_fk, roll and the other settings between twins")
+      "flip swaps ikfk, roll and the other settings between twins")
 flipped_pose = {n: pose[n].matrix_basis.copy() for n in data["controls"]}
 ns["flip_pose"](rig)
 err = max(max(abs(a - b) for ra, rb in zip(pose[n].matrix_basis, before_pose[n]) for a, b in zip(ra, rb))
@@ -355,7 +355,7 @@ check(not any(ns["bone_selected"](p) for p in pose if p.name not in data["contro
 ns["reset_pose"](rig)
 if has_limbs:
     hand_ik = arm["ik"]
-    pose[hand_ik]["ik_fk"] = 1.0
+    pose[hand_ik]["ikfk"] = 0.0
     target = 2
 else:
     hand_ik = next(c for c in data["controls"] if c in data["spaces"])
@@ -417,8 +417,8 @@ if has_limbs:
     ik = pose[limb["ik"]]
     for f in frames:
         scene.frame_set(f)
-        ik["ik_fk"] = 0.0
-        ik.keyframe_insert('["ik_fk"]')
+        ik["ikfk"] = 1.0
+        ik.keyframe_insert('["ikfk"]')
         for k, ctrl in enumerate(limb["fk"]):
             pb = pose[ctrl]
             pb.rotation_mode = "XYZ"
@@ -438,7 +438,7 @@ if has_limbs:
     check(n == len(frames) and scene.frame_current == 3, "range: FK to IK visits %d frames and comes back" % n)
     for f in frames:
         scene.frame_set(f)
-        check(pose[limb["ik"]]["ik_fk"] == 1.0, "range: frame %d is keyed to IK" % f)
+        check(pose[limb["ik"]]["ikfk"] == 0.0, "range: frame %d is keyed to IK" % f)
         for bone, want in zip(chain_bones(limb), fk_poses[f]):
             ok, how = same(world(bone), want)
             check(ok, "range: frame %d, %s keeps its FK pose in IK (%s)" % (f, bone, how))
@@ -446,7 +446,7 @@ if has_limbs:
     n = ns["match_range"](rig, name, "fk", frames)
     for f in frames:
         scene.frame_set(f)
-        check(pose[limb["ik"]]["ik_fk"] == 0.0, "range: frame %d is keyed back to FK" % f)
+        check(pose[limb["ik"]]["ikfk"] == 1.0, "range: frame %d is keyed back to FK" % f)
         for bone, ctrl, want in zip(chain_bones(limb), limb["fk"], fk_poses[f]):
             ok, how = same(world(bone), want)
             check(ok, "range: frame %d, %s keeps its pose back in FK (%s)" % (f, bone, how))
@@ -490,7 +490,26 @@ for fan in RIG_DATA["controls"].get("feathers", []):
 fade = ns["proximity_fade"]
 check(fade(0) == 1.0 and fade(ns["PROXIMITY_NEAR"]) == 1.0 and fade(ns["PROXIMITY_FAR"]) == 0.0
       and 0.0 < fade(0.5 * (ns["PROXIMITY_NEAR"] + ns["PROXIMITY_FAR"])) < 1.0, "proximity: controls fade in between near and far")
-names = data["controls"]
+# The IK/FK switch shows one side of each limb, as Zoo Hive does; Proximity
+# Controls leaves those controls to it.
+switched = set(data["switched"])
+for limb in data["limbs"]:
+    ik = pose[limb["ik"]]
+    ik_side = [limb["ik"], limb["pole"]] + ([limb["hock"]["control"]] if limb["hock"] else [])
+    check(set(ik_side + limb["fk"]) <= switched, "%s: its controls follow the IK/FK switch" % limb["name"])
+    was = ik["ikfk"]
+    for value, ik_shows, fk_shows in ((0.0, True, False), (1.0, False, True), (0.5, True, True)):
+        ik["ikfk"] = value
+        rig.update_tag()
+        bpy.context.view_layer.update()
+        shown = lambda n: not ns["bone_hidden"](pose[n])
+        check(all(shown(n) == ik_shows for n in ik_side) and all(shown(n) == fk_shows for n in limb["fk"]),
+              "%s: ikfk %g shows %s" % (limb["name"], value, "both sides" if ik_shows and fk_shows
+                                        else "only IK" if ik_shows else "only FK"))
+    ik["ikfk"] = was
+    rig.update_tag()
+    bpy.context.view_layer.update()
+names = [n for n in data["controls"] if n not in switched]
 near_one, picked = names[0], names[-1]
 for n in names:
     ns["set_bone_selected"](pose[n], n == picked)
@@ -503,7 +522,7 @@ check(len(lines) > 0 and all(abs(f - 0.3) < 1e-6 and len(p) % 2 == 0 for f, p in
       "proximity: the fading controls are drawn as lines (%d)" % len(lines))
 # Distances from a projection: straight down the view, the root sits under the mouse.
 at = ns["proximity_fades"](rig, lambda p: (p.x * 1000.0, p.y * 1000.0), (0.0, 0.0))
-check(set(at) == set(names) and max(at.values()) == 1.0, "proximity: fades come from screen distance")
+check(set(names) <= set(at) and max(at.values()) == 1.0, "proximity: fades come from screen distance")
 ns["show_all_controls"](rig)
 check(not any(ns["bone_hidden"](pose[n]) for n in names), "proximity: turning it off shows every control")
 check(hasattr(bpy.types.WindowManager, "hive_proximity") and hasattr(bpy.types, "HIVE_OT_proximity"),

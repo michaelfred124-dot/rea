@@ -133,7 +133,7 @@ for name in ("arm_l", "leg_l", "arm_r", "leg_r"):
     upper, lower = b["upper"], b["lower"]
     reset()
     # Pose the limb first (FK for arms, IK for legs) so the bend works on a posed limb.
-    if limb["fk"] and pose[limb["ik"]]["ik_fk"] < 0.5:
+    if limb["fk"] and pose[limb["ik"]]["ikfk"] > 0.5:
         pose[limb["fk"][0]].rotation_euler = (0.2, 0.1, -0.15)
         pose[limb["fk"][1]].rotation_euler = (0.0, 0.0, 0.0)
     else:
@@ -214,7 +214,7 @@ def sweep(soft_value, stretch=0.0, lo=0.85, hi=1.15, steps=61):
     """Move the IK goal out along the rest reach line; return (goal distance, knee
     angle, end distance) at each step."""
     reset()
-    ik["ik_fk"] = 1.0
+    ik["ikfk"] = 0.0
     ik["soft"] = soft_value
     ik["stretch"] = stretch
     update()
@@ -273,7 +273,7 @@ check(all(stretchy[i + 1][1] <= stretchy[i][1] + 1e-6 for i in range(len(stretch
 # FK to IK on a nearly straight leg: the goal is pushed out so the softened reach lands on FK.
 reset()
 ik["soft"] = 0.5
-ik["ik_fk"] = 0.0
+ik["ikfk"] = 1.0
 
 
 def bend_axis(limb):

@@ -871,7 +871,7 @@ if __name__ == "__main__":
                     keys = {c.args[3] for c in lib.set_local_control_rig_euler_transform.call_args_list
                             if c.args[2] == keyed}
                     blend = {(c.args[3], c.args[4]) for c in lib.set_local_control_rig_float.call_args_list
-                             if c.args[2] == n + "_ik_fk"}
+                             if c.args[2] == n + "_ikfk"}
                     assert loaded == keys == frames, (n, to, argv, loaded, keys)
                     assert blend == {(f, 0.5) for f in frames}, blend  # the stub reads every float as 0.5
         entries = ns["register_menu"]()
@@ -898,7 +898,7 @@ if __name__ == "__main__":
             twins_f = ns["float_twins"]()
             for chain in rig["ik_chains"]:
                 if chain["name"].endswith("_l"):
-                    assert twins_f[chain["name"] + "_ik_fk"] == chain["name"][:-2] + "_r_ik_fk", twins_f
+                    assert twins_f[chain["name"] + "_ikfk"] == chain["name"][:-2] + "_r_ikfk", twins_f
             # Twins land on each other's mirror image: with every rest frame
             # the same, a centre control stays on the mirror plane.
             point, normal = ns["mirror_plane"]((None, lib.get_control_rigs.return_value[0].control_rig))
@@ -919,8 +919,8 @@ if __name__ == "__main__":
                 settings = {c.args[2] for c in lib.set_local_control_rig_float.call_args_list}
                 for chain in rig["ik_chains"]:
                     side = chain["ik_control"] in onto
-                    has_twin = chain["name"] + "_ik_fk" in twins_f
-                    assert (chain["name"] + "_ik_fk" in settings) == (side and has_twin), (argv, chain["name"])
+                    has_twin = chain["name"] + "_ikfk" in twins_f
+                    assert (chain["name"] + "_ikfk" in settings) == (side and has_twin), (argv, chain["name"])
             # One control given: only its twin takes the pose.
             hierarchy.set_global_transform.reset_mock()
             assert ns["mirror_pose"](None, [pairs[0][0]]) == 1

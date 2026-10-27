@@ -2,7 +2,8 @@
 
 Imports the skinned glTF, creates a Control Rig Blueprint for it and fills it
 with the hive controls: FK controls for every bone, Two Bone IK with pole
-vectors on each limb, and an `<limb>_ik_fk` float control blending IK and FK.
+vectors on each limb, and Zoo Hive's switch as an `<limb>_ikfk` float control
+(0 = IK, 1 = FK); each limb shows only the active side's controls.
 
 Bendy limbs are an approximation here: the bend joints slide onto the curve the
 bend and pin controls describe but don't turn along it. Soft IK eases the reach
@@ -413,7 +414,7 @@ def build():
 
     for chain in CHAINS:
         owner = control_key(chain["ik_control"])
-        add_float(chain["name"] + "_ik_fk", owner, 0.0, 1.0, chain["default_blend"])
+        add_float(chain["name"] + "_ikfk", owner, 0.0, 1.0, 1.0 - chain["default_blend"])
         add_float(chain["name"] + "_stretch", owner, 0.0, 1.0, chain["default_stretch"])
         if chain.get("foot"):
             add_float(chain["name"] + "_roll", owner, -90.0, 120.0, 0.0)
@@ -551,6 +552,27 @@ def build():
 
     def get_float(name):
         return unit("RigUnit_GetControlFloat", "Get_" + name, {"Control": name})
+
+
+    def show_limb_side(chain, ikfk):
+        """Show only the active side's controls, as Zoo Hive does: the IK control,
+        pole and hock while `ikfk` is below 1, the FK controls while it is above 0."""
+        hock, n = chain.get("hock"), chain["name"]
+        ik_side = [chain["ik_control"], chain["pole_control"]] + ([hock["control"]] if hock else [])
+        fk = chain["fk_controls"]
+        fk_side = fk[:2] + ([hock["fk_control"]] if hock else []) + fk[2:]
+        try:
+            ik_shows = math("FloatLess", n + "_ik_shows", {"B": "1.0"})
+            fk_shows = math("FloatGreater", n + "_fk_shows", {"B": "0.0"})
+            vm.add_link(ikfk + ".FloatValue", ik_shows + ".A")
+            vm.add_link(ikfk + ".FloatValue", fk_shows + ".A")
+            for names, shows in ((ik_side, ik_shows), (fk_side, fk_shows)):
+                for c in names:
+                    vis = unit("RigUnit_SetControlVisibility", "Show_" + c, {"Item": item_pin("Control", c)})
+                    vm.add_link(shows + ".Result", vis + ".bVisible")
+                    chain_exec(vis)
+        except Exception as e:  # an engine without the node still gets a working rig
+            unreal.log_warning("hive-rig: %s shows both IK and FK controls (%s)" % (n, e))
 
 
     math_pi = _math.pi
@@ -949,7 +971,12 @@ def build():
         bend = m - (a + e) * 0.5
         secondary = upper.inverse_transform_direction(bend.normal() if bend.length() > 1e-3 else unreal.Vector(0, 1, 0))
 
-        blend = get_float(chain["name"] + "_ik_fk")
+        # Zoo Hive's switch: `ikfk` 0 = IK, 1 = FK; the IK weighs 1 - ikfk.
+        ikfk = get_float(chain["name"] + "_ikfk")
+        ik_on = math("FloatSub", chain["name"] + "_ik_on", {"A": "1.0"})
+        vm.add_link(ikfk + ".FloatValue", ik_on + ".B")
+        ik_weight = ik_on + ".Result"
+        show_limb_side(chain, ikfk)
         rig_foot = foot_rig.get(chain["name"])
         if rig_foot:
             # Roll: heel takes min(roll, 0), ball clamp(roll, 0, break), toe max(roll - break, 0).
@@ -1052,7 +1079,7 @@ def build():
             place = unit("RigUnit_SetTranslation", "Stretch_" + bone,
                          {"Item": item_pin("Bone", bone), "Space": "LocalSpace", "bPropagateToChildren": "True"})
             vm.add_link(longer + ".Result", place + ".Value")
-            vm.add_link(blend + ".FloatValue", place + ".Weight")
+            vm.add_link(ik_weight, place + ".Weight")
             chain_exec(place)
 
         ik = unit("RigUnit_TwoBoneIKSimplePerItem", "IK_" + chain["name"], {
@@ -1068,20 +1095,20 @@ def build():
         vm.add_link(toward + ".Result", ik + ".Effector.Translation")
         vm.add_link(solve_to + ".Transform.Rotation", ik + ".Effector.Rotation")
         vm.add_link(pole + ".Transform.Translation", ik + ".PoleVector")
-        vm.add_link(blend + ".FloatValue", ik + ".Weight")
+        vm.add_link(ik_weight, ik + ".Weight")
         chain_exec(ik)
 
         if ik_end != chain["end"]:
             seg = unit("RigUnit_SetRotation", "IKRot_" + ik_end,
                        {"Item": item_pin("Bone", ik_end), "Space": "GlobalSpace", "bPropagateToChildren": "True"})
             vm.add_link(solve_to + ".Transform.Rotation", seg + ".Value")
-            vm.add_link(blend + ".FloatValue", seg + ".Weight")
+            vm.add_link(ik_weight, seg + ".Weight")
             chain_exec(seg)
 
         hand = unit("RigUnit_SetRotation", "IKRot_" + chain["end"],
                     {"Item": item_pin("Bone", chain["end"]), "Space": "GlobalSpace", "bPropagateToChildren": "True"})
         vm.add_link(effector + ".Transform.Rotation", hand + ".Value")
-        vm.add_link(blend + ".FloatValue", hand + ".Weight")
+        vm.add_link(ik_weight, hand + ".Weight")
         chain_exec(hand)
 
         if rig_foot:
@@ -1096,7 +1123,7 @@ def build():
                        {"Item": item_pin("Bone", rig_foot["ball_bone"]), "Space": "GlobalSpace",
                         "bPropagateToChildren": "True"})
             vm.add_link(combined + ".Result", toe + ".Value")
-            vm.add_link(blend + ".FloatValue", toe + ".Weight")
+            vm.add_link(ik_weight, toe + ".Weight")
             chain_exec(toe)
 
     # Bendy limbs (an approximation): after the limb is solved, each bend joint moves
@@ -1488,7 +1515,7 @@ def animator_data():
             "goal": null_key(n + "_ankle") if c.get("foot") else control_key(c["ik_control"]),
             "hock": {"control": hock["control"], "target": n + "_hock"} if hock else None,
             "soft": None if hock else {"zone": float(c["soft_zone"])},
-            "floats": [n + "_ik_fk", n + "_stretch"] + ([n + "_roll"] if c.get("foot") else [])
+            "floats": [n + "_ikfk", n + "_stretch"] + ([n + "_roll"] if c.get("foot") else [])
             + ([n + "_spring"] if hock else [n + "_soft"]),
         })
     floats = [f for l in limbs for f in l["floats"]]
@@ -1688,21 +1715,21 @@ def unsoft_reach(reach, length, soft, zone):
 
 def match_ik_to_fk(ctx, limb):
     """Turn the FK controls onto the IK pose, then switch the limb to FK."""
-    blend = limb["name"] + "_ik_fk"
-    set_float(ctx, blend, 1.0)
+    blend = limb["name"] + "_ikfk"
+    set_float(ctx, blend, 0.0)
     targets = [global_of(ctx, bone_key(b)) for b in limb["bones"]]
     for ctrl, target in zip(limb["fk"], targets):
         k = control_key(ctrl)
         place(ctx, k, turned_like(global_of(ctx, k).translation, target))
-    set_float(ctx, blend, 0.0)
+    set_float(ctx, blend, 1.0)
     return limb["fk"] + [blend]
 
 
 def match_fk_to_ik(ctx, limb):
     """Move the IK control (and hock control) and pole onto the FK pose, then
     switch the limb to IK."""
-    blend = limb["name"] + "_ik_fk"
-    set_float(ctx, blend, 0.0)
+    blend = limb["name"] + "_ikfk"
+    set_float(ctx, blend, 1.0)
     fk = [global_of(ctx, bone_key(b)) for b in limb["bones"]]
     ik = control_key(limb["ik"])
     # The goal can sit below the control (a rolled foot); keep that offset.
@@ -1739,7 +1766,7 @@ def match_fk_to_ik(ctx, limb):
             target = carry.inverse() * turned_like(fk[2].translation, fk[2])
             place(ctx, ctrl, turned_like(global_of(ctx, ctrl).translation, target))
         place(ctx, pole, turned_like(unreal.Vector(*pole_position(ctx, limb, a, b, c, fk[0])), global_of(ctx, pole)))
-        set_float(ctx, blend, 1.0)
+        set_float(ctx, blend, 0.0)
         # Turn the pole about the reach until the middle joint lands on the FK one.
         for _ in range(8):
             got = v_sub(vec(global_of(ctx, bone_key(limb["bones"][1])).translation), a)
@@ -1855,7 +1882,7 @@ def twins():
 
 
 def float_twins():
-    """Each limb setting (arm_l_ik_fk...) mapped to its twin limb's."""
+    """Each limb setting (arm_l_ikfk...) mapped to its twin limb's."""
     out = {}
     twin = twins()
     by_ik = {c["ik_control"]: c["name"] for c in CHAINS}

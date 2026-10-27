@@ -95,8 +95,8 @@ def reset():
         for prop in ("roll", "stretch", "space"):
             if prop in p.keys():
                 p[prop] = 0
-        if "ik_fk" in p.keys():
-            p["ik_fk"] = 1.0
+        if "ikfk" in p.keys():
+            p["ikfk"] = 0.0
     update()
 
 
@@ -117,7 +117,7 @@ check(all(fc.driver.type != "SCRIPTED" or fc.driver.is_simple_expression for fc 
 for s in ("l", "r"):
     reset()
     foot_ik = "foot_%s_ik_ctrl" % s
-    check(pb[foot_ik]["ik_fk"] == 1.0, "hind leg %s starts in IK" % s)
+    check(pb[foot_ik]["ikfk"] == 0.0, "hind leg %s starts in IK" % s)
     # The pole stands straight ahead of the knee.
     off = head("calf_%s_pole_ctrl" % s) - rest_head("calf_" + s)
     check(off.dot(FORWARD) > 0.9 * off.length and abs(off.x) < 0.05 * off.length,
@@ -144,7 +144,7 @@ for s in ("l", "r"):
 
     # FK: the hock FK control turns everything below it.
     reset()
-    pb[foot_ik]["ik_fk"] = 0.0
+    pb[foot_ik]["ikfk"] = 1.0
     pb["hock_%s_fk_ctrl" % s].rotation_euler = (0.4, 0.0, 0.0)
     check((head("foot_" + s) - rest_head("foot_" + s)).length > 0.02, "hock %s FK control moves the paw" % s)
     pb["hock_%s_fk_ctrl" % s].rotation_euler = (0.0, 0.0, 0.0)
@@ -154,7 +154,7 @@ for s in ("l", "r"):
     # Front legs start in IK and their elbows fold backward.
     reset()
     hand_ik = "hand_%s_ik_ctrl" % s
-    check(pb[hand_ik]["ik_fk"] == 1.0, "front leg %s starts in IK" % s)
+    check(pb[hand_ik]["ikfk"] == 0.0, "front leg %s starts in IK" % s)
     move(hand_ik, (0, 0, 0.06))
     check((head("hand_" + s) - (rest_head("hand_" + s) + Vector((0, 0, 0.06)))).length < 1e-3,
           "front paw %s follows its IK control" % s)

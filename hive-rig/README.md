@@ -386,9 +386,12 @@ by readers, are not built yet.
   or a spline spine (see [Spline chains](#spline-chains-tentacles-and-a-spline-spine))
 * Arms and legs have FK controls, an IK control, a pole-vector control and an
   `ik_fk` blend (0 = FK, 1 = IK). Legs start in IK and arms start in FK.
-  In Maya the switch is Zoo Hive's `ikfk` (0 = IK, 1 = FK): it sits on the IK
-  control and every other control of the limb carries it as a proxy, so it is
-  in the channel box whichever control is picked. As in Zoo Hive, a limb shows
+  In the Maya, Blender and Unreal rigs the switch is Zoo Hive's `ikfk`
+  (0 = IK, 1 = FK). In Maya it sits on the IK control and every other control
+  of the limb carries it as a proxy, so it is in the channel box whichever
+  control is picked; in Blender it is a property of the IK control with a
+  slider per limb in the Hive tab; in Unreal it is the `<limb>_ikfk` float
+  control. As in Zoo Hive, a limb shows
   only the active side's controls (the IK control, pole and hock while any IK
   is on, the FK controls while any FK is). Hive Studio's Rig stage does the
   same, with an **IK | FK** switch on every limb control (and on its right-click

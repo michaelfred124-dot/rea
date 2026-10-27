@@ -155,12 +155,12 @@ for side in ("l", "r"):
     check(head("calf_" + side).y < rest_head("calf_" + side).y - 0.05, "knee_%s bends forward" % side)
 
     hand_ik = "hand_%s_ik_ctrl" % side
-    check(pb[hand_ik]["ik_fk"] == 0.0, "arm_%s starts in FK" % side)
+    check(pb[hand_ik]["ikfk"] == 1.0, "arm_%s starts in FK" % side)
     pb["upperarm_%s_fk_ctrl" % side].rotation_euler = (0.0, 0.0, 0.6)
     check((head("hand_" + side) - rest_head("hand_" + side)).length > 0.1, "arm_%s FK control moves the hand" % side)
     pb["upperarm_%s_fk_ctrl" % side].rotation_euler = (0.0, 0.0, 0.0)
 
-    pb[hand_ik]["ik_fk"] = 1.0
+    pb[hand_ik]["ikfk"] = 0.0
     # Pull the hand a third of the way toward the shoulder: always reachable.
     delta = (rest_head("upperarm_" + side) - rest_head("hand_" + side)) * 0.33
     move(hand_ik, delta)
@@ -198,7 +198,7 @@ check(head("ball_l").z > ball0.z + 0.02 and (toe_now - toe0).length < 0.02, "pas
 
 # Stretchy IK.
 reset()
-pb["hand_l_ik_ctrl"]["ik_fk"] = 1.0
+pb["hand_l_ik_ctrl"]["ikfk"] = 0.0
 far = (rest_head("hand_l") - rest_head("upperarm_l")).normalized() * 0.25
 move("hand_l_ik_ctrl", far)
 goal = rest_head("hand_l") + far
@@ -208,7 +208,7 @@ check((head("hand_l") - goal).length < 0.02, "with stretch the arm reaches a far
 
 # Twist helpers.
 reset()
-pb["hand_l_ik_ctrl"]["ik_fk"] = 0.0
+pb["hand_l_ik_ctrl"]["ikfk"] = 1.0
 pb["hand_l_fk_ctrl"].rotation_euler = (0.0, 1.0, 0.0)  # 1 rad about the hand's length
 update()
 # A bendy forearm grades the twist over several joints; the far one takes the usual half.
@@ -220,7 +220,7 @@ check(all(a < b + 1e-4 for a, b in zip(_angles, _angles[1:])), "forearm twist gr
 
 # Space switching.
 reset()
-pb["hand_l_ik_ctrl"]["ik_fk"] = 1.0
+pb["hand_l_ik_ctrl"]["ikfk"] = 0.0
 before = head("hand_l_ik_ctrl")
 pb["hand_l_ik_ctrl"]["space"] = 2  # chest
 check((head("hand_l_ik_ctrl") - before).length < 1e-4, "switching space at rest causes no pop")
