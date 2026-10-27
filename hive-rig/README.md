@@ -1154,10 +1154,29 @@ builds with the newest rules this one has, and the app, the command line and
 
 ### Skin weights in the app
 
-After Build, the Properties panel's skin weights section starts with the
-**mesh tool**: **View** (drags orbit), **Paint**, **Select** or **Sculpt** (the
+After Build, a **tool strip** runs down the left edge, as in Photoshop. Each
+button opens its own window beside it (drag it anywhere, close it with its
+cross), the way Zoo Tools' toolsets pop out:
+
+* **Paint Weights** (Maya's Paint Skin Weights): the influence list, the brush
+  operations **Add**, **Sub**, **Replace** and **Scale**, the blending ones
+  **Smooth**, **Sharpen** and **Mend**, and the brush size and strength.
+  Opening it turns the brush on. **Ctrl+click** a joint, or the skin, to pick
+  the joint to paint: on the skin it picks the bone with the most weight there.
+* **Smooth Weights** (brSmoothWeights): the smooth, sharpen and mend brushes,
+  and **Relax** and **Sharpen** floods over the selected vertices (or the whole
+  mesh) with a strength and a number of passes, optionally only around the
+  picked joint; then normalize, fix spikes and automatic weights.
+* **Weight Tools** (ngSkinTools): mirror either way, smooth, copy from another
+  rig, **Prune** (drop influences below a weight and keep at most so many
+  bones a vertex), locks, and keeping edited weights on rebuild.
+* **Vertex Weights**: the vertex selection with its tools, and the inspected
+  vertex's weights to type exactly. Opening it turns the select tool on.
+
+The tools are described below as they behave; the **mesh tool** is
+**View** (drags orbit), **Paint**, **Select** or **Sculpt** (the
 picked shape). One is on at a time, and a line over the viewport says which
-and what a drag does. Below it, the **bone list** shows every deform bone with
+and what a drag does. The **bone list** shows every deform bone with
 a search box: click a bone to show its weights as a heat map (click again to
 hide them), or switch **Bone** to **All** to colour the mesh by every bone at
 once, each in the colour of its swatch in the list. Each row has a lock, and a

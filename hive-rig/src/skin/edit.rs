@@ -9,7 +9,9 @@
 //! edit also applies the rig's influence limits, so the result adds up to 1
 //! and is ready to export.
 
-use super::{SkinLimits, SkinWeights, limit_pairs, relock, spike, surface_adjacency, with_weight};
+use super::{
+    SkinLimits, SkinWeights, limit_pairs, relock, sharpened, spike, surface_adjacency, with_weight,
+};
 use crate::mesh::Mesh;
 use crate::skeleton::Skeleton;
 
@@ -92,6 +94,107 @@ pub fn fix_spikes(
         let old = skin.pairs(v);
         let mut pairs = skin.average(adjacency[v].iter().map(|&n| n as usize));
         relock(&old, &mut pairs, locked);
+        limit_pairs(&mut pairs, limits, None, locked);
+        if !same_pairs(&old, &pairs) {
+            out.set(v, pairs);
+            changed += 1;
+        }
+    }
+    (out, changed)
+}
+
+/// What a flood pass does to each vertex it touches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flood {
+    /// Blend toward the neighbours' average (brSmoothWeights' smooth).
+    Relax,
+    /// Push away from the neighbours' average (ngSkinTools' contrast).
+    Sharpen,
+}
+
+/// Relax or sharpen the weights over the whole mesh, or only the vertices
+/// marked in `only`, `iterations` times by `strength` (0 to 1), as
+/// brSmoothWeights' and ngSkinTools' flood buttons do. Each pass reads the
+/// weights the previous one left, so more passes spread further. With `bone`,
+/// only vertices that bone already influences, or that touch one it does, are
+/// changed. Locked bones keep their weights and the rig's limits hold. Returns
+/// the weights and how many vertices changed.
+#[allow(clippy::too_many_arguments)]
+pub fn flood(
+    skin: &SkinWeights,
+    adjacency: &[Vec<u32>],
+    how: Flood,
+    only: Option<&[bool]>,
+    bone: Option<usize>,
+    strength: f32,
+    iterations: usize,
+    limits: SkinLimits,
+    locked: &[bool],
+) -> (SkinWeights, usize) {
+    let t = strength.clamp(0.0, 1.0);
+    let n = skin.vertex_count();
+    let touches = |s: &SkinWeights, v: usize, b: usize| {
+        s.weight(v, b) > 0.0
+            || adjacency
+                .get(v)
+                .is_some_and(|nb| nb.iter().any(|&u| s.weight(u as usize, b) > 0.0))
+    };
+    let mut out = skin.clone();
+    if t <= 0.0 {
+        return (out, 0);
+    }
+    for _ in 0..iterations.max(1) {
+        let before = out.clone();
+        for v in 0..n {
+            if only.is_some_and(|m| !m.get(v).copied().unwrap_or(false))
+                || bone.is_some_and(|b| !touches(&before, v, b))
+            {
+                continue;
+            }
+            let Some(nbrs) = adjacency.get(v).filter(|nb| !nb.is_empty()) else {
+                continue;
+            };
+            let old = before.pairs(v);
+            let avg = before.average(nbrs.iter().map(|&u| u as usize));
+            let mut pairs = match how {
+                Flood::Relax => {
+                    let mut p: Vec<(u16, f32)> =
+                        old.iter().map(|&(j, w)| (j, w * (1.0 - t))).collect();
+                    p.extend(avg.iter().map(|&(j, w)| (j, w * t)));
+                    p
+                }
+                Flood::Sharpen => sharpened(&old, &avg, t),
+            };
+            relock(&old, &mut pairs, locked);
+            limit_pairs(&mut pairs, limits, None, locked);
+            out.set(v, pairs);
+        }
+    }
+    let changed = (0..n)
+        .filter(|&v| !same_pairs(&skin.pairs(v), &out.pairs(v)))
+        .count();
+    (out, changed)
+}
+
+/// Drop every influence below `threshold` and keep at most `max_influences`
+/// per vertex (the strongest), renormalising the rest; locked bones keep
+/// their weights (ngSkinTools' prune and influence limit). Returns the weights
+/// and how many vertices changed.
+pub fn prune(
+    skin: &SkinWeights,
+    threshold: f32,
+    max_influences: usize,
+    locked: &[bool],
+) -> (SkinWeights, usize) {
+    let limits = SkinLimits {
+        max_influences: max_influences.clamp(1, super::INFLUENCE_CAP),
+        prune: threshold.clamp(0.0, 0.5),
+    };
+    let mut out = skin.clone();
+    let mut changed = 0;
+    for v in 0..skin.vertex_count() {
+        let old = skin.pairs(v);
+        let mut pairs = old.clone();
         limit_pairs(&mut pairs, limits, None, locked);
         if !same_pairs(&old, &pairs) {
             out.set(v, pairs);
@@ -336,6 +439,138 @@ mod tests {
             sk,
             skin,
             adj,
+        }
+    }
+
+    /// How soft the weights are across the mesh: the summed difference between
+    /// each vertex and its neighbours' average (lower is smoother).
+    fn roughness(d: &Demo, skin: &SkinWeights) -> f32 {
+        spikes(skin, &d.adj).iter().sum()
+    }
+
+    #[test]
+    fn flood_relax_softens_sharpen_tightens_and_locks_hold() {
+        let d = demo_rig();
+        let limits = SkinLimits::default();
+        let none = vec![false; d.sk.bones.len()];
+        let base = roughness(&d, &d.skin);
+        let (relaxed, n) = flood(
+            &d.skin,
+            &d.adj,
+            Flood::Relax,
+            None,
+            None,
+            0.6,
+            4,
+            limits,
+            &none,
+        );
+        assert!(n > 100 && roughness(&d, &relaxed) < base * 0.8, "{n}");
+        let (sharp, n) = flood(
+            &d.skin,
+            &d.adj,
+            Flood::Sharpen,
+            None,
+            None,
+            0.6,
+            2,
+            limits,
+            &none,
+        );
+        assert!(n > 100 && roughness(&d, &sharp) > base, "{n}");
+        for skin in [&relaxed, &sharp] {
+            for v in 0..skin.vertex_count() {
+                let total: f32 = skin.influences(v).map(|(_, w)| w).sum();
+                assert!((total - 1.0).abs() < 1e-4, "vertex {v} sums to {total}");
+                assert!(skin.influences(v).count() <= limits.max_influences);
+            }
+        }
+        // Only the selected vertices change, and a locked bone keeps its weights.
+        let (_, patch) = around(&d, "upperarm_l", 0.05);
+        let mut only = vec![false; d.skin.vertex_count()];
+        patch.iter().for_each(|&v| only[v] = true);
+        let arm = d.sk.index_of("upperarm_l").unwrap();
+        let locked = lock_mask(&d.sk, ["upperarm_l"]);
+        let (out, _) = flood(
+            &d.skin,
+            &d.adj,
+            Flood::Relax,
+            Some(&only),
+            None,
+            1.0,
+            5,
+            limits,
+            &locked,
+        );
+        for (v, &picked) in only.iter().enumerate() {
+            if !picked {
+                assert!(
+                    same_pairs(&out.pairs(v), &d.skin.pairs(v)),
+                    "vertex {v} was not selected"
+                );
+            }
+            assert!((out.weight(v, arm) - d.skin.weight(v, arm)).abs() < 1e-5);
+        }
+        // Around one bone only: vertices far from it are left alone.
+        let foot = d.sk.index_of("foot_l").unwrap();
+        let (out, _) = flood(
+            &d.skin,
+            &d.adj,
+            Flood::Relax,
+            None,
+            Some(arm),
+            1.0,
+            2,
+            limits,
+            &none,
+        );
+        for v in 0..out.vertex_count() {
+            if d.skin.weight(v, foot) > 0.99 {
+                assert!(same_pairs(&out.pairs(v), &d.skin.pairs(v)));
+            }
+        }
+    }
+
+    #[test]
+    fn the_sharpen_brush_tightens_a_blend() {
+        let d = demo_rig();
+        let (at, near) = around(&d, "lowerarm_l", 0.06);
+        let mut skin = d.skin.clone();
+        let before = roughness(&d, &skin);
+        let dab = Dab {
+            center: at,
+            radius: 0.08,
+            strength: 1.0,
+            mode: BrushMode::Sharpen,
+            value: 1.0,
+        };
+        let bone = d.sk.index_of("lowerarm_l").unwrap();
+        let none = vec![false; d.sk.bones.len()];
+        let n = paint(
+            &mut skin,
+            &d.mesh.positions,
+            &d.adj,
+            &d.sk,
+            bone,
+            dab,
+            SkinLimits::default(),
+            &none,
+        );
+        assert!(n > 0 && !near.is_empty());
+        assert!(roughness(&d, &skin) > before);
+    }
+
+    #[test]
+    fn prune_drops_small_weights_and_caps_the_count() {
+        let d = demo_rig();
+        let none = vec![false; d.sk.bones.len()];
+        let (out, n) = prune(&d.skin, 0.2, 2, &none);
+        assert!(n > 0);
+        for v in 0..out.vertex_count() {
+            let infl: Vec<f32> = out.influences(v).map(|(_, w)| w).collect();
+            assert!(infl.len() <= 2, "vertex {v} keeps {}", infl.len());
+            let total: f32 = infl.iter().sum();
+            assert!((total - 1.0).abs() < 1e-4);
         }
     }
 

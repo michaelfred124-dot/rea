@@ -326,6 +326,7 @@ impl Studio {
             self.outliner(&ctx);
             self.properties(&ctx);
             self.weight_table(&ctx);
+            self.tool_strip(&ctx);
             self.dock(&ctx);
             self.library_window(&ctx);
             self.export_window(&ctx);
@@ -940,7 +941,12 @@ impl Studio {
                 .collect();
         let max_h = ctx.content_rect().height() - PANEL_TOP - DOCK_CLEARANCE - 70.0;
 
-        floating_area("outliner", Align2::LEFT_TOP, Vec2::new(EDGE, PANEL_TOP)).show(ctx, |ui| {
+        floating_area(
+            "outliner",
+            Align2::LEFT_TOP,
+            Vec2::new(self.left_edge(), PANEL_TOP),
+        )
+        .show(ctx, |ui| {
             room(ui, OUTLINER_WIDTH, max_h + 70.0);
             panel_frame().show(ui, |ui| {
                 ui.set_width(OUTLINER_WIDTH);
@@ -1592,7 +1598,21 @@ impl Studio {
                     .color(TEXT_FAINT),
             );
         } else {
-            self.skin_card(ui, &deform);
+            ui.label(
+                RichText::new(
+                    "Paint, smooth and fix the weights with the skin tools on the left-hand strip.",
+                )
+                .size(12.0)
+                .color(TEXT_FAINT),
+            );
+            ui.horizontal_wrapped(|ui| {
+                for w in super::SkinWindow::ALL {
+                    let on = self.window_open(w);
+                    if ui.selectable_label(on, w.title()).clicked() {
+                        self.set_window(w, !on);
+                    }
+                }
+            });
         }
 
         ui.add_space(8.0);
@@ -3147,7 +3167,22 @@ impl Studio {
             {
                 self.brush_at = hit_at(self, p);
             }
-            if response.drag_started_by(PointerButton::Primary)
+            // Ctrl+click picks the joint under the pointer (or the bone with the
+            // most weight on the skin there) to paint, as Maya does.
+            let ctrl = ui.input(|i| i.modifiers.command);
+            if ctrl
+                && response.clicked()
+                && let Some(p) = pointer
+            {
+                let joint = match self.pick_rig(&pr, p) {
+                    Some(RigPick::Bone(b)) => Some(b),
+                    _ => None,
+                };
+                let (o, d) = pr.ray(p);
+                self.pick_influence(joint, o, d);
+            }
+            if !ctrl
+                && response.drag_started_by(PointerButton::Primary)
                 && let Some(p) = press.or(pointer)
                 && let Some(hit) = hit_at(self, p)
                 && self.begin_stroke()
@@ -3167,6 +3202,7 @@ impl Studio {
                 }
             }
             if response.clicked()
+                && !ctrl
                 && let Some(hit) = pointer.and_then(|p| hit_at(self, p))
                 && self.begin_stroke()
             {

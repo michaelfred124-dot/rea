@@ -689,6 +689,9 @@ pub enum BrushMode {
     /// Only where a vertex's weights stand out from its neighbours' (by more
     /// than [`SPIKE`]), replace them with the neighbours' average.
     Mend,
+    /// Push every bone's weight away from the neighbours' average, so a soft
+    /// blend between bones tightens (ngSkinTools' contrast).
+    Sharpen,
 }
 
 /// How far a vertex's weights may stand out from the average of its
@@ -732,7 +735,10 @@ pub fn paint(
     limits: SkinLimits,
     locked: &[bool],
 ) -> usize {
-    let blends = matches!(dab.mode, BrushMode::Smooth | BrushMode::Mend);
+    let blends = matches!(
+        dab.mode,
+        BrushMode::Smooth | BrushMode::Mend | BrushMode::Sharpen
+    );
     let bone_locked = locked.get(bone).copied().unwrap_or(false);
     if bone >= sk.bones.len()
         || dab.radius <= 0.0
@@ -767,6 +773,17 @@ pub fn paint(
             BrushMode::Subtract => (set(own * (1.0 - t)), None),
             BrushMode::Replace => (set(own + t * (value - own)), (value > 0.0).then_some(b)),
             BrushMode::Scale => (set(own * (1.0 - t * (1.0 - value))), None),
+            BrushMode::Sharpen => {
+                let before = before.as_ref().unwrap();
+                let nbrs = adjacency.get(v).map_or(&[][..], Vec::as_slice);
+                if nbrs.is_empty() {
+                    continue;
+                }
+                let avg = before.average(nbrs.iter().map(|&n| n as usize));
+                let mut pushed = sharpened(&old, &avg, t);
+                relock(&old, &mut pushed, locked);
+                (pushed, None)
+            }
             BrushMode::Smooth | BrushMode::Mend => {
                 let before = before.as_ref().unwrap();
                 let nbrs = adjacency.get(v).map_or(&[][..], Vec::as_slice);
@@ -791,6 +808,26 @@ pub fn paint(
         }
     }
     changed
+}
+
+/// A vertex's influences pushed `t` of the way past themselves away from
+/// `avg` (the neighbours' average), clamped at 0 and renormalised: each bone
+/// keeps its share where it leads and loses it where it trails.
+pub(crate) fn sharpened(pairs: &[(u16, f32)], avg: &[(u16, f32)], t: f32) -> Vec<(u16, f32)> {
+    let weight = |list: &[(u16, f32)], j: u16| -> f32 {
+        list.iter().filter(|p| p.0 == j).map(|p| p.1).sum()
+    };
+    let mut out: Vec<(u16, f32)> = pairs
+        .iter()
+        .map(|&(j, w)| (j, (w + t * (w - weight(avg, j))).max(0.0)))
+        .filter(|p| p.1 > 0.0)
+        .collect();
+    let total: f32 = out.iter().map(|p| p.1).sum();
+    if total <= 0.0 {
+        return pairs.to_vec();
+    }
+    out.iter_mut().for_each(|p| p.1 /= total);
+    out
 }
 
 /// How far a vertex's influences stand out from `avg`: half the summed weight

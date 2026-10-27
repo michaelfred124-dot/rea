@@ -1639,7 +1639,10 @@ impl Studio {
             self.fail("Build the rig and pick a bone under Weights, then paint it.");
             return false;
         };
-        let evens_out = matches!(self.brush.mode, BrushMode::Smooth | BrushMode::Mend);
+        let evens_out = matches!(
+            self.brush.mode,
+            BrushMode::Smooth | BrushMode::Mend | BrushMode::Sharpen
+        );
         if !evens_out && self.lock_mask().get(bone).copied().unwrap_or(false) {
             let name = self.weights_bone.clone().unwrap_or_default();
             self.fail(format!("{name} is locked; unlock it to paint it."));
@@ -2221,7 +2224,7 @@ pub mod update;
 pub use control_shapes::ShapeDraft;
 pub use posing::Tool;
 pub use shapes::ShapeTools;
-pub use skin_edit::{MeshTool, SelectOp, SkinTools};
+pub use skin_edit::{MeshTool, SelectOp, SkinTools, SkinWindow};
 
 #[cfg(test)]
 mod tests {
@@ -3187,6 +3190,53 @@ mod tests {
             .iter()
             .min_by(|a, b| a.distance(p).total_cmp(&b.distance(p)))
             .unwrap()
+    }
+
+    /// The skin tool windows: Paint turns the brush on and Vertices the
+    /// select tool; Ctrl+click picks the joint, or the skin's strongest bone;
+    /// the floods and prune are one undo step each.
+    #[test]
+    fn skin_tool_windows_pick_influences_and_flood() {
+        let mut s = demo_studio();
+        assert!(s.build(), "{}", s.status);
+        s.mode = Mode::Skeleton;
+        s.set_window(SkinWindow::Paint, true);
+        assert!(s.window_open(SkinWindow::Paint) && s.mesh_tool() == MeshTool::Paint);
+        s.set_window(SkinWindow::Vertices, true);
+        assert_eq!(s.mesh_tool(), MeshTool::Select);
+        s.set_window(SkinWindow::Vertices, false);
+        assert_eq!(s.mesh_tool(), MeshTool::View);
+        // A joint picked under the pointer wins; a non-deforming one doesn't.
+        assert_eq!(
+            s.pick_influence(Some("lowerarm_l".into()), Vec3::ZERO, Vec3::Z)
+                .as_deref(),
+            Some("lowerarm_l")
+        );
+        assert_eq!(s.weights_bone.as_deref(), Some("lowerarm_l"));
+        // On the skin: the bone holding most of the vertex hit, here the head.
+        let head = {
+            let rig = s.doc.as_ref().unwrap().rig.as_ref().unwrap();
+            let b = &rig.skeleton.bones[rig.skeleton.index_of("head").unwrap()];
+            (b.head + b.tail) * 0.5
+        };
+        let picked = s
+            .pick_influence(Some("root".into()), head + Vec3::Z * 2.0, -Vec3::Z)
+            .unwrap();
+        assert!(
+            picked.starts_with("head") || picked.starts_with("neck"),
+            "{picked}"
+        );
+        // Relax, then undo it in one step.
+        let before = s.doc.as_ref().unwrap().rig.as_ref().unwrap().skin.clone();
+        s.flood_weights(hive_rig::skin::edit::Flood::Relax);
+        assert!(!s.error, "{}", s.status);
+        assert_ne!(s.doc.as_ref().unwrap().rig.as_ref().unwrap().skin, before);
+        s.undo();
+        assert_eq!(s.doc.as_ref().unwrap().rig.as_ref().unwrap().skin, before);
+        s.skin_tools.prune_max = 2;
+        s.prune_weights();
+        let rig = s.doc.as_ref().unwrap().rig.as_ref().unwrap();
+        assert!((0..rig.skin.vertex_count()).all(|v| rig.skin.influences(v).count() <= 2));
     }
 
     #[test]

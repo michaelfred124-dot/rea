@@ -10,10 +10,10 @@ use eframe::egui::{
 
 use hive_rig::shapes::SculptBrush;
 use hive_rig::skeleton::Side;
-use hive_rig::skin::BrushMode;
+use hive_rig::skin::{BrushMode, edit};
 
-use super::super::{MeshTool, Mode, SelectOp, Studio};
-use super::{DOCK_CLEARANCE, EDGE, floating_area, panel_frame, panel_header, room};
+use super::super::{MeshTool, Mode, SelectOp, SkinWindow, Studio};
+use super::{DOCK_CLEARANCE, EDGE, PANEL_TOP, floating_area, panel_frame, panel_header, room};
 use crate::theme::{self, ACCENT, BORDER, TEXT, TEXT_DIM, TEXT_FAINT, WARN};
 use crate::view::Projector;
 
@@ -23,22 +23,28 @@ const SELECTED: Color32 = Color32::from_rgb(110, 200, 255);
 const BONE_LIST_HEIGHT: f32 = 176.0;
 const BONE_ROW: f32 = 19.0;
 const TABLE_WIDTH: f32 = 270.0;
+/// The tool strip: its width, and the size of one of its buttons.
+pub(super) const TOOL_STRIP: f32 = 46.0;
+const TOOL_BUTTON: f32 = 36.0;
+const TOOL_WINDOW_WIDTH: f32 = 290.0;
 /// Vertices listed in the weight table; the rest are counted.
 const TABLE_ROWS: usize = 12;
 
 /// One row of the weight table: bone index, bone name and weight.
 type Influence = (usize, String, f32);
 
-/// The brush modes in two rows of three, so they fit the panel.
-const MODES: [[(BrushMode, &str); 3]; 2] = [
-    [
+/// The brush modes in two rows, as Maya's paint operations (Add, Subtract,
+/// Replace, Scale) above the blending ones (Smooth, Sharpen, Mend).
+const MODES: [&[(BrushMode, &str)]; 2] = [
+    &[
         (BrushMode::Add, "Add"),
-        (BrushMode::Subtract, "Subtract"),
+        (BrushMode::Subtract, "Sub"),
         (BrushMode::Replace, "Replace"),
-    ],
-    [
         (BrushMode::Scale, "Scale"),
+    ],
+    &[
         (BrushMode::Smooth, "Smooth"),
+        (BrushMode::Sharpen, "Sharpen"),
         (BrushMode::Mend, "Mend"),
     ],
 ];
@@ -52,6 +58,7 @@ pub(super) fn brush_glyph(mode: BrushMode) -> (&'static str, Color32) {
         BrushMode::Scale => ("\u{00d7}", Color32::from_rgb(255, 140, 90)),
         BrushMode::Smooth => ("~", Color32::from_rgb(190, 160, 255)),
         BrushMode::Mend => ("^", Color32::from_rgb(255, 120, 200)),
+        BrushMode::Sharpen => ("\u{25c6}", Color32::from_rgb(255, 210, 90)),
     }
 }
 
@@ -69,18 +76,53 @@ fn sculpt_glyph(brush: SculptBrush) -> (&'static str, Color32) {
 fn mode_label(mode: BrushMode) -> &'static str {
     MODES
         .iter()
-        .flatten()
+        .flat_map(|row| row.iter())
         .find(|(m, _)| *m == mode)
         .map_or("Add", |(_, l)| l)
 }
 
-/// One line on what a drag does with this mesh tool.
-fn mesh_tool_tip(tool: MeshTool) -> &'static str {
-    match tool {
-        MeshTool::View => "Drags orbit; pick a tool to edit the skin or shapes.",
-        MeshTool::Paint => "Drag on the mesh to paint the picked bone.",
-        MeshTool::Select => "Click or box-select vertices to edit their weights exactly.",
-        MeshTool::Sculpt => "Drag on the mesh to sculpt the picked shape.",
+/// A tool strip button's picture, drawn in `r`.
+fn tool_icon(p: &egui::Painter, r: Rect, w: SkinWindow, color: Color32) {
+    let stroke = Stroke::new(1.8, color);
+    let at = |x: f32, y: f32| Pos2::new(r.left() + x * r.width(), r.top() + y * r.height());
+    match w {
+        // A brush: handle, ferrule and a painted dab.
+        SkinWindow::Paint => {
+            p.line_segment([at(0.85, 0.12), at(0.45, 0.55)], Stroke::new(2.4, color));
+            p.line_segment([at(0.45, 0.55), at(0.32, 0.68)], Stroke::new(4.0, color));
+            p.circle_filled(at(0.22, 0.8), r.width() * 0.13, color);
+        }
+        // Waves: smoothing.
+        SkinWindow::Smooth => {
+            for y in [0.3, 0.55, 0.8] {
+                let pts: Vec<Pos2> = (0..=12)
+                    .map(|i| {
+                        let x = i as f32 / 12.0;
+                        at(x, y + 0.09 * (x * std::f32::consts::TAU).sin())
+                    })
+                    .collect();
+                p.add(egui::Shape::line(pts, stroke));
+            }
+        }
+        // Sliders: the weight tools.
+        SkinWindow::Tools => {
+            for (y, knob) in [(0.22, 0.7), (0.5, 0.3), (0.78, 0.55)] {
+                p.line_segment([at(0.05, y), at(0.95, y)], stroke);
+                p.circle_filled(at(knob, y), r.width() * 0.11, color);
+            }
+        }
+        // Picked vertices on a patch of mesh.
+        SkinWindow::Vertices => {
+            p.rect_stroke(
+                Rect::from_min_max(at(0.08, 0.08), at(0.92, 0.92)),
+                2,
+                Stroke::new(1.2, color.gamma_multiply(0.6)),
+                egui::StrokeKind::Inside,
+            );
+            for (x, y) in [(0.3, 0.3), (0.7, 0.35), (0.35, 0.7), (0.72, 0.72)] {
+                p.circle_filled(at(x, y), r.width() * 0.09, color);
+            }
+        }
     }
 }
 
@@ -124,7 +166,7 @@ impl Studio {
 
     /// The brush mode buttons.
     pub(super) fn brush_modes(&mut self, ui: &mut Ui) {
-        for row in &MODES {
+        for row in MODES {
             theme::segmented(ui, &mut self.brush.mode, row);
         }
     }
@@ -174,12 +216,10 @@ impl Studio {
         }
     }
 
-    /// Locks, whole-mesh fixes, re-running the automatic weights, and the
-    /// vertex selection with its tools.
-    pub(super) fn weight_tools(&mut self, ui: &mut Ui) {
+    /// Lock the shown bone, and unlock them all.
+    fn locks_section(&mut self, ui: &mut Ui) {
         let small = |t: &str| egui::Button::new(RichText::new(t).size(12.5)).corner_radius(8);
         let shown = self.weights_bone.clone();
-        ui.add_space(4.0);
         theme::label_caps(ui, "Locks");
         ui.horizontal(|ui| {
             match &shown {
@@ -211,8 +251,12 @@ impl Studio {
             let names: Vec<&str> = self.skin_tools.locked.iter().map(String::as_str).collect();
             ui.label(RichText::new(names.join(", ")).size(11.5).color(TEXT_FAINT));
         }
+    }
 
-        ui.add_space(4.0);
+    /// Normalize, fix spikes and put the automatic weights back.
+    fn fix_section(&mut self, ui: &mut Ui) {
+        let small = |t: &str| egui::Button::new(RichText::new(t).size(12.5)).corner_radius(8);
+        let shown = self.weights_bone.clone();
         theme::label_caps(ui, "Fix");
         ui.horizontal(|ui| {
             if ui
@@ -252,11 +296,12 @@ impl Studio {
                      with them.",
                 );
         });
+    }
 
-        ui.add_space(4.0);
-        if self.skin_tools.selecting {
-            self.scroll_here(ui);
-        }
+    /// The vertex selection and its tools: grow, shrink, copy, paste, flood.
+    fn selection_section(&mut self, ui: &mut Ui) {
+        let small = |t: &str| egui::Button::new(RichText::new(t).size(12.5)).corner_radius(8);
+        let shown = self.weights_bone.clone();
         theme::label_caps(ui, "Selection");
         ui.horizontal(|ui| {
             let mut on = self.skin_tools.selecting;
@@ -530,7 +575,7 @@ impl Studio {
         floating_area(
             "weight_table",
             Align2::LEFT_BOTTOM,
-            Vec2::new(EDGE, -DOCK_CLEARANCE),
+            Vec2::new(self.left_edge(), -DOCK_CLEARANCE),
         )
         .show(ctx, |ui| {
             room(ui, TABLE_WIDTH, max_h + 60.0);
@@ -585,15 +630,142 @@ impl Studio {
         });
     }
 
-    /// The Skin weights card under the rig's Properties: the mesh tool, the
-    /// bone list, the brush, mirror and copy, the vertex inspector and the
-    /// other weight tools.
-    pub(super) fn skin_card(&mut self, ui: &mut Ui, deform: &[String]) {
-        if !self.skin_tools.selecting {
-            self.scroll_here(ui);
+    // ----------------------------------------------------------------------- tool strip
+
+    /// Where the left-hand panels start: right of the tool strip when it shows.
+    pub(super) fn left_edge(&self) -> f32 {
+        if self.tool_strip_on() {
+            EDGE + TOOL_STRIP + 8.0
+        } else {
+            EDGE
         }
-        self.mesh_tool_bar(ui);
+    }
+
+    /// The tool strip shows: a built rig with skin, past the guides stage.
+    pub(super) fn tool_strip_on(&self) -> bool {
+        self.skin_view()
+    }
+
+    /// The tool strip down the left edge, as in Photoshop: one button per skin
+    /// tool, each opening its own window beside the strip (Zoo Tools' toolsets
+    /// pop out the same way). A lit button's window is open.
+    pub(super) fn tool_strip(&mut self, ctx: &egui::Context) {
+        if !self.tool_strip_on() {
+            return;
+        }
+        let mut toggled = None;
+        floating_area("tool_strip", Align2::LEFT_TOP, Vec2::new(EDGE, PANEL_TOP)).show(ctx, |ui| {
+            panel_frame()
+                .inner_margin(egui::Margin::same(5))
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 4.0;
+                    ui.vertical(|ui| {
+                        for w in SkinWindow::ALL {
+                            let on = self.window_open(w);
+                            let (rect, r) =
+                                ui.allocate_exact_size(Vec2::splat(TOOL_BUTTON), Sense::click());
+                            let p = ui.painter();
+                            if on {
+                                p.rect_filled(rect, 7, ACCENT.gamma_multiply(0.22));
+                                p.rect_stroke(
+                                    rect,
+                                    7,
+                                    Stroke::new(1.0, ACCENT),
+                                    egui::StrokeKind::Inside,
+                                );
+                            } else if r.hovered() {
+                                p.rect_filled(rect, 7, Color32::from_white_alpha(14));
+                            }
+                            let color = if on {
+                                ACCENT
+                            } else if r.hovered() {
+                                TEXT
+                            } else {
+                                TEXT_DIM
+                            };
+                            tool_icon(p, rect.shrink(7.0), w, color);
+                            if r.on_hover_text(w.tip()).clicked() {
+                                toggled = Some((w, !on));
+                            }
+                        }
+                    });
+                });
+        });
+        if let Some((w, open)) = toggled {
+            self.set_window(w, open);
+        }
+        for (k, w) in SkinWindow::ALL.into_iter().enumerate() {
+            if self.window_open(w) {
+                self.tool_window(ctx, w, k);
+            }
+        }
+    }
+
+    /// One skin tool window, first placed beside its button on the strip;
+    /// it can be dragged anywhere and closed with its cross.
+    fn tool_window(&mut self, ctx: &egui::Context, w: SkinWindow, slot: usize) {
+        let Some(deform) = self.deform_bones() else {
+            return;
+        };
+        let mut open = true;
+        // Two columns from the strip, so a few open at once don't cover each other.
+        let at = Pos2::new(
+            EDGE + TOOL_STRIP + 10.0 + (slot % 2) as f32 * (TOOL_WINDOW_WIDTH + 34.0),
+            PANEL_TOP + (slot / 2) as f32 * 330.0,
+        );
+        egui::Window::new(w.title())
+            .id(egui::Id::unique(("skin_window", slot)))
+            .open(&mut open)
+            .default_pos(at)
+            .resizable(false)
+            .collapsible(true)
+            // Solid, so the panels under a window never show through it.
+            .frame(panel_frame().fill(crate::theme::PANEL))
+            .show(ctx, |ui| {
+                ui.set_width(TOOL_WINDOW_WIDTH);
+                match w {
+                    SkinWindow::Paint => self.paint_window(ui, &deform),
+                    SkinWindow::Smooth => self.smooth_window(ui),
+                    SkinWindow::Tools => self.tools_window(ui),
+                    SkinWindow::Vertices => self.vertices_window(ui),
+                }
+            });
+        if !open {
+            self.set_window(w, false);
+        }
+    }
+
+    /// The deforming bones of the built rig, by exported name.
+    fn deform_bones(&self) -> Option<Vec<String>> {
+        let rig = self.doc.as_ref()?.rig.as_ref()?;
+        Some(
+            rig.skeleton
+                .bones
+                .iter()
+                .filter(|b| b.deform)
+                .map(|b| b.name.clone())
+                .collect(),
+        )
+    }
+
+    /// Maya's Paint Skin Weights: the influence list, the brush operations
+    /// and the brush.
+    fn paint_window(&mut self, ui: &mut Ui, deform: &[String]) {
+        ui.horizontal(|ui| {
+            let mut on = self.painting;
+            theme::pill(ui, &mut on, "Paint")
+                .on_hover_text("Drag on the mesh to paint the picked joint.");
+            if on != self.painting {
+                self.set_mesh_tool(if on { MeshTool::Paint } else { MeshTool::View });
+            }
+            ui.label(
+                RichText::new("Ctrl+click a joint or the skin to pick it")
+                    .size(11.5)
+                    .color(TEXT_FAINT),
+            );
+        });
         ui.add_space(4.0);
+        theme::label_caps(ui, "Influences");
         self.bone_list(ui, deform);
         if !self.skin_tools.color_all {
             super::weight_legend(ui);
@@ -601,12 +773,136 @@ impl Studio {
         ui.add_space(4.0);
         theme::label_caps(ui, "Brush");
         self.brush_controls(ui);
-        ui.add_space(4.0);
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new("[ and ] resize the brush. Locked joints keep their weights.")
+                .size(11.0)
+                .color(TEXT_FAINT),
+        );
+    }
+
+    /// brSmoothWeights: smooth and sharpen brushes, and the same over the
+    /// selection or the whole mesh with a strength and a number of passes.
+    fn smooth_window(&mut self, ui: &mut Ui) {
+        let small = |t: &str| egui::Button::new(RichText::new(t).size(12.5)).corner_radius(8);
+        theme::label_caps(ui, "Brush");
+        ui.horizontal(|ui| {
+            for (mode, label, tip) in [
+                (
+                    BrushMode::Smooth,
+                    "Smooth",
+                    "Blend each vertex with its neighbours.",
+                ),
+                (
+                    BrushMode::Sharpen,
+                    "Sharpen",
+                    "Tighten soft blends between joints.",
+                ),
+                (
+                    BrushMode::Mend,
+                    "Mend",
+                    "Only fix vertices that stand out from their neighbours.",
+                ),
+            ] {
+                let on = self.painting && self.brush.mode == mode;
+                if ui.selectable_label(on, label).on_hover_text(tip).clicked() {
+                    self.brush.mode = mode;
+                    self.set_mesh_tool(MeshTool::Paint);
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Strength").size(12.0).color(TEXT_DIM));
+            ui.add(egui::Slider::new(&mut self.brush.strength, 0.01..=1.0).max_decimals(2));
+        });
+
+        ui.add_space(6.0);
+        let n = self.skin_tools.selected_count();
+        let scope = if n > 0 {
+            format!("Flood: the {n} selected vertices")
+        } else {
+            "Flood: the whole mesh".to_string()
+        };
+        theme::label_caps(ui, &scope);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Strength").size(12.0).color(TEXT_DIM));
+            ui.add(
+                egui::Slider::new(&mut self.skin_tools.flood_strength, 0.05..=1.0).max_decimals(2),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Passes").size(12.0).color(TEXT_DIM));
+            ui.add(egui::Slider::new(&mut self.skin_tools.flood_passes, 1..=20))
+                .on_hover_text("More passes spread the smoothing further over the surface.");
+        });
+        let bone = self.weights_bone.clone();
+        ui.add_enabled_ui(bone.is_some(), |ui| {
+            let label = match &bone {
+                Some(b) => format!("Only around {b}"),
+                None => "Only around the picked joint".to_string(),
+            };
+            ui.checkbox(
+                &mut self.skin_tools.flood_near_bone,
+                RichText::new(label).size(12.5),
+            );
+        });
+        ui.horizontal(|ui| {
+            if ui
+                .add(small("Relax"))
+                .on_hover_text(
+                    "Blend every vertex toward its neighbours (brSmoothWeights' smooth).",
+                )
+                .clicked()
+            {
+                self.flood_weights(edit::Flood::Relax);
+            }
+            if ui
+                .add(small("Sharpen"))
+                .on_hover_text(
+                    "Push every vertex away from its neighbours' blend (ngSkinTools' contrast).",
+                )
+                .clicked()
+            {
+                self.flood_weights(edit::Flood::Sharpen);
+            }
+        });
+        ui.add_space(6.0);
+        self.fix_section(ui);
+    }
+
+    /// ngSkinTools' weight tools: mirror and transfer, prune and influence
+    /// limits, locks, and keeping edits on rebuild.
+    fn tools_window(&mut self, ui: &mut Ui) {
+        let small = |t: &str| egui::Button::new(RichText::new(t).size(12.5)).corner_radius(8);
         theme::label_caps(ui, "Mirror and transfer");
         self.mirror_row(ui);
-        ui.add_space(4.0);
-        self.vertex_inspector(ui);
-        self.weight_tools(ui);
+        ui.add_space(6.0);
+        theme::label_caps(ui, "Prune and limit");
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Below").size(12.0).color(TEXT_DIM));
+            ui.add(egui::Slider::new(&mut self.skin_tools.prune_below, 0.0..=0.2).max_decimals(3))
+                .on_hover_text("Influences smaller than this are dropped.");
+        });
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Most bones").size(12.0).color(TEXT_DIM));
+            ui.add(egui::Slider::new(
+                &mut self.skin_tools.prune_max,
+                1..=hive_rig::skin::INFLUENCE_CAP,
+            ))
+            .on_hover_text("Each vertex keeps at most this many bones, the strongest.");
+        });
+        if ui
+            .add(small("Prune"))
+            .on_hover_text(
+                "Drop the small influences and cap the bones per vertex; the rest add up to 1.",
+            )
+            .clicked()
+        {
+            self.prune_weights();
+        }
+        ui.add_space(6.0);
+        self.locks_section(ui);
+        ui.add_space(6.0);
         ui.checkbox(
             &mut self.keep_weights,
             RichText::new("Keep edited weights on rebuild").size(12.5),
@@ -617,25 +913,13 @@ impl Studio {
         );
     }
 
-    /// What a drag on the mesh does, as one row of buttons, and a line on
-    /// how to use the tool that is on.
-    pub(super) fn mesh_tool_bar(&mut self, ui: &mut Ui) {
-        theme::label_caps(ui, "Mesh tool");
-        let now = self.mesh_tool();
-        let mut tool = now;
-        let options: Vec<(MeshTool, &str)> =
-            MeshTool::ALL.iter().map(|t| (*t, t.label())).collect();
-        theme::segmented(ui, &mut tool, &options);
-        if tool != now {
-            self.set_mesh_tool(tool);
-        }
-        ui.label(
-            RichText::new(mesh_tool_tip(self.mesh_tool()))
-                .size(11.5)
-                .color(TEXT_FAINT),
-        );
+    /// The vertex selection with its tools, and the inspected vertex's
+    /// weights to type exactly.
+    fn vertices_window(&mut self, ui: &mut Ui) {
+        self.selection_section(ui);
+        ui.add_space(6.0);
+        self.vertex_inspector(ui);
     }
-
     /// The deform bones, searchable: click one to show (and paint) its
     /// weights. Each row has the bone's colour in the all-bones view, its
     /// weight on the inspected vertex as a bar, and a lock.

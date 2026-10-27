@@ -46,21 +46,49 @@ pub enum MeshTool {
     Sculpt,
 }
 
-impl MeshTool {
-    pub const ALL: [MeshTool; 4] = [
-        MeshTool::View,
-        MeshTool::Paint,
-        MeshTool::Select,
-        MeshTool::Sculpt,
+/// The skin tool windows the tool strip opens, as Zoo Tools' toolsets pop out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkinWindow {
+    /// Maya's Paint Skin Weights: the influence list and the brush.
+    Paint,
+    /// brSmoothWeights: smooth, relax and sharpen, by brush or flood.
+    Smooth,
+    /// ngSkinTools' weight tools: mirror, transfer, prune, limits and locks.
+    Tools,
+    /// The vertex selection and the exact weights of a vertex.
+    Vertices,
+}
+
+impl SkinWindow {
+    pub const ALL: [SkinWindow; 4] = [
+        SkinWindow::Paint,
+        SkinWindow::Smooth,
+        SkinWindow::Tools,
+        SkinWindow::Vertices,
     ];
 
-    pub fn label(self) -> &'static str {
+    pub fn title(self) -> &'static str {
         match self {
-            MeshTool::View => "View",
-            MeshTool::Paint => "Paint",
-            MeshTool::Select => "Select",
-            MeshTool::Sculpt => "Sculpt",
+            SkinWindow::Paint => "Paint Weights",
+            SkinWindow::Smooth => "Smooth Weights",
+            SkinWindow::Tools => "Weight Tools",
+            SkinWindow::Vertices => "Vertex Weights",
         }
+    }
+
+    pub fn tip(self) -> &'static str {
+        match self {
+            SkinWindow::Paint => {
+                "Paint Weights: pick a joint (in the list, or Ctrl+click it or the skin) and paint"
+            }
+            SkinWindow::Smooth => "Smooth Weights: smooth, relax and sharpen by brush or flood",
+            SkinWindow::Tools => "Weight Tools: mirror, copy, prune, influence limits and locks",
+            SkinWindow::Vertices => "Vertex Weights: select vertices and type exact weights",
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
     }
 }
 
@@ -97,6 +125,16 @@ pub struct SkinTools {
     pub inspect: Option<usize>,
     /// Surface neighbours of the mesh (seam copies welded), built once per character.
     neighbours: Option<Arc<Vec<Vec<u32>>>>,
+    /// Which skin tool windows are open, by [`SkinWindow`].
+    pub windows: [bool; 4],
+    /// How far one flood pass relaxes or sharpens (0 to 1), and how many passes.
+    pub flood_strength: f32,
+    pub flood_passes: usize,
+    /// Floods only change the weights around the shown bone.
+    pub flood_near_bone: bool,
+    /// Prune drops influences below this, and keeps at most this many a vertex.
+    pub prune_below: f32,
+    pub prune_max: usize,
 }
 
 impl Default for SkinTools {
@@ -117,6 +155,12 @@ impl Default for SkinTools {
             color_all: false,
             inspect: None,
             neighbours: None,
+            windows: [false; 4],
+            flood_strength: 0.5,
+            flood_passes: 3,
+            flood_near_bone: false,
+            prune_below: 0.01,
+            prune_max: 4,
         }
     }
 }
@@ -200,6 +244,109 @@ impl Studio {
         doc.exported = false;
         self.weight_colors = None;
         self.info(msg);
+    }
+
+    /// Whether a skin tool window is open.
+    pub fn window_open(&self, w: SkinWindow) -> bool {
+        self.skin_tools.windows[w.index()]
+    }
+
+    /// Open or close a skin tool window. Opening Paint Weights turns the brush
+    /// on and Vertex Weights the select tool, as Maya's tools do; closing them
+    /// turns it off again.
+    pub fn set_window(&mut self, w: SkinWindow, open: bool) {
+        self.skin_tools.windows[w.index()] = open;
+        let tool = match w {
+            SkinWindow::Paint => MeshTool::Paint,
+            SkinWindow::Vertices => MeshTool::Select,
+            _ => return,
+        };
+        if open {
+            self.set_mesh_tool(tool);
+        } else if self.mesh_tool() == tool {
+            self.set_mesh_tool(MeshTool::View);
+        }
+    }
+
+    /// Relax or sharpen the weights over the selection (or the whole mesh
+    /// when nothing is selected), with the flood strength and passes; with
+    /// "near the shown bone" on, only around the shown bone.
+    pub fn flood_weights(&mut self, how: edit::Flood) {
+        if !self.need_rig("smooth its weights") {
+            return;
+        }
+        let (locks, adj) = (self.lock_mask(), self.neighbours());
+        let only = (self.skin_tools.selected_count() > 0).then(|| self.skin_tools.selected.clone());
+        let bone = if self.skin_tools.flood_near_bone {
+            self.paint_bone()
+        } else {
+            None
+        };
+        let (strength, passes) = (self.skin_tools.flood_strength, self.skin_tools.flood_passes);
+        let rig = self.doc.as_ref().unwrap().rig.as_ref().unwrap();
+        let (skin, n) = edit::flood(
+            &rig.skin,
+            &adj,
+            how,
+            only.as_deref(),
+            bone,
+            strength,
+            passes,
+            rig.guides.skin,
+            &locks,
+        );
+        let what = match how {
+            edit::Flood::Relax => "Relaxed",
+            edit::Flood::Sharpen => "Sharpened",
+        };
+        let scope = if only.is_some() { "selected" } else { "" };
+        self.commit_skin(
+            skin,
+            true,
+            format!("{what} the weights: {n} {scope} vertices changed ({passes} passes)."),
+        );
+    }
+
+    /// Drop the small influences and cap how many each vertex keeps.
+    pub fn prune_weights(&mut self) {
+        if !self.need_rig("prune its weights") {
+            return;
+        }
+        let locks = self.lock_mask();
+        let (below, max) = (self.skin_tools.prune_below, self.skin_tools.prune_max);
+        let rig = self.doc.as_ref().unwrap().rig.as_ref().unwrap();
+        let (skin, n) = edit::prune(&rig.skin, below, max, &locks);
+        self.commit_skin(
+            skin,
+            true,
+            format!("Pruned weights below {below:.3} and kept {max} bones a vertex at most: {n} vertices changed."),
+        );
+    }
+
+    /// Ctrl+click while painting: the joint under the pointer, else the bone
+    /// with the most weight on the skin there, becomes the painted influence
+    /// (Maya picks influences from the viewport the same way). Returns the
+    /// bone picked.
+    pub fn pick_influence(
+        &mut self,
+        joint: Option<String>,
+        origin: Vec3,
+        dir: Vec3,
+    ) -> Option<String> {
+        let rig = self.doc.as_ref()?.rig.as_ref()?;
+        let deforms = |n: &str| rig.skeleton.bone(n).is_some_and(|b| b.deform);
+        let name = match joint.filter(|j| deforms(j)) {
+            Some(j) => j,
+            None => {
+                let v = self.hit_vertex(origin, dir)?;
+                let (j, _) = rig.skin.influences(v).max_by(|a, b| a.1.total_cmp(&b.1))?;
+                rig.skeleton.bones[j].name.clone()
+            }
+        };
+        self.weights_bone = Some(name.clone());
+        self.weight_colors = None;
+        self.info(format!("Painting {name}."));
+        Some(name)
     }
 
     /// Lock or unlock a bone's weights.

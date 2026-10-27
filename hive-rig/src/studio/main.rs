@@ -2,7 +2,7 @@
 //! the guides, build and export.
 //!
 //! `HiveRig [character, rig or guides file] [--demo [dog|bird|spider|snake|horse|dinosaur]] [--build] [--weights BONE] [--paint] [--dab add|subtract|replace|scale|smooth|mend]
-//! [--lock BONE] [--bend DEGREES] [--bend-axis x|y|z] [--tools] [--vertices] [--hover] [--library] [--templates] [--export]
+//! [--lock BONE] [--bend DEGREES] [--bend-axis x|y|z] [--tools] [--window paint|smooth|tools|vertices]... [--vertices] [--hover] [--library] [--templates] [--export]
 //! [--select COMPONENT[,COMPONENT...]] [--pick NAME] [--pose BONE[=DEGREES[@x|y|z]]] [--set CONTROL=TX,TY,TZ,RX,RY,RZ]... [--attr CONTROL.NAME=VALUE]... [--shape NAME=WEIGHT]... [--feathers COUNT[,ROWS]]
 //! [--corrective] [--inbetween WEIGHT] [--sculpt grab|smooth|relax|inflate|erase] [--all-bones]
 //! [--bone-filter TEXT] [--add-demo [dog|bird|...]] [--build-all] [--character NAME]
@@ -45,6 +45,8 @@ struct Launch {
     bend_axis: Option<usize>,
     /// Scroll Properties down to the weight tools (or a picked control's look).
     tools: bool,
+    /// `--window NAME`: open that skin tool window. Repeatable.
+    windows: Vec<String>,
     /// Turn the select tool on and select the vertices around the brush spot.
     vertices: bool,
     /// Show the influences of the vertex at the brush spot, as on hover.
@@ -151,6 +153,9 @@ fn parse_args() -> Launch {
                     .and_then(|s| ["x", "y", "z"].iter().position(|a| s.to_str() == Some(a)))
             }
             Some("--tools") => launch.tools = true,
+            Some("--window") => launch
+                .windows
+                .extend(args.next().map(|s| s.to_string_lossy().into_owned())),
             Some("--vertices") => launch.vertices = true,
             Some("--hover") => launch.hover = true,
             Some("--library") => launch.library = true,
@@ -323,6 +328,7 @@ fn main() -> eframe::Result {
             "scale" => BrushMode::Scale,
             "smooth" => BrushMode::Smooth,
             "mend" => BrushMode::Mend,
+            "sharpen" => BrushMode::Sharpen,
             _ => BrushMode::Add,
         };
         studio.brush.strength = 0.8;
@@ -352,6 +358,18 @@ fn main() -> eframe::Result {
     }
     if launch.tools {
         studio.skin_tools.scroll_to_tools = 4;
+    }
+    for name in &launch.windows {
+        let w = match name.as_str() {
+            "paint" => Some(app::SkinWindow::Paint),
+            "smooth" => Some(app::SkinWindow::Smooth),
+            "tools" => Some(app::SkinWindow::Tools),
+            "vertices" => Some(app::SkinWindow::Vertices),
+            _ => None,
+        };
+        if let Some(w) = w {
+            studio.set_window(w, true);
+        }
     }
     studio.library_open = launch.library;
     if launch.templates {
