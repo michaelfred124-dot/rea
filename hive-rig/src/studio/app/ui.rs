@@ -22,6 +22,7 @@ use hive_rig::skeleton::Side;
 use hive_rig::skin::{Engine, INFLUENCE_CAP};
 use hive_rig::template::{self, Listed, Scope, Source, Template};
 
+use super::update::{self, UpdateState};
 use super::{
     Category, Doc, Drag, FingerSides, Mode, Pose, RigPick, Studio, Tool, count, push_undo,
 };
@@ -304,6 +305,7 @@ impl Studio {
             self.open(path);
         }
         self.sync_control_selection();
+        self.poll_update(&ctx);
         self.shortcuts(&ctx);
         self.sync_picks();
 
@@ -383,9 +385,55 @@ impl Studio {
                     }
                     ui.add_space(2.0);
                     self.file_menu(ui);
+                    self.update_button(ui);
                 });
             });
         });
+    }
+
+    /// Take in the update's progress and say how it went.
+    fn poll_update(&mut self, ctx: &egui::Context) {
+        if self.updater.poll() {
+            match self.updater.state.clone() {
+                UpdateState::Working(s) => self.info(s),
+                UpdateState::UpToDate(v) => self.info(format!("Hive Rig is up to date ({v}).")),
+                UpdateState::Ready(v) => self.info(format!(
+                    "Updated to {v}. Save your work, then click Restart to use it."
+                )),
+                UpdateState::Failed(e) => self.fail(format!("Couldn't update: {e}")),
+                UpdateState::Idle => {}
+            }
+        }
+        if self.updater.busy() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
+    }
+
+    /// Beside the File menu: the update's progress, then Restart once the new
+    /// version is in place.
+    fn update_button(&mut self, ui: &mut Ui) {
+        match &self.updater.state {
+            UpdateState::Working(s) => {
+                ui.add(egui::Spinner::new().size(14.0))
+                    .on_hover_text(s.clone());
+                ui.label(RichText::new("Updating…").color(TEXT_DIM));
+            }
+            UpdateState::Ready(v) => {
+                let v = v.clone();
+                if theme::primary(ui, "Restart to update", 140.0, true)
+                    .on_hover_text(format!(
+                        "{v} is ready. Save your work first: the window closes and opens again."
+                    ))
+                    .clicked()
+                {
+                    match update::relaunch() {
+                        Ok(()) => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
+                        Err(e) => self.fail(e),
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     fn file_menu(&mut self, ui: &mut Ui) {
@@ -401,6 +449,23 @@ impl Studio {
             if ui.button("Demo character").clicked() {
                 ui.close();
                 self.load_demo();
+            }
+            ui.separator();
+            let label = if self.updater.busy() {
+                "Updating…"
+            } else {
+                "Update Hive Rig"
+            };
+            if ui
+                .add_enabled(!self.updater.busy(), egui::Button::new(label))
+                .on_hover_text(
+                    "Get the newest version, build it and swap it in; restart when it's ready",
+                )
+                .clicked()
+            {
+                ui.close();
+                self.updater.start();
+                self.info("Updating Hive Rig…");
             }
             ui.separator();
             if ui.button("Open scene…").clicked() {

@@ -276,6 +276,8 @@ fn write_ppm(path: &std::path::Path, image: &egui::ColorImage) -> std::io::Resul
 
 fn main() -> eframe::Result {
     let launch = parse_args();
+    // The programs the last in-app update moved aside.
+    app::update::clean_up();
     let mut studio = app::Studio::default();
     // `--demo layout.guides.json` opens the demo, then the guides onto it.
     match launch.creature {

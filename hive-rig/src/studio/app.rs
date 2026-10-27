@@ -348,6 +348,8 @@ pub struct Studio {
     pub shape_lib_path: Option<PathBuf>,
     /// A control shape being drawn in the shape editor.
     pub shape_draft: Option<control_shapes::ShapeDraft>,
+    /// The in-app update (File > Update Hive Rig).
+    pub updater: update::Updater,
 }
 
 impl Default for Studio {
@@ -406,6 +408,7 @@ impl Default for Studio {
             shape_lib: None,
             shape_lib_path: control_shapes::default_library_path(),
             shape_draft: None,
+            updater: update::Updater::default(),
         }
     }
 }
@@ -2213,6 +2216,7 @@ mod readers;
 mod shapes;
 mod skin_edit;
 mod ui;
+pub mod update;
 
 pub use control_shapes::ShapeDraft;
 pub use posing::Tool;

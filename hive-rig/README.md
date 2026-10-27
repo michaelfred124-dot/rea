@@ -78,6 +78,14 @@ Double-clicking `hive-rig.exe` (the command line) still works without the app:
 it asks for a character file, rigs it with the default guides and opens the
 output folder.
 
+**File > Update Hive Rig** updates the app in place from a git checkout of
+this repository: it pulls the newest code, builds it (with `cargo`, into
+`%LOCALAPPDATA%\HiveRig\target`) and swaps the new `HiveRig.exe` and
+`hive-rig.exe` in next to the running ones; a **Restart to update** button
+then opens the new version. Name the checkout in `hive-rig-source.txt` next to
+`HiveRig.exe` (one line, the repository folder) or in `HIVE_RIG_SOURCE`. The
+old programs are kept as `*.old.exe` until the next start.
+
 ## What you get
 
 | File | Use it in | What it contains |
