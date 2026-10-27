@@ -1572,6 +1572,68 @@ mod tests {
         }
     }
 
+    /// Moving the body, bending the spine and turning every FK control keeps
+    /// each FK control on its bone (the spine's controls hang from the COG
+    /// while its bones hang from the pelvis), in IK and in FK.
+    #[test]
+    fn fk_controls_stay_on_their_bones() {
+        let mut builds = vec![biped().1];
+        for c in [
+            crate::demo::Creature::Dog,
+            crate::demo::Creature::Bird,
+            crate::demo::Creature::Snake,
+        ] {
+            builds.push(components::build(&c.guides()).unwrap());
+        }
+        let (mut g, _) = biped();
+        for preset in [Preset::Fingers, Preset::Eyes, Preset::Tentacle, Preset::Jaw] {
+            components::add_preset(&mut g, preset, &AddOptions::default()).unwrap();
+        }
+        builds.push(components::build(&g).unwrap());
+        for b in &builds {
+            let (sk, rig) = (&b.skeleton, &b.controls);
+            let mut pose = Pose::default();
+            for c in &rig.controls {
+                let ch = match c.kind {
+                    ControlKind::Root => Channels {
+                        translate: Vec3::new(0.7, 0.2, -0.4),
+                        rotate: Vec3::new(0.0, 40.0, 0.0),
+                        ..Channels::default()
+                    },
+                    ControlKind::Cog => Channels {
+                        translate: Vec3::new(0.05, -0.1, 0.08),
+                        rotate: Vec3::new(10.0, 20.0, 5.0),
+                        ..Channels::default()
+                    },
+                    ControlKind::Fk if !locks(c, sk).rotate => turned(Vec3::new(8.0, -12.0, 15.0)),
+                    _ => continue,
+                };
+                pose.set_channels(&c.name, ch);
+            }
+            for blend in [0.0, 1.0] {
+                for ch in &rig.ik_chains {
+                    pose.set_attribute(rig, &ch.ik_control, "ik_fk", blend);
+                }
+                let posed = evaluate(sk, rig, &pose);
+                let hidden = hidden_controls(rig, &pose);
+                for (i, c) in rig.controls.iter().enumerate() {
+                    if c.kind != ControlKind::Fk || hidden.contains(&c.name) {
+                        continue;
+                    }
+                    let Some(bone) = c.bone.as_deref().and_then(|n| sk.index_of(n)) else {
+                        continue;
+                    };
+                    let at = pivot(c, sk);
+                    assert_near(
+                        posed.controls[i].transform_point3(at),
+                        posed.bones[bone].transform_point3(at),
+                        1e-3,
+                        &format!("{} on {} (ik_fk {blend})", c.name, sk.bones[bone].name),
+                    );
+                }
+            }
+        }
+    }
     #[test]
     fn rest_pose_is_the_identity() {
         let (mut g, _) = biped();

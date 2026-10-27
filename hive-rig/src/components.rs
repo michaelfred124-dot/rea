@@ -2328,6 +2328,7 @@ pub fn build(g: &Guides) -> Result<Built> {
         build_board(&mut b, face)?;
     }
     assign_spaces(&mut b);
+    pin_bones_to_controls(&mut b);
     b.rig.find_mirror_pairs();
     for (name, style) in &g.control_styles {
         let Some(c) = b.rig.controls.iter_mut().find(|c| &c.name == name) else {
@@ -2359,6 +2360,59 @@ pub fn build(g: &Guides) -> Result<Built> {
         skeleton: b.sk,
         controls: b.rig,
     })
+}
+
+/// Keep every FK control on its bone. A bone normally rides on its parent bone
+/// and only turns with its control, which is right when the control hangs
+/// from the parent bone's own control. When it hangs from something else (the
+/// spine's first control from the COG, while its bone hangs from the pelvis),
+/// turning the parent would carry the bone away from its control, and every
+/// control below with it. Those bones take their place from the control too
+/// (`translate`), so the bone stays under its control in every builder.
+fn pin_bones_to_controls(b: &mut Builder) {
+    let limb_bones: HashSet<String> = b
+        .rig
+        .ik_chains
+        .iter()
+        .flat_map(|ch| ch.bones().into_iter().map(str::to_string))
+        .collect();
+    let driver_of: HashMap<&str, &str> = b
+        .rig
+        .controls
+        .iter()
+        .filter(|c| matches!(c.kind, ControlKind::Fk | ControlKind::Root))
+        .filter_map(|c| Some((c.bone.as_deref()?, c.name.as_str())))
+        .collect();
+    let mut pin = Vec::new();
+    for c in &b.rig.controls {
+        if !matches!(c.kind, ControlKind::Fk | ControlKind::Root) {
+            continue;
+        }
+        let Some(bone) = c.bone.as_deref() else {
+            continue;
+        };
+        let Some(i) = b.sk.index_of(bone) else {
+            continue;
+        };
+        let Some(p) = b.sk.bones[i].parent else {
+            continue;
+        };
+        if b.sk.bones[i].translate || limb_bones.contains(bone) {
+            continue;
+        }
+        let parent = b.sk.bones[p].name.as_str();
+        let rides = match &c.parent {
+            ControlParent::Control(name) => driver_of.get(parent) == Some(&name.as_str()),
+            ControlParent::Bone(name) => name == parent,
+            ControlParent::None => false,
+        };
+        if !rides {
+            pin.push(i);
+        }
+    }
+    for i in pin {
+        b.sk.bones[i].translate = true;
+    }
 }
 
 fn validate(g: &Guides) -> Result<()> {
