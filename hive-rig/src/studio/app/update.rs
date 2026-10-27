@@ -135,6 +135,7 @@ fn target_dir() -> PathBuf {
 
 /// A command with no console window popping up behind the app.
 fn quiet(program: &str) -> Command {
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut c = Command::new(program);
     #[cfg(windows)]
     {
