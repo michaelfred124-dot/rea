@@ -853,12 +853,16 @@ hive-rig add [OPTIONS] <GUIDES> <PRESET>
 ```
 
 - `<GUIDES>`
-- `<PRESET>` (one of `fingers`, `tail`, `chain`, `eyes`, `jaw`, `face`, `face_board`, `toes`, `quad_legs`, `tentacle`, `antlers`)
-- `--side <SIDE>`: Which hands get fingers (default: both) (one of `left`, `right`)
-- `--parent <PARENT>`: Bone to attach a tail or chain to
-- `--joints <JOINTS>`: Bones in a tail or chain; for a face or face board, the extra lip joints on each lip between its middle and each corner (0 to 3)
+- `<PRESET>` (one of `fingers`, `tail`, `chain`, `eyes`, `jaw`, `face`, `face_board`, `toes`, `quad_legs`, `tentacle`, `antlers`, `arms`, `legs`, `wings`, `spider_legs`, `ears`, `horns`, `ponytail`, `cape`, `skirt`, `prop`)
+- `--side <SIDE>`: Which side gets the part, for pairs such as fingers, arms, legs, ears (default: both) (one of `left`, `right`)
+- `--parent <PARENT>`: Bone to attach the part to (arms, wings and spider legs pick the nearest spine bone; a chain needs one)
+- `--joints <JOINTS>`: Bones in a tail, chain, ear, horn, hair, cape or skirt chain, or in each finger or toe (1 to 5); for a face or face board, the extra lip joints on each lip between its middle and each corner (0 to 3)
 - `--id <ID>`: Component id for a tail or chain, or for quad legs added to a side that has a leg already (`leg2` adds `leg2_l` and `leg2_r` with IK of their own; hang them with --parent)
 - `--controls <CONTROLS>`: Curve controls on a tentacle (ends included, default 4)
+- `--bendy`: Bend controls on arms, legs, wings, hind legs and spider legs
+- `--count <COUNT>`: Fingers or toes a hand or foot (1 to 5, thumb first), feathers a row on wings, chains in a cape or skirt, pairs of spider legs
+- `--rows <ROWS>`: Rows of feathers on wings
+- `--spline`: Drive a tail with a curve (spline) instead of an FK control a bone
 
 ### `hive-rig spine`
 

@@ -176,13 +176,16 @@ enum Command {
     Add {
         guides: PathBuf,
         preset: Preset,
-        /// Which hands get fingers (default: both).
+        /// Which side gets the part, for pairs such as fingers, arms, legs,
+        /// ears (default: both).
         #[arg(long)]
         side: Option<SideArg>,
-        /// Bone to attach a tail or chain to.
+        /// Bone to attach the part to (arms, wings and spider legs pick the
+        /// nearest spine bone; a chain needs one).
         #[arg(long)]
         parent: Option<String>,
-        /// Bones in a tail or chain; for a face or face board, the extra lip
+        /// Bones in a tail, chain, ear, horn, hair, cape or skirt chain, or in
+        /// each finger or toe (1 to 5); for a face or face board, the extra lip
         /// joints on each lip between its middle and each corner (0 to 3).
         #[arg(long)]
         joints: Option<usize>,
@@ -194,6 +197,19 @@ enum Command {
         /// Curve controls on a tentacle (ends included, default 4).
         #[arg(long)]
         controls: Option<usize>,
+        /// Bend controls on arms, legs, wings, hind legs and spider legs.
+        #[arg(long)]
+        bendy: bool,
+        /// Fingers or toes a hand or foot (1 to 5, thumb first), feathers a
+        /// row on wings, chains in a cape or skirt, pairs of spider legs.
+        #[arg(long)]
+        count: Option<usize>,
+        /// Rows of feathers on wings.
+        #[arg(long)]
+        rows: Option<usize>,
+        /// Drive a tail with a curve (spline) instead of an FK control a bone.
+        #[arg(long)]
+        spline: bool,
     },
     /// Change the spine: its joint count, and whether a curve between the hips
     /// and chest controls drives it (a spline spine) instead of FK.
@@ -3057,6 +3073,10 @@ fn main() -> Result<()> {
             joints,
             id,
             controls,
+            bendy,
+            count,
+            rows,
+            spline,
         } => {
             let mut g = load_guides(&guides)?;
             let opts = AddOptions {
@@ -3068,6 +3088,10 @@ fn main() -> Result<()> {
                 joints,
                 id,
                 controls,
+                bendy,
+                count,
+                rows,
+                spline,
             };
             let added = components::add_preset(&mut g, preset, &opts)?;
             g.save(&guides)?;

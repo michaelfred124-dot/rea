@@ -648,4 +648,65 @@ mod tests {
             assert!(human_template(&r).is_none(), "{c:?}");
         }
     }
+
+    /// Every library part goes through the Blender, Maya and Unreal builders: a
+    /// rig with all of them writes a script for each program that names their
+    /// bones and controls.
+    #[test]
+    fn library_parts_reach_every_program() {
+        use crate::components::{AddOptions, Preset, add_preset};
+        let mut g = rig::auto_rig(demo_humanoid(), "demo", Default::default())
+            .unwrap()
+            .guides;
+        let more = AddOptions {
+            bendy: true,
+            ..Default::default()
+        };
+        for (preset, opts) in [
+            (Preset::Arms, more.clone()),
+            (Preset::Legs, Default::default()),
+            (Preset::Wings, Default::default()),
+            (Preset::SpiderLegs, Default::default()),
+            (Preset::Ears, Default::default()),
+            (Preset::Horns, Default::default()),
+            (Preset::Ponytail, Default::default()),
+            (Preset::Cape, Default::default()),
+            (Preset::Skirt, Default::default()),
+            (Preset::Prop, Default::default()),
+            (Preset::Fingers, Default::default()),
+            (Preset::Toes, Default::default()),
+            (
+                Preset::Tail,
+                AddOptions {
+                    spline: true,
+                    ..Default::default()
+                },
+            ),
+            (Preset::Face, Default::default()),
+        ] {
+            add_preset(&mut g, preset, &opts).unwrap_or_else(|e| panic!("{preset:?}: {e:#}"));
+        }
+        let r = rig::build_rig(demo_humanoid(), "parts", g, Default::default()).unwrap();
+        let names = [
+            "arm2_upperarm_l",
+            "wing_feather1_01_01_l",
+            "leg3_thigh_r",
+            "horn_01_l",
+            "ear_02_r",
+            "ponytail_04",
+            "cape_1_01",
+            "skirt_6_03",
+            "prop_01_r",
+            "thumb_01_l",
+            "toe_big_01_l",
+            "tail_01",
+            "lip_up",
+        ];
+        for target in [Target::Blender, Target::Maya, Target::Unreal] {
+            let text = script(&r, target, Path::new("parts.glb")).unwrap();
+            for n in names {
+                assert!(text.contains(n), "{target:?} script lacks {n}");
+            }
+        }
+    }
 }

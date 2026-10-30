@@ -1060,6 +1060,36 @@ pub enum Preset {
     /// bone): a beam of three joints with a tine off each of its first two,
     /// an FK control on every joint. `branch` adds more forks.
     Antlers,
+    /// A pair of arms, or a second and third pair for a four- or six-armed
+    /// character (`--id arm3`; each pair gets its own number and IK). They
+    /// hang from the spine bone nearest them and set `--bendy` for bend controls.
+    #[value(alias = "arm")]
+    Arms,
+    /// A pair of biped legs, or more of them (`leg2_l`, `leg2_r`, behind the first).
+    #[value(alias = "leg")]
+    Legs,
+    /// Wings on the upper back with rows of feathers (`--count` a row, `--rows`).
+    #[value(alias = "wing")]
+    Wings,
+    /// Spider-style legs, `--count` pairs along the spine: each a three-segment
+    /// leg with its knee folding up, with IK and FK.
+    #[value(name = "spider_legs", alias = "spider-legs", alias = "extra_legs")]
+    SpiderLegs,
+    /// A two-bone FK chain on each side of the head (`--joints` for more).
+    #[value(alias = "ear")]
+    Ears,
+    /// A curved FK horn on each side of the head (3 joints, `--joints`).
+    #[value(alias = "horn")]
+    Horns,
+    /// Hair that swings from the back of the head.
+    Ponytail,
+    /// A cape: `--count` FK chains side by side from the upper back (3 by
+    /// default) with `--joints` bones each.
+    Cape,
+    /// A skirt: `--count` FK chains around the hips (6 by default).
+    Skirt,
+    /// A one-bone socket for a weapon or tool in a hand (`--side`, right by default).
+    Prop,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1073,8 +1103,17 @@ pub struct AddOptions {
     /// Component id for a tail or chain, or for hind legs added beside the
     /// legs a side already has (without its side: `leg2` makes `leg2_l`).
     pub id: Option<String>,
-    /// Curve controls on a tentacle.
+    /// Curve controls on a tentacle (or spline tail).
     pub controls: Option<usize>,
+    /// Bend controls on arms, legs and hind legs.
+    pub bendy: bool,
+    /// Fingers or toes a hand or foot (1 to 5, the thumb first), feathers a
+    /// row on wings, chains in a cape or skirt, pairs of spider legs.
+    pub count: Option<usize>,
+    /// Rows of feathers on wings.
+    pub rows: Option<usize>,
+    /// A tail driven by a curve (spline) instead of an FK control a bone.
+    pub spline: bool,
 }
 
 /// Add a premade component with guides placed from the current layout. Returns the
@@ -1086,6 +1125,8 @@ pub fn add_preset(g: &mut Guides, preset: Preset, opts: &AddOptions) -> Result<V
     let mut added = Vec::new();
     match preset {
         Preset::Fingers => {
+            let count = digit_count(opts.count)?;
+            let segments = segment_count(opts.joints)?;
             let sides = match opts.side {
                 Some(Side::Center) => bail!("fingers need --side left or right"),
                 Some(s) => vec![s],
@@ -1116,7 +1157,7 @@ pub fn add_preset(g: &mut Guides, preset: Preset, opts: &AddOptions) -> Result<V
                     ("ring", 0.46, -0.08, 0.49),
                     ("pinky", 0.43, -0.19, 0.40),
                 ];
-                for (name, along, off, flen) in fingers {
+                for (name, along, off, flen) in fingers.into_iter().take(count) {
                     let id = format!("{name}{}", side.suffix());
                     ensure!(g.component(&id).is_none(), "{id} already exists");
                     let base = wrist + dir * along * len + across * off * len;
@@ -1126,8 +1167,8 @@ pub fn add_preset(g: &mut Guides, preset: Preset, opts: &AddOptions) -> Result<V
                         dir
                     };
                     let mut c = Component::new(&id, Kind::Chain, side, Some(&hand));
-                    for k in 0..4 {
-                        let p = base + fdir * flen * len * (k as f32 / 3.0);
+                    for k in 0..=segments {
+                        let p = base + fdir * flen * len * (k as f32 / segments as f32);
                         c = c.guide(format!("j{}", k + 1), p);
                     }
                     g.components.push(c);
@@ -1136,6 +1177,8 @@ pub fn add_preset(g: &mut Guides, preset: Preset, opts: &AddOptions) -> Result<V
             }
         }
         Preset::Toes => {
+            let count = digit_count(opts.count)?;
+            let segments = segment_count(opts.joints)?;
             let sides = match opts.side {
                 Some(Side::Center) => bail!("toes need --side left or right"),
                 Some(s) => vec![s],
@@ -1166,13 +1209,13 @@ pub fn add_preset(g: &mut Guides, preset: Preset, opts: &AddOptions) -> Result<V
                     ("fourth", -0.16, 0.48, 0.30),
                     ("little", -0.32, 0.40, 0.30),
                 ];
-                for (name, off, flen, _) in toes {
+                for (name, off, flen, _) in toes.into_iter().take(count) {
                     let id = format!("toe_{name}{}", side.suffix());
                     ensure!(g.component(&id).is_none(), "{id} already exists");
                     let base = ball_at + across * off * len * 0.5;
                     let mut c = Component::new(&id, Kind::Chain, side, Some(&ball));
-                    for k in 0..4 {
-                        let p = base + dir * flen * len * (k as f32 / 3.0);
+                    for k in 0..=segments {
+                        let p = base + dir * flen * len * (k as f32 / segments as f32);
                         c = c.guide(format!("j{}", k + 1), p);
                     }
                     g.components.push(c);
@@ -1225,6 +1268,7 @@ pub fn add_preset(g: &mut Guides, preset: Preset, opts: &AddOptions) -> Result<V
                 for (name, p) in QUAD_LEG_GUIDES.iter().zip(quad_leg_points(hip, floor)) {
                     c = c.guide(*name, p);
                 }
+                c.options.bendy = opts.bendy;
                 g.components.push(c);
                 added.push(id);
             }
@@ -1457,7 +1501,15 @@ pub fn add_preset(g: &mut Guides, preset: Preset, opts: &AddOptions) -> Result<V
                 None => unique_id(g, default_id, side),
             };
             ensure!(g.component(&id).is_none(), "{id} already exists");
-            let mut c = Component::new(&id, Kind::Chain, side, Some(&parent));
+            let spline = preset == Preset::Tail && opts.spline;
+            if let Some(k) = opts.controls.filter(|_| spline) {
+                ensure!((2..=16).contains(&k), "--controls must be between 2 and 16");
+            }
+            let kind = if spline { Kind::Spline } else { Kind::Chain };
+            let mut c = Component::new(&id, kind, side, Some(&parent));
+            if spline {
+                c.options.controls = opts.controls;
+            }
             for k in 0..=joints {
                 c = c.guide(
                     format!("j{}", k + 1),
@@ -1467,8 +1519,519 @@ pub fn add_preset(g: &mut Guides, preset: Preset, opts: &AddOptions) -> Result<V
             g.components.push(c);
             added.push(id);
         }
+        Preset::Arms | Preset::Legs | Preset::Wings | Preset::SpiderLegs => {
+            added = add_limbs(g, sk, preset, opts)?;
+        }
+        Preset::Ears | Preset::Horns | Preset::Ponytail | Preset::Cape | Preset::Skirt => {
+            added = add_head_and_hair(g, sk, preset, opts)?;
+        }
+        Preset::Prop => {
+            let side = match opts.side {
+                Some(Side::Center) => bail!("a prop goes in a hand: --side left or right"),
+                Some(s) => s,
+                None => Side::Right,
+            };
+            let hand = opts
+                .parent
+                .clone()
+                .unwrap_or_else(|| format!("hand{}", side.suffix()));
+            let b = sk
+                .bone(&hand)
+                .with_context(|| format!("no bone named {hand} to hold a prop"))?;
+            let id = match &opts.id {
+                Some(id) => id.clone(),
+                None => unique_id(g, "prop", side),
+            };
+            ensure!(g.component(&id).is_none(), "{id} already exists");
+            let start = b.head.lerp(b.tail, 0.5);
+            g.components.push(line_chain(
+                &id,
+                side,
+                &hand,
+                start,
+                Vec3::Z,
+                0.12 * h,
+                opts.joints.unwrap_or(1),
+            ));
+            added.push(id);
+        }
     }
     build(g).context("the new component doesn't build")?;
+    Ok(added)
+}
+
+/// Fingers or toes a hand or foot: 1 to 5, five unless set.
+fn digit_count(n: Option<usize>) -> Result<usize> {
+    let n = n.unwrap_or(5);
+    ensure!((1..=5).contains(&n), "--count must be between 1 and 5");
+    Ok(n)
+}
+
+/// Bones in each finger or toe: 1 to 5, three unless set.
+fn segment_count(n: Option<usize>) -> Result<usize> {
+    let n = n.unwrap_or(3);
+    ensure!((1..=5).contains(&n), "--joints must be between 1 and 5");
+    Ok(n)
+}
+
+/// The sides a premade pair of parts goes on: both unless `side` says one.
+fn pair_sides(side: Option<Side>, what: &str) -> Result<Vec<Side>> {
+    Ok(match side {
+        Some(Side::Center) => bail!("{what} need --side left or right"),
+        Some(s) => vec![s],
+        None => vec![Side::Left, Side::Right],
+    })
+}
+
+/// A straight FK chain component of `joints` bones from `start` along `dir`.
+fn line_chain(
+    id: &str,
+    side: Side,
+    parent: &str,
+    start: Vec3,
+    dir: Vec3,
+    length: f32,
+    joints: usize,
+) -> Component {
+    let joints = joints.max(1);
+    let mut c = Component::new(id, Kind::Chain, side, Some(parent));
+    for k in 0..=joints {
+        c = c.guide(
+            format!("j{}", k + 1),
+            start + dir * length * (k as f32 / joints as f32),
+        );
+    }
+    c
+}
+
+/// The base id for a part added on `sides`: `explicit` when given (it must be
+/// free), otherwise the first of `base`, `base2`, `base3`... whose ids are all free.
+fn free_base(g: &Guides, base: &str, sides: &[Side], explicit: Option<&str>) -> Result<String> {
+    let free = |b: &str| {
+        sides
+            .iter()
+            .all(|s| g.component(&format!("{b}{}", s.suffix())).is_none())
+    };
+    if let Some(id) = explicit {
+        let b = sides
+            .first()
+            .map(|s| id_base(id, *s))
+            .unwrap_or(id)
+            .to_string();
+        ensure!(free(&b), "{b} already exists; pick another --id");
+        return Ok(b);
+    }
+    Ok((1..)
+        .map(|n| {
+            if n == 1 {
+                base.to_string()
+            } else {
+                format!("{base}{n}")
+            }
+        })
+        .find(|b| free(b))
+        .unwrap())
+}
+
+/// The spine bone nearest `p`, which a limb or wing grows from.
+fn nearest_spine_bone(g: &Guides, sk: &Skeleton, p: Vec3) -> Option<String> {
+    let spine = g.components.iter().find(|c| c.kind == Kind::Spine)?;
+    sk.bones
+        .iter()
+        .filter(|b| b.component == spine.id && b.name.starts_with("spine_"))
+        .min_by(|a, b| {
+            a.tail
+                .distance(p)
+                .partial_cmp(&b.tail.distance(p))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|b| b.name.clone())
+}
+
+/// Arms, legs, wings and spider legs: limb components with ids of their own.
+fn add_limbs(
+    g: &mut Guides,
+    sk: &Skeleton,
+    preset: Preset,
+    opts: &AddOptions,
+) -> Result<Vec<String>> {
+    let h = g.body.height;
+    let cx = g.body.center_x;
+    let floor = g.body.floor;
+    let what = match preset {
+        Preset::Arms => "arms",
+        Preset::Legs => "legs",
+        Preset::Wings => "wings",
+        _ => "spider legs",
+    };
+    let sides = pair_sides(opts.side, what)?;
+    let spine = g
+        .components
+        .iter()
+        .find(|c| c.kind == Kind::Spine)
+        .context("the rig has no spine to hang limbs from")?;
+    let (pelvis_at, chest_at) = (
+        spine
+            .position("pelvis")
+            .context("the spine has no pelvis")?,
+        spine.position("chest").context("the spine has no chest")?,
+    );
+    let chest = spine_name(g.spine_joints(spine) - 1);
+    let top = sk
+        .bone(&chest)
+        .with_context(|| format!("no bone named {chest}"))?
+        .tail;
+    let mut added = Vec::new();
+    if preset == Preset::SpiderLegs {
+        let pairs = opts.count.unwrap_or(1);
+        ensure!(
+            (1..=8).contains(&pairs),
+            "--count must be between 1 and 8 pairs"
+        );
+        // The first free number from 2 (leg1 is the mannequin's leg), a pair each.
+        let free = |n: usize| {
+            (0..pairs).all(|j| {
+                sides.iter().all(|s| {
+                    g.component(&format!("leg{}{}", n + j, s.suffix()))
+                        .is_none()
+                })
+            })
+        };
+        let first = (2..).find(|&n| free(n)).unwrap();
+        for j in 0..pairs {
+            // Pair j grows from the front of the body to the back, sweeping
+            // from forward to backward like a spider's.
+            let t = if pairs == 1 {
+                0.5
+            } else {
+                j as f32 / (pairs - 1) as f32
+            };
+            let sweep = (45.0 - 90.0 * t).to_radians();
+            let on_spine = chest_at.lerp(pelvis_at, 0.1 + 0.8 * t);
+            let parent = match &opts.parent {
+                Some(p) => p.clone(),
+                None => nearest_spine_bone(g, sk, on_spine).unwrap_or_else(|| chest.clone()),
+            };
+            ensure!(sk.bone(&parent).is_some(), "no bone named {parent}");
+            // The spider's proportions, scaled so the hip sits at the spine.
+            let u = ((on_spine.y - floor) / 0.44).max(0.05 * h);
+            for side in &sides {
+                let sx = side.sign();
+                let at = |out: f32, up: f32| {
+                    Vec3::new(
+                        cx + sx * out * u * sweep.cos(),
+                        floor + up * u,
+                        on_spine.z + out * u * sweep.sin(),
+                    )
+                };
+                let id = match &opts.id {
+                    Some(id) if pairs == 1 => format!("{}{}", id_base(id, *side), side.suffix()),
+                    Some(id) => format!("{}{}{}", id_base(id, *side), j + 1, side.suffix()),
+                    None => format!("leg{}{}", first + j, side.suffix()),
+                };
+                ensure!(g.component(&id).is_none(), "{id} already exists");
+                let mut leg = Component::new(&id, Kind::QuadLeg, *side, Some(&parent));
+                let points = [
+                    at(0.07, 0.44),
+                    at(0.34, 0.95),
+                    at(0.64, 0.58),
+                    at(0.8, 0.12),
+                    at(0.85, 0.035),
+                    at(0.88, 0.0),
+                    at(0.76, 0.0),
+                ];
+                for (name, p) in QUAD_LEG_GUIDES.iter().zip(points) {
+                    leg = leg.guide(*name, p);
+                }
+                leg.options.knee_up = true;
+                leg.options.bendy = opts.bendy;
+                g.components.push(leg);
+                added.push(id);
+            }
+        }
+        return Ok(added);
+    }
+
+    let (kind, default_base) = match preset {
+        Preset::Arms => (Kind::Arm, "arm"),
+        Preset::Legs => (Kind::Leg, "leg"),
+        _ => (Kind::Arm, "wing"),
+    };
+    let base = free_base(g, default_base, &sides, opts.id.as_deref())?;
+    let names = kind.guide_names().unwrap();
+    let down = (pelvis_at - chest_at).try_normalize().unwrap_or(-Vec3::Y);
+    for side in sides {
+        let sx = side.sign();
+        let id = format!("{base}{}", side.suffix());
+        // What this side has already: the new limb copies the first plain one,
+        // shifted clear of the others.
+        let on_side: Vec<&Component> = g
+            .components
+            .iter()
+            .filter(|c| c.kind == kind && c.side == side)
+            .collect();
+        let source = on_side
+            .iter()
+            .find(|c| c.options.feathers == 0)
+            .copied()
+            .filter(|_| preset != Preset::Wings);
+        let shift = match (preset, on_side.len()) {
+            (_, 0) | (Preset::Wings, _) => Vec3::ZERO,
+            (Preset::Arms, n) => down * (0.11 * h * n as f32),
+            (_, n) => -Vec3::Z * (0.12 * h * n as f32),
+        };
+        let points: Vec<Vec3> = match (preset, source) {
+            (Preset::Wings, _) => {
+                let o = |x: f32, y: f32, z: f32| top + Vec3::new(x * sx, y, z) * h;
+                let shoulder = o(0.05, -0.02, -0.05);
+                let elbow = shoulder + Vec3::new(0.2 * sx, 0.07, -0.08) * h;
+                let wrist = elbow + Vec3::new(0.2 * sx, 0.05, 0.05) * h;
+                vec![
+                    o(0.015, -0.01, -0.03),
+                    shoulder,
+                    elbow,
+                    wrist,
+                    wrist + Vec3::new(0.22 * sx, 0.0, 0.03) * h,
+                ]
+            }
+            (_, Some(src)) => names
+                .iter()
+                .map(|n| src.position(n).unwrap() + shift)
+                .collect(),
+            (Preset::Arms, None) => {
+                let o = |x: f32, y: f32, z: f32| top + Vec3::new(x * sx, y, z) * h;
+                vec![
+                    o(0.02, -0.02, 0.0),
+                    o(0.09, -0.03, 0.0),
+                    o(0.13, -0.17, -0.01),
+                    o(0.17, -0.3, 0.02),
+                    o(0.19, -0.37, 0.03),
+                ]
+            }
+            _ => {
+                let pelvis = sk
+                    .bone("pelvis")
+                    .context("the rig has no pelvis bone")?
+                    .head;
+                let hip = Vec3::new(cx + sx * 0.055 * h, pelvis.y, pelvis.z) + shift;
+                let l = (hip.y - floor).max(0.1 * h);
+                let at = |up: f32, fwd: f32| Vec3::new(hip.x, floor + up * l, hip.z + fwd * l);
+                vec![
+                    hip,
+                    at(0.52, 0.03),
+                    at(0.06, 0.0),
+                    at(0.025, 0.1),
+                    at(0.01, 0.18),
+                    at(0.0, -0.05),
+                ]
+            }
+        };
+        let parent = match &opts.parent {
+            Some(p) => p.clone(),
+            None if kind == Kind::Leg => source
+                .and_then(|s| s.parent.clone())
+                .unwrap_or_else(|| "pelvis".into()),
+            None => nearest_spine_bone(g, sk, points[0]).unwrap_or_else(|| chest.clone()),
+        };
+        ensure!(sk.bone(&parent).is_some(), "no bone named {parent}");
+        ensure!(g.component(&id).is_none(), "{id} already exists");
+        let mut c = Component::new(&id, kind, side, Some(&parent));
+        for (name, p) in names.iter().zip(points) {
+            c = c.guide(*name, p);
+        }
+        c.options.bendy = opts.bendy;
+        g.components.push(c);
+        added.push(id);
+    }
+    if preset == Preset::Wings {
+        let count = opts.count.unwrap_or(6);
+        if count > 0 {
+            let first = added[0].clone();
+            set_feathers(g, Some(&first), count, opts.rows.unwrap_or(1))?;
+        }
+    }
+    Ok(added)
+}
+
+/// Ears, horns, hair, capes and skirts: FK chains on the head or the body.
+fn add_head_and_hair(
+    g: &mut Guides,
+    sk: &Skeleton,
+    preset: Preset,
+    opts: &AddOptions,
+) -> Result<Vec<String>> {
+    let h = g.body.height;
+    let cx = g.body.center_x;
+    let mut parts: Vec<Component> = Vec::new();
+    match preset {
+        Preset::Ears | Preset::Horns | Preset::Ponytail => {
+            let head = g
+                .components
+                .iter()
+                .find(|c| c.kind == Kind::Head)
+                .context("the rig has no head component")?;
+            let (base, top) = (
+                head.position("head").unwrap(),
+                head.position("head_top").unwrap(),
+            );
+            let parent = opts.parent.clone().unwrap_or_else(|| "head".into());
+            ensure!(sk.bone(&parent).is_some(), "no bone named {parent}");
+            let joints = opts.joints.unwrap_or(match preset {
+                Preset::Ears => 2,
+                Preset::Horns => 3,
+                _ => 4,
+            });
+            ensure!(
+                (1..=16).contains(&joints),
+                "--joints must be between 1 and 16"
+            );
+            if preset == Preset::Ponytail {
+                let id = opts.id.clone().unwrap_or_else(|| "ponytail".into());
+                let start = base.lerp(top, 0.6) - Vec3::Z * (0.06 * h);
+                let dir = Vec3::new(0.0, -0.7, -1.0).normalize();
+                parts.push(line_chain(
+                    &id,
+                    Side::Center,
+                    &parent,
+                    start,
+                    dir,
+                    0.22 * h,
+                    joints,
+                ));
+            } else {
+                let name = if preset == Preset::Ears {
+                    "ear"
+                } else {
+                    "horn"
+                };
+                for side in pair_sides(opts.side, name)? {
+                    let s = side.sign();
+                    let id = format!(
+                        "{}{}",
+                        opts.id.as_deref().map(|i| id_base(i, side)).unwrap_or(name),
+                        side.suffix()
+                    );
+                    if preset == Preset::Ears {
+                        let start = base.lerp(top, 0.45) + Vec3::X * (0.055 * h * s);
+                        let dir = Vec3::new(0.45 * s, 1.0, -0.15).normalize();
+                        parts.push(line_chain(&id, side, &parent, start, dir, 0.07 * h, joints));
+                    } else {
+                        // Out and up, curving in towards the tips.
+                        let out = Vec3::X * s;
+                        let mut at = base.lerp(top, 0.62) + out * (0.04 * h);
+                        let mut c =
+                            Component::new(&id, Kind::Chain, side, Some(&parent)).guide("j1", at);
+                        for k in 0..joints {
+                            let t = k as f32 / joints as f32;
+                            let d = (out * (0.9 - 1.6 * t) + Vec3::Y * (0.6 + 0.5 * t)
+                                - Vec3::Z * 0.1)
+                                .normalize();
+                            at += d * (0.2 * h / joints as f32);
+                            c = c.guide(format!("j{}", k + 2), at);
+                        }
+                        parts.push(c);
+                    }
+                }
+            }
+        }
+        Preset::Cape => {
+            let spine = g
+                .components
+                .iter()
+                .find(|c| c.kind == Kind::Spine)
+                .context("the rig has no spine")?;
+            let chest = opts
+                .parent
+                .clone()
+                .unwrap_or_else(|| spine_name(g.spine_joints(spine) - 1));
+            let top = sk
+                .bone(&chest)
+                .with_context(|| format!("no bone named {chest}"))?
+                .tail;
+            let n = opts.count.unwrap_or(3);
+            let joints = opts.joints.unwrap_or(4);
+            ensure!((1..=12).contains(&n), "--count must be between 1 and 12");
+            ensure!(
+                (1..=16).contains(&joints),
+                "--joints must be between 1 and 16"
+            );
+            let base = (1..)
+                .map(|k| {
+                    if k == 1 {
+                        "cape".to_string()
+                    } else {
+                        format!("cape{k}")
+                    }
+                })
+                .find(|b| g.component(&format!("{b}_1")).is_none())
+                .unwrap();
+            let width = (0.07 * h * n as f32).min(0.3 * h);
+            for i in 0..n {
+                let x = if n == 1 {
+                    0.0
+                } else {
+                    (i as f32 / (n - 1) as f32 - 0.5) * width
+                };
+                let start = Vec3::new(cx + x, top.y - 0.02 * h, top.z - 0.07 * h);
+                let dir = Vec3::new(x * 0.4, -1.0, -0.15).normalize();
+                parts.push(line_chain(
+                    &format!("{base}_{}", i + 1),
+                    Side::Center,
+                    &chest,
+                    start,
+                    dir,
+                    0.45 * h,
+                    joints,
+                ));
+            }
+        }
+        _ => {
+            let parent = opts.parent.clone().unwrap_or_else(|| "pelvis".into());
+            let p = sk
+                .bone(&parent)
+                .with_context(|| format!("no bone named {parent}"))?
+                .head;
+            let n = opts.count.unwrap_or(6);
+            let joints = opts.joints.unwrap_or(3);
+            ensure!((3..=16).contains(&n), "--count must be between 3 and 16");
+            ensure!(
+                (1..=16).contains(&joints),
+                "--joints must be between 1 and 16"
+            );
+            let base = (1..)
+                .map(|k| {
+                    if k == 1 {
+                        "skirt".to_string()
+                    } else {
+                        format!("skirt{k}")
+                    }
+                })
+                .find(|b| g.component(&format!("{b}_1")).is_none())
+                .unwrap();
+            let r = (0.08 * h).min(g.body.torso_half_width);
+            for i in 0..n {
+                let a = std::f32::consts::TAU * i as f32 / n as f32;
+                let (sin, cos) = a.sin_cos();
+                let start = Vec3::new(p.x + r * sin, p.y - 0.02 * h, p.z + r * cos);
+                let dir = Vec3::new(sin * 0.25, -1.0, cos * 0.25).normalize();
+                parts.push(line_chain(
+                    &format!("{base}_{}", i + 1),
+                    Side::Center,
+                    &parent,
+                    start,
+                    dir,
+                    0.28 * h,
+                    joints,
+                ));
+            }
+        }
+    }
+    let mut added = Vec::new();
+    for c in parts {
+        ensure!(g.component(&c.id).is_none(), "{} already exists", c.id);
+        added.push(c.id.clone());
+        g.components.push(c);
+    }
     Ok(added)
 }
 
@@ -6023,5 +6586,340 @@ mod tests {
             .unwrap();
         c.guides[1].from = Some(c.guides[0].name.clone());
         assert!(build(&bad).is_err(), "a fork on a wing");
+    }
+
+    /// Every library part on the demo biped: it builds, hangs from bones that
+    /// exist, keeps its controls consistent, and added twice gets names of its
+    /// own (or is refused when a rig has only one).
+    #[test]
+    fn library_parts_build_and_never_clash() {
+        let ids_of =
+            |g: &Guides| -> Vec<String> { g.components.iter().map(|c| c.id.clone()).collect() };
+        let plain = AddOptions::default();
+        let both = |opts: AddOptions| opts;
+        // (preset, options, can be added twice)
+        let cases: Vec<(Preset, AddOptions, bool)> = vec![
+            (
+                Preset::Arms,
+                AddOptions {
+                    bendy: true,
+                    ..plain.clone()
+                },
+                true,
+            ),
+            (Preset::Legs, plain.clone(), true),
+            (
+                Preset::Wings,
+                AddOptions {
+                    count: Some(5),
+                    rows: Some(2),
+                    ..plain.clone()
+                },
+                true,
+            ),
+            (
+                Preset::SpiderLegs,
+                AddOptions {
+                    count: Some(2),
+                    ..plain.clone()
+                },
+                true,
+            ),
+            (Preset::Ears, plain.clone(), false),
+            (
+                Preset::Horns,
+                AddOptions {
+                    joints: Some(4),
+                    ..plain.clone()
+                },
+                false,
+            ),
+            (Preset::Ponytail, plain.clone(), false),
+            (Preset::Cape, plain.clone(), true),
+            (
+                Preset::Skirt,
+                AddOptions {
+                    count: Some(8),
+                    joints: Some(2),
+                    ..plain.clone()
+                },
+                true,
+            ),
+            (Preset::Prop, plain.clone(), true),
+            (
+                Preset::Tail,
+                AddOptions {
+                    spline: true,
+                    ..plain.clone()
+                },
+                true,
+            ),
+            (
+                Preset::Fingers,
+                AddOptions {
+                    count: Some(3),
+                    joints: Some(2),
+                    ..plain.clone()
+                },
+                false,
+            ),
+            (
+                Preset::Toes,
+                AddOptions {
+                    count: Some(2),
+                    ..plain.clone()
+                },
+                false,
+            ),
+            (
+                Preset::Tentacle,
+                both(AddOptions {
+                    joints: Some(6),
+                    controls: Some(3),
+                    ..plain.clone()
+                }),
+                true,
+            ),
+            (Preset::Antlers, plain.clone(), false),
+        ];
+        for (preset, opts, repeats) in cases {
+            let mut g = demo_guides();
+            let before = ids_of(&g);
+            let added =
+                add_preset(&mut g, preset, &opts).unwrap_or_else(|e| panic!("{preset:?}: {e:#}"));
+            assert!(!added.is_empty(), "{preset:?}");
+            for id in &added {
+                assert!(!before.contains(id), "{preset:?} reused {id}");
+                let c = g.component(id).unwrap();
+                let parent = c.parent.as_deref().unwrap();
+                let built = build(&g).unwrap();
+                assert!(
+                    built.skeleton.bone(parent).is_some(),
+                    "{id} hangs from {parent}"
+                );
+                assert_controls_consistent(&built);
+            }
+            let mut unique = ids_of(&g);
+            unique.sort();
+            unique.dedup();
+            assert_eq!(
+                unique.len(),
+                g.components.len(),
+                "{preset:?} made duplicate ids"
+            );
+            let again = add_preset(&mut g, preset, &opts);
+            if repeats {
+                let more = again.unwrap_or_else(|e| panic!("{preset:?} twice: {e:#}"));
+                assert!(
+                    more.iter().all(|id| !added.contains(id)),
+                    "{preset:?}: {more:?}"
+                );
+                let built = build(&g).unwrap();
+                assert_controls_consistent(&built);
+            } else {
+                assert!(again.is_err(), "{preset:?} twice should be refused");
+                assert_eq!(
+                    g.components.len(),
+                    before.len() + added.len(),
+                    "{preset:?} left a mess"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn library_options_reach_the_components() {
+        // Arms: a second pair is named arm2, hangs lower, and is bendy on request.
+        let mut g = demo_guides();
+        let ids = add_preset(
+            &mut g,
+            Preset::Arms,
+            &AddOptions {
+                bendy: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ids, ["arm2_l", "arm2_r"]);
+        let (first, second) = (
+            g.component("arm_l").unwrap(),
+            g.component("arm2_l").unwrap(),
+        );
+        assert!(second.options.bendy && !first.options.bendy);
+        assert!(second.position("shoulder").unwrap().y < first.position("shoulder").unwrap().y);
+        assert_eq!(
+            add_preset(&mut g, Preset::Arms, &AddOptions::default()).unwrap(),
+            ["arm3_l", "arm3_r"]
+        );
+        // One side only.
+        let one = add_preset(
+            &mut g,
+            Preset::Arms,
+            &AddOptions {
+                side: Some(Side::Right),
+                id: Some("claw".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(one, ["claw_r"]);
+        assert!(build(&g).is_ok());
+
+        // Wings carry their feathers and fan control.
+        let mut g = demo_guides();
+        add_preset(
+            &mut g,
+            Preset::Wings,
+            &AddOptions {
+                count: Some(4),
+                rows: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                g.component("wing_l").unwrap().options.feathers,
+                g.component("wing_l").unwrap().options.feather_rows
+            ),
+            (4, 2)
+        );
+        assert_eq!(build(&g).unwrap().controls.feathers.len(), 2);
+
+        // Spider legs: pairs numbered after the legs a rig has, knees up.
+        let mut g = demo_guides();
+        let ids = add_preset(
+            &mut g,
+            Preset::SpiderLegs,
+            &AddOptions {
+                count: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ids, ["leg2_l", "leg2_r", "leg3_l", "leg3_r"]);
+        assert!(g.component("leg3_r").unwrap().options.knee_up);
+        let ik: Vec<_> = build(&g)
+            .unwrap()
+            .controls
+            .ik_chains
+            .iter()
+            .map(|k| k.name.clone())
+            .collect();
+        assert!(ik.contains(&"leg3_r".to_string()), "{ik:?}");
+        // On the spider creature the new pairs come after its eight.
+        let mut s = spider(1.0);
+        let ids = add_preset(&mut s, Preset::SpiderLegs, &AddOptions::default()).unwrap();
+        assert_eq!(ids, ["leg5_l", "leg5_r"]);
+
+        // A tail either follows a curve or has an FK control a bone.
+        let mut g = demo_guides();
+        add_preset(
+            &mut g,
+            Preset::Tail,
+            &AddOptions {
+                spline: true,
+                controls: Some(3),
+                joints: Some(6),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let tail = g.component("tail").unwrap();
+        assert_eq!(
+            (tail.kind, tail.options.controls, tail.guides.len()),
+            (Kind::Spline, Some(3), 7)
+        );
+        let mut g = demo_guides();
+        add_preset(&mut g, Preset::Tail, &AddOptions::default()).unwrap();
+        assert_eq!(g.component("tail").unwrap().kind, Kind::Chain);
+
+        // Fingers: how many, and how many bones each.
+        let mut g = demo_guides();
+        let ids = add_preset(
+            &mut g,
+            Preset::Fingers,
+            &AddOptions {
+                count: Some(3),
+                joints: Some(2),
+                side: Some(Side::Left),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ids, ["thumb_l", "index_l", "middle_l"]);
+        assert_eq!(g.component("index_l").unwrap().guides.len(), 3);
+        assert!(
+            add_preset(
+                &mut g,
+                Preset::Fingers,
+                &AddOptions {
+                    count: Some(6),
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+
+        // A cape is strips side by side; a second cape numbers itself.
+        let mut g = demo_guides();
+        let ids = add_preset(
+            &mut g,
+            Preset::Cape,
+            &AddOptions {
+                count: Some(4),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ids, ["cape_1", "cape_2", "cape_3", "cape_4"]);
+        assert_eq!(
+            add_preset(&mut g, Preset::Cape, &AddOptions::default()).unwrap()[0],
+            "cape2_1"
+        );
+
+        // A prop in either hand, and in both when asked twice.
+        let mut g = demo_guides();
+        assert_eq!(
+            add_preset(&mut g, Preset::Prop, &AddOptions::default()).unwrap(),
+            ["prop_r"]
+        );
+        let left = add_preset(
+            &mut g,
+            Preset::Prop,
+            &AddOptions {
+                side: Some(Side::Left),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(left, ["prop_l"]);
+        assert_eq!(
+            g.component("prop_l").unwrap().parent.as_deref(),
+            Some("hand_l")
+        );
+
+        // Parts that need a part the rig lacks say so, and change nothing.
+        let mut g = snake(1.0);
+        let n = g.components.len();
+        assert!(add_preset(&mut g, Preset::Prop, &AddOptions::default()).is_err());
+        assert_eq!(g.components.len(), n);
+        // Arms, legs and wings also work on a layout that lost them.
+        let mut g = demo_guides();
+        for id in ["arm_l", "arm_r", "leg_l", "leg_r"] {
+            remove(&mut g, id).unwrap();
+        }
+        assert_eq!(
+            add_preset(&mut g, Preset::Arms, &AddOptions::default()).unwrap(),
+            ["arm_l", "arm_r"]
+        );
+        assert_eq!(
+            add_preset(&mut g, Preset::Legs, &AddOptions::default()).unwrap(),
+            ["leg_l", "leg_r"]
+        );
+        let built = build(&g).unwrap();
+        assert!(
+            built.skeleton.bone("upperarm_l").is_some() && built.skeleton.bone("thigh_r").is_some()
+        );
     }
 }
