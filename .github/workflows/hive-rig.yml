@@ -1,0 +1,950 @@
+name: hive-rig
+
+on:
+  push:
+    branches: [main]
+    paths: ["hive-rig/**", ".github/workflows/hive-rig.yml"]
+  pull_request:
+    paths: ["hive-rig/**", ".github/workflows/hive-rig.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hive-rig-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: hive-rig
+
+jobs:
+  rust:
+    name: Rust build, lint and tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Toolchain
+        run: rustup update stable && rustup default stable && rustup component add clippy rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      - name: Open the Hive Rig app on a virtual screen
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq xvfb libxkbcommon-x11-0 libgl1-mesa-dri
+          xvfb-run -a -s "-screen 0 1400x900x24" cargo run --locked -q --bin HiveRig -- \
+            --demo --build --weights upperarm_l --screenshot "$RUNNER_TEMP/hive-rig-app.ppm"
+          test "$(head -c 2 "$RUNNER_TEMP/hive-rig-app.ppm")" = P6
+          # The weight brush, with one subtracting dab on the upper arm.
+          xvfb-run -a -s "-screen 0 1400x900x24" cargo run --locked -q --bin HiveRig -- \
+            --demo --build --weights upperarm_l --dab subtract --screenshot "$RUNNER_TEMP/hive-rig-brush.ppm"
+          test "$(head -c 2 "$RUNNER_TEMP/hive-rig-brush.ppm")" = P6
+          # A built-in creature opened as the demo and built.
+          xvfb-run -a -s "-screen 0 1400x900x24" cargo run --locked -q --bin HiveRig -- \
+            --demo spider --build --screenshot "$RUNNER_TEMP/hive-rig-spider.ppm"
+          test "$(head -c 2 "$RUNNER_TEMP/hive-rig-spider.ppm")" = P6
+      - name: Developer API - the scripted example, help-all, ASCII FBX into edits
+        run: |
+          a="$RUNNER_TEMP/api"
+          cargo run --locked -q --example script_rig -- - "$a/script"
+          test -s "$a/script/scripted.hive.json" && test -s "$a/script/scripted.fbx"
+          cargo run --locked -q -- help-all --markdown > "$a.md"
+          grep -q '^### `hive-rig weights copy`' "$a.md"
+          cargo run --locked -q -- demo -o "$a/demo" -t fbx
+          python3 -I tests/fbx_to_ascii.py "$a/demo/hive_demo.fbx" "$a/demo/hive_demo_ascii.fbx"
+          head -1 "$a/demo/hive_demo_ascii.fbx" | grep -q "; FBX 7.4.0 project file"
+          cargo run --locked -q -- edits "$a/demo/hive_demo.hive.json" "$a/demo/hive_demo_ascii.fbx" -o "$a/ascii.edits.json"
+          cargo run --locked -q -- edits "$a/demo/hive_demo.hive.json" "$a/demo/hive_demo.fbx" -o "$a/binary.edits.json"
+          cmp "$a/ascii.edits.json" "$a/binary.edits.json"
+          cargo run --locked -q -- weights import "$a/demo/hive_demo.hive.json" "$a/ascii.edits.json" | tee "$a.log"
+          grep -q "0 of 2676 vertices changed" "$a.log"
+      - name: Skin tools - influence limits, prune, copy weights, keep weights on rebuild
+        run: |
+          s="$RUNNER_TEMP/skin"
+          cargo run --locked -q -- demo -o "$s/src" --engine unreal --prune 0.01 | tee "$s.log"
+          grep -Eq "up to [5-8] influences" "$s.log"
+          grep -q '"max_influences": 8' "$s/src/hive_demo.guides.json"
+          cargo run --locked -q -- demo -o "$s/dst" --arm-drop 45
+          cargo run --locked -q -- naming "$s/dst/hive_demo.guides.json" suffix
+          cargo run --locked -q -- rebuild "$s/dst/hive_demo.hive.json"
+          cargo run --locked -q -- weights copy "$s/src/hive_demo.hive.json" "$s/dst/hive_demo.hive.json" | tee "$s.log"
+          grep -q "31 of 31 bones matched" "$s.log"
+          cargo run --locked -q -- weights limit "$s/dst/hive_demo.hive.json" --engine unity
+          cargo run --locked -q -- add "$s/dst/hive_demo.guides.json" tail
+          cargo run --locked -q -- rebuild "$s/dst/hive_demo.hive.json" --keep-weights | tee "$s.log"
+          grep -q "Kept the hand-edited weights of" "$s.log"
+          python3 -I tests/dcc_stub_run.py maya "$s/dst/hive_demo_maya.py"
+          python3 -I tests/dcc_stub_run.py unreal "$s/dst/hive_demo_unreal.py"
+      - name: Pre-build checks on the demo and the creatures
+        run: |
+          c="$RUNNER_TEMP/checks"
+          cargo run --locked -q -- demo -o "$c/demo"
+          cargo run --locked -q -- demo --quadruped -o "$c/dog"
+          for creature in bird spider snake; do
+            cargo run --locked -q -- demo --creature "$creature" -o "$c/$creature"
+          done
+          for rig in demo/hive_demo dog/hive_dog bird/hive_bird spider/hive_spider snake/hive_snake; do
+            cargo run --locked -q -- check "$c/$rig.hive.json" | tee "$c/log.txt"
+            grep -q "No problems found" "$c/log.txt"
+            grep -q "written by hive-rig" "$c/log.txt"
+          done
+          # A wrist on top of its elbow can't build: check fails, and --fix repairs it.
+          python3 -I - "$c/demo/hive_demo.guides.json" <<'EOF'
+          import json, sys
+          g = json.load(open(sys.argv[1]))
+          arm = next(c for c in g["components"] if c["id"] == "arm_l")
+          pos = {x["name"]: x for x in arm["guides"]}
+          pos["wrist"]["position"] = list(pos["elbow"]["position"])
+          json.dump(g, open(sys.argv[1], "w"))
+          EOF
+          if cargo run --locked -q -- check "$c/demo/hive_demo.guides.json"; then exit 1; fi
+          cargo run --locked -q -- check "$c/demo/hive_demo.guides.json" --mesh "$c/demo/hive_demo.glb" --fix
+          cargo run --locked -q -- rebuild "$c/demo/hive_demo.hive.json"
+      - name: Control looks from the CLI, built-skin checks, Maya and Unreal builders
+        run: |
+          c="$RUNNER_TEMP/looks"
+          cargo run --locked -q -- demo -o "$c"
+          g="$c/hive_demo.guides.json"
+          cargo run --locked -q -- control "$g" hand_l_ik_ctrl --shape gear --scale 1.3 --twin
+          cargo run --locked -q -- control "$g" foot_l_ik_ctrl --shape rounded_square --color green --twin
+          cargo run --locked -q -- control "$g" upperarm_l_fk_ctrl --component --twin --color '#ff8c1a'
+          cargo run --locked -q -- control "$g" cog_ctrl --shape curved_arrow
+          cargo run --locked -q -- control "$g" | tee "$c/log.txt"
+          grep -Eq "^hand_r_ik_ctrl +gear .*restyled" "$c/log.txt"
+          grep -Eq "^foot_r_ik_ctrl +rounded_square .*0.20,0.85,0.35" "$c/log.txt"
+          test "$(grep -c restyled "$c/log.txt")" -ge 14
+          cargo run --locked -q -- rebuild "$c/hive_demo.hive.json"
+          python3 -I tests/dcc_stub_run.py maya "$c/hive_demo_maya.py"
+          python3 -I tests/dcc_stub_run.py unreal "$c/hive_demo_unreal.py"
+          # Strip some weights: check reports them, --fix fills the bare vertices,
+          # and the automatic weights give the hand its skin back.
+          python3 -I - "$c/hive_demo.hive.json" <<'EOF'
+          import json, sys
+          r = json.load(open(sys.argv[1]))
+          names = [b["name"] for b in r["skeleton"]["bones"]]
+          hand = names.index("hand_l")
+          skin = r["skin"]
+          for v in range(len(skin["joints"])):
+              if v in (5, 6, 7) or hand in skin["joints"][v]:
+                  skin["joints"][v], skin["weights"][v] = [], []
+          json.dump(r, open(sys.argv[1], "w"))
+          EOF
+          cargo run --locked -q -- check "$c/hive_demo.hive.json" | tee "$c/log.txt"
+          grep -q "warning: skin: .* vertices have no weight" "$c/log.txt"
+          grep -q "hand_l deforms but has no skin" "$c/log.txt"
+          cargo run --locked -q -- check "$c/hive_demo.hive.json" --fix | tee "$c/log.txt"
+          grep -q "Filled .* vertices with no weight" "$c/log.txt"
+          ! grep -q "no weight, so" "$c/log.txt" || exit 1
+          cargo run --locked -q -- weights auto "$c/hive_demo.hive.json" --bone hand_l 2>&1 | tee "$c/log.txt"
+          ! grep -q "has no skin" "$c/log.txt" || exit 1
+          cargo run --locked -q -- check "$c/hive_demo.hive.json" | tee "$c/log.txt"
+          grep -q "No problems found" "$c/log.txt"
+          # The app with a restyled control picked in the controls stage.
+          xvfb-run -a -s "-screen 0 1400x900x24" cargo run --locked -q --bin HiveRig -- \
+            "$c/hive_demo.hive.json" --pick hand_l_ik_ctrl --tools --screenshot "$RUNNER_TEMP/hive-rig-control-styles.ppm"
+          test "$(head -c 2 "$RUNNER_TEMP/hive-rig-control-styles.ppm")" = P6
+      - name: Custom control shapes - draw, import, line widths; Maya and Unreal builders
+        run: |
+          c="$RUNNER_TEMP/custom_shapes"
+          export HIVE_RIG_SHAPES="$c/library.json"
+          cargo run --locked -q -- demo -o "$c"
+          g="$c/hive_demo.guides.json"
+          # Half a crown drawn with mirror on; an SVG badge imported onto a hand and its twin.
+          cargo run --locked -q -- shapes draw crown "0,-0.5 0.75,-0.5 0.875,0.5 0.5,0.125 0.25,0.625 0,0.25" --mirror --guides "$g"
+          printf '%s\n' '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">' \
+            '<polygon points="50,2 61,38 98,38 68,60 79,96 50,74 21,96 32,60 2,38 39,38"/></svg>' > "$c/badge.svg"
+          cargo run --locked -q -- control "$g" head_ctrl --custom crown --line-width 3
+          cargo run --locked -q -- control "$g" hand_l_ik_ctrl --import-shape "$c/badge.svg" --twin --line-width 0.5
+          cargo run --locked -q -- shapes list --guides "$g" | tee "$c/log.txt"
+          grep -q "crown" "$c/log.txt" && grep -q "badge" "$c/log.txt"
+          test -f "$HIVE_RIG_SHAPES"
+          cargo run --locked -q -- shapes export crown "$c/crown.svg"
+          grep -q "<polyline\|<polygon" "$c/crown.svg"
+          cargo run --locked -q -- control "$g" | tee "$c/log.txt"
+          grep -Eq "^hand_r_ik_ctrl +custom:badge" "$c/log.txt"
+          cargo run --locked -q -- rebuild "$c/hive_demo.hive.json"
+          python3 -I tests/dcc_stub_run.py maya "$c/hive_demo_maya.py"
+          python3 -I tests/dcc_stub_run.py unreal "$c/hive_demo_unreal.py"
+          grep -q '"line_width":0.5' "$c/hive_demo_unreal.py"
+          # Removing a shape from the guides gives its controls their built-in shape back.
+          cargo run --locked -q -- shapes remove crown --guides "$g"
+          ! cargo run --locked -q -- control "$g" | grep -q "custom:crown" || exit 1
+          # The app with the badge picked and the shape editor's crown draft open.
+          cargo run --locked -q -- rebuild "$c/hive_demo.hive.json"
+          xvfb-run -a -s "-screen 0 1400x900x24" cargo run --locked -q --bin HiveRig -- \
+            "$c/hive_demo.hive.json" --pick hand_r_ik_ctrl --mode rig --no-toast --draw-shape \
+            --screenshot "$RUNNER_TEMP/hive-rig-custom-shapes.ppm"
+          test "$(head -c 2 "$RUNNER_TEMP/hive-rig-custom-shapes.ppm")" = P6
+      - name: Several characters in one scene - props held across characters; Maya and Unreal builders
+        run: |
+          d="$RUNNER_TEMP/scene"
+          s="$d/duel.scene.json"
+          mkdir -p "$d"
+          cargo run --locked -q -- scene new "$s" hero=demo rival=demo@-1.45,0,0.15 dog=demo:dog@1.6,0,0.3
+          cargo run --locked -q -- scene prop "$s" hero --id sword
+          cargo run --locked -q -- scene hold "$s" --prop hero:sword_01_r_ctrl --holder rival:hand_l
+          # A bone the holder doesn't have is refused.
+          ! cargo run --locked -q -- scene hold "$s" --prop hero:sword_01_r_ctrl --holder dog:wing_l || exit 1
+          cargo run --locked -q -- scene list "$s" | tee "$d/log.txt"
+          grep -q "hero:sword_01_r_ctrl held by rival:hand_l" "$d/log.txt"
+          cargo run --locked -q -- scene build "$s"
+          r="$d/duel_rigs"
+          for n in hero rival dog; do test -f "$r/$n.hive.json" && test -f "$r/${n}_blender.py"; done
+          python3 -I tests/dcc_stub_run.py maya "$r/duel_scene_maya.py" | tee "$d/log.txt"
+          grep -q "maya scene builder ran 3 characters and 1 holds" "$d/log.txt"
+          python3 -I tests/dcc_stub_run.py unreal "$r/duel_scene_unreal.py" | tee "$d/log.txt"
+          grep -q "unreal scene builder ran 3 characters and 1 holds" "$d/log.txt"
+          # One character again: the others keep their last export.
+          cargo run --locked -q -- scene build "$s" --only rival | tee "$d/log.txt"
+          grep -q "rival" "$d/log.txt"
+          # Taking the holder out drops the hold.
+          cp "$s" "$d/copy.scene.json"
+          cargo run --locked -q -- scene remove "$d/copy.scene.json" rival
+          ! cargo run --locked -q -- scene list "$d/copy.scene.json" | grep -q "held by" || exit 1
+          # The app with all three characters, the held sword picked.
+          xvfb-run -a -s "-screen 0 1400x900x24" cargo run --locked -q --bin HiveRig -- \
+            "$s" --build-all --pick sword_01_r_ctrl --mode rig --no-toast \
+            --view persp --look 0.1,0.8,0 --zoom 0.5 --screenshot "$RUNNER_TEMP/hive-rig-two-characters.ppm"
+          test "$(head -c 2 "$RUNNER_TEMP/hive-rig-two-characters.ppm")" = P6
+      - name: Generate demo rigs (T-pose and A-pose)
+        run: |
+          cargo run --locked -q -- demo -o "$RUNNER_TEMP/t_pose"
+          cargo run --locked -q -- demo -o "$RUNNER_TEMP/a_pose" --arm-drop 45
+      - name: Maya and Unreal builders run against stub APIs
+        run: |
+          for pose in t_pose a_pose; do
+            python3 -I tests/dcc_stub_run.py maya "$RUNNER_TEMP/$pose/hive_demo_maya.py"
+            python3 -I tests/dcc_stub_run.py unreal "$RUNNER_TEMP/$pose/hive_demo_unreal.py"
+          done
+      - name: Components - add, remove, rebuild and the Maya guide tools
+        run: |
+          rig="$RUNNER_TEMP/components"
+          cargo run --locked -q -- demo -o "$rig"
+          cargo run --locked -q -- add "$rig/hive_demo.guides.json" fingers
+          cargo run --locked -q -- add "$rig/hive_demo.guides.json" tail
+          cargo run --locked -q -- add "$rig/hive_demo.guides.json" chain --parent head --joints 2 --id ear
+          cargo run --locked -q -- add "$rig/hive_demo.guides.json" eyes
+          cargo run --locked -q -- add "$rig/hive_demo.guides.json" jaw
+          cargo run --locked -q -- add "$rig/hive_demo.guides.json" face
+          cargo run --locked -q -- remove "$rig/hive_demo.guides.json" ear
+          # Toes and an import from another layout, hung from the left ball of the foot.
+          cargo run --locked -q -- demo -o "$rig/other"
+          cargo run --locked -q -- add "$rig/other/hive_demo.guides.json" toes --side left
+          cargo run --locked -q -- import "$rig/hive_demo.guides.json" "$rig/other/hive_demo.guides.json" --parent ball_l
+          cargo run --locked -q -- attach "$rig/hive_demo.guides.json" toe_big_l ball_l
+          cargo run --locked -q -- components "$rig/hive_demo.guides.json"
+          cargo run --locked -q -- rebuild "$rig/hive_demo.hive.json"
+          python3 -I tests/dcc_stub_run.py unreal "$rig/hive_demo_unreal.py"
+          python3 -I tests/dcc_stub_run.py maya "$rig/hive_demo_maya.py" --guides
+          # Again with another naming convention (the guide tools add stub_ear each run).
+          cargo run --locked -q -- remove "$rig/hive_demo.guides.json" stub_ear
+          cargo run --locked -q -- naming "$rig/hive_demo.guides.json" suffix
+          cargo run --locked -q -- rebuild "$rig/hive_demo.hive.json"
+          python3 -I tests/dcc_stub_run.py unreal "$rig/hive_demo_unreal.py"
+          python3 -I tests/dcc_stub_run.py maya "$rig/hive_demo_maya.py" --guides
+      - name: Rig templates - save, apply onto another character, rebuild
+        run: |
+          t="$RUNNER_TEMP/templates"
+          export XDG_CONFIG_HOME="$t/config"
+          cargo run --locked -q -- demo -o "$t/a"
+          cargo run --locked -q -- demo -o "$t/b" --arm-drop 45
+          for part in fingers tail eyes; do cargo run --locked -q -- add "$t/a/hive_demo.guides.json" "$part"; done
+          cargo run --locked -q -- template save "$t/a/hive_demo.guides.json" "$t/studio.template.json"
+          cargo run --locked -q -- template save "$t/a/hive_demo.guides.json" "$XDG_CONFIG_HOME/hive-rig/templates/bits.template.json" --only index_l,tail
+          cargo run --locked -q -- template list | grep -q "^bits "
+          cargo run --locked -q -- template apply "$t/b/hive_demo.guides.json" "$t/studio.template.json"
+          cargo run --locked -q -- template apply "$t/b/hive_demo.guides.json" bits | tee "$t/log.txt"
+          grep -q "index2_l, tail2" "$t/log.txt"
+          cargo run --locked -q -- template apply "$t/b/hive_demo.guides.json" bits --parent head
+          cargo run --locked -q -- template apply "$t/a/hive_demo.guides.json" biped_face_fingers
+          for rig in a b; do cargo run --locked -q -- rebuild "$t/$rig/hive_demo.hive.json"; done
+          python3 -I tests/dcc_stub_run.py maya "$t/b/hive_demo_maya.py"
+      - name: Quadruped - the dog demo and hind legs on a biped, Maya and Unreal builders
+        run: |
+          dog="$RUNNER_TEMP/dog"
+          cargo run --locked -q -- demo --quadruped -o "$dog"
+          python3 -I tests/dcc_stub_run.py maya "$dog/hive_dog_maya.py" --guides
+          python3 -I tests/dcc_stub_run.py unreal "$dog/hive_dog_unreal.py"
+          # Swap a biped's legs for three-segment hind legs.
+          swap="$RUNNER_TEMP/swap"
+          cargo run --locked -q -- demo -o "$swap"
+          cargo run --locked -q -- remove "$swap/hive_demo.guides.json" leg_l
+          cargo run --locked -q -- remove "$swap/hive_demo.guides.json" leg_r
+          cargo run --locked -q -- add "$swap/hive_demo.guides.json" quad_legs
+          cargo run --locked -q -- rebuild "$swap/hive_demo.hive.json"
+          python3 -I tests/dcc_stub_run.py maya "$swap/hive_demo_maya.py"
+          python3 -I tests/dcc_stub_run.py unreal "$swap/hive_demo_unreal.py"
+      - name: Creatures - bird, spider and snake, Maya and Unreal builders
+        run: |
+          for creature in bird spider snake; do
+            cr="$RUNNER_TEMP/creature_$creature"
+            cargo run --locked -q -- demo --creature "$creature" -o "$cr"
+            python3 -I tests/dcc_stub_run.py unreal "$cr/hive_${creature}_unreal.py"
+            python3 -I tests/dcc_stub_run.py maya "$cr/hive_${creature}_maya.py" --guides
+          done
+          # Each creature is a built-in template that loads onto the biped demo.
+          t="$RUNNER_TEMP/creature_templates"
+          cargo run --locked -q -- demo -o "$t"
+          for creature in dog bird spider snake; do
+            cargo run --locked -q -- template apply "$t/hive_demo.guides.json" "$creature"
+            cargo run --locked -q -- rebuild "$t/hive_demo.hive.json"
+          done
+      - name: Engine presets - Unity Humanoid and Mixamo names, extra IK legs, Maya and Unreal builders
+        run: |
+          for n in unity mixamo; do
+            e="$RUNNER_TEMP/engine_$n"
+            cargo run --locked -q -- demo -o "$e" --naming "$n" --targets maya,unreal,fbx
+            test -s "$e/hive_demo.ht"
+            grep -q "m_BoneTemplate:" "$e/hive_demo.ht"
+            python3 -I tests/dcc_stub_run.py maya "$e/hive_demo_maya.py"
+            python3 -I tests/dcc_stub_run.py unreal "$e/hive_demo_unreal.py"
+          done
+          grep -q "    Hips: Hips" "$RUNNER_TEMP/engine_unity/hive_demo.ht"
+          grep -q "LeftUpperLeg: 'mixamorig:LeftUpLeg'" "$RUNNER_TEMP/engine_mixamo/hive_demo.ht"
+          cargo run --locked -q -- naming "$RUNNER_TEMP/engine_unity/hive_demo.guides.json" | grep -q "LeftUpperArm"
+          # A second pair of IK hind legs on the dog, hung from the spine.
+          x="$RUNNER_TEMP/extra_legs"
+          cargo run --locked -q -- demo --quadruped -o "$x" --targets maya,unreal
+          cargo run --locked -q -- add "$x/hive_dog.guides.json" quad_legs --id mid_leg --parent spine_02
+          cargo run --locked -q -- rebuild "$x/hive_dog.hive.json" --targets maya,unreal | grep -q "6 IK limbs"
+          python3 -I tests/dcc_stub_run.py maya "$x/hive_dog_maya.py"
+          python3 -I tests/dcc_stub_run.py unreal "$x/hive_dog_unreal.py"
+      - name: Spline chains - a tentacle and a spline spine, Maya and Unreal builders
+        run: |
+          sp="$RUNNER_TEMP/spline"
+          cargo run --locked -q -- demo -o "$sp"
+          cargo run --locked -q -- add "$sp/hive_demo.guides.json" tentacle
+          cargo run --locked -q -- add "$sp/hive_demo.guides.json" tentacle --parent hand_l --joints 4 --controls 3
+          cargo run --locked -q -- spine "$sp/hive_demo.guides.json" --spline true --controls 4
+          cargo run --locked -q -- components "$sp/hive_demo.guides.json"
+          cargo run --locked -q -- rebuild "$sp/hive_demo.hive.json"
+          python3 -I tests/dcc_stub_run.py maya "$sp/hive_demo_maya.py" --guides
+          python3 -I tests/dcc_stub_run.py unreal "$sp/hive_demo_unreal.py"
+      - name: Wing feathers, forking chains and spline slide, Maya and Unreal builders
+        run: |
+          f="$RUNNER_TEMP/feathers"
+          cargo run --locked -q -- demo --creature bird --feathers 5 --feather-rows 2 -o "$f" --targets maya,unreal
+          cargo run --locked -q -- add "$f/hive_bird.guides.json" antlers
+          cargo run --locked -q -- branch "$f/hive_bird.guides.json" antler_l --from j4 --joints 2
+          cargo run --locked -q -- feathers "$f/hive_bird.guides.json" --id wing_l --count 6 --rows 2
+          cargo run --locked -q -- components "$f/hive_bird.guides.json" | tee "$f/log.txt"
+          grep -q "6 feathers a row" "$f/log.txt" && grep -q "forking" "$f/log.txt"
+          cargo run --locked -q -- rebuild "$f/hive_bird.hive.json"
+          cargo run --locked -q -- pose "$f/hive_bird.hive.json" --attr wing_feathers_l_ctrl.spread=0.7
+          python3 -I tests/dcc_stub_run.py maya "$f/hive_bird_maya.py" | tee "$f/maya.txt"
+          grep -q "maya feathers ran against stubs" "$f/maya.txt"
+          python3 -I tests/dcc_stub_run.py unreal "$f/hive_bird_unreal.py" | tee "$f/unreal.txt"
+          grep -q "unreal feathers ran against stubs" "$f/unreal.txt"
+          t="$RUNNER_TEMP/slide"
+          cargo run --locked -q -- demo -o "$t" --targets maya,unreal
+          cargo run --locked -q -- add "$t/hive_demo.guides.json" tentacle
+          cargo run --locked -q -- rebuild "$t/hive_demo.hive.json"
+          cargo run --locked -q -- pose "$t/hive_demo.hive.json" --attr tentacle_ik_04_ctrl.slide=0.4
+          python3 -I tests/dcc_stub_run.py maya "$t/hive_demo_maya.py"
+          python3 -I tests/dcc_stub_run.py unreal "$t/hive_demo_unreal.py"
+      - name: Bendy limbs and soft IK, Maya and Unreal builders
+        run: |
+          b="$RUNNER_TEMP/bendy"
+          cargo run --locked -q -- demo -o "$b" --bendy --soft 0.5
+          python3 -I tests/dcc_stub_run.py maya "$b/hive_demo_maya.py"
+          python3 -I tests/dcc_stub_run.py unreal "$b/hive_demo_unreal.py"
+          cargo run --locked -q -- naming "$b/hive_demo.guides.json" suffix
+          cargo run --locked -q -- rebuild "$b/hive_demo.hive.json"
+          python3 -I tests/dcc_stub_run.py maya "$b/hive_demo_maya.py"
+          python3 -I tests/dcc_stub_run.py unreal "$b/hive_demo_unreal.py"
+      - name: Spring hocks, Unreal mirror/reset pose and Send to Hive - Maya and Unreal builders
+        run: |
+          # Horse (spring 1), dinosaur and dog (spring 0): the spring helper chain
+          # in Maya and Unreal, mirror and reset pose in Unreal, and Unreal's
+          # Send to Hive (the rig's own .fbx stands in for Unreal's export).
+          for creature in horse dinosaur dog; do
+            cr="$RUNNER_TEMP/spring_$creature"
+            cargo run --locked -q -- demo --creature "$creature" -o "$cr" --targets maya,unreal,fbx
+            python3 -I tests/dcc_stub_run.py maya "$cr/hive_${creature}_maya.py"
+            python3 -I tests/dcc_stub_run.py unreal "$cr/hive_${creature}_unreal.py" --send
+          done
+          # An exported mesh turned into an edits file: nothing changes.
+          cr="$RUNNER_TEMP/spring_horse"
+          cargo run --locked -q -- edits "$cr/hive_horse.hive.json" "$cr/hive_horse.fbx"
+          cargo run --locked -q -- weights import "$cr/hive_horse.hive.json" "$cr/hive_horse.edits.json" | tee "$cr/log.txt"
+          grep -q "0 of [0-9]* vertices changed" "$cr/log.txt"
+          # A pose posed with the CLI (as in the app) goes into Maya's pose library.
+          p="$RUNNER_TEMP/studio_pose_maya"
+          cargo run --locked -q -- demo -o "$p" --targets maya,unreal
+          cargo run --locked -q -- pose "$p/hive_demo.hive.json" --set head_ctrl=,,,0,-30,5 --attr foot_r_ik_ctrl.roll=30
+          python3 -I tests/dcc_stub_run.py maya "$p/hive_demo_maya.py"
+      - name: Blendshapes - sculpt, mirror, split, combine, drive; Maya and Unreal builders
+        run: |
+          s="$RUNNER_TEMP/blendshapes"
+          cargo run --locked -q -- demo -o "$s" --targets blender,maya,unreal,fbx
+          r="$s/hive_demo.hive.json"
+          elbow=$(python3 -I - "$r" <<'EOF'
+          import json, sys
+          rig = json.load(open(sys.argv[1]))
+          bone = next(b for b in rig["skeleton"]["bones"] if b["name"] == "lowerarm_l")
+          print(",".join(str(x) for x in bone["head"]))
+          EOF
+          )
+          cargo run --locked -q -- shape "$r" sculpt elbow_fix_l --pose lowerarm_l=90 --at "$elbow" --radius 0.08 --offset 0,0.03,0 --drive
+          # An in-between half way through the bend, sculpted in that pose.
+          cargo run --locked -q -- shape "$r" inbetween elbow_fix_l 0.5
+          cargo run --locked -q -- shape "$r" sculpt elbow_fix_l --inbetween 0.5 --pose lowerarm_l=45 --at "$elbow" --radius 0.06 --offset 0,0.02,0.01
+          cargo run --locked -q -- shape "$r" mirror elbow_fix_l
+          cargo run --locked -q -- shape "$r" sculpt brow_up --at 0.03,1.72,0.1 --radius 0.06 --offset 0,0.02,0
+          cargo run --locked -q -- shape "$r" split brow_up
+          cargo run --locked -q -- shape "$r" combine brow_up_l,elbow_fix_l --as combo
+          cargo run --locked -q -- shape "$r" weight brow_up 0.25
+          cargo run --locked -q -- shape "$r" drive combo --bone upperarm_l --toward up --start 10 --end 80
+          cargo run --locked -q -- shape "$r" remove combo
+          cargo run --locked -q -- shape "$r" list | tee "$s/log.txt"
+          grep -q "elbow_fix_r .*driven by lowerarm_r.*in-betweens at 0.50" "$s/log.txt"
+          # Maya: in-betweens as blendShape items, and Send to Hive reads every
+          # shape and weight back and runs `shape import`. Unreal: a curve per
+          # morph target blended through the in-betweens, sliders for free shapes.
+          python3 -I tests/dcc_stub_run.py maya "$s/hive_demo_maya.py" --send
+          python3 -I tests/dcc_stub_run.py unreal "$s/hive_demo_unreal.py"
+          cargo run --locked -q -- rebuild "$r"
+          python3 -I tests/dcc_stub_run.py maya "$s/hive_demo_maya.py" --guides
+          # Edits made elsewhere come back: one repainted vertex and a new shape.
+          python3 -I - "$r" "$s/hive_demo.edits.json" <<'EOF'
+          import json, sys
+          rig = json.load(open(sys.argv[1]))
+          bones = [b["name"] for b in rig["skeleton"]["bones"]]
+          weights = []
+          for js, ws in zip(rig["skin"]["joints"], rig["skin"]["weights"]):
+              v = {}
+              for j, w in zip(js, ws):
+                  if w > 0.0:
+                      v[bones[j]] = v.get(bones[j], 0.0) + w
+              weights.append(v)
+          weights[0] = {"head": 1.0}
+          shape = {"name": "smile", "weight": 0.5, "vertices": [0], "offsets": [[0, 0.01, 0]],
+                   "inbetweens": [{"weight": 0.5, "vertices": [0], "offsets": [[0, 0.002, 0]]}]}
+          json.dump({"hive_rig_edits": 1, "rig": "hive_demo", "source": "ci", "vertex_count": len(weights),
+                     "weights": weights, "shapes": [shape]}, open(sys.argv[2], "w"))
+          EOF
+          cargo run --locked -q -- weights import "$r" "$s/hive_demo.edits.json" | tee "$s/log.txt"
+          grep -q "1 of [0-9]* vertices changed" "$s/log.txt"
+          cargo run --locked -q -- shape "$r" import "$s/hive_demo.edits.json"
+          cargo run --locked -q -- shape "$r" list | tee "$s/log.txt"
+          grep -q "smile .*weight 0.50  in-betweens at 0.50" "$s/log.txt"
+          # The studio shows a shape at a weight and a driven corrective in a pose.
+          xvfb-run -a -s "-screen 0 1400x900x24" cargo run --locked -q --bin HiveRig -- \
+            "$r" --pose lowerarm_l=-90@y --shape brow_up=1 --screenshot "$RUNNER_TEMP/hive-rig-shapes.ppm"
+          test "$(head -c 2 "$RUNNER_TEMP/hive-rig-shapes.ppm")" = P6
+          # The sculpt tools on an in-between of a new corrective, and the
+          # weight tools with every bone in its own colour.
+          xvfb-run -a -s "-screen 0 1400x900x24" cargo run --locked -q --bin HiveRig -- \
+            --demo --build --pose lowerarm_l=90@y --corrective --inbetween 0.5 --sculpt inflate \
+            --screenshot "$RUNNER_TEMP/hive-rig-sculpt.ppm"
+          test "$(head -c 2 "$RUNNER_TEMP/hive-rig-sculpt.ppm")" = P6
+          xvfb-run -a -s "-screen 0 1400x900x24" cargo run --locked -q --bin HiveRig -- \
+            --demo --build --weights upperarm_l --all-bones --vertices --bone-filter arm \
+            --screenshot "$RUNNER_TEMP/hive-rig-skin-tools.ppm"
+          test "$(head -c 2 "$RUNNER_TEMP/hive-rig-skin-tools.ppm")" = P6
+      - name: Cone and RBF pose readers with a helper joint; Maya and Unreal builders
+        run: |
+          s="$RUNNER_TEMP/readers"
+          cargo run --locked -q -- demo -o "$s" --targets blender,maya,unreal,fbx
+          r="$s/hive_demo.hive.json"
+          # A cone on the shoulder (on as the arm swings up, whichever way), sculpted there.
+          cargo run --locked -q -- shape "$r" reader cone shoulder_up_l --bone upperarm_l --pose upperarm_l=70@up --angle 10 --falloff 40 --shape shoulder_up_l
+          cargo run --locked -q -- shape "$r" sculpt shoulder_up_l --pose upperarm_l=70@up --at 0.2,1.45,0 --radius 0.08 --offset 0,0.02,0
+          # An RBF reader on the elbow from two studio poses, with a volume helper joint.
+          cargo run --locked -q -- shape "$r" reader rbf elbow_l --bone lowerarm_l
+          cargo run --locked -q -- pose "$r" --reset --set lowerarm_l_fk_ctrl=0,0,0,0,80,0 >/dev/null
+          cargo run --locked -q -- shape "$r" reader pose elbow_l --studio --set elbow_fix_l=1
+          cargo run --locked -q -- pose "$r" --reset --set lowerarm_l_fk_ctrl=0,0,0,0,40,30 >/dev/null
+          cargo run --locked -q -- shape "$r" reader pose elbow_l --studio --set elbow_fix_l=0.4
+          cargo run --locked -q -- shape "$r" reader helper elbow_l elbow_vol_l --offset 0,0,-0.02 --across 1.3 --along 0.9 --on 1
+          # A rebuild keeps the readers and puts the helper joint back.
+          cargo run --locked -q -- rebuild "$r" >/dev/null
+          cargo run --locked -q -- shape "$r" reader list --studio | tee "$s/log.txt"
+          grep -q "elbow_l" "$s/log.txt" && grep -q "shoulder_up_l" "$s/log.txt"
+          # Poses to check, each with hive-rig's answer (twist included).
+          cargo run --locked -q -- pose "$r" --reset --set lowerarm_l_fk_ctrl=0,0,0,0,80,0 --readers "$s/p1.json" >/dev/null
+          cargo run --locked -q -- pose "$r" --reset --set lowerarm_l_fk_ctrl=0,0,0,0,55,15 --set upperarm_l_fk_ctrl=0,0,0,0,0,50 --readers "$s/p2.json" >/dev/null
+          cargo run --locked -q -- pose "$r" --reset --set upperarm_l_fk_ctrl=0,0,0,30,0,60 --readers "$s/p3.json" >/dev/null
+          cargo run --locked -q -- pose "$r" --reset --set upperarm_l_fk_ctrl=0,0,0,0,-40,70 --set lowerarm_l_fk_ctrl=0,0,0,20,30,0 --readers "$s/p4.json" >/dev/null
+          cargo run --locked -q -- pose "$r" --reset >/dev/null
+          # Maya: the reader expressions, evaluated on hive-rig's local rotations,
+          # give hive-rig's outputs. Unreal: the reader and helper nodes are made.
+          python3 -I tests/dcc_stub_run.py maya "$s/hive_demo_maya.py" --answers "$s"/p?.json
+          python3 -I tests/dcc_stub_run.py unreal "$s/hive_demo_unreal.py"
+      - name: Face board - sliders, lip zippers, sticky lips; Maya and Unreal builders
+        run: |
+          f="$RUNNER_TEMP/face_board"
+          cargo run --locked -q -- demo -o "$f"
+          for p in eyes jaw face; do cargo run --locked -q -- add "$f/hive_demo.guides.json" "$p"; done
+          cargo run --locked -q -- rebuild "$f/hive_demo.hive.json"
+          r="$f/hive_demo.hive.json"
+          cargo run --locked -q -- shape "$r" sculpt blink_l --at 0.03,1.62,0.08 --radius 0.03 --offset 0,-0.005,0
+          cargo run --locked -q -- shape "$r" board --auto
+          cargo run --locked -q -- shape "$r" list | tee "$f/log.txt"
+          grep -q "blink_l .*follows the face board's lid_l slider going y-" "$f/log.txt"
+          # The board's expression run against the sliders in Maya; its nodes in Unreal.
+          python3 -I tests/dcc_stub_run.py maya "$f/hive_demo_maya.py" | tee "$f/maya.txt"
+          grep -q "maya face board ran against stubs" "$f/maya.txt"
+          python3 -I tests/dcc_stub_run.py unreal "$f/hive_demo_unreal.py" | tee "$f/unreal.txt"
+          grep -q "unreal face board ran against stubs" "$f/unreal.txt"
+          # The studio with the board posed: a brow up, a smile, the jaw open and
+          # the left zipper part way, with the board's pads in Properties.
+          xvfb-run -a -s "-screen 0 1400x900x24" cargo run --locked -q --bin HiveRig -- \
+            "$r" --mode rig --no-toast --no-outliner \
+            --set board_brow_l_ctrl=0,0.012,0 --set board_corner_l_ctrl=0.005,0.014,0 \
+            --set board_corner_r_ctrl=-0.005,0.014,0 --set board_jaw_ctrl=0,-0.009,0 \
+            --set board_zip_l_ctrl=-0.015,0,0 --view front --zoom 3.5 --look 0.42,1.68,0 \
+            --screenshot "$RUNNER_TEMP/hive-rig-face-board.ppm"
+          test "$(head -c 2 "$RUNNER_TEMP/hive-rig-face-board.ppm")" = P6
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hive-demo-rigs
+          path: ${{ runner.temp }}/*_pose
+          retention-days: 7
+
+  windows:
+    name: Windows build
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Toolchain
+        run: rustup update stable && rustup default stable
+      - run: cargo build --release --locked
+      - name: Rig the demo with the Windows command line
+        shell: bash
+        run: ./target/release/hive-rig.exe demo -o "$RUNNER_TEMP/win_demo"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hive-rig-windows
+          path: |
+            hive-rig/target/release/HiveRig.exe
+            hive-rig/target/release/hive-rig.exe
+          retention-days: 14
+
+  blender:
+    name: Build and exercise the rig in Blender
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.13"
+      - name: Install Blender as a Python module
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq libxkbcommon0 libsm6 libxi6 libxxf86vm1 libxfixes3 libxrender1 libgl1
+          python -m pip install --quiet bpy==5.2.2
+      - name: Generate and check rigs
+        run: |
+          for drop in 0 45; do
+            cargo run -q -- demo -o "$RUNNER_TEMP/rig$drop" --arm-drop "$drop"
+            python tests/blender_check.py "$RUNNER_TEMP/rig$drop/hive_demo_blender.py" "$RUNNER_TEMP/rig$drop/hive_demo.glb"
+          done
+      - name: FBX through Blender's FBX importer - demo, dog, bendy, 8 influences, side-first names
+        run: |
+          f="$RUNNER_TEMP/fbx"
+          cargo run -q -- demo -o "$f/plain" --targets fbx
+          cargo run -q -- demo -o "$f/dog" --quadruped --targets fbx
+          cargo run -q -- demo -o "$f/bendy" --bendy --targets fbx
+          cargo run -q -- demo -o "$f/m8" --engine unreal --targets fbx
+          cargo run -q -- naming "$f/m8/hive_demo.guides.json" prefix
+          cargo run -q -- rebuild "$f/m8/hive_demo.hive.json" -o "$f/named" --targets fbx
+          for rig in plain/hive_demo dog/hive_dog bendy/hive_demo m8/hive_demo named/hive_demo; do
+            python tests/blender_fbx_check.py "$f/$rig.fbx" "$f/$rig.hive.json"
+          done
+      - name: Control shapes set in guides.json, in Blender
+        run: |
+          rig="$RUNNER_TEMP/shapes"
+          cargo run -q -- demo -o "$rig"
+          python - "$rig/hive_demo.guides.json" <<'EOF'
+          import json, sys
+          shapes = {"root_ctrl": "four_arrows", "cog_ctrl": "octagon", "head_ctrl": "sphere",
+                    "pelvis_ctrl": "star", "spine_02_ctrl": "hexagon", "hand_l_ik_ctrl": "pyramid",
+                    "lowerarm_l_pole_ctrl": "arrow", "lowerarm_r_pole_ctrl": "triangle",
+                    "foot_l_ik_ctrl": "double_arrow", "foot_r_ik_ctrl": "half_circle",
+                    "spine_01_ctrl": "rounded_square", "spine_03_ctrl": "rounded_triangle",
+                    "neck_01_ctrl": "quarter_circle", "hand_r_ik_ctrl": "gear",
+                    "upperarm_l_fk_ctrl": "curved_arrow", "upperarm_r_fk_ctrl": "lollipop",
+                    "thigh_l_fk_ctrl": "cylinder", "thigh_r_fk_ctrl": "plus"}
+          g = json.load(open(sys.argv[1]))
+          g["control_styles"] = {name: {"shape": shape} for name, shape in shapes.items()}
+          json.dump(g, open(sys.argv[1], "w"))
+          EOF
+          # Colours and sizes from the CLI too (the check compares every colour).
+          cargo run -q -- control "$rig/hive_demo.guides.json" calf_l_fk_ctrl --color cyan --size 0.09 --twin
+          cargo run -q -- rebuild "$rig/hive_demo.hive.json"
+          python tests/blender_check.py "$rig/hive_demo_blender.py" "$rig/hive_demo.glb"
+      - name: Custom control shapes and line widths in Blender
+        run: |
+          rig="$RUNNER_TEMP/custom_shapes"
+          export HIVE_RIG_SHAPES="$rig/library.json"
+          cargo run -q -- demo -o "$rig"
+          cargo run -q -- shapes draw crown "0,-0.5 0.75,-0.5 0.875,0.5 0.5,0.125 0.25,0.625 0,0.25" --mirror --guides "$rig/hive_demo.guides.json"
+          cargo run -q -- shapes draw tick "-0.6,0 -0.2,-0.5 0.7,0.6" --guides "$rig/hive_demo.guides.json"
+          cargo run -q -- control "$rig/hive_demo.guides.json" head_ctrl --custom crown --line-width 3
+          cargo run -q -- control "$rig/hive_demo.guides.json" hand_l_ik_ctrl --custom tick --twin --line-width 0.5
+          cargo run -q -- rebuild "$rig/hive_demo.hive.json"
+          python tests/blender_check.py "$rig/hive_demo_blender.py" "$rig/hive_demo.glb"
+      - name: Several characters in one Blender file, a prop held across characters
+        run: |
+          d="$RUNNER_TEMP/scene"
+          mkdir -p "$d"
+          cargo run -q -- scene new "$d/duel.scene.json" hero=demo rival=demo@-1.45,0,0.15 dog=demo:dog@1.6,0,0.3
+          cargo run -q -- scene prop "$d/duel.scene.json" hero --id sword
+          cargo run -q -- scene hold "$d/duel.scene.json" --prop hero:sword_01_r_ctrl --holder rival:hand_l
+          cargo run -q -- scene build "$d/duel.scene.json"
+          python tests/blender_scene_check.py "$d/duel_rigs/duel_scene_blender.py"
+      - name: Face board in Blender - sliders, lip zippers, sticky lips, linked shapes
+        run: |
+          f="$RUNNER_TEMP/face_board"
+          cargo run -q -- demo -o "$f"
+          for p in eyes jaw face; do cargo run -q -- add "$f/hive_demo.guides.json" "$p"; done
+          cargo run -q -- rebuild "$f/hive_demo.hive.json"
+          cargo run -q -- shape "$f/hive_demo.hive.json" sculpt blink_l --at 0.03,1.62,0.08 --radius 0.03 --offset 0,-0.005,0
+          cargo run -q -- shape "$f/hive_demo.hive.json" board --auto
+          python tests/blender_check.py "$f/hive_demo_blender.py" "$f/hive_demo.glb" | tee "$f/log.txt"
+          grep -q "face board checked" "$f/log.txt"
+          python tests/blender_anim_check.py "$f/hive_demo_blender.py"
+      - name: Skin weights in Blender - 8 influences (JOINTS_1), 4 with pruning, copied weights
+        run: |
+          s="$RUNNER_TEMP/skin"
+          cargo run -q -- demo -o "$s/m8" --engine unreal
+          python tests/blender_check.py "$s/m8/hive_demo_blender.py" "$s/m8/hive_demo.glb"
+          python tests/blender_anim_check.py "$s/m8/hive_demo_blender.py"
+          cargo run -q -- demo -o "$s/m4" --arm-drop 45 --max-influences 4 --prune 0.02
+          python tests/blender_check.py "$s/m4/hive_demo_blender.py" "$s/m4/hive_demo.glb"
+          cargo run -q -- demo -o "$s/src"
+          cargo run -q -- demo -o "$s/dst" --arm-drop 45
+          cargo run -q -- naming "$s/dst/hive_demo.guides.json" suffix
+          cargo run -q -- rebuild "$s/dst/hive_demo.hive.json"
+          cargo run -q -- weights copy "$s/src/hive_demo.hive.json" "$s/dst/hive_demo.hive.json" --engine unreal12
+          python tests/blender_check.py "$s/dst/hive_demo_blender.py" "$s/dst/hive_demo.glb"
+      - name: Automatic skin weights on public characters, posed in Blender
+        run: |
+          w="$RUNNER_TEMP/weights"
+          # Downloaded at pinned commits, never committed; read with python -I.
+          sh tests/fetch_skin_models.sh "$w/models" CesiumMan RobotExpressive
+          cargo run -q --release -- rig "$w/models/CesiumMan/CesiumMan.glb" -o "$w/cesium" -t blender
+          # The guides sit on CesiumMan's own joints; its artist weights keep 0.82 of
+          # the thickness on the same bend.
+          python -I tests/blender_skin_eval.py "$w/cesium/CesiumMan.hive.json" \
+            --source "$w/models/CesiumMan/CesiumMan.glb" \
+            --max-leg-leak 0.02 --max-arm-leak 0.08 --min-thickness 0.8 --max-spikes 0.4 \
+            --max-artist-diff 0.55 --require-artist
+          cargo run -q --release -- rig "$w/models/RobotExpressive/RobotExpressive.glb" -o "$w/robot" -t blender
+          python -I tests/blender_skin_eval.py "$w/robot/RobotExpressive.hive.json" \
+            --source "$w/models/RobotExpressive/RobotExpressive.glb" \
+            --max-arm-leak 0.02 --max-piece-wrong 0.05 --min-thickness 0.85 --max-spikes 0.6 --max-artist-diff 0.2
+          for drop in 0 45; do
+            cargo run -q --release -- demo -o "$w/demo$drop" --arm-drop "$drop"
+            python -I tests/blender_skin_eval.py "$w/demo$drop/hive_demo.hive.json" \
+              --max-leg-leak 0.02 --max-arm-leak 0.02 --min-thickness 0.85 --max-spikes 0.4
+          done
+          for creature in dog bird spider snake; do
+            cargo run -q --release -- demo --creature "$creature" -o "$w/$creature"
+            python -I tests/blender_skin_eval.py "$w/$creature/hive_$creature.hive.json" \
+              --max-leg-leak 0.02 --min-thickness 0.75 --max-spikes 0.4 --max-piece-wrong 0.1
+          done
+      - name: Orientation, facing and body template read from public characters
+        run: |
+          o="$RUNNER_TEMP/orient"
+          # Soldier faces -Z (its left and right were swapped), Michelle is stood
+          # up by her armature (she loaded lying down), and Fox is a quadruped
+          # whose joints the dog layout reads by their shape.
+          sh tests/fetch_skin_models.sh "$o/models" Soldier Michelle Fox
+          for m in Soldier Michelle Fox; do
+            cargo run -q --release -- rig "$o/models/$m/$m.glb" -o "$o/$m" -t blender,fbx | tee "$o/$m.log"
+          done
+          # The Blender script builds Soldier upright facing +Z; the .fbx stands it
+          # as in the source.
+          python -I tests/blender_mesh_check.py "$o/Soldier/Soldier_blender.py" \
+            --source "$o/models/Soldier/Soldier.glb" --fbx "$o/Soldier/Soldier.fbx"
+          grep -q "^Orientation: up +Y, facing -Z" "$o/Soldier.log"
+          grep -q "^Orientation: up +Y, facing +Z" "$o/Michelle.log"
+          grep -q "^Template: dog" "$o/Fox.log"
+          cargo run -q --release -- check "$o/Fox/Fox.guides.json" --mesh "$o/models/Fox/Fox.glb" | tee "$o/check.log"
+          grep -q "template: dog" "$o/check.log"
+          # The guides stand upright with the character's left on +X.
+          python3 -I - "$o/Soldier/Soldier.guides.json" "$o/Michelle/Michelle.guides.json" <<'EOF'
+          import json, sys
+          for path in sys.argv[1:]:
+              g = json.load(open(path))
+              def pos(comp, name):
+                  c = next(c for c in g["components"] if c["id"] == comp)
+                  return next(x["position"] for x in c["guides"] if x["name"] == name)
+              assert pos("arm_l", "shoulder")[0] > pos("arm_r", "shoulder")[0], path
+              assert pos("leg_l", "hip")[0] > pos("leg_r", "hip")[0], path
+              assert pos("head", "head")[1] > pos("spine", "pelvis")[1] > pos("leg_l", "ankle")[1], path
+          print("upright, left on +X")
+          EOF
+          python -I tests/blender_skin_eval.py "$o/Soldier/Soldier.hive.json" \
+            --source "$o/models/Soldier/Soldier.glb" --require-artist \
+            --max-leg-leak 0.05 --max-arm-leak 0.05 --min-thickness 0.85 --max-artist-diff 0.35
+          python -I tests/blender_skin_eval.py "$o/Fox/Fox.hive.json" \
+            --source "$o/models/Fox/Fox.glb" --require-artist --max-artist-diff 0.6
+      - name: FBX input - public characters turned into FBX by Blender, rigged from .glb and .fbx
+        run: |
+          f="$RUNNER_TEMP/fbx_in"
+          sh tests/fetch_skin_models.sh "$f/models" Soldier Michelle Fox CesiumMan
+          for m in Soldier Michelle Fox CesiumMan; do
+            # CesiumMan with Blender's `_end` leaf bones, which stay unused.
+            leaf=""; [ "$m" = CesiumMan ] && leaf=--leaf-bones
+            python -I tests/blender_glb_to_fbx.py "$f/models/$m/$m.glb" "$f/models/$m/$m.fbx" $leaf
+            for ext in glb fbx; do
+              cargo run -q --release -- rig "$f/models/$m/$m.$ext" -o "$f/$m-$ext" -t blender | tee "$f/$m-$ext.log"
+            done
+            # The same guides (and components) from either file.
+            python3 -I tests/compare_guides.py "$f/$m-glb/$m.guides.json" "$f/$m-fbx/$m.guides.json"
+            # The Blender FBX rewritten as ASCII FBX rigs the same, to the byte.
+            python3 -I tests/fbx_to_ascii.py "$f/models/$m/$m.fbx" "$f/models/$m/${m}_ascii.fbx"
+            cargo run -q --release -- rig "$f/models/$m/${m}_ascii.fbx" -n "$m" -o "$f/$m-ascii" -t blender
+            python3 -I tests/compare_guides.py "$f/$m-fbx/$m.guides.json" "$f/$m-ascii/$m.guides.json" --tolerance 0.000001
+            cmp "$f/$m-fbx/$m.glb" "$f/$m-ascii/$m.glb"
+          done
+          grep -q "^Orientation: up +Y, facing -Z" "$f/Soldier-fbx.log"
+          grep -q "^Template: dog" "$f/Fox-fbx.log"
+          # Every rig vertex sits where Blender's own FBX importer puts one, and
+          # the weights compare with the artist's as from the .glb.
+          python -I tests/blender_skin_eval.py "$f/Soldier-fbx/Soldier.hive.json" \
+            --source "$f/models/Soldier/Soldier.fbx" --require-artist \
+            --max-leg-leak 0.05 --max-arm-leak 0.05 --min-thickness 0.85 --max-artist-diff 0.35
+          python -I tests/blender_skin_eval.py "$f/Fox-fbx/Fox.hive.json" \
+            --source "$f/models/Fox/Fox.fbx" --require-artist --max-artist-diff 0.6
+          python -I tests/blender_skin_eval.py "$f/CesiumMan-fbx/CesiumMan.hive.json" \
+            --source "$f/models/CesiumMan/CesiumMan.fbx" --require-artist
+          # The rig built from the .fbx works in Blender.
+          python tests/blender_check.py "$f/Soldier-fbx/Soldier_blender.py" "$f/Soldier-fbx/Soldier.glb"
+      - name: Animator tools - IK/FK matching, mirror, reset and space switching in Blender
+        run: |
+          for drop in 0 45; do
+            python tests/blender_anim_check.py "$RUNNER_TEMP/rig$drop/hive_demo_blender.py"
+          done
+          # The dog's hind legs have a hock segment between calf and foot.
+          cargo run -q -- demo --quadruped -o "$RUNNER_TEMP/anim_dog"
+          python tests/blender_anim_check.py "$RUNNER_TEMP/anim_dog/hive_dog_blender.py"
+          # Wings and hocked legs (bird), eight IK legs (spider), spline spine and tail (snake).
+          for creature in bird spider snake; do
+            cargo run -q -- demo --creature "$creature" -o "$RUNNER_TEMP/anim_$creature"
+            python tests/blender_anim_check.py "$RUNNER_TEMP/anim_$creature/hive_${creature}_blender.py" | tee "$RUNNER_TEMP/anim_$creature.log"
+          done
+          # Every spider leg was matched IK to FK and back.
+          grep -q "leg4_r: FK to IK keeps the pole in front of the joint" "$RUNNER_TEMP/anim_spider.log"
+          # Unity Humanoid and Mixamo bone names: the builder, the tools and the FBX in Blender.
+          for n in unity mixamo; do
+            e="$RUNNER_TEMP/anim_$n"
+            cargo run -q -- demo -o "$e" --naming "$n" --targets blender,fbx
+            cargo run -q -- add "$e/hive_demo.guides.json" fingers
+            cargo run -q -- rebuild "$e/hive_demo.hive.json" --targets blender,fbx
+            python tests/blender_check.py "$e/hive_demo_blender.py" "$e/hive_demo.glb"
+            python tests/blender_anim_check.py "$e/hive_demo_blender.py"
+            python tests/blender_fbx_check.py "$e/hive_demo.fbx" "$e/hive_demo.hive.json"
+          done
+      - name: Eyes, jaw, face joints and fingers in Blender
+        run: |
+          rig="$RUNNER_TEMP/face"
+          cargo run -q -- demo -o "$rig"
+          for part in eyes jaw face fingers toes; do cargo run -q -- add "$rig/hive_demo.guides.json" "$part"; done
+          cargo run -q -- rebuild "$rig/hive_demo.hive.json"
+          python tests/blender_check.py "$rig/hive_demo_blender.py" "$rig/hive_demo.glb"
+      - name: Quadruped (dog) rig in Blender, default and side-first naming
+        run: |
+          dog="$RUNNER_TEMP/dog"
+          cargo run -q -- demo --quadruped -o "$dog"
+          python tests/blender_quad_check.py "$dog/hive_dog_blender.py" "$dog/hive_dog.glb"
+          cargo run -q -- naming "$dog/hive_dog.guides.json" prefix
+          cargo run -q -- rebuild "$dog/hive_dog.hive.json"
+          python tests/blender_quad_check.py "$dog/hive_dog_blender.py" "$dog/hive_dog.glb"
+          python tests/blender_anim_check.py "$dog/hive_dog_blender.py"
+      - name: Spline chains (a tentacle and a spline spine) in Blender, default and side-first naming
+        run: |
+          sp="$RUNNER_TEMP/spline"
+          cargo run -q -- demo -o "$sp"
+          cargo run -q -- add "$sp/hive_demo.guides.json" tentacle
+          cargo run -q -- spine "$sp/hive_demo.guides.json" --spline true
+          cargo run -q -- rebuild "$sp/hive_demo.hive.json"
+          python tests/blender_spline_check.py "$sp/hive_demo_blender.py" "$sp/hive_demo.glb"
+          python tests/blender_anim_check.py "$sp/hive_demo_blender.py"
+          cargo run -q -- naming "$sp/hive_demo.guides.json" prefix
+          cargo run -q -- rebuild "$sp/hive_demo.hive.json"
+          python tests/blender_spline_check.py "$sp/hive_demo_blender.py" "$sp/hive_demo.glb"
+          python tests/blender_guides_check.py "$sp/hive_demo_blender.py"
+          # Slide: the tentacle runs along its curve as hive-rig's evaluator has it.
+          sl="$RUNNER_TEMP/slide"
+          cargo run -q -- demo -o "$sl" --targets blender
+          cargo run -q -- add "$sl/hive_demo.guides.json" tentacle
+          cargo run -q -- rebuild "$sl/hive_demo.hive.json"
+          for case in "slide=0.3 stretch=0" "slide=0.3 stretch=1" "slide=0.6 stretch=0"; do
+            set --
+            for kv in $case; do set -- "$@" --attr "tentacle_ik_04_ctrl.$kv"; done
+            cargo run -q -- pose "$sl/hive_demo.hive.json" --reset "$@" --set tentacle_ik_03_ctrl=0,0.1,0.05 \
+              --bones "$sl/posed.json"
+            python -I tests/blender_studio_pose_check.py "$sl/hive_demo_blender.py" "$sl/posed.json" 0.01
+          done
+      - name: Wing feathers, forking chains and proximity controls in Blender
+        run: |
+          f="$RUNNER_TEMP/feathers"
+          cargo run -q -- demo --creature bird --feathers 6 --feather-rows 2 -o "$f" --targets blender
+          cargo run -q -- add "$f/hive_bird.guides.json" antlers
+          cargo run -q -- branch "$f/hive_bird.guides.json" antler_l --from j4 --joints 2
+          cargo run -q -- rebuild "$f/hive_bird.hive.json"
+          # Spread, feather FK, proximity: the anim check runs on a rig at rest.
+          python tests/blender_anim_check.py "$f/hive_bird_blender.py"
+          for spread in 1 -1 0.5; do
+            cargo run -q -- pose "$f/hive_bird.hive.json" --reset --attr wing_feathers_l_ctrl.spread=$spread \
+              --attr wing_feathers_r_ctrl.spread=-0.4 --set wing_feather1_04_01_l_ctrl=,,,10,20,5 \
+              --set wing_feather1_04_02_l_ctrl=,,,0,15,0 --set antler_03_l_ctrl=,,,20,0,10 \
+              --set antler_06_r_ctrl=,,,0,30,0 --set lowerarm_l_fk_ctrl=,,,0,25,0 --bones "$f/posed.json"
+            python -I tests/blender_studio_pose_check.py "$f/hive_bird_blender.py" "$f/posed.json"
+          done
+      - name: Bendy limbs and soft IK in Blender
+        run: |
+          b="$RUNNER_TEMP/bendy"
+          cargo run -q -- demo -o "$b" --bendy --soft 0.5
+          python tests/blender_bendy_check.py "$b/hive_demo_blender.py"
+          cargo run -q -- demo -o "$b/plain" --bendy
+          python tests/blender_anim_check.py "$b/plain/hive_demo_blender.py"
+      - name: Side-first naming in Blender
+        run: |
+          rig="$RUNNER_TEMP/face"
+          cargo run -q -- naming "$rig/hive_demo.guides.json" prefix
+          cargo run -q -- rebuild "$rig/hive_demo.hive.json"
+          python tests/blender_check.py "$rig/hive_demo_blender.py" "$rig/hive_demo.glb"
+          python tests/blender_anim_check.py "$rig/hive_demo_blender.py"
+          named="$RUNNER_TEMP/named_guides"
+          cargo run -q -- demo -o "$named"
+          cargo run -q -- naming "$named/hive_demo.guides.json" prefix
+          cargo run -q -- rebuild "$named/hive_demo.hive.json"
+          python tests/blender_guides_check.py "$named/hive_demo_blender.py"
+      - name: Joints to guides - a Mixamo-named skeleton exported from Blender
+        run: |
+          rig="$RUNNER_TEMP/joints"
+          cargo run -q -- demo -o "$rig"
+          for part in eyes jaw face; do cargo run -q -- add "$rig/hive_demo.guides.json" "$part"; done
+          cargo run -q -- rebuild "$rig/hive_demo.hive.json"
+          python tests/blender_joints_export.py "$rig/hive_demo.glb" "$rig/mixamo.glb"
+          cargo run -q -- rig "$rig/mixamo.glb" -o "$rig/out" | tee "$rig/log.txt"
+          grep -q "and added eyes, jaw, face" "$rig/log.txt"
+          python3 - "$rig/hive_demo.guides.json" "$rig/out/mixamo.guides.json" <<'PY'
+          import json, sys
+          a, b = (json.load(open(p)) for p in sys.argv[1:])
+          def pos(g, comp, name):
+              c = next(c for c in g["components"] if c["id"] == comp)
+              return next(x["position"] for x in c["guides"] if x["name"] == name)
+          # The brow was raised 1 cm in Blender; the shoulder kept its place.
+          assert abs(pos(b, "face", "brow_in_l")[1] - pos(a, "face", "brow_in_l")[1] - 0.01) < 1e-3
+          assert all(abs(x - y) < 1e-3 for x, y in zip(pos(a, "arm_l", "shoulder"), pos(b, "arm_l", "shoulder")))
+          print("joints read back as guides")
+          PY
+          python tests/blender_check.py "$rig/out/mixamo_blender.py" "$rig/out/mixamo.glb"
+      - name: Real models keep their look - UVs, materials, textures, pieces, morph targets
+        run: |
+          # Public Khronos samples at a pinned commit, downloaded as data into
+          # their own folders (never committed), and read with python -I.
+          base="https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/edc7c9e67c639d230715049ee31f9a96a6babbbe/Models"
+          a="$RUNNER_TEMP/samples"
+          o="$RUNNER_TEMP/samples_rigged"
+          for m in CesiumMan MorphPrimitivesTest; do
+            mkdir -p "$a/$m"
+            curl -sSfL --retry 3 -o "$a/$m/$m.glb" "$base/$m/glTF-Binary/$m.glb"
+            cargo run -q -- rig "$a/$m/$m.glb" -o "$o/$m" --targets blender,fbx
+            python -I tests/blender_mesh_check.py "$o/$m/${m}_blender.py" --source "$a/$m/$m.glb" --fbx "$o/$m/$m.fbx"
+          done
+      - name: A corrective shape driven by the elbow, in Blender and through FBX
+        run: |
+          s="$RUNNER_TEMP/corrective"
+          cargo run -q -- demo -o "$s" --targets blender,fbx
+          r="$s/hive_demo.hive.json"
+          elbow=$(python -I - "$r" <<'EOF'
+          import json, sys
+          rig = json.load(open(sys.argv[1]))
+          bone = next(b for b in rig["skeleton"]["bones"] if b["name"] == "lowerarm_l")
+          print(",".join(str(x) for x in bone["head"]))
+          EOF
+          )
+          cargo run -q -- shape "$r" sculpt elbow_fix_l --pose lowerarm_l=90 --at "$elbow" --radius 0.08 --offset 0,0.03,0 --drive
+          cargo run -q -- shape "$r" mirror elbow_fix_l
+          python -I tests/blender_mesh_check.py "$s/hive_demo_blender.py" --corrective elbow_fix_l lowerarm_l_fk_ctrl --fbx "$s/hive_demo.fbx"
+          python -I tests/blender_mesh_check.py "$s/hive_demo_blender.py" --corrective elbow_fix_r lowerarm_r_fk_ctrl
+      - name: In-betweens, shape drivers and Send to Hive - a round trip through Blender
+        run: |
+          s="$RUNNER_TEMP/roundtrip"
+          cargo run -q -- demo -o "$s" --targets blender,fbx
+          r="$s/hive_demo.hive.json"
+          elbow=$(python -I - "$r" <<'EOF'
+          import json, sys
+          rig = json.load(open(sys.argv[1]))
+          bone = next(b for b in rig["skeleton"]["bones"] if b["name"] == "lowerarm_l")
+          print(",".join(str(x) for x in bone["head"]))
+          EOF
+          )
+          cargo run -q -- shape "$r" sculpt elbow_fix_l --pose lowerarm_l=90 --at "$elbow" --radius 0.08 --offset 0,0.03,0 --drive
+          cargo run -q -- shape "$r" inbetween elbow_fix_l 0.5
+          cargo run -q -- shape "$r" sculpt elbow_fix_l --inbetween 0.5 --pose lowerarm_l=45 --at "$elbow" --radius 0.06 --offset 0,0.02,0.01
+          cargo run -q -- shape "$r" mirror elbow_fix_l
+          cargo run -q -- shape "$r" sculpt brow_up --at 0.03,1.72,0.1 --radius 0.06 --offset 0,0.02,0
+          cargo run -q -- shape "$r" inbetween brow_up 0.4
+          cargo run -q -- shape "$r" sculpt brow_up --inbetween 0.4 --at 0.03,1.72,0.1 --radius 0.06 --offset 0.01,0,0
+          cargo run -q -- shape "$r" weight brow_up 0.25
+          python -I tests/blender_mesh_check.py "$s/hive_demo_blender.py" --corrective elbow_fix_r lowerarm_r_fk_ctrl --fbx "$s/hive_demo.fbx"
+          python -I tests/blender_roundtrip_check.py "$s/hive_demo_blender.py" --corrective elbow_fix_r lowerarm_r_fk_ctrl --slider brow_up
+      - name: Cone and RBF pose readers with a helper joint, in Blender
+        run: |
+          s="$RUNNER_TEMP/readers"
+          cargo run -q -- demo -o "$s" --targets blender,maya,unreal,fbx
+          r="$s/hive_demo.hive.json"
+          # A cone on the shoulder (on as the arm swings up, whichever way), sculpted there.
+          cargo run -q -- shape "$r" reader cone shoulder_up_l --bone upperarm_l --pose upperarm_l=70@up --angle 10 --falloff 40 --shape shoulder_up_l
+          cargo run -q -- shape "$r" sculpt shoulder_up_l --pose upperarm_l=70@up --at 0.2,1.45,0 --radius 0.08 --offset 0,0.02,0
+          # An RBF reader on the elbow from two studio poses, with a volume helper joint.
+          cargo run -q -- shape "$r" reader rbf elbow_l --bone lowerarm_l
+          cargo run -q -- pose "$r" --reset --set lowerarm_l_fk_ctrl=0,0,0,0,80,0 >/dev/null
+          cargo run -q -- shape "$r" reader pose elbow_l --studio --set elbow_fix_l=1
+          cargo run -q -- pose "$r" --reset --set lowerarm_l_fk_ctrl=0,0,0,0,40,30 >/dev/null
+          cargo run -q -- shape "$r" reader pose elbow_l --studio --set elbow_fix_l=0.4
+          cargo run -q -- shape "$r" reader helper elbow_l elbow_vol_l --offset 0,0,-0.02 --across 1.3 --along 0.9 --on 1
+          # A rebuild keeps the readers and puts the helper joint back.
+          cargo run -q -- rebuild "$r" >/dev/null
+          cargo run -q -- shape "$r" reader list --studio | tee "$s/log.txt"
+          grep -q "elbow_l" "$s/log.txt" && grep -q "shoulder_up_l" "$s/log.txt"
+          # Poses to check, each with hive-rig's answer (twist included).
+          cargo run -q -- pose "$r" --reset --set lowerarm_l_fk_ctrl=0,0,0,0,80,0 --readers "$s/p1.json" >/dev/null
+          cargo run -q -- pose "$r" --reset --set lowerarm_l_fk_ctrl=0,0,0,0,55,15 --set upperarm_l_fk_ctrl=0,0,0,0,0,50 --readers "$s/p2.json" >/dev/null
+          cargo run -q -- pose "$r" --reset --set upperarm_l_fk_ctrl=0,0,0,30,0,60 --readers "$s/p3.json" >/dev/null
+          cargo run -q -- pose "$r" --reset --set upperarm_l_fk_ctrl=0,0,0,0,-40,70 --set lowerarm_l_fk_ctrl=0,0,0,20,30,0 --readers "$s/p4.json" >/dev/null
+          cargo run -q -- pose "$r" --reset >/dev/null
+          # The drivers give hive-rig's outputs, shape keys and helper moves.
+          python -I tests/blender_reader_check.py "$s/hive_demo_blender.py" "$s"/p?.json
+      - name: Send to Hive from an exported FBX (Blender standing in for Unreal), and the studio pose
+        run: |
+          # Blender imports the .glb, repaints a vertex and moves a shape key point,
+          # and its FBX exporter writes the mesh; hive-rig edits brings it back.
+          s="$RUNNER_TEMP/fbx_edits"
+          cargo run -q -- demo -o "$s/rig"
+          r="$s/rig/hive_demo.hive.json"
+          cargo run -q -- shape "$r" sculpt brow_up --at 0.03,1.72,0.1 --radius 0.06 --offset 0,0.02,0
+          cargo run -q -- shape "$r" inbetween brow_up 0.4
+          cargo run -q -- shape "$r" sculpt brow_up --inbetween 0.4 --at 0.03,1.72,0.1 --radius 0.06 --offset 0.01,0,0
+          python -I tests/blender_fbx_edits_check.py "$r" "$s/rig/hive_demo.glb" "$PWD/target/debug/hive-rig" "$s/work"
+          # The horse's body pieces meet at shared points with different skins.
+          cargo run -q -- demo --creature horse -o "$s/horse"
+          python -I tests/blender_fbx_edits_check.py "$s/horse/hive_horse.hive.json" "$s/horse/hive_horse.glb" \
+            "$PWD/target/debug/hive-rig" "$s/hwork"
+          # A pose posed in hive-rig lands in Blender's pose library and matches
+          # hive-rig's evaluator: FK, IK, the body, a pole, roll and IK/FK.
+          p="$RUNNER_TEMP/studio_pose"
+          cargo run -q -- demo -o "$p" --targets blender
+          cargo run -q -- pose "$p/hive_demo.hive.json" --set cog_ctrl=0.05,-0.08,0.02,0,15,0 \
+            --set spine_02_ctrl=,,,10,0,12 --set head_ctrl=,,,0,-30,5 --set upperarm_l_fk_ctrl=,,,20,30,-40 \
+            --set foot_l_ik_ctrl=0.1,0.2,0.15,20,0,10 --set calf_r_pole_ctrl=0.2,0,0 \
+            --set hand_r_ik_ctrl=-0.1,0.1,0.2 --attr hand_r_ik_ctrl.ik_fk=1 --attr foot_r_ik_ctrl.roll=30 \
+            --bones "$p/posed.json"
+          python -I tests/blender_studio_pose_check.py "$p/hive_demo_blender.py" "$p/posed.json"
+      - name: Edit guides, add fingers and a tail, and rebuild in Blender
+        run: |
+          cargo run -q -- demo -o "$RUNNER_TEMP/guides"
+          python tests/blender_guides_check.py "$RUNNER_TEMP/guides/hive_demo_blender.py"

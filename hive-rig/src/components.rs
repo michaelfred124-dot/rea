@@ -1,0 +1,6925 @@
+//! Premade rig components placed by editable guides.
+//!
+//! A rig is an ordered list of components (root, spine, head, arms, legs, and
+//! chains for fingers, tails and the like). Each component owns a few named guide
+//! points. Building turns the guides into bones and animator controls. The guides
+//! are saved next to the rig as `<name>.guides.json`, so they can be moved,
+//! components can be added or removed, and the rig rebuilt from them.
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+use anyhow::{Context, Result, bail, ensure};
+use glam::Vec3;
+use serde::{Deserialize, Serialize};
+
+use crate::controls::{
+    BendSegment, Bendy, Control, ControlKind, ControlParent, ControlRig, FaceBoard, FanFeather,
+    FeatherFan, FootRoll, HockSegment, IkChain, SOFT_ZONE, Shape, SplineChain, ctrl_name, fk_name,
+};
+use crate::custom_shapes::{CustomShape, NamedShape};
+use crate::face_board::{self, Dir};
+use crate::landmarks::{Landmarks, mirror};
+use crate::naming::Naming;
+use crate::skeleton::{Region, Side, Skeleton, Twist};
+use crate::skin::SkinLimits;
+
+pub const GUIDES_FORMAT: &str = "hive-rig-guides";
+/// The newest guides version this program knows. A guides file's `version`
+/// pins the builder [`Rules`] it is built with; new files get this one.
+pub const GUIDES_VERSION: u32 = 1;
+/// The default spine joint count of the current [`Rules`].
+pub const SPINE_JOINTS: usize = RULES_V1.spine_joints;
+
+/// Builder behaviours that aren't written in the guides themselves, pinned by
+/// the guides `version` so a layout rebuilds the same way in later releases.
+/// When a release changes one of these, it adds a guides version with the new
+/// value; files of older versions keep the rules they were written with.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rules {
+    /// Spine joints when the spine component doesn't set `joints`.
+    pub spine_joints: usize,
+    /// Foot and paw roll: degrees of heel lift before the roll moves to the toe tip.
+    pub foot_break_degrees: f32,
+    /// IK pole distance from the elbow or knee, as a fraction of the limb's length.
+    pub pole_reach: f32,
+    /// The least pole distance, as a fraction of the body height.
+    pub pole_min_reach: f32,
+    /// An arm whose elbow and wrist are below the belly line (`crotch_y`) is a
+    /// front leg: skinned as a leg, starting in IK, with an upright IK control.
+    pub planted_front_legs: bool,
+}
+
+/// The rules of guides version 1 (hive-rig 0.1.0 onwards).
+pub const RULES_V1: Rules = Rules {
+    spine_joints: 3,
+    foot_break_degrees: 30.0,
+    pole_reach: 0.5,
+    pole_min_reach: 0.1,
+    planted_front_legs: true,
+};
+
+/// The builder rules pinned by a guides `version`. Every version so far has
+/// the version 1 rules; a version newer than this program builds with the
+/// newest rules it knows (and loading it warns).
+pub fn rules(_version: u32) -> Rules {
+    RULES_V1
+}
+
+/// Bend joints on each segment of a bendy limb.
+pub const BEND_JOINTS: usize = 4;
+
+/// The editable rig layout: components and their guide positions (model space,
+/// Y-up, metres, facing +Z).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Guides {
+    pub format: String,
+    /// Pins the builder [`Rules`]; kept as read when the file is saved again.
+    pub version: u32,
+    /// The hive-rig that last wrote the file (absent before 0.1.0 stamped it).
+    /// Writing always stamps this program's version.
+    #[serde(default, rename = "hive_rig", serialize_with = "crate::version::stamp")]
+    pub written_by: Option<String>,
+    pub body: Body,
+    pub components: Vec<Component>,
+    /// How exported joints and controls are named. Absent means the default
+    /// (Unreal mannequin) names.
+    #[serde(default, skip_serializing_if = "Naming::is_default")]
+    pub naming: Naming,
+    /// Changes to individual controls' look, keyed by the control's internal name.
+    /// They survive rebuilds; a control that no longer exists is ignored.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub control_styles: BTreeMap<String, ControlStyle>,
+    /// Control shapes the user drew or imported, by name, for `control_styles`
+    /// to use (see [`crate::custom_shapes`]).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub custom_shapes: BTreeMap<String, CustomShape>,
+    /// Influence limits for the skin weights (most bones per vertex, smallest
+    /// weight kept). Absent means four influences and no pruning.
+    #[serde(default, skip_serializing_if = "SkinLimits::is_default")]
+    pub skin: SkinLimits,
+}
+
+/// How one control looks. Unset fields keep the component's default.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ControlStyle {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<Shape>,
+    /// A custom shape from the guides' `custom_shapes`, drawn instead of `shape`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom: Option<String>,
+    /// Line thickness, 1 being normal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_width: Option<f32>,
+    /// Radius or half-extent in metres.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<[f32; 3]>,
+}
+
+/// Whole-body measurements from the landmarks (the skin weights don't use them).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Body {
+    pub floor: f32,
+    pub height: f32,
+    pub center_x: f32,
+    /// Height of the crotch: an arm reaching below it is a planted front leg.
+    pub crotch_y: f32,
+    /// Half the torso's width at the chest.
+    pub torso_half_width: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    Root,
+    Spine,
+    Head,
+    Arm,
+    Leg,
+    /// A three-segment hind leg for quadrupeds and creatures: thigh, calf, hock
+    /// (metatarsus) and a paw with a toe, with the knee in front and the hock behind.
+    QuadLeg,
+    /// FK chain of any length: fingers, tails, ears, hair, props.
+    Chain,
+    /// A curve-driven chain (tentacle): a few curve controls bend a smooth
+    /// curve that the joints follow, with stretch, volume and an FK layer.
+    Spline,
+    /// Two eyes that look at a movable target.
+    Eyes,
+    /// A jaw hinging open from below the ears.
+    Jaw,
+    /// Joint-based face: brows, eyelids, cheeks, nose and lips, each a joint
+    /// with a control that moves and rotates it.
+    Face,
+}
+
+/// The face component's guides, which are also its joint names.
+pub const FACE_GUIDES: [&str; 17] = [
+    "brow_in_l",
+    "brow_mid_l",
+    "brow_out_l",
+    "brow_in_r",
+    "brow_mid_r",
+    "brow_out_r",
+    "lid_up_l",
+    "lid_low_l",
+    "lid_up_r",
+    "lid_low_r",
+    "cheek_l",
+    "cheek_r",
+    "nose",
+    "lip_up",
+    "lip_low",
+    "lip_corner_l",
+    "lip_corner_r",
+];
+
+/// The quad leg's guides: hip, knee (stifle), hock, ankle (where the paw
+/// starts), ball (the pads), toe tip and heel (the back of the paw on the ground).
+pub const QUAD_LEG_GUIDES: [&str; 7] = ["hip", "knee", "hock", "ankle", "ball", "toe", "heel"];
+
+impl Kind {
+    /// Guide names in order, or `None` for a chain (two or more guides, any names).
+    pub fn guide_names(self) -> Option<&'static [&'static str]> {
+        Some(match self {
+            Kind::Root => &["root"],
+            Kind::Spine => &["pelvis", "chest"],
+            Kind::Head => &["neck", "head", "head_top"],
+            Kind::Arm => &["clavicle", "shoulder", "elbow", "wrist", "hand_tip"],
+            Kind::Leg => &["hip", "knee", "ankle", "ball", "toe", "heel"],
+            Kind::QuadLeg => &QUAD_LEG_GUIDES,
+            Kind::Eyes => &["eye_l", "eye_r", "target"],
+            Kind::Jaw => &["jaw", "chin"],
+            Kind::Face => &FACE_GUIDES,
+            Kind::Chain | Kind::Spline => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Component {
+    pub id: String,
+    pub kind: Kind,
+    #[serde(default)]
+    pub side: Side,
+    /// Bone this component hangs from. Only the root has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    pub guides: Vec<Guide>,
+    #[serde(default)]
+    pub options: Options,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Guide {
+    pub name: String,
+    pub position: Vec3,
+    /// Chains: the earlier guide this one grows from, which makes the chain
+    /// fork there (antlers, branches, tendrils). Unset, it grows from the
+    /// guide before it. The bone ending at this guide hangs from the bone
+    /// ending at `from` (or from the component's parent when `from` is the
+    /// first guide), and its FK control from that bone's control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+}
+
+impl Guide {
+    pub fn new(name: impl Into<String>, position: Vec3) -> Guide {
+        Guide {
+            name: name.into(),
+            position,
+            from: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Options {
+    /// Spine joints between the pelvis and the chest guide, or a spline chain's
+    /// joints along its guides (one per guide segment when unset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joints: Option<usize>,
+    /// Twist helper bones on arms and legs.
+    #[serde(default = "yes")]
+    pub twist: bool,
+    /// Spine: the spine joints follow a curve between the hips and chest
+    /// controls (a spline spine) instead of an FK control each.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub spline: bool,
+    /// Curve controls of a spline chain or spline spine, ends included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controls: Option<usize>,
+    /// Bendy arms, legs and quad legs (whose thigh and calf bend; the hock stays
+    /// one bone): bend controls arc each segment's joints, and a pin
+    /// control moves the elbow or knee. Replaces the twist helpers with
+    /// [`BEND_JOINTS`] bend joints per segment (which still take the twist shares
+    /// when `twist` is on).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bendy: bool,
+    /// Default of the IK limb's `soft` attribute (0 to 1), which eases the reach
+    /// near full extension so the knee or elbow doesn't pop.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub soft: f32,
+    /// Quad legs: default of the IK control's `spring` attribute (0 to 1). At 1
+    /// the hock swings with the thigh as the paw moves (a spring hock, see
+    /// [`crate::controls::spring_hock`]); at 0 it keeps the hock control's angle.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub spring: f32,
+    /// Face: a face board beside the head (sliders posing the face joints
+    /// and face blendshapes) with lip zippers and sticky lips. On a face,
+    /// `joints` is the extra lip joints on each lip between its middle and
+    /// each corner (0 to 3; none when unset).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub board: bool,
+    /// Legs and quad legs splayed out to the side with the knee folding up
+    /// over the foot, as a spider's or insect's: the IK pole sits above the
+    /// knee instead of in front of it, and the checks expect the knee (and a
+    /// quad leg's hock) to bend up.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub knee_up: bool,
+    /// Arms (wings): feathers in each row along the forearm and hand, each a
+    /// chain of [`FEATHER_JOINTS`] joints with FK controls, fanned open and
+    /// closed by the wing's spread control (0 = no feathers).
+    #[serde(default, skip_serializing_if = "is_zero_count")]
+    pub feathers: usize,
+    /// Rows of feathers (1 to [`MAX_FEATHER_ROWS`]; 1 when unset): the flight
+    /// feathers, then shorter coverts above them.
+    #[serde(default, skip_serializing_if = "is_zero_count")]
+    pub feather_rows: usize,
+}
+
+fn is_zero_count(n: &usize) -> bool {
+    *n == 0
+}
+
+/// Joints in each feather.
+pub const FEATHER_JOINTS: usize = 2;
+/// Most feathers a row.
+pub const MAX_FEATHERS: usize = 24;
+/// Most rows of feathers on a wing.
+pub const MAX_FEATHER_ROWS: usize = 3;
+/// Degrees the outermost and innermost feathers turn at full spread.
+pub const FEATHER_FAN_DEGREES: f32 = 30.0;
+
+fn is_zero(v: &f32) -> bool {
+    *v == 0.0
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options {
+            joints: None,
+            twist: true,
+            spline: false,
+            controls: None,
+            bendy: false,
+            soft: 0.0,
+            spring: 0.0,
+            board: false,
+            knee_up: false,
+            feathers: 0,
+            feather_rows: 0,
+        }
+    }
+}
+
+/// Curve controls on a spline chain (tentacle) unless the options say otherwise.
+pub const SPLINE_CONTROLS: usize = 4;
+/// Curve controls on a spline spine: hips, middle and chest.
+pub const SPINE_SPLINE_CONTROLS: usize = 3;
+
+impl Options {
+    /// Curve controls of a spline chain (`spine` false) or spline spine.
+    pub fn curve_controls(&self, spine: bool) -> usize {
+        self.controls.unwrap_or(if spine {
+            SPINE_SPLINE_CONTROLS
+        } else {
+            SPLINE_CONTROLS
+        })
+    }
+}
+
+impl Component {
+    fn new(id: impl Into<String>, kind: Kind, side: Side, parent: Option<&str>) -> Self {
+        Component {
+            id: id.into(),
+            kind,
+            side,
+            parent: parent.map(str::to_string),
+            guides: Vec::new(),
+            options: Options::default(),
+        }
+    }
+
+    fn guide(mut self, name: impl Into<String>, position: Vec3) -> Self {
+        self.guides.push(Guide::new(name, position));
+        self
+    }
+
+    pub fn position(&self, name: &str) -> Option<Vec3> {
+        self.guides
+            .iter()
+            .find(|g| g.name == name)
+            .map(|g| g.position)
+    }
+}
+
+impl Guides {
+    pub fn component(&self, id: &str) -> Option<&Component> {
+        self.components.iter().find(|c| c.id == id)
+    }
+
+    pub fn load(path: &std::path::Path) -> Result<Guides> {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let g: Guides =
+            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        ensure!(
+            g.format == GUIDES_FORMAT,
+            "{} is not a hive-rig guides file",
+            path.display()
+        );
+        Ok(g)
+    }
+
+    /// Write the guides as pretty JSON, stamped with this program's version.
+    pub fn save(&self, path: &std::path::Path) -> Result<()> {
+        std::fs::write(path, serde_json::to_vec_pretty(self)?)
+            .with_context(|| format!("writing {}", path.display()))
+    }
+
+    /// The builder rules this layout's `version` pins.
+    pub fn rules(&self) -> Rules {
+        rules(self.version)
+    }
+
+    /// The spine joint count of a spine component.
+    pub fn spine_joints(&self, c: &Component) -> usize {
+        c.options.joints.unwrap_or(self.rules().spine_joints)
+    }
+
+    /// A warning when the file came from a newer hive-rig: a guides version
+    /// this program doesn't know (built with the newest rules it has), or a
+    /// newer program's stamp.
+    pub fn newer_warning(&self) -> Option<String> {
+        if self.version > GUIDES_VERSION {
+            return Some(format!(
+                "these guides are version {} from a newer hive-rig{}; this {} knows up to version {GUIDES_VERSION}, so they build with its rules and may differ",
+                self.version,
+                self.written_by
+                    .as_deref()
+                    .map(|v| format!(" ({v})"))
+                    .unwrap_or_default(),
+                crate::version::CURRENT
+            ));
+        }
+        crate::version::newer_note("these guides", self.written_by.as_deref())
+    }
+
+    /// Where the layout came from, for display: "guides version 1, written by
+    /// hive-rig 0.1.0".
+    pub fn origin(&self) -> String {
+        let by = match &self.written_by {
+            Some(v) => format!("hive-rig {v}"),
+            None => "a hive-rig from before version stamps".into(),
+        };
+        format!("guides version {}, written by {by}", self.version)
+    }
+}
+
+pub fn spine_name(i: usize) -> String {
+    format!("spine_{:02}", i + 1)
+}
+
+/// `upperarm_l` -> `upperarm_twist_01_l`.
+pub fn twist_name(bone: &str) -> String {
+    twist_joint_name(bone, 1)
+}
+
+/// Twist (or bend) joint `n` (from 1) of a limb segment: `upperarm_l`, 2 ->
+/// `upperarm_twist_02_l`.
+pub fn twist_joint_name(bone: &str, n: usize) -> String {
+    match bone.rsplit_once('_') {
+        Some((base, side)) => format!("{base}_twist_{n:02}_{side}"),
+        None => format!("{bone}_twist_{n:02}"),
+    }
+}
+
+/// Bone `i` (from 1) of a chain: `index_l` -> `index_01_l`, `tail` -> `tail_01`.
+fn chain_bone_name(id: &str, side: Side, i: usize) -> String {
+    let s = side.suffix();
+    format!("{}_{i:02}{s}", id_base(id, side))
+}
+
+/// A sided component's id without its side: `tentacle_l` -> `tentacle`.
+fn id_base(id: &str, side: Side) -> &str {
+    let s = side.suffix();
+    if s.is_empty() {
+        id
+    } else {
+        id.strip_suffix(s).unwrap_or(id)
+    }
+}
+
+/// Joints in a spline chain.
+fn spline_joints(c: &Component) -> usize {
+    c.options.joints.unwrap_or(c.guides.len().saturating_sub(1))
+}
+
+/// The bone and control names a component takes from its id, in build order
+/// (chain bones and their controls, the eyes' master control). Every other name
+/// a component builds is fixed by its kind.
+pub fn id_names(c: &Component) -> (Vec<String>, Vec<String>) {
+    match c.kind {
+        Kind::Chain => {
+            let bones: Vec<String> = (1..c.guides.len())
+                .map(|i| chain_bone_name(&c.id, c.side, i))
+                .collect();
+            let controls = bones.iter().map(|b| ctrl_name(b)).collect();
+            (bones, controls)
+        }
+        Kind::Spline => {
+            let bones = (1..=spline_joints(c))
+                .map(|i| chain_bone_name(&c.id, c.side, i))
+                .collect();
+            let (base, s) = (id_base(&c.id, c.side), c.side.suffix());
+            let k = c.options.curve_controls(false);
+            let curve = (1..=k).map(|i| format!("{base}{s}_ik_{i:02}_ctrl"));
+            let fk = (1..k).map(|i| format!("{base}{s}_fk_{i:02}_ctrl"));
+            (bones, curve.chain(fk).collect())
+        }
+        Kind::Eyes => (Vec::new(), vec![format!("{}_ctrl", c.id)]),
+        _ => (Vec::new(), Vec::new()),
+    }
+}
+
+/// Kinds that can be added to any rig: the body's own kinds are fixed to the
+/// mannequin's bone names, so a rig has exactly one of each.
+pub fn is_premade_part(kind: Kind) -> bool {
+    matches!(
+        kind,
+        Kind::Chain | Kind::Spline | Kind::Eyes | Kind::Jaw | Kind::Face
+    )
+}
+
+// --------------------------------------------------------------------------- default layout
+
+/// The default biped layout (mannequin bone names) placed on detected landmarks.
+pub fn biped(lm: &Landmarks) -> Guides {
+    let floor_center = Vec3::new(lm.center_x, lm.floor, lm.pelvis.z);
+    let chest_bone = spine_name(SPINE_JOINTS - 1);
+    let mut components = vec![
+        Component::new("root", Kind::Root, Side::Center, None).guide("root", floor_center),
+        Component::new("spine", Kind::Spine, Side::Center, Some("root"))
+            .guide("pelvis", lm.pelvis)
+            .guide("chest", lm.neck),
+        Component::new("head", Kind::Head, Side::Center, Some(&chest_bone))
+            .guide("neck", lm.neck)
+            .guide("head", lm.neck.lerp(lm.head_top, 0.25))
+            .guide("head_top", lm.head_top),
+    ];
+    for side in [Side::Left, Side::Right] {
+        let m = |p: Vec3| {
+            if side == Side::Left {
+                p
+            } else {
+                mirror(p, lm.center_x)
+            }
+        };
+        let s = side.suffix();
+        components.push(
+            Component::new(format!("arm{s}"), Kind::Arm, side, Some(&chest_bone))
+                .guide("clavicle", m(lm.clavicle_l))
+                .guide("shoulder", m(lm.shoulder_l))
+                .guide("elbow", m(lm.elbow_l))
+                .guide("wrist", m(lm.wrist_l))
+                .guide("hand_tip", m(lm.hand_tip_l)),
+        );
+    }
+    for side in [Side::Left, Side::Right] {
+        let m = |p: Vec3| {
+            if side == Side::Left {
+                p
+            } else {
+                mirror(p, lm.center_x)
+            }
+        };
+        let s = side.suffix();
+        components.push(
+            Component::new(format!("leg{s}"), Kind::Leg, side, Some("pelvis"))
+                .guide("hip", m(lm.hip_l))
+                .guide("knee", m(lm.knee_l))
+                .guide("ankle", m(lm.ankle_l))
+                .guide("ball", m(lm.ball_l))
+                .guide("toe", m(lm.toe_l))
+                .guide("heel", m(lm.heel_l)),
+        );
+    }
+    Guides {
+        format: GUIDES_FORMAT.into(),
+        version: GUIDES_VERSION,
+        written_by: None,
+        body: Body {
+            floor: lm.floor,
+            height: lm.height,
+            center_x: lm.center_x,
+            crotch_y: lm.crotch_y,
+            torso_half_width: lm.torso_half_width,
+        },
+        components,
+        naming: Naming::default(),
+        skin: SkinLimits::default(),
+        control_styles: BTreeMap::new(),
+        custom_shapes: BTreeMap::new(),
+    }
+}
+
+/// Guide points of a three-segment hind leg hanging from `hip` down to `floor`,
+/// in [`QUAD_LEG_GUIDES`] order. The proportions are fractions of the hip height:
+/// the knee sits forward, the hock back, and the paw rests on the floor facing +Z.
+pub fn quad_leg_points(hip: Vec3, floor: f32) -> [Vec3; 7] {
+    let len = (hip.y - floor).max(1e-3);
+    // (height above the floor, forward of the hip), as fractions of the hip height.
+    let at = |up: f32, fwd: f32| Vec3::new(hip.x, floor + up * len, hip.z + fwd * len);
+    [
+        hip,
+        at(0.655, 0.21),  // knee (stifle), forward
+        at(0.345, -0.10), // hock, back
+        at(0.07, -0.035), // ankle: the paw starts here
+        at(0.035, 0.10),  // ball: the pads
+        at(0.017, 0.21),  // toe tip
+        at(0.0, -0.085),  // heel: the back of the paw on the ground
+    ]
+}
+
+/// The built-in quadruped (dog) layout for a character `height` metres tall
+/// (floor to the top of the head), facing +Z: spine, neck and head, a tail, two
+/// front legs and two three-segment hind legs. Front legs are arm components
+/// (scapula, upper arm, forearm and a paw) whose elbows point back; the hind
+/// legs are [`Kind::QuadLeg`].
+pub fn quadruped(height: f32) -> Guides {
+    let h = height;
+    let v = |x: f32, y: f32, z: f32| Vec3::new(x, y, z) * h;
+    let chest_bone = spine_name(SPINE_JOINTS - 1);
+    let mut components = vec![
+        Component::new("root", Kind::Root, Side::Center, None).guide("root", Vec3::ZERO),
+        Component::new("spine", Kind::Spine, Side::Center, Some("root"))
+            .guide("pelvis", v(0.0, 0.6, -0.38))
+            .guide("chest", v(0.0, 0.64, 0.3)),
+        Component::new("head", Kind::Head, Side::Center, Some(&chest_bone))
+            .guide("neck", v(0.0, 0.68, 0.36))
+            .guide("head", v(0.0, 0.88, 0.52))
+            .guide("head_top", v(0.0, 0.84, 0.74)),
+    ];
+    for side in [Side::Left, Side::Right] {
+        let sx = side.sign();
+        let s = side.suffix();
+        components.push(
+            Component::new(format!("front_leg{s}"), Kind::Arm, side, Some(&chest_bone))
+                .guide("clavicle", v(0.05 * sx, 0.7, 0.26))
+                .guide("shoulder", v(0.1 * sx, 0.52, 0.34))
+                .guide("elbow", v(0.1 * sx, 0.32, 0.24))
+                .guide("wrist", v(0.1 * sx, 0.07, 0.29))
+                .guide("hand_tip", v(0.1 * sx, 0.015, 0.38)),
+        );
+    }
+    for side in [Side::Left, Side::Right] {
+        let s = side.suffix();
+        let mut leg = Component::new(format!("hind_leg{s}"), Kind::QuadLeg, side, Some("pelvis"));
+        let points = quad_leg_points(v(0.1 * side.sign(), 0.56, -0.38), 0.0);
+        for (name, p) in QUAD_LEG_GUIDES.iter().zip(points) {
+            leg = leg.guide(*name, p);
+        }
+        components.push(leg);
+    }
+    components.push(chain(
+        "tail".into(),
+        Side::Center,
+        "pelvis",
+        (0..=5).map(|k| {
+            let t = k as f32 / 5.0;
+            v(0.0, 0.62 + 0.1 * t, -0.48 - 0.4 * t)
+        }),
+    ));
+    // Below the belly line the skin belongs to a leg; everything above it is
+    // body, however wide.
+    creature(h, components, 0.45 * h, 0.5 * h)
+}
+
+/// A creature layout standing on the floor at the origin, facing +Z, with its
+/// belly line at `crotch_y` and half its body's width `torso_half_width`.
+fn creature(h: f32, components: Vec<Component>, crotch_y: f32, torso_half_width: f32) -> Guides {
+    Guides {
+        format: GUIDES_FORMAT.into(),
+        version: GUIDES_VERSION,
+        written_by: None,
+        body: Body {
+            floor: 0.0,
+            height: h,
+            center_x: 0.0,
+            crotch_y,
+            torso_half_width,
+        },
+        components,
+        naming: Naming::default(),
+        skin: SkinLimits::default(),
+        control_styles: BTreeMap::new(),
+        custom_shapes: BTreeMap::new(),
+    }
+}
+
+/// A chain component through `points`, with guides `j1`, `j2`, ...
+pub(crate) fn chain(
+    id: String,
+    side: Side,
+    parent: &str,
+    points: impl IntoIterator<Item = Vec3>,
+) -> Component {
+    let mut c = Component::new(id, Kind::Chain, side, Some(parent));
+    for (k, p) in points.into_iter().enumerate() {
+        c = c.guide(format!("j{}", k + 1), p);
+    }
+    c
+}
+
+/// The built-in bird layout for a bird `height` metres tall (floor to the top
+/// of the head), facing +Z: a tilted spine, a long neck and head with the beak
+/// along the head bone, two wings, two legs with hocks and a tail. The wings
+/// are arm components spread to the sides (shoulder, elbow folded back, wrist
+/// and the hand to the wing tip), so they get IK/FK and a pole like an arm;
+/// the legs are [`Kind::QuadLeg`], whose knee and hock fold the way a bird's do.
+pub fn bird(height: f32) -> Guides {
+    let h = height;
+    let v = |x: f32, y: f32, z: f32| Vec3::new(x, y, z) * h;
+    let chest_bone = spine_name(SPINE_JOINTS - 1);
+    let mut components = vec![
+        Component::new("root", Kind::Root, Side::Center, None).guide("root", Vec3::ZERO),
+        Component::new("spine", Kind::Spine, Side::Center, Some("root"))
+            .guide("pelvis", v(0.0, 0.46, -0.12))
+            .guide("chest", v(0.0, 0.56, 0.12)),
+        Component::new("head", Kind::Head, Side::Center, Some(&chest_bone))
+            .guide("neck", v(0.0, 0.6, 0.14))
+            .guide("head", v(0.0, 0.84, 0.2))
+            .guide("head_top", v(0.0, 0.86, 0.36)),
+    ];
+    for side in [Side::Left, Side::Right] {
+        let sx = side.sign();
+        components.push(
+            Component::new(
+                format!("wing{}", side.suffix()),
+                Kind::Arm,
+                side,
+                Some(&chest_bone),
+            )
+            .guide("clavicle", v(0.03 * sx, 0.58, 0.1))
+            .guide("shoulder", v(0.1 * sx, 0.6, 0.06))
+            .guide("elbow", v(0.32 * sx, 0.62, -0.02))
+            .guide("wrist", v(0.55 * sx, 0.62, 0.03))
+            .guide("hand_tip", v(0.85 * sx, 0.6, -0.05)),
+        );
+    }
+    for side in [Side::Left, Side::Right] {
+        let mut leg = Component::new(
+            format!("leg{}", side.suffix()),
+            Kind::QuadLeg,
+            side,
+            Some("pelvis"),
+        );
+        let points = quad_leg_points(v(0.07 * side.sign(), 0.42, -0.04), 0.0);
+        for (name, p) in QUAD_LEG_GUIDES.iter().zip(points) {
+            leg = leg.guide(*name, p);
+        }
+        components.push(leg);
+    }
+    components.push(chain(
+        "tail".into(),
+        Side::Center,
+        "pelvis",
+        (0..4).map(|k| {
+            let t = k as f32 / 3.0;
+            v(0.0, 0.47 - 0.08 * t, -0.22 - 0.4 * t)
+        }),
+    ));
+    // The thighs sit inside the body, as a bird's do, so the leg skin starts
+    // below its belly; the wings reach out past the body.
+    creature(h, components, 0.3 * h, 0.12 * h)
+}
+
+/// Legs of the built-in spider on each side, front to back.
+pub const SPIDER_LEGS: usize = 4;
+
+/// The built-in spider layout for a spider `height` metres tall (floor to the
+/// top of its knees), facing +Z: a spine through the cephalothorax, a head with
+/// the fangs along the head bone, an abdomen chain behind and four legs a side.
+/// Each leg is a [`Kind::QuadLeg`] with its knee folding up (`knee_up`): the
+/// coxa and femur rise to the knee as the thigh, the patella and tibia come
+/// down to the hock as the calf, the metatarsus is the hock bone and the
+/// tarsus the paw, touching the floor. Every leg has IK and FK with a pole
+/// above its knee; the first leg a side takes the mannequin leg names
+/// (`thigh_l`, IK chain `leg_l`) and the others their own (`leg2_thigh_l`,
+/// `leg2_l`). Each hangs from the spine bone it grows from, the front legs
+/// reaching forward and the back legs back.
+pub fn spider(height: f32) -> Guides {
+    let h = height;
+    let v = |x: f32, y: f32, z: f32| Vec3::new(x, y, z) * h;
+    let mut components = vec![
+        Component::new("root", Kind::Root, Side::Center, None).guide("root", Vec3::ZERO),
+        Component::new("spine", Kind::Spine, Side::Center, Some("root"))
+            .guide("pelvis", v(0.0, 0.42, -0.02))
+            .guide("chest", v(0.0, 0.44, 0.3)),
+        Component::new(
+            "head",
+            Kind::Head,
+            Side::Center,
+            Some(&spine_name(SPINE_JOINTS - 1)),
+        )
+        .guide("neck", v(0.0, 0.44, 0.33))
+        .guide("head", v(0.0, 0.45, 0.4))
+        .guide("head_top", v(0.0, 0.4, 0.54)),
+        chain(
+            "abdomen".into(),
+            Side::Center,
+            "pelvis",
+            [
+                v(0.0, 0.46, -0.08),
+                v(0.0, 0.56, -0.42),
+                v(0.0, 0.48, -0.78),
+            ],
+        ),
+    ];
+    // (where along the body it grows, the spine bone there, its sweep forward in degrees)
+    let legs: [(f32, usize, f32); SPIDER_LEGS] = [
+        (0.27, 2, 45.0),
+        (0.17, 1, 15.0),
+        (0.08, 0, -15.0),
+        (0.0, 0, -45.0),
+    ];
+    for side in [Side::Left, Side::Right] {
+        let sx = side.sign();
+        for (n, (z, bone, sweep)) in legs.into_iter().enumerate() {
+            let (sin, cos) = sweep.to_radians().sin_cos();
+            // (distance out from the body's mid-line, height above the floor)
+            let at = |out: f32, up: f32| v(sx * out * cos, up, z + out * sin);
+            let mut leg = Component::new(
+                format!("leg{}{}", n + 1, side.suffix()),
+                Kind::QuadLeg,
+                side,
+                Some(&spine_name(bone)),
+            );
+            // In QUAD_LEG_GUIDES order: the hock arcs up off the line from the
+            // knee to the tarsus, so the leg bows like a spider's.
+            let points = [
+                at(0.07, 0.44), // hip: where the coxa leaves the body
+                at(0.34, 0.95), // knee, high
+                at(0.64, 0.58), // hock: tibia to metatarsus
+                at(0.8, 0.12),  // ankle: the tarsus starts here
+                at(0.85, 0.035),
+                at(0.88, 0.0), // tip on the floor
+                at(0.76, 0.0), // heel, under the ankle toward the body
+            ];
+            for (name, p) in QUAD_LEG_GUIDES.iter().zip(points) {
+                leg = leg.guide(*name, p);
+            }
+            leg.options.knee_up = true;
+            components.push(leg);
+        }
+    }
+    // A low body with legs spread wide: no skin is cut off as a leg or an
+    // arm region, so each leg's skin follows its nearest bones.
+    creature(h, components, -h, 10.0 * h)
+}
+
+/// Joints of the built-in snake's spline spine (its top joint carries the head).
+pub const SNAKE_SPINE_JOINTS: usize = 10;
+
+/// The built-in snake layout, `height` metres being its size unit (the snake is
+/// about four of them long), facing +Z along the floor: a spline spine with ten
+/// joints driven by five curve controls, a raised neck and head with the jaw
+/// along the head bone, and a spline tail tapering behind.
+pub fn snake(height: f32) -> Guides {
+    let h = height;
+    let v = |x: f32, y: f32, z: f32| Vec3::new(x, y, z) * h;
+    let mut spine = Component::new("spine", Kind::Spine, Side::Center, Some("root"))
+        .guide("pelvis", v(0.0, 0.1, -1.2))
+        .guide("chest", v(0.0, 0.14, 1.0));
+    spine.options.joints = Some(SNAKE_SPINE_JOINTS);
+    spine.options.spline = true;
+    spine.options.controls = Some(5);
+    let mut tail = Component::new("tail", Kind::Spline, Side::Center, Some("pelvis"));
+    for k in 0..=8 {
+        let t = k as f32 / 8.0;
+        tail = tail.guide(
+            format!("j{}", k + 1),
+            v(0.0, 0.12 - 0.05 * t, -1.26 - 1.5 * t),
+        );
+    }
+    tail.options.controls = Some(4);
+    let components = vec![
+        Component::new("root", Kind::Root, Side::Center, None).guide("root", Vec3::ZERO),
+        spine,
+        Component::new(
+            "head",
+            Kind::Head,
+            Side::Center,
+            Some(&spine_name(SNAKE_SPINE_JOINTS - 1)),
+        )
+        .guide("neck", v(0.0, 0.15, 1.05))
+        .guide("head", v(0.0, 0.32, 1.3))
+        .guide("head_top", v(0.0, 0.32, 1.55)),
+        tail,
+    ];
+    // Lying on the floor: no leg or arm regions, the skin follows the bones.
+    creature(h, components, -h, 10.0 * h)
+}
+
+/// The built-in horse layout for a horse `height` metres tall (floor to the top
+/// of the raised head), facing +Z: a long level back, a long neck rising to the
+/// head with the muzzle along the head bone, a hanging tail, two front legs and
+/// two three-segment hind legs on long cannons.
+///
+/// The front legs are arm components whose elbows sit back against the belly:
+/// the scapula, the upper arm from the point of the shoulder to the elbow, the
+/// forearm and cannon as one bone down to the fetlock, and the pastern and hoof
+/// as the hand. The hind legs are [`Kind::QuadLeg`] with the stifle forward, the
+/// hock high and behind, and the pastern and hoof as the paw. A horse's stifle
+/// and hock flex together, so the hind legs start with a full spring hock
+/// (`spring` = 1): lifting a hoof folds the whole leg.
+pub fn horse(height: f32) -> Guides {
+    let h = height;
+    let v = |x: f32, y: f32, z: f32| Vec3::new(x, y, z) * h;
+    let chest_bone = spine_name(SPINE_JOINTS - 1);
+    let mut components = vec![
+        Component::new("root", Kind::Root, Side::Center, None).guide("root", Vec3::ZERO),
+        Component::new("spine", Kind::Spine, Side::Center, Some("root"))
+            .guide("pelvis", v(0.0, 0.7, -0.36))
+            .guide("chest", v(0.0, 0.72, 0.2)),
+        Component::new("head", Kind::Head, Side::Center, Some(&chest_bone))
+            .guide("neck", v(0.0, 0.76, 0.27))
+            .guide("head", v(0.0, 0.95, 0.47))
+            .guide("head_top", v(0.0, 0.8, 0.66)),
+    ];
+    for side in [Side::Left, Side::Right] {
+        let sx = side.sign();
+        components.push(
+            Component::new(
+                format!("front_leg{}", side.suffix()),
+                Kind::Arm,
+                side,
+                Some(&chest_bone),
+            )
+            .guide("clavicle", v(0.04 * sx, 0.78, 0.17))
+            .guide("shoulder", v(0.09 * sx, 0.6, 0.29))
+            .guide("elbow", v(0.09 * sx, 0.46, 0.19))
+            .guide("wrist", v(0.09 * sx, 0.065, 0.22))
+            .guide("hand_tip", v(0.09 * sx, 0.01, 0.27)),
+        );
+    }
+    for side in [Side::Left, Side::Right] {
+        let sx = side.sign();
+        let mut leg = Component::new(
+            format!("hind_leg{}", side.suffix()),
+            Kind::QuadLeg,
+            side,
+            Some("pelvis"),
+        );
+        let points = [
+            v(0.09 * sx, 0.66, -0.36),  // hip
+            v(0.09 * sx, 0.48, -0.23),  // stifle, forward
+            v(0.09 * sx, 0.3, -0.45),   // hock, high and behind
+            v(0.09 * sx, 0.065, -0.41), // fetlock: the pastern starts here
+            v(0.09 * sx, 0.03, -0.37),  // coronet: the top of the hoof
+            v(0.09 * sx, 0.005, -0.33), // toe of the hoof
+            v(0.09 * sx, 0.0, -0.42),   // heel of the hoof
+        ];
+        for (name, p) in QUAD_LEG_GUIDES.iter().zip(points) {
+            leg = leg.guide(*name, p);
+        }
+        leg.options.spring = 1.0;
+        components.push(leg);
+    }
+    components.push(chain(
+        "tail".into(),
+        Side::Center,
+        "pelvis",
+        (0..=4).map(|k| {
+            let t = k as f32 / 4.0;
+            v(0.0, 0.7 - 0.3 * t, -0.48 - 0.16 * t + 0.04 * t * t)
+        }),
+    ));
+    // The belly line is above the elbows and stifles, so the front legs are
+    // planted; the body is wide enough that nothing above it counts as a leg.
+    creature(h, components, 0.52 * h, 0.5 * h)
+}
+
+/// Joints of the built-in dinosaur's spline tail.
+pub const DINOSAUR_TAIL_JOINTS: usize = 8;
+
+/// The built-in dinosaur (a biped theropod) layout for one `height` metres tall
+/// (floor to the top of the head), facing +Z: a level spine balanced over the
+/// hips, a curved neck and a big head with the snout along the head bone, two
+/// short arms held under the chest, two three-segment legs that stand on their
+/// toes, and a long spline tail behind. The arms are arm components (FK, as
+/// arms start); the legs are [`Kind::QuadLeg`]: thigh, shin, the long
+/// metatarsus as the hock and the toes as the paw.
+pub fn dinosaur(height: f32) -> Guides {
+    let h = height;
+    let v = |x: f32, y: f32, z: f32| Vec3::new(x, y, z) * h;
+    let chest_bone = spine_name(SPINE_JOINTS - 1);
+    let mut tail = Component::new("tail", Kind::Spline, Side::Center, Some("pelvis"));
+    for k in 0..=DINOSAUR_TAIL_JOINTS {
+        let t = k as f32 / DINOSAUR_TAIL_JOINTS as f32;
+        tail = tail.guide(
+            format!("j{}", k + 1),
+            v(0.0, 0.66 - 0.16 * t, -0.16 - 1.0 * t),
+        );
+    }
+    tail.options.controls = Some(4);
+    let mut components = vec![
+        Component::new("root", Kind::Root, Side::Center, None).guide("root", Vec3::ZERO),
+        Component::new("spine", Kind::Spine, Side::Center, Some("root"))
+            .guide("pelvis", v(0.0, 0.66, -0.08))
+            .guide("chest", v(0.0, 0.7, 0.3)),
+        Component::new("head", Kind::Head, Side::Center, Some(&chest_bone))
+            .guide("neck", v(0.0, 0.73, 0.36))
+            .guide("head", v(0.0, 0.9, 0.52))
+            .guide("head_top", v(0.0, 0.86, 0.8)),
+    ];
+    for side in [Side::Left, Side::Right] {
+        let sx = side.sign();
+        components.push(
+            Component::new(
+                format!("arm{}", side.suffix()),
+                Kind::Arm,
+                side,
+                Some(&chest_bone),
+            )
+            .guide("clavicle", v(0.03 * sx, 0.66, 0.32))
+            .guide("shoulder", v(0.09 * sx, 0.62, 0.36))
+            .guide("elbow", v(0.11 * sx, 0.54, 0.33))
+            .guide("wrist", v(0.11 * sx, 0.52, 0.42))
+            .guide("hand_tip", v(0.11 * sx, 0.48, 0.48)),
+        );
+    }
+    for side in [Side::Left, Side::Right] {
+        let mut leg = Component::new(
+            format!("leg{}", side.suffix()),
+            Kind::QuadLeg,
+            side,
+            Some("pelvis"),
+        );
+        let points = quad_leg_points(v(0.11 * side.sign(), 0.6, -0.06), 0.0);
+        for (name, p) in QUAD_LEG_GUIDES.iter().zip(points) {
+            leg = leg.guide(*name, p);
+        }
+        components.push(leg);
+    }
+    components.push(tail);
+    // The arms hang above the belly line, so they aren't planted front legs.
+    creature(h, components, 0.4 * h, 0.16 * h)
+}
+
+/// Premade components that can be added to an existing layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Preset {
+    /// Thumb, index, middle, ring and pinky on a hand (3 joints each).
+    Fingers,
+    /// A tail behind the pelvis.
+    Tail,
+    /// A plain FK chain continuing from any bone (`--parent`).
+    Chain,
+    /// Eyes on the head with a look-at control.
+    Eyes,
+    /// A jaw on the head.
+    Jaw,
+    /// Face joints: brows, eyelids, cheeks, nose and lips, with a lip joint
+    /// between the middle and each corner and a face board.
+    Face,
+    /// A face board for a face that has none: sliders beside the head for the
+    /// brows, lids, cheeks, nose, mouth corners, lips and jaw, lip zippers and
+    /// sticky lips. `--joints` sets the extra lip joints a side (0 to 3).
+    #[value(name = "face_board", alias = "board", alias = "face-board")]
+    FaceBoard,
+    /// Five toes on each foot, from the ball of the foot (3 joints each).
+    Toes,
+    /// Three-segment hind legs (thigh, calf, hock, paw) on the pelvis, left and right.
+    #[value(name = "quad_legs", alias = "quad_leg", alias = "quad-legs")]
+    QuadLegs,
+    /// A curve-driven tentacle: curve controls with stretch, volume and an FK
+    /// layer, from the pelvis or any bone (`--parent`).
+    Tentacle,
+    /// A forking FK chain on each side of the head (`--parent` for another
+    /// bone): a beam of three joints with a tine off each of its first two,
+    /// an FK control on every joint. `branch` adds more forks.
+    Antlers,
+    /// A pair of arms, or a second and third pair for a four- or six-armed
+    /// character (`--id arm3`; each pair gets its own number and IK). They
+    /// hang from the spine bone nearest them and set `--bendy` for bend controls.
+    #[value(alias = "arm")]
+    Arms,
+    /// A pair of biped legs, or more of them (`leg2_l`, `leg2_r`, behind the first).
+    #[value(alias = "leg")]
+    Legs,
+    /// Wings on the upper back with rows of feathers (`--count` a row, `--rows`).
+    #[value(alias = "wing")]
+    Wings,
+    /// Spider-style legs, `--count` pairs along the spine: each a three-segment
+    /// leg with its knee folding up, with IK and FK.
+    #[value(name = "spider_legs", alias = "spider-legs", alias = "extra_legs")]
+    SpiderLegs,
+    /// A two-bone FK chain on each side of the head (`--joints` for more).
+    #[value(alias = "ear")]
+    Ears,
+    /// A curved FK horn on each side of the head (3 joints, `--joints`).
+    #[value(alias = "horn")]
+    Horns,
+    /// Hair that swings from the back of the head.
+    Ponytail,
+    /// A cape: `--count` FK chains side by side from the upper back (3 by
+    /// default) with `--joints` bones each.
+    Cape,
+    /// A skirt: `--count` FK chains around the hips (6 by default).
+    Skirt,
+    /// A one-bone socket for a weapon or tool in a hand (`--side`, right by default).
+    Prop,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AddOptions {
+    /// Which hands get fingers (both when unset).
+    pub side: Option<Side>,
+    /// Bone to attach to (tail: `pelvis`; chain: required).
+    pub parent: Option<String>,
+    /// Bones in a tail or chain.
+    pub joints: Option<usize>,
+    /// Component id for a tail or chain, or for hind legs added beside the
+    /// legs a side already has (without its side: `leg2` makes `leg2_l`).
+    pub id: Option<String>,
+    /// Curve controls on a tentacle (or spline tail).
+    pub controls: Option<usize>,
+    /// Bend controls on arms, legs and hind legs.
+    pub bendy: bool,
+    /// Fingers or toes a hand or foot (1 to 5, the thumb first), feathers a
+    /// row on wings, chains in a cape or skirt, pairs of spider legs.
+    pub count: Option<usize>,
+    /// Rows of feathers on wings.
+    pub rows: Option<usize>,
+    /// A tail driven by a curve (spline) instead of an FK control a bone.
+    pub spline: bool,
+}
+
+/// Add a premade component with guides placed from the current layout. Returns the
+/// ids of the added components.
+pub fn add_preset(g: &mut Guides, preset: Preset, opts: &AddOptions) -> Result<Vec<String>> {
+    let built = build(g).context("the current guides don't build")?;
+    let sk = &built.skeleton;
+    let h = g.body.height;
+    let mut added = Vec::new();
+    match preset {
+        Preset::Fingers => {
+            let count = digit_count(opts.count)?;
+            let segments = segment_count(opts.joints)?;
+            let sides = match opts.side {
+                Some(Side::Center) => bail!("fingers need --side left or right"),
+                Some(s) => vec![s],
+                None => vec![Side::Left, Side::Right],
+            };
+            for side in sides {
+                let arm = g
+                    .components
+                    .iter()
+                    .find(|c| c.kind == Kind::Arm && c.side == side)
+                    .with_context(|| format!("no {side:?} arm to add fingers to"))?;
+                let wrist = arm.position("wrist").unwrap();
+                let tip = arm.position("hand_tip").unwrap();
+                let hand = format!("hand{}", side.suffix());
+                ensure!(sk.bone(&hand).is_some(), "no bone named {hand}");
+                let len = wrist.distance(tip);
+                let dir = (tip - wrist).normalize();
+                // Across the palm, pointing to the front of the character (thumb side).
+                let mut across = dir.cross(Vec3::Y).try_normalize().unwrap_or(Vec3::Z);
+                if across.z < 0.0 {
+                    across = -across;
+                }
+                let fingers: [(&str, f32, f32, f32); 5] = [
+                    // name, distance along the hand, offset across, length (fractions of hand length)
+                    ("thumb", 0.12, 0.30, 0.42),
+                    ("index", 0.48, 0.16, 0.50),
+                    ("middle", 0.48, 0.04, 0.52),
+                    ("ring", 0.46, -0.08, 0.49),
+                    ("pinky", 0.43, -0.19, 0.40),
+                ];
+                for (name, along, off, flen) in fingers.into_iter().take(count) {
+                    let id = format!("{name}{}", side.suffix());
+                    ensure!(g.component(&id).is_none(), "{id} already exists");
+                    let base = wrist + dir * along * len + across * off * len;
+                    let fdir = if name == "thumb" {
+                        (dir + across).normalize()
+                    } else {
+                        dir
+                    };
+                    let mut c = Component::new(&id, Kind::Chain, side, Some(&hand));
+                    for k in 0..=segments {
+                        let p = base + fdir * flen * len * (k as f32 / segments as f32);
+                        c = c.guide(format!("j{}", k + 1), p);
+                    }
+                    g.components.push(c);
+                    added.push(id);
+                }
+            }
+        }
+        Preset::Toes => {
+            let count = digit_count(opts.count)?;
+            let segments = segment_count(opts.joints)?;
+            let sides = match opts.side {
+                Some(Side::Center) => bail!("toes need --side left or right"),
+                Some(s) => vec![s],
+                None => vec![Side::Left, Side::Right],
+            };
+            for side in sides {
+                let leg = g
+                    .components
+                    .iter()
+                    .find(|c| c.kind == Kind::Leg && c.side == side)
+                    .with_context(|| format!("no {side:?} leg to add toes to"))?;
+                let ball_at = leg.position("ball").unwrap();
+                let toe_tip = leg.position("toe").unwrap();
+                let ball = format!("ball{}", side.suffix());
+                ensure!(sk.bone(&ball).is_some(), "no bone named {ball}");
+                let len = ball_at.distance(toe_tip);
+                let dir = (toe_tip - ball_at).normalize();
+                // Across the foot, pointing towards the big toe (the inside).
+                let mut across = dir.cross(Vec3::Y).try_normalize().unwrap_or(Vec3::X);
+                if (across.x < 0.0) == (side == Side::Left) {
+                    across = -across;
+                }
+                let toes: [(&str, f32, f32, f32); 5] = [
+                    // name, offset across, length (fractions of the foot), joint spacing
+                    ("big", 0.36, 0.45, 0.30),
+                    ("second", 0.18, 0.50, 0.30),
+                    ("middle", 0.0, 0.52, 0.30),
+                    ("fourth", -0.16, 0.48, 0.30),
+                    ("little", -0.32, 0.40, 0.30),
+                ];
+                for (name, off, flen, _) in toes.into_iter().take(count) {
+                    let id = format!("toe_{name}{}", side.suffix());
+                    ensure!(g.component(&id).is_none(), "{id} already exists");
+                    let base = ball_at + across * off * len * 0.5;
+                    let mut c = Component::new(&id, Kind::Chain, side, Some(&ball));
+                    for k in 0..=segments {
+                        let p = base + dir * flen * len * (k as f32 / segments as f32);
+                        c = c.guide(format!("j{}", k + 1), p);
+                    }
+                    g.components.push(c);
+                    added.push(id);
+                }
+            }
+        }
+        Preset::QuadLegs => {
+            let sides = match opts.side {
+                Some(Side::Center) => bail!("hind legs need --side left or right"),
+                Some(s) => vec![s],
+                None => vec![Side::Left, Side::Right],
+            };
+            let parent = opts.parent.clone().unwrap_or_else(|| "pelvis".into());
+            let pelvis = sk
+                .bone(&parent)
+                .with_context(|| format!("no bone named {parent}"))?
+                .head;
+            let floor = g.body.floor;
+            ensure!(
+                pelvis.y > floor + 0.05 * h,
+                "{parent} is too close to the floor for a hind leg"
+            );
+            for side in sides {
+                let s = side.suffix();
+                let has_leg = g
+                    .components
+                    .iter()
+                    .any(|c| matches!(c.kind, Kind::Leg | Kind::QuadLeg) && c.side == side);
+                // A side with a leg takes another only under its own id: an
+                // extra IK leg named after it (leg2_l -> leg2_thigh_l).
+                let id = match &opts.id {
+                    Some(id) => format!("{}{s}", id_base(id, side)),
+                    None => {
+                        ensure!(
+                            !has_leg,
+                            "the rig already has a {side:?} leg; remove it first, or give the new one an --id (such as leg2) to add another leg"
+                        );
+                        format!("hind_leg{s}")
+                    }
+                };
+                ensure!(g.component(&id).is_none(), "{id} already exists");
+                let len = pelvis.y - floor;
+                let hip = Vec3::new(
+                    g.body.center_x + side.sign() * 0.17 * len,
+                    pelvis.y,
+                    pelvis.z,
+                );
+                let mut c = Component::new(&id, Kind::QuadLeg, side, Some(&parent));
+                for (name, p) in QUAD_LEG_GUIDES.iter().zip(quad_leg_points(hip, floor)) {
+                    c = c.guide(*name, p);
+                }
+                c.options.bendy = opts.bendy;
+                g.components.push(c);
+                added.push(id);
+            }
+        }
+        Preset::Eyes | Preset::Jaw => {
+            let kind = if preset == Preset::Eyes {
+                Kind::Eyes
+            } else {
+                Kind::Jaw
+            };
+            ensure!(
+                !g.components.iter().any(|c| c.kind == kind),
+                "the rig already has {}",
+                if kind == Kind::Eyes { "eyes" } else { "a jaw" }
+            );
+            let head = g
+                .components
+                .iter()
+                .find(|c| c.kind == Kind::Head)
+                .context("eyes and jaws go on a head component")?;
+            let (base, top) = (
+                head.position("head").unwrap(),
+                head.position("head_top").unwrap(),
+            );
+            let parent = opts.parent.clone().unwrap_or_else(|| "head".into());
+            ensure!(sk.bone(&parent).is_some(), "no bone named {parent}");
+            let up = (top - base).try_normalize().unwrap_or(Vec3::Y);
+            let id = opts
+                .id
+                .clone()
+                .unwrap_or_else(|| (if kind == Kind::Eyes { "eyes" } else { "jaw" }).to_string());
+            ensure!(g.component(&id).is_none(), "{id} already exists");
+            let mut c = Component::new(&id, kind, Side::Center, Some(&parent));
+            if kind == Kind::Eyes {
+                let level = base + (top - base) * 0.45 + Vec3::Z * (0.04 * h);
+                for (name, sx) in [("eye_l", 1.0), ("eye_r", -1.0)] {
+                    c = c.guide(name, level + Vec3::X * (0.0175 * h * sx));
+                }
+                c = c.guide("target", level + Vec3::Z * (0.35 * h));
+            } else {
+                c = c
+                    .guide("jaw", base + up * (0.02 * h) + Vec3::Z * (0.01 * h))
+                    .guide("chin", base - up * (0.025 * h) + Vec3::Z * (0.06 * h));
+            }
+            g.components.push(c);
+            added.push(id);
+        }
+        Preset::Face => {
+            ensure!(
+                !g.components.iter().any(|c| c.kind == Kind::Face),
+                "the rig already has a face"
+            );
+            let head = g
+                .components
+                .iter()
+                .find(|c| c.kind == Kind::Head)
+                .context("the face goes on a head component")?;
+            let (base, top) = (
+                head.position("head").unwrap(),
+                head.position("head_top").unwrap(),
+            );
+            let parent = opts.parent.clone().unwrap_or_else(|| "head".into());
+            ensure!(sk.bone(&parent).is_some(), "no bone named {parent}");
+            let id = opts.id.clone().unwrap_or_else(|| "face".into());
+            ensure!(g.component(&id).is_none(), "{id} already exists");
+            // Lay the face out around the eyes, using the eye guides when there are some.
+            let level = base + (top - base) * 0.45 + Vec3::Z * (0.04 * h);
+            let eyes = g.components.iter().find(|c| c.kind == Kind::Eyes);
+            let eye = |sx: f32| {
+                let name = if sx > 0.0 { "eye_l" } else { "eye_r" };
+                eyes.and_then(|c| c.position(name))
+                    .unwrap_or(level + Vec3::X * (0.0175 * h * sx))
+            };
+            let v = |x: f32, y: f32, z: f32| Vec3::new(x, y, z) * h;
+            let mouth = level + v(0.0, -0.045, 0.012);
+            let mut c = Component::new(&id, Kind::Face, Side::Center, Some(&parent));
+            for (sx, s) in [(1.0f32, "l"), (-1.0, "r")] {
+                let brow = level + v(0.0, 0.018, 0.006);
+                for (part, x) in [("in", 0.008), ("mid", 0.018), ("out", 0.028)] {
+                    c = c.guide(
+                        format!("brow_{part}_{s}"),
+                        brow + v(x * sx, 0.0, -0.002 * x / 0.008),
+                    );
+                }
+            }
+            for (sx, s) in [(1.0f32, "l"), (-1.0, "r")] {
+                c = c
+                    .guide(format!("lid_up_{s}"), eye(sx) + v(0.0, 0.007, 0.008))
+                    .guide(format!("lid_low_{s}"), eye(sx) + v(0.0, -0.007, 0.007));
+            }
+            for (sx, s) in [(1.0f32, "l"), (-1.0, "r")] {
+                c = c.guide(
+                    format!("cheek_{s}"),
+                    eye(sx) + v(0.007 * sx, -0.022, -0.002),
+                );
+            }
+            c = c
+                .guide("nose", level + v(0.0, -0.02, 0.022))
+                .guide("lip_up", mouth + v(0.0, 0.004, 0.0))
+                .guide("lip_low", mouth + v(0.0, -0.004, 0.0))
+                .guide("lip_corner_l", mouth + v(0.014, 0.0, -0.004))
+                .guide("lip_corner_r", mouth + v(-0.014, 0.0, -0.004));
+            // New faces come with a lip joint between the middle and each
+            // corner (so the lips can zip) and a face board.
+            c.options.joints = Some(opts.joints.unwrap_or(1));
+            c.options.board = true;
+            g.components.push(c);
+            added.push(id);
+        }
+        Preset::FaceBoard => {
+            let face = g
+                .components
+                .iter_mut()
+                .find(|c| c.kind == Kind::Face)
+                .context("add the face first (`add <guides> face`): the board poses its joints")?;
+            ensure!(!face.options.board, "the face already has a face board");
+            face.options.board = true;
+            if let Some(n) = opts.joints {
+                face.options.joints = Some(n);
+            }
+            added.push(face.id.clone());
+        }
+        Preset::Tentacle => {
+            let joints = opts.joints.unwrap_or(8);
+            ensure!(
+                (2..=64).contains(&joints),
+                "--joints must be between 2 and 64"
+            );
+            if let Some(k) = opts.controls {
+                ensure!((2..=16).contains(&k), "--controls must be between 2 and 16");
+            }
+            let parent = opts.parent.clone().unwrap_or_else(|| "pelvis".into());
+            let p = sk
+                .bone(&parent)
+                .with_context(|| format!("no bone named {parent}"))?;
+            let side = p.side;
+            let (start, dir, length) = if parent == "pelvis" {
+                // Out behind the body (the character faces +Z), nearly level.
+                let dir = Vec3::new(0.0, -0.2, -1.0).normalize();
+                (p.head - Vec3::Z * 0.07 * h, dir, 0.6 * h)
+            } else {
+                (p.tail, p.direction(), (p.length() * 3.0).max(0.2 * h))
+            };
+            let id = match &opts.id {
+                Some(id) => id.clone(),
+                None => unique_id(g, "tentacle", side),
+            };
+            ensure!(g.component(&id).is_none(), "{id} already exists");
+            let mut c = Component::new(&id, Kind::Spline, side, Some(&parent));
+            c.options.controls = opts.controls;
+            for k in 0..=joints {
+                c = c.guide(
+                    format!("j{}", k + 1),
+                    start + dir * length * (k as f32 / joints as f32),
+                );
+            }
+            g.components.push(c);
+            added.push(id);
+        }
+        Preset::Antlers => {
+            let parent = opts.parent.clone().unwrap_or_else(|| "head".into());
+            let head = sk
+                .bone(&parent)
+                .with_context(|| format!("no bone named {parent} to grow antlers from"))?
+                .clone();
+            let seg = (head.length() * 0.45).max(0.03 * h);
+            let base_id = opts.id.clone().unwrap_or_else(|| "antler".into());
+            for side in [Side::Left, Side::Right] {
+                let id = format!("{base_id}{}", side.suffix());
+                ensure!(g.component(&id).is_none(), "{id} already exists");
+                let out = Vec3::X * side.sign();
+                let base = head.head.lerp(head.tail, 0.8) + out * 0.25 * seg;
+                // The beam rises out and back, bending up; a tine forks
+                // forward off its first two joints.
+                let beam = [
+                    (out * 0.8 + Vec3::Y - Vec3::Z * 0.2).normalize(),
+                    (out * 0.5 + Vec3::Y - Vec3::Z * 0.4).normalize(),
+                    (out * 0.2 + Vec3::Y - Vec3::Z * 0.3).normalize(),
+                ];
+                let mut c = Component::new(&id, Kind::Chain, side, Some(&parent)).guide("j1", base);
+                let mut at = base;
+                for (k, d) in beam.iter().enumerate() {
+                    at += *d * seg;
+                    c = c.guide(format!("j{}", k + 2), at);
+                }
+                for (t, from) in ["j2", "j3"].into_iter().enumerate() {
+                    let root = c.position(from).unwrap();
+                    let tip = root + (Vec3::Z + Vec3::Y * 0.7 + out * 0.2).normalize() * seg * 0.8;
+                    c = c.guide(format!("tine{}", t + 1), tip);
+                    c.guides.last_mut().unwrap().from = Some(from.to_string());
+                }
+                g.components.push(c);
+                added.push(id);
+            }
+        }
+        Preset::Tail | Preset::Chain => {
+            let joints = opts
+                .joints
+                .unwrap_or(if preset == Preset::Tail { 5 } else { 3 });
+            ensure!(
+                (1..=64).contains(&joints),
+                "--joints must be between 1 and 64"
+            );
+            let (parent, start, dir, length) = if preset == Preset::Tail {
+                let parent = opts.parent.clone().unwrap_or_else(|| "pelvis".into());
+                let p = sk
+                    .bone(&parent)
+                    .with_context(|| format!("no bone named {parent}"))?;
+                // Behind the body (the character faces +Z), sloping down.
+                let dir = Vec3::new(0.0, -0.35, -1.0).normalize();
+                (parent, p.head - Vec3::Z * 0.06 * h, dir, 0.45 * h)
+            } else {
+                let parent = opts
+                    .parent
+                    .clone()
+                    .context("a chain needs --parent <bone>")?;
+                let p = sk
+                    .bone(&parent)
+                    .with_context(|| format!("no bone named {parent}"))?;
+                (parent, p.tail, p.direction(), p.length().max(0.05 * h))
+            };
+            let side = sk.bone(&parent).map(|b| b.side).unwrap_or_default();
+            let default_id = if preset == Preset::Tail {
+                "tail"
+            } else {
+                "chain"
+            };
+            let id = match &opts.id {
+                Some(id) => id.clone(),
+                None => unique_id(g, default_id, side),
+            };
+            ensure!(g.component(&id).is_none(), "{id} already exists");
+            let spline = preset == Preset::Tail && opts.spline;
+            if let Some(k) = opts.controls.filter(|_| spline) {
+                ensure!((2..=16).contains(&k), "--controls must be between 2 and 16");
+            }
+            let kind = if spline { Kind::Spline } else { Kind::Chain };
+            let mut c = Component::new(&id, kind, side, Some(&parent));
+            if spline {
+                c.options.controls = opts.controls;
+            }
+            for k in 0..=joints {
+                c = c.guide(
+                    format!("j{}", k + 1),
+                    start + dir * length * (k as f32 / joints as f32),
+                );
+            }
+            g.components.push(c);
+            added.push(id);
+        }
+        Preset::Arms | Preset::Legs | Preset::Wings | Preset::SpiderLegs => {
+            added = add_limbs(g, sk, preset, opts)?;
+        }
+        Preset::Ears | Preset::Horns | Preset::Ponytail | Preset::Cape | Preset::Skirt => {
+            added = add_head_and_hair(g, sk, preset, opts)?;
+        }
+        Preset::Prop => {
+            let side = match opts.side {
+                Some(Side::Center) => bail!("a prop goes in a hand: --side left or right"),
+                Some(s) => s,
+                None => Side::Right,
+            };
+            let hand = opts
+                .parent
+                .clone()
+                .unwrap_or_else(|| format!("hand{}", side.suffix()));
+            let b = sk
+                .bone(&hand)
+                .with_context(|| format!("no bone named {hand} to hold a prop"))?;
+            let id = match &opts.id {
+                Some(id) => id.clone(),
+                None => unique_id(g, "prop", side),
+            };
+            ensure!(g.component(&id).is_none(), "{id} already exists");
+            let start = b.head.lerp(b.tail, 0.5);
+            g.components.push(line_chain(
+                &id,
+                side,
+                &hand,
+                start,
+                Vec3::Z,
+                0.12 * h,
+                opts.joints.unwrap_or(1),
+            ));
+            added.push(id);
+        }
+    }
+    build(g).context("the new component doesn't build")?;
+    Ok(added)
+}
+
+/// Fingers or toes a hand or foot: 1 to 5, five unless set.
+fn digit_count(n: Option<usize>) -> Result<usize> {
+    let n = n.unwrap_or(5);
+    ensure!((1..=5).contains(&n), "--count must be between 1 and 5");
+    Ok(n)
+}
+
+/// Bones in each finger or toe: 1 to 5, three unless set.
+fn segment_count(n: Option<usize>) -> Result<usize> {
+    let n = n.unwrap_or(3);
+    ensure!((1..=5).contains(&n), "--joints must be between 1 and 5");
+    Ok(n)
+}
+
+/// The sides a premade pair of parts goes on: both unless `side` says one.
+fn pair_sides(side: Option<Side>, what: &str) -> Result<Vec<Side>> {
+    Ok(match side {
+        Some(Side::Center) => bail!("{what} need --side left or right"),
+        Some(s) => vec![s],
+        None => vec![Side::Left, Side::Right],
+    })
+}
+
+/// A straight FK chain component of `joints` bones from `start` along `dir`.
+fn line_chain(
+    id: &str,
+    side: Side,
+    parent: &str,
+    start: Vec3,
+    dir: Vec3,
+    length: f32,
+    joints: usize,
+) -> Component {
+    let joints = joints.max(1);
+    let mut c = Component::new(id, Kind::Chain, side, Some(parent));
+    for k in 0..=joints {
+        c = c.guide(
+            format!("j{}", k + 1),
+            start + dir * length * (k as f32 / joints as f32),
+        );
+    }
+    c
+}
+
+/// The base id for a part added on `sides`: `explicit` when given (it must be
+/// free), otherwise the first of `base`, `base2`, `base3`... whose ids are all free.
+fn free_base(g: &Guides, base: &str, sides: &[Side], explicit: Option<&str>) -> Result<String> {
+    let free = |b: &str| {
+        sides
+            .iter()
+            .all(|s| g.component(&format!("{b}{}", s.suffix())).is_none())
+    };
+    if let Some(id) = explicit {
+        let b = sides
+            .first()
+            .map(|s| id_base(id, *s))
+            .unwrap_or(id)
+            .to_string();
+        ensure!(free(&b), "{b} already exists; pick another --id");
+        return Ok(b);
+    }
+    Ok((1..)
+        .map(|n| {
+            if n == 1 {
+                base.to_string()
+            } else {
+                format!("{base}{n}")
+            }
+        })
+        .find(|b| free(b))
+        .unwrap())
+}
+
+/// The spine bone nearest `p`, which a limb or wing grows from.
+fn nearest_spine_bone(g: &Guides, sk: &Skeleton, p: Vec3) -> Option<String> {
+    let spine = g.components.iter().find(|c| c.kind == Kind::Spine)?;
+    sk.bones
+        .iter()
+        .filter(|b| b.component == spine.id && b.name.starts_with("spine_"))
+        .min_by(|a, b| {
+            a.tail
+                .distance(p)
+                .partial_cmp(&b.tail.distance(p))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|b| b.name.clone())
+}
+
+/// Arms, legs, wings and spider legs: limb components with ids of their own.
+fn add_limbs(
+    g: &mut Guides,
+    sk: &Skeleton,
+    preset: Preset,
+    opts: &AddOptions,
+) -> Result<Vec<String>> {
+    let h = g.body.height;
+    let cx = g.body.center_x;
+    let floor = g.body.floor;
+    let what = match preset {
+        Preset::Arms => "arms",
+        Preset::Legs => "legs",
+        Preset::Wings => "wings",
+        _ => "spider legs",
+    };
+    let sides = pair_sides(opts.side, what)?;
+    let spine = g
+        .components
+        .iter()
+        .find(|c| c.kind == Kind::Spine)
+        .context("the rig has no spine to hang limbs from")?;
+    let (pelvis_at, chest_at) = (
+        spine
+            .position("pelvis")
+            .context("the spine has no pelvis")?,
+        spine.position("chest").context("the spine has no chest")?,
+    );
+    let chest = spine_name(g.spine_joints(spine) - 1);
+    let top = sk
+        .bone(&chest)
+        .with_context(|| format!("no bone named {chest}"))?
+        .tail;
+    let mut added = Vec::new();
+    if preset == Preset::SpiderLegs {
+        let pairs = opts.count.unwrap_or(1);
+        ensure!(
+            (1..=8).contains(&pairs),
+            "--count must be between 1 and 8 pairs"
+        );
+        // The first free number from 2 (leg1 is the mannequin's leg), a pair each.
+        let free = |n: usize| {
+            (0..pairs).all(|j| {
+                sides.iter().all(|s| {
+                    g.component(&format!("leg{}{}", n + j, s.suffix()))
+                        .is_none()
+                })
+            })
+        };
+        let first = (2..).find(|&n| free(n)).unwrap();
+        for j in 0..pairs {
+            // Pair j grows from the front of the body to the back, sweeping
+            // from forward to backward like a spider's.
+            let t = if pairs == 1 {
+                0.5
+            } else {
+                j as f32 / (pairs - 1) as f32
+            };
+            let sweep = (45.0 - 90.0 * t).to_radians();
+            let on_spine = chest_at.lerp(pelvis_at, 0.1 + 0.8 * t);
+            let parent = match &opts.parent {
+                Some(p) => p.clone(),
+                None => nearest_spine_bone(g, sk, on_spine).unwrap_or_else(|| chest.clone()),
+            };
+            ensure!(sk.bone(&parent).is_some(), "no bone named {parent}");
+            // The spider's proportions, scaled so the hip sits at the spine.
+            let u = ((on_spine.y - floor) / 0.44).max(0.05 * h);
+            for side in &sides {
+                let sx = side.sign();
+                let at = |out: f32, up: f32| {
+                    Vec3::new(
+                        cx + sx * out * u * sweep.cos(),
+                        floor + up * u,
+                        on_spine.z + out * u * sweep.sin(),
+                    )
+                };
+                let id = match &opts.id {
+                    Some(id) if pairs == 1 => format!("{}{}", id_base(id, *side), side.suffix()),
+                    Some(id) => format!("{}{}{}", id_base(id, *side), j + 1, side.suffix()),
+                    None => format!("leg{}{}", first + j, side.suffix()),
+                };
+                ensure!(g.component(&id).is_none(), "{id} already exists");
+                let mut leg = Component::new(&id, Kind::QuadLeg, *side, Some(&parent));
+                let points = [
+                    at(0.07, 0.44),
+                    at(0.34, 0.95),
+                    at(0.64, 0.58),
+                    at(0.8, 0.12),
+                    at(0.85, 0.035),
+                    at(0.88, 0.0),
+                    at(0.76, 0.0),
+                ];
+                for (name, p) in QUAD_LEG_GUIDES.iter().zip(points) {
+                    leg = leg.guide(*name, p);
+                }
+                leg.options.knee_up = true;
+                leg.options.bendy = opts.bendy;
+                g.components.push(leg);
+                added.push(id);
+            }
+        }
+        return Ok(added);
+    }
+
+    let (kind, default_base) = match preset {
+        Preset::Arms => (Kind::Arm, "arm"),
+        Preset::Legs => (Kind::Leg, "leg"),
+        _ => (Kind::Arm, "wing"),
+    };
+    let base = free_base(g, default_base, &sides, opts.id.as_deref())?;
+    let names = kind.guide_names().unwrap();
+    let down = (pelvis_at - chest_at).try_normalize().unwrap_or(-Vec3::Y);
+    for side in sides {
+        let sx = side.sign();
+        let id = format!("{base}{}", side.suffix());
+        // What this side has already: the new limb copies the first plain one,
+        // shifted clear of the others.
+        let on_side: Vec<&Component> = g
+            .components
+            .iter()
+            .filter(|c| c.kind == kind && c.side == side)
+            .collect();
+        let source = on_side
+            .iter()
+            .find(|c| c.options.feathers == 0)
+            .copied()
+            .filter(|_| preset != Preset::Wings);
+        let shift = match (preset, on_side.len()) {
+            (_, 0) | (Preset::Wings, _) => Vec3::ZERO,
+            (Preset::Arms, n) => down * (0.11 * h * n as f32),
+            (_, n) => -Vec3::Z * (0.12 * h * n as f32),
+        };
+        let points: Vec<Vec3> = match (preset, source) {
+            (Preset::Wings, _) => {
+                let o = |x: f32, y: f32, z: f32| top + Vec3::new(x * sx, y, z) * h;
+                let shoulder = o(0.05, -0.02, -0.05);
+                let elbow = shoulder + Vec3::new(0.2 * sx, 0.07, -0.08) * h;
+                let wrist = elbow + Vec3::new(0.2 * sx, 0.05, 0.05) * h;
+                vec![
+                    o(0.015, -0.01, -0.03),
+                    shoulder,
+                    elbow,
+                    wrist,
+                    wrist + Vec3::new(0.22 * sx, 0.0, 0.03) * h,
+                ]
+            }
+            (_, Some(src)) => names
+                .iter()
+                .map(|n| src.position(n).unwrap() + shift)
+                .collect(),
+            (Preset::Arms, None) => {
+                let o = |x: f32, y: f32, z: f32| top + Vec3::new(x * sx, y, z) * h;
+                vec![
+                    o(0.02, -0.02, 0.0),
+                    o(0.09, -0.03, 0.0),
+                    o(0.13, -0.17, -0.01),
+                    o(0.17, -0.3, 0.02),
+                    o(0.19, -0.37, 0.03),
+                ]
+            }
+            _ => {
+                let pelvis = sk
+                    .bone("pelvis")
+                    .context("the rig has no pelvis bone")?
+                    .head;
+                let hip = Vec3::new(cx + sx * 0.055 * h, pelvis.y, pelvis.z) + shift;
+                let l = (hip.y - floor).max(0.1 * h);
+                let at = |up: f32, fwd: f32| Vec3::new(hip.x, floor + up * l, hip.z + fwd * l);
+                vec![
+                    hip,
+                    at(0.52, 0.03),
+                    at(0.06, 0.0),
+                    at(0.025, 0.1),
+                    at(0.01, 0.18),
+                    at(0.0, -0.05),
+                ]
+            }
+        };
+        let parent = match &opts.parent {
+            Some(p) => p.clone(),
+            None if kind == Kind::Leg => source
+                .and_then(|s| s.parent.clone())
+                .unwrap_or_else(|| "pelvis".into()),
+            None => nearest_spine_bone(g, sk, points[0]).unwrap_or_else(|| chest.clone()),
+        };
+        ensure!(sk.bone(&parent).is_some(), "no bone named {parent}");
+        ensure!(g.component(&id).is_none(), "{id} already exists");
+        let mut c = Component::new(&id, kind, side, Some(&parent));
+        for (name, p) in names.iter().zip(points) {
+            c = c.guide(*name, p);
+        }
+        c.options.bendy = opts.bendy;
+        g.components.push(c);
+        added.push(id);
+    }
+    if preset == Preset::Wings {
+        let count = opts.count.unwrap_or(6);
+        if count > 0 {
+            let first = added[0].clone();
+            set_feathers(g, Some(&first), count, opts.rows.unwrap_or(1))?;
+        }
+    }
+    Ok(added)
+}
+
+/// Ears, horns, hair, capes and skirts: FK chains on the head or the body.
+fn add_head_and_hair(
+    g: &mut Guides,
+    sk: &Skeleton,
+    preset: Preset,
+    opts: &AddOptions,
+) -> Result<Vec<String>> {
+    let h = g.body.height;
+    let cx = g.body.center_x;
+    let mut parts: Vec<Component> = Vec::new();
+    match preset {
+        Preset::Ears | Preset::Horns | Preset::Ponytail => {
+            let head = g
+                .components
+                .iter()
+                .find(|c| c.kind == Kind::Head)
+                .context("the rig has no head component")?;
+            let (base, top) = (
+                head.position("head").unwrap(),
+                head.position("head_top").unwrap(),
+            );
+            let parent = opts.parent.clone().unwrap_or_else(|| "head".into());
+            ensure!(sk.bone(&parent).is_some(), "no bone named {parent}");
+            let joints = opts.joints.unwrap_or(match preset {
+                Preset::Ears => 2,
+                Preset::Horns => 3,
+                _ => 4,
+            });
+            ensure!(
+                (1..=16).contains(&joints),
+                "--joints must be between 1 and 16"
+            );
+            if preset == Preset::Ponytail {
+                let id = opts.id.clone().unwrap_or_else(|| "ponytail".into());
+                let start = base.lerp(top, 0.6) - Vec3::Z * (0.06 * h);
+                let dir = Vec3::new(0.0, -0.7, -1.0).normalize();
+                parts.push(line_chain(
+                    &id,
+                    Side::Center,
+                    &parent,
+                    start,
+                    dir,
+                    0.22 * h,
+                    joints,
+                ));
+            } else {
+                let name = if preset == Preset::Ears {
+                    "ear"
+                } else {
+                    "horn"
+                };
+                for side in pair_sides(opts.side, name)? {
+                    let s = side.sign();
+                    let id = format!(
+                        "{}{}",
+                        opts.id.as_deref().map(|i| id_base(i, side)).unwrap_or(name),
+                        side.suffix()
+                    );
+                    if preset == Preset::Ears {
+                        let start = base.lerp(top, 0.45) + Vec3::X * (0.055 * h * s);
+                        let dir = Vec3::new(0.45 * s, 1.0, -0.15).normalize();
+                        parts.push(line_chain(&id, side, &parent, start, dir, 0.07 * h, joints));
+                    } else {
+                        // Out and up, curving in towards the tips.
+                        let out = Vec3::X * s;
+                        let mut at = base.lerp(top, 0.62) + out * (0.04 * h);
+                        let mut c =
+                            Component::new(&id, Kind::Chain, side, Some(&parent)).guide("j1", at);
+                        for k in 0..joints {
+                            let t = k as f32 / joints as f32;
+                            let d = (out * (0.9 - 1.6 * t) + Vec3::Y * (0.6 + 0.5 * t)
+                                - Vec3::Z * 0.1)
+                                .normalize();
+                            at += d * (0.2 * h / joints as f32);
+                            c = c.guide(format!("j{}", k + 2), at);
+                        }
+                        parts.push(c);
+                    }
+                }
+            }
+        }
+        Preset::Cape => {
+            let spine = g
+                .components
+                .iter()
+                .find(|c| c.kind == Kind::Spine)
+                .context("the rig has no spine")?;
+            let chest = opts
+                .parent
+                .clone()
+                .unwrap_or_else(|| spine_name(g.spine_joints(spine) - 1));
+            let top = sk
+                .bone(&chest)
+                .with_context(|| format!("no bone named {chest}"))?
+                .tail;
+            let n = opts.count.unwrap_or(3);
+            let joints = opts.joints.unwrap_or(4);
+            ensure!((1..=12).contains(&n), "--count must be between 1 and 12");
+            ensure!(
+                (1..=16).contains(&joints),
+                "--joints must be between 1 and 16"
+            );
+            let base = (1..)
+                .map(|k| {
+                    if k == 1 {
+                        "cape".to_string()
+                    } else {
+                        format!("cape{k}")
+                    }
+                })
+                .find(|b| g.component(&format!("{b}_1")).is_none())
+                .unwrap();
+            let width = (0.07 * h * n as f32).min(0.3 * h);
+            for i in 0..n {
+                let x = if n == 1 {
+                    0.0
+                } else {
+                    (i as f32 / (n - 1) as f32 - 0.5) * width
+                };
+                let start = Vec3::new(cx + x, top.y - 0.02 * h, top.z - 0.07 * h);
+                let dir = Vec3::new(x * 0.4, -1.0, -0.15).normalize();
+                parts.push(line_chain(
+                    &format!("{base}_{}", i + 1),
+                    Side::Center,
+                    &chest,
+                    start,
+                    dir,
+                    0.45 * h,
+                    joints,
+                ));
+            }
+        }
+        _ => {
+            let parent = opts.parent.clone().unwrap_or_else(|| "pelvis".into());
+            let p = sk
+                .bone(&parent)
+                .with_context(|| format!("no bone named {parent}"))?
+                .head;
+            let n = opts.count.unwrap_or(6);
+            let joints = opts.joints.unwrap_or(3);
+            ensure!((3..=16).contains(&n), "--count must be between 3 and 16");
+            ensure!(
+                (1..=16).contains(&joints),
+                "--joints must be between 1 and 16"
+            );
+            let base = (1..)
+                .map(|k| {
+                    if k == 1 {
+                        "skirt".to_string()
+                    } else {
+                        format!("skirt{k}")
+                    }
+                })
+                .find(|b| g.component(&format!("{b}_1")).is_none())
+                .unwrap();
+            let r = (0.08 * h).min(g.body.torso_half_width);
+            for i in 0..n {
+                let a = std::f32::consts::TAU * i as f32 / n as f32;
+                let (sin, cos) = a.sin_cos();
+                let start = Vec3::new(p.x + r * sin, p.y - 0.02 * h, p.z + r * cos);
+                let dir = Vec3::new(sin * 0.25, -1.0, cos * 0.25).normalize();
+                parts.push(line_chain(
+                    &format!("{base}_{}", i + 1),
+                    Side::Center,
+                    &parent,
+                    start,
+                    dir,
+                    0.28 * h,
+                    joints,
+                ));
+            }
+        }
+    }
+    let mut added = Vec::new();
+    for c in parts {
+        ensure!(g.component(&c.id).is_none(), "{} already exists", c.id);
+        added.push(c.id.clone());
+        g.components.push(c);
+    }
+    Ok(added)
+}
+
+pub(crate) fn unique_id(g: &Guides, base: &str, side: Side) -> String {
+    let s = side.suffix();
+    let first = format!("{base}{s}");
+    if g.component(&first).is_none() {
+        return first;
+    }
+    (2..)
+        .map(|n| format!("{base}{n}{s}"))
+        .find(|id| g.component(id).is_none())
+        .unwrap()
+}
+
+/// Remove a component and every component hanging from it. Returns the removed ids.
+pub fn remove(g: &mut Guides, id: &str) -> Result<Vec<String>> {
+    ensure!(g.component(id).is_some(), "no component named {id}");
+    ensure!(
+        g.component(id).unwrap().kind != Kind::Root,
+        "the root component can't be removed"
+    );
+    let built = build(g)?;
+    let owner: HashMap<&str, &str> = built
+        .skeleton
+        .bones
+        .iter()
+        .map(|b| (b.name.as_str(), b.component.as_str()))
+        .collect();
+    let mut removed: HashSet<String> = HashSet::from([id.to_string()]);
+    // Components are ordered parents-first, so one pass catches every descendant.
+    for c in &g.components {
+        if let Some(p) = &c.parent
+            && owner.get(p.as_str()).is_some_and(|o| removed.contains(*o))
+        {
+            removed.insert(c.id.clone());
+        }
+    }
+    let ids: Vec<String> = g
+        .components
+        .iter()
+        .filter(|c| removed.contains(&c.id))
+        .map(|c| c.id.clone())
+        .collect();
+    g.components.retain(|c| !removed.contains(&c.id));
+    build(g).context("the layout doesn't build without that component")?;
+    Ok(ids)
+}
+
+/// Hang a component from another bone. The caller checks that the layout still builds.
+pub fn attach(g: &mut Guides, id: &str, bone: &str) -> Result<()> {
+    let c = g
+        .components
+        .iter_mut()
+        .find(|c| c.id == id)
+        .with_context(|| format!("no component named {id}"))?;
+    ensure!(c.kind != Kind::Root, "the root component stays where it is");
+    let owner_of: HashMap<String, String> = build(g)?
+        .skeleton
+        .bones
+        .into_iter()
+        .map(|b| (b.name, b.component))
+        .collect();
+    let owner = owner_of
+        .get(bone)
+        .with_context(|| format!("there is no bone called {bone}"))?;
+    ensure!(owner != id, "{id} can't hang from one of its own bones");
+    let c = g.components.iter_mut().find(|c| c.id == id).unwrap();
+    c.parent = Some(bone.to_string());
+    // Components build in order, so each must follow the one owning its parent
+    // bone. Keep the existing order wherever that already holds.
+    let mut order = Vec::with_capacity(g.components.len());
+    let mut state: HashMap<&str, bool> = HashMap::new(); // false = visiting
+    fn visit<'a>(
+        g: &'a Guides,
+        owner_of: &HashMap<String, String>,
+        i: usize,
+        state: &mut HashMap<&'a str, bool>,
+        order: &mut Vec<usize>,
+    ) -> Result<()> {
+        let c = &g.components[i];
+        match state.get(c.id.as_str()) {
+            Some(true) => return Ok(()),
+            Some(false) => bail!("{} would end up hanging from its own child", c.id),
+            None => {}
+        }
+        state.insert(&c.id, false);
+        if let Some(owner) = c.parent.as_ref().and_then(|p| owner_of.get(p))
+            && let Some(j) = g.components.iter().position(|o| &o.id == owner)
+        {
+            visit(g, owner_of, j, state, order)?;
+        }
+        state.insert(&c.id, true);
+        order.push(i);
+        Ok(())
+    }
+    for i in 0..g.components.len() {
+        visit(g, &owner_of, i, &mut state, &mut order)?;
+    }
+    let mut slots: Vec<Option<Component>> = g.components.drain(..).map(Some).collect();
+    g.components = order
+        .into_iter()
+        .map(|i| slots[i].take().unwrap())
+        .collect();
+    build(g).map(|_| ())
+}
+
+/// Set one control's look, or clear it when the style is empty.
+pub fn set_control_style(g: &mut Guides, control: &str, style: ControlStyle) -> Result<()> {
+    if style == ControlStyle::default() {
+        g.control_styles.remove(control);
+    } else {
+        if let Some(size) = style.size {
+            ensure!(size > 0.0, "control size must be positive");
+        }
+        g.control_styles.insert(control.to_string(), style);
+    }
+    Ok(())
+}
+
+/// Which controls a change of look goes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StyleScope {
+    /// The control alone.
+    One,
+    /// The control and its left/right twin (what symmetry does in the app).
+    WithTwin,
+    /// Every control its component built (and their twins, with `twins`).
+    Component { twins: bool },
+}
+
+/// A change to some controls' look: the fields that are set replace what the
+/// controls have, `scale` multiplies their current size, and the rest is kept.
+/// A built-in `shape` replaces a custom one and a `custom` shape (a name in the
+/// guides' `custom_shapes`) replaces a built-in one.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StyleChange {
+    pub shape: Option<Shape>,
+    pub custom: Option<String>,
+    pub size: Option<f32>,
+    pub scale: Option<f32>,
+    pub color: Option<[f32; 3]>,
+    pub line_width: Option<f32>,
+}
+
+/// The colour a twin on the other side gets: the left and right side colours
+/// swap, any other colour is kept.
+pub fn twin_color(color: [f32; 3]) -> [f32; 3] {
+    let near = |a: [f32; 3], b: [f32; 3]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-3);
+    if near(color, LEFT) {
+        RIGHT
+    } else if near(color, RIGHT) {
+        LEFT
+    } else {
+        color
+    }
+}
+
+/// The default colours: the centre, the left and right sides, and the root.
+pub const SIDE_COLORS: [(&str, [f32; 3]); 4] = [
+    ("Centre", CENTER),
+    ("Left", LEFT),
+    ("Right", RIGHT),
+    ("Root", ROOT),
+];
+
+/// More colours offered for controls, by name.
+pub const MORE_COLORS: [(&str, [f32; 3]); 4] = [
+    ("Green", [0.2, 0.85, 0.35]),
+    ("Cyan", [0.1, 0.85, 0.9]),
+    ("Orange", [1.0, 0.55, 0.1]),
+    ("White", [0.95, 0.95, 0.95]),
+];
+
+/// The controls a change of look on `control` reaches under `scope`, the
+/// control itself first. Each comes with whether it is a twin (on the other
+/// side) of the control it follows.
+pub fn style_targets(
+    built: &Built,
+    control: &str,
+    scope: StyleScope,
+) -> Result<Vec<(String, bool)>> {
+    let rig = &built.controls;
+    let c = rig
+        .control(control)
+        .ok_or_else(|| anyhow::anyhow!("no control named '{control}'"))?;
+    let twin_of = |name: &str| -> Option<String> {
+        rig.mirror_pairs.iter().find_map(|pair| {
+            let [l, r] = pair;
+            if l == name {
+                Some(r.clone())
+            } else if r == name {
+                Some(l.clone())
+            } else {
+                None
+            }
+        })
+    };
+    let mut out = vec![(c.name.clone(), false)];
+    let (own, twins) = match scope {
+        StyleScope::One => (vec![], false),
+        StyleScope::WithTwin => (vec![], true),
+        StyleScope::Component { twins } => (
+            rig.controls
+                .iter()
+                .filter(|o| o.component == c.component && o.name != c.name)
+                .map(|o| o.name.clone())
+                .collect(),
+            twins,
+        ),
+    };
+    out.extend(own.into_iter().map(|n| (n, false)));
+    if twins {
+        let sided: Vec<String> = out.iter().map(|(n, _)| n.clone()).collect();
+        for n in sided {
+            if let Some(t) = twin_of(&n)
+                && !out.iter().any(|(o, _)| *o == t)
+            {
+                out.push((t, true));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Change the look of `control` (and, by `scope`, its twin or its component's
+/// controls) as written in the guides. A twin gets the same shape and size and
+/// the other side's colour when the colour is a side colour. Returns the
+/// controls changed.
+pub fn restyle(
+    g: &mut Guides,
+    control: &str,
+    change: StyleChange,
+    scope: StyleScope,
+) -> Result<Vec<String>> {
+    if let Some(size) = change.size {
+        ensure!(size > 0.0, "control size must be positive");
+    }
+    if let Some(scale) = change.scale {
+        ensure!(scale > 0.0, "control scale must be positive");
+    }
+    if let Some(w) = change.line_width {
+        ensure!(w > 0.0, "line width must be positive");
+    }
+    if let Some(name) = &change.custom {
+        ensure!(
+            g.custom_shapes.contains_key(name),
+            "no custom shape named '{name}' in these guides"
+        );
+    }
+    let built = build(g)?;
+    let targets = style_targets(&built, control, scope)?;
+    for (name, twin) in &targets {
+        let Some(c) = built.controls.control(name) else {
+            continue;
+        };
+        let mut style = g.control_styles.get(name).cloned().unwrap_or_default();
+        if let Some(shape) = change.shape {
+            style.shape = Some(shape);
+            style.custom = None;
+        }
+        if let Some(custom) = &change.custom {
+            style.custom = Some(custom.clone());
+            style.shape = None;
+        }
+        if let Some(w) = change.line_width {
+            style.line_width = Some(crate::custom_shapes::clamp_width(w));
+        }
+        if let Some(size) = change.size {
+            style.size = Some(size);
+        }
+        if let Some(scale) = change.scale {
+            style.size = Some((c.size * scale).max(0.001));
+        }
+        if let Some(color) = change.color {
+            style.color = Some(if *twin { twin_color(color) } else { color });
+        }
+        set_control_style(g, name, style)?;
+    }
+    Ok(targets.into_iter().map(|(n, _)| n).collect())
+}
+
+/// Keep `shape` in the guides as `name`, replacing a shape of that name.
+pub fn add_custom_shape(g: &mut Guides, name: &str, shape: CustomShape) -> Result<()> {
+    crate::custom_shapes::check_name(name)?;
+    shape.validate()?;
+    g.custom_shapes.insert(name.to_string(), shape);
+    Ok(())
+}
+
+/// Take a custom shape out of the guides. Controls that used it get their
+/// built-in shape back. Returns how many controls did.
+pub fn remove_custom_shape(g: &mut Guides, name: &str) -> Result<usize> {
+    ensure!(
+        g.custom_shapes.remove(name).is_some(),
+        "no custom shape named '{name}' in these guides"
+    );
+    let mut n = 0;
+    g.control_styles.retain(|_, s| {
+        if s.custom.as_deref() == Some(name) {
+            s.custom = None;
+            n += 1;
+        }
+        *s != ControlStyle::default()
+    });
+    Ok(n)
+}
+
+/// Give the controls `names` their component's default look again.
+pub fn reset_styles<'a>(g: &mut Guides, names: impl IntoIterator<Item = &'a str>) -> usize {
+    names
+        .into_iter()
+        .filter(|n| g.control_styles.remove(*n).is_some())
+        .count()
+}
+
+/// Bring the components of another layout in, hung from `bone`. Only premade
+/// parts (chains, eyes, jaw, face) can be imported: the body's own components
+/// are fixed to the mannequin's bones. Components keep their ids, so an id
+/// already in use is refused rather than renamed, because bone names depend on it.
+pub fn import(g: &mut Guides, src: &Guides, bone: &str) -> Result<Vec<String>> {
+    let target = build(g)?;
+    ensure!(
+        target.skeleton.bone(bone).is_some(),
+        "no bone named {bone} to attach to"
+    );
+    let source = build(src).context("the file to import doesn't build")?;
+    let owner: HashMap<&str, &str> = source
+        .skeleton
+        .bones
+        .iter()
+        .map(|b| (b.name.as_str(), b.component.as_str()))
+        .collect();
+    let imported: Vec<&Component> = src
+        .components
+        .iter()
+        .filter(|c| is_premade_part(c.kind))
+        .collect();
+    let ids: HashSet<&str> = imported.iter().map(|c| c.id.as_str()).collect();
+    for c in &imported {
+        ensure!(
+            g.component(&c.id).is_none(),
+            "the rig already has a component named {}; rename it or remove it first",
+            c.id
+        );
+        if matches!(c.kind, Kind::Eyes | Kind::Jaw | Kind::Face) {
+            ensure!(
+                !g.components.iter().any(|x| x.kind == c.kind),
+                "the rig already has one {:?} component",
+                c.kind
+            );
+        }
+    }
+    let mut added = Vec::new();
+    for c in imported {
+        let mut c = c.clone();
+        // Parts that hang from another imported part keep that link; the rest hang from `bone`.
+        let inside = c
+            .parent
+            .as_deref()
+            .and_then(|p| owner.get(p))
+            .is_some_and(|o| ids.contains(o));
+        if !inside {
+            c.parent = Some(bone.to_string());
+        }
+        added.push(c.id.clone());
+        g.components.push(c);
+    }
+    build(g).context("the imported parts don't fit this rig")?;
+    Ok(added)
+}
+
+/// The other side's twin of a sided component (`arm_l` <-> `arm_r`), if any.
+pub fn twin_id(c: &Component) -> Option<String> {
+    let (from, to) = match c.side {
+        Side::Left => ("_l", "_r"),
+        Side::Right => ("_r", "_l"),
+        Side::Center => return None,
+    };
+    c.id.strip_suffix(from).map(|base| format!("{base}{to}"))
+}
+
+/// `p` reflected across the body's centre line.
+pub fn mirror_point(g: &Guides, p: Vec3) -> Vec3 {
+    mirror(p, g.body.center_x)
+}
+
+/// Copy every `source`-side component's guides onto its twin, mirrored across
+/// the body. Returns how many components were updated.
+pub fn mirror_side(g: &mut Guides, source: Side) -> usize {
+    let mut updates = Vec::new();
+    for (i, c) in g.components.iter().enumerate() {
+        if c.side != source {
+            continue;
+        }
+        let Some(twin) = twin_id(c) else { continue };
+        if let Some(j) = g.components.iter().position(|t| t.id == twin)
+            && g.components[j].guides.len() == c.guides.len()
+        {
+            updates.push((i, j));
+        }
+    }
+    let cx = g.body.center_x;
+    // Eyes and the face keep both sides in one component.
+    let suffix = match source {
+        Side::Left => "_l",
+        Side::Right => "_r",
+        Side::Center => "",
+    };
+    let mut paired = 0;
+    for c in g
+        .components
+        .iter_mut()
+        .filter(|c| matches!(c.kind, Kind::Eyes | Kind::Face))
+    {
+        let moves: Vec<(usize, Vec3)> = c
+            .guides
+            .iter()
+            .filter(|x| !suffix.is_empty() && x.name.ends_with(suffix))
+            .filter_map(|x| {
+                let twin = paired_guide(&x.name)?;
+                let j = c.guides.iter().position(|y| y.name == twin)?;
+                Some((j, mirror(x.position, cx)))
+            })
+            .collect();
+        if !moves.is_empty() {
+            paired += 1;
+        }
+        for (j, p) in moves {
+            c.guides[j].position = p;
+        }
+    }
+    for &(i, j) in &updates {
+        let points: Vec<Vec3> = g.components[i].guides.iter().map(|x| x.position).collect();
+        for (guide, p) in g.components[j].guides.iter_mut().zip(points) {
+            guide.position = mirror(p, cx);
+        }
+    }
+    updates.len() + paired
+}
+
+/// Set `bendy` and the default `soft` on every arm, leg and quad leg.
+pub fn set_limb_options(g: &mut Guides, bendy: bool, soft: f32) {
+    for c in &mut g.components {
+        if matches!(c.kind, Kind::Arm | Kind::Leg | Kind::QuadLeg) {
+            c.options.bendy = bendy;
+            c.options.soft = soft;
+        }
+    }
+}
+
+/// Feathers on a wing (an arm component) and its twin, or on every arm when
+/// `id` is `None`: `count` a row (0 takes them off) in `rows` rows. Returns
+/// the ids changed. Nothing changes when the result wouldn't build.
+pub fn set_feathers(
+    g: &mut Guides,
+    id: Option<&str>,
+    count: usize,
+    rows: usize,
+) -> Result<Vec<String>> {
+    ensure!(
+        count <= MAX_FEATHERS,
+        "a wing takes 0 to {MAX_FEATHERS} feathers a row"
+    );
+    ensure!(
+        (1..=MAX_FEATHER_ROWS).contains(&rows),
+        "a wing takes 1 to {MAX_FEATHER_ROWS} rows of feathers"
+    );
+    let mut ids: Vec<String> = match id {
+        Some(id) => {
+            let c = g
+                .component(id)
+                .with_context(|| format!("no component named {id}"))?;
+            ensure!(c.kind == Kind::Arm, "{id} isn't an arm or wing");
+            let mut ids = vec![id.to_string()];
+            ids.extend(twin_id(c).filter(|t| g.component(t).is_some()));
+            ids
+        }
+        None => g
+            .components
+            .iter()
+            .filter(|c| c.kind == Kind::Arm)
+            .map(|c| c.id.clone())
+            .collect(),
+    };
+    ensure!(!ids.is_empty(), "this layout has no arms or wings");
+    ids.sort();
+    let mut next = g.clone();
+    for c in next.components.iter_mut().filter(|c| ids.contains(&c.id)) {
+        c.options.feathers = count;
+        c.options.feather_rows = if count == 0 || rows == 1 { 0 } else { rows };
+    }
+    build(&next)?;
+    *g = next;
+    Ok(ids)
+}
+
+/// Fork a chain: add a branch of `joints` guides growing from its guide
+/// `from`, angled off the bone that ends there, and the same (mirrored) on
+/// its twin when it has one with the same guides. Returns the new guides' names.
+pub fn add_branch(g: &mut Guides, id: &str, from: &str, joints: usize) -> Result<Vec<String>> {
+    ensure!((1..=16).contains(&joints), "a branch takes 1 to 16 joints");
+    let ci = g
+        .components
+        .iter()
+        .position(|c| c.id == id)
+        .with_context(|| format!("no component named {id}"))?;
+    let c = &g.components[ci];
+    ensure!(
+        c.kind == Kind::Chain,
+        "{id} isn't a chain, so it can't fork"
+    );
+    let k = c
+        .guides
+        .iter()
+        .position(|x| x.name == from)
+        .with_context(|| format!("{id} has no guide named {from}"))?;
+    let at = c.guides[k].position;
+    // The bone ending at `from` (or the first bone, from the chain's root).
+    let (a, b) = if k == 0 {
+        (at, c.guides[1].position)
+    } else {
+        (c.guides[guide_from(c, k)].position, at)
+    };
+    let along = (b - a).try_normalize().unwrap_or(Vec3::Y);
+    let mean = (1..c.guides.len())
+        .map(|j| {
+            c.guides[guide_from(c, j)]
+                .position
+                .distance(c.guides[j].position)
+        })
+        .sum::<f32>()
+        / (c.guides.len() - 1) as f32;
+    // Off to the outside (or forward on the centre line), 40 degrees from the bone.
+    let side_dir = match c.side {
+        Side::Center => Vec3::Z,
+        s => Vec3::X * s.sign(),
+    };
+    let mut off = side_dir - along * along.dot(side_dir);
+    if off.length() < 1e-3 {
+        off = along.any_orthonormal_vector();
+    }
+    let dir =
+        glam::Quat::from_axis_angle(along.cross(off.normalize()).normalize(), 40f32.to_radians())
+            * along;
+    let n = (1..)
+        .find(|n| c.guides.iter().all(|x| x.name != format!("b{n}_1")))
+        .unwrap();
+    let names: Vec<String> = (1..=joints).map(|j| format!("b{n}_{j}")).collect();
+    let mut added: Vec<Guide> = Vec::new();
+    for (j, name) in names.iter().enumerate() {
+        let mut guide = Guide::new(name, at + dir * (0.7 * mean * (j + 1) as f32));
+        if j == 0 {
+            guide.from = Some(from.to_string());
+        }
+        added.push(guide);
+    }
+    let mut next = g.clone();
+    let twin = twin_id(&next.components[ci]).and_then(|t| {
+        let tj = next.components.iter().position(|o| o.id == t)?;
+        let same = next.components[tj]
+            .guides
+            .iter()
+            .map(|x| &x.name)
+            .eq(next.components[ci].guides.iter().map(|x| &x.name));
+        same.then_some(tj)
+    });
+    if let Some(tj) = twin {
+        let cx = next.body.center_x;
+        next.components[tj]
+            .guides
+            .extend(added.iter().map(|x| Guide {
+                position: mirror(x.position, cx),
+                ..x.clone()
+            }));
+    }
+    next.components[ci].guides.extend(added);
+    build(&next)?;
+    *g = next;
+    Ok(names)
+}
+
+/// Set the default hock `spring` on every quad leg; returns how many there are.
+pub fn set_hock_spring(g: &mut Guides, spring: f32) -> usize {
+    let legs = g.components.iter_mut().filter(|c| c.kind == Kind::QuadLeg);
+    legs.map(|c| c.options.spring = spring).count()
+}
+
+/// Change the spine component's joint count, re-attaching components that hung
+/// from the old top joint to the new one. Nothing changes when the result
+/// wouldn't build.
+pub fn set_spine_joints(g: &mut Guides, spine_id: &str, joints: usize) -> Result<()> {
+    ensure!((1..=16).contains(&joints), "spine joints must be 1 to 16");
+    change_spine(g, spine_id, |next, i| {
+        let default_joints = next.rules().spine_joints;
+        let spine = &mut next.components[i];
+        let old_top = spine_name(spine.options.joints.unwrap_or(default_joints) - 1);
+        spine.options.joints = Some(joints);
+        let new_top = spine_name(joints - 1);
+        for c in &mut next.components {
+            if c.parent.as_deref() == Some(old_top.as_str()) {
+                c.parent = Some(new_top.clone());
+            }
+        }
+    })
+}
+
+/// Turn the spine's spline (curve) drive on or off, optionally changing its
+/// number of curve controls. The bones keep their names, so everything hung
+/// from the spine stays where it is. Nothing changes when the result wouldn't build.
+pub fn set_spine_spline(
+    g: &mut Guides,
+    spine_id: &str,
+    on: bool,
+    controls: Option<usize>,
+) -> Result<()> {
+    if let Some(k) = controls {
+        ensure!((2..=16).contains(&k), "curve controls must be 2 to 16");
+    }
+    change_spine(g, spine_id, |next, i| {
+        let options = &mut next.components[i].options;
+        options.spline = on;
+        if controls.is_some() {
+            options.controls = controls;
+        }
+    })
+}
+
+/// Apply `change` to a copy of the layout (with the spine's index) and keep it
+/// only if it builds.
+fn change_spine(
+    g: &mut Guides,
+    spine_id: &str,
+    change: impl FnOnce(&mut Guides, usize),
+) -> Result<()> {
+    let i = g
+        .components
+        .iter()
+        .position(|c| c.id == spine_id && c.kind == Kind::Spine)
+        .with_context(|| format!("no spine component named {spine_id}"))?;
+    let mut next = g.clone();
+    change(&mut next, i);
+    build(&next)?;
+    *g = next;
+    Ok(())
+}
+
+// --------------------------------------------------------------------------- building
+
+pub struct Built {
+    pub skeleton: Skeleton,
+    pub controls: ControlRig,
+}
+
+const CENTER: [f32; 3] = [1.0, 0.85, 0.1];
+const LEFT: [f32; 3] = [0.1, 0.45, 1.0];
+const RIGHT: [f32; 3] = [1.0, 0.15, 0.15];
+const ROOT: [f32; 3] = [0.85, 0.3, 0.9];
+
+fn side_color(side: Side) -> [f32; 3] {
+    match side {
+        Side::Center => CENTER,
+        Side::Left => LEFT,
+        Side::Right => RIGHT,
+    }
+}
+
+struct Builder {
+    h: f32,
+    sk: Skeleton,
+    rig: ControlRig,
+    /// Bone -> the FK control that drives it.
+    ctrl_of: HashMap<String, String>,
+    /// Bones driven by an IK/FK blend, whose controls don't follow them in IK.
+    blended: HashSet<String>,
+    /// Arm IK chain -> the control of the bone its clavicle hangs from (the chest).
+    arm_chest: HashMap<String, String>,
+    /// The (arm or leg, side) limbs built so far: the first of each takes the
+    /// mannequin names, later ones their component's.
+    limbs: HashSet<(&'static str, Side)>,
+    head_chest: Option<String>,
+    /// Bones without an FK control that a control stands in for as a space: a
+    /// spline spine's top joint -> its chest control.
+    chest_space: HashMap<String, String>,
+    component: String,
+    /// The body's belly or crotch line: skin below it belongs to a leg.
+    crotch_y: f32,
+    rules: Rules,
+}
+
+impl Builder {
+    fn bone(
+        &mut self,
+        name: &str,
+        parent: &str,
+        head: Vec3,
+        tail: Vec3,
+        side: Side,
+        region: Region,
+    ) -> Result<usize> {
+        self.check_bone(name, head, tail)?;
+        ensure!(
+            self.sk.bone(parent).is_some(),
+            "component {}: parent bone '{parent}' doesn't exist (components must come after the component that owns their parent)",
+            self.component
+        );
+        let parent_deforms = self.sk.bone(parent).is_some_and(|p| p.deform);
+        let i = self.sk.add(name, Some(parent), head, tail, side, region);
+        self.sk.bones[i].component = self.component.clone();
+        self.sk.bones[i].translate = !parent_deforms;
+        Ok(i)
+    }
+
+    fn check_bone(&self, name: &str, head: Vec3, tail: Vec3) -> Result<()> {
+        ensure!(
+            self.sk.bone(name).is_none(),
+            "component {}: a bone named '{name}' already exists",
+            self.component
+        );
+        ensure!(
+            head.distance(tail) > 1e-4 * self.h,
+            "component {}: bone '{name}' has no length (two guides are in the same place)",
+            self.component
+        );
+        Ok(())
+    }
+
+    fn link(&mut self, bone: &str, region: Region) {
+        if let Some(i) = self.sk.index_of(bone)
+            && !self.sk.bones[i].links.contains(&region)
+        {
+            self.sk.bones[i].links.push(region);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn control(
+        &mut self,
+        name: String,
+        kind: ControlKind,
+        parent: ControlParent,
+        bone: Option<&str>,
+        position: Vec3,
+        axis: Vec3,
+        shape: Shape,
+        size: f32,
+        color: [f32; 3],
+    ) {
+        if let (ControlKind::Fk | ControlKind::Root, Some(b)) = (kind, bone) {
+            self.ctrl_of.insert(b.to_string(), name.clone());
+        }
+        self.rig.controls.push(Control {
+            name,
+            kind,
+            parent,
+            bone: bone.map(str::to_string),
+            position,
+            axis,
+            shape,
+            custom: None,
+            size,
+            color,
+            line_width: None,
+            spaces: Vec::new(),
+            extra: Vec::new(),
+            component: self.component.clone(),
+        });
+    }
+
+    /// The control a component attached to `bone` should hang from.
+    fn parent_control(&self, bone: &str) -> ControlParent {
+        match self.ctrl_of.get(bone) {
+            Some(c) if !self.blended.contains(bone) => ControlParent::Control(c.clone()),
+            _ => ControlParent::Bone(bone.to_string()),
+        }
+    }
+
+    fn has_control(&self, name: &str) -> bool {
+        self.rig.control(name).is_some()
+    }
+
+    /// The bone-name prefix and IK chain name of an arm (`group` "arm") or leg
+    /// ("leg", for legs and quad legs alike). The first arm and the first leg
+    /// on each side take the mannequin names (`thigh_l`, chain `leg_l`); every
+    /// later one is named after its component (`leg2_l` gives `leg2_thigh_l`,
+    /// `leg2_foot_l_ik_ctrl` and chain `leg2_l`), so a creature can have any
+    /// number of IK legs a side.
+    fn limb_names(&mut self, c: &Component, group: &'static str) -> Result<(String, String)> {
+        let s = c.side.suffix();
+        if self.limbs.insert((group, c.side)) {
+            return Ok((String::new(), format!("{group}{s}")));
+        }
+        let base = id_base(&c.id, c.side);
+        ensure!(
+            base != group,
+            "component {}: a second {group} on this side needs another id (such as {group}2{s}), since {group}{s} names the first one's IK",
+            c.id
+        );
+        Ok((format!("{base}_"), format!("{base}{s}")))
+    }
+
+    /// The control a part hung from `parent` (its parent control) offers as its
+    /// chest space: the parent control itself, or the control standing in for
+    /// a bone that has none (a spline spine's chest).
+    fn chest_of(&self, parent: &ControlParent) -> Option<String> {
+        match parent {
+            ControlParent::Control(c) => Some(c.clone()),
+            ControlParent::Bone(bone) => self.chest_space.get(bone).cloned(),
+            ControlParent::None => None,
+        }
+    }
+}
+
+/// Turn guides into a skeleton and control rig.
+pub fn build(g: &Guides) -> Result<Built> {
+    validate(g)?;
+    let mut b = Builder {
+        h: g.body.height,
+        sk: Skeleton::default(),
+        rig: ControlRig::default(),
+        ctrl_of: HashMap::new(),
+        blended: HashSet::new(),
+        arm_chest: HashMap::new(),
+        limbs: HashSet::new(),
+        head_chest: None,
+        chest_space: HashMap::new(),
+        component: String::new(),
+        crotch_y: g.body.crotch_y,
+        rules: g.rules(),
+    };
+    for c in &g.components {
+        b.component = c.id.clone();
+        let p = |name: &str| c.position(name).unwrap();
+        let parent = c.parent.as_deref().unwrap_or("");
+        match c.kind {
+            Kind::Root => build_root(&mut b, p("root"))?,
+            Kind::Spine => build_spine(&mut b, c, parent)?,
+            Kind::Head => build_head(&mut b, parent, p("neck"), p("head"), p("head_top"))?,
+            Kind::Arm => build_arm(&mut b, c, parent)?,
+            Kind::Leg => build_leg(&mut b, c, parent)?,
+            Kind::QuadLeg => build_quad_leg(&mut b, c, parent)?,
+            Kind::Chain => build_chain(&mut b, c, parent)?,
+            Kind::Spline => build_spline(&mut b, c, parent)?,
+            Kind::Eyes => build_eyes(&mut b, c, parent)?,
+            Kind::Jaw => build_jaw(&mut b, p("jaw"), p("chin"), parent)?,
+            Kind::Face => build_face(&mut b, c, parent)?,
+        }
+    }
+    // The face board goes on last: it drives the jaw and the face, whatever
+    // order they were added in.
+    if let Some(face) = g
+        .components
+        .iter()
+        .find(|c| c.kind == Kind::Face && c.options.board)
+    {
+        b.component = face.id.clone();
+        build_board(&mut b, face)?;
+    }
+    assign_spaces(&mut b);
+    pin_bones_to_controls(&mut b);
+    b.rig.find_mirror_pairs();
+    for (name, style) in &g.control_styles {
+        let Some(c) = b.rig.controls.iter_mut().find(|c| &c.name == name) else {
+            continue;
+        };
+        if let Some(shape) = style.shape {
+            c.shape = shape;
+        }
+        if let Some(size) = style.size {
+            c.size = size.max(0.001);
+        }
+        if let Some(color) = style.color {
+            c.color = color;
+        }
+        if let Some(shape) = style.custom.as_ref().and_then(|n| {
+            g.custom_shapes.get(n).map(|s| NamedShape {
+                name: n.clone(),
+                shape: s.clone(),
+            })
+        }) {
+            c.shape = shape.shape.look_alike();
+            c.custom = Some(shape);
+        }
+        if let Some(w) = style.line_width {
+            c.line_width = Some(crate::custom_shapes::clamp_width(w));
+        }
+    }
+    Ok(Built {
+        skeleton: b.sk,
+        controls: b.rig,
+    })
+}
+
+/// Keep every FK control on its bone. A bone normally rides on its parent bone
+/// and only turns with its control, which is right when the control hangs
+/// from the parent bone's own control. When it hangs from something else (the
+/// spine's first control from the COG, while its bone hangs from the pelvis),
+/// turning the parent would carry the bone away from its control, and every
+/// control below with it. Those bones take their place from the control too
+/// (`translate`), so the bone stays under its control in every builder.
+fn pin_bones_to_controls(b: &mut Builder) {
+    let limb_bones: HashSet<String> = b
+        .rig
+        .ik_chains
+        .iter()
+        .flat_map(|ch| ch.bones().into_iter().map(str::to_string))
+        .collect();
+    let driver_of: HashMap<&str, &str> = b
+        .rig
+        .controls
+        .iter()
+        .filter(|c| matches!(c.kind, ControlKind::Fk | ControlKind::Root))
+        .filter_map(|c| Some((c.bone.as_deref()?, c.name.as_str())))
+        .collect();
+    let mut pin = Vec::new();
+    for c in &b.rig.controls {
+        if !matches!(c.kind, ControlKind::Fk | ControlKind::Root) {
+            continue;
+        }
+        let Some(bone) = c.bone.as_deref() else {
+            continue;
+        };
+        let Some(i) = b.sk.index_of(bone) else {
+            continue;
+        };
+        let Some(p) = b.sk.bones[i].parent else {
+            continue;
+        };
+        if b.sk.bones[i].translate || limb_bones.contains(bone) {
+            continue;
+        }
+        let parent = b.sk.bones[p].name.as_str();
+        let rides = match &c.parent {
+            ControlParent::Control(name) => driver_of.get(parent) == Some(&name.as_str()),
+            ControlParent::Bone(name) => name == parent,
+            ControlParent::None => false,
+        };
+        if !rides {
+            pin.push(i);
+        }
+    }
+    for i in pin {
+        b.sk.bones[i].translate = true;
+    }
+}
+
+fn validate(g: &Guides) -> Result<()> {
+    ensure!(
+        g.body.height > 0.0,
+        "body height must be positive (got {})",
+        g.body.height
+    );
+    ensure!(
+        g.components.first().map(|c| c.kind) == Some(Kind::Root),
+        "the first component must be the root"
+    );
+    let mut ids = HashSet::new();
+    for c in &g.components {
+        ensure!(
+            !c.id.is_empty()
+                && c.id
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'),
+            "component id '{}' must be letters, digits and underscores",
+            c.id
+        );
+        ensure!(ids.insert(&c.id), "two components are called {}", c.id);
+        ensure!(
+            (c.kind == Kind::Root) == c.parent.is_none(),
+            "component {}: every component except the root needs a parent bone",
+            c.id
+        );
+        match c.kind.guide_names() {
+            Some(names) => {
+                let have: Vec<&str> = c.guides.iter().map(|g| g.name.as_str()).collect();
+                ensure!(
+                    have == names,
+                    "component {} ({:?}) needs guides {names:?}, found {have:?}",
+                    c.id,
+                    c.kind
+                );
+            }
+            None => ensure!(
+                c.guides.len() >= 2,
+                "component {}: a chain needs at least two guides",
+                c.id
+            ),
+        }
+        if c.kind == Kind::Spline {
+            ensure!(
+                (2..=64).contains(&spline_joints(c)),
+                "component {}: a spline chain needs 2 to 64 joints",
+                c.id
+            );
+        }
+        if c.kind == Kind::Spine && c.options.spline {
+            ensure!(
+                c.options.joints.unwrap_or(SPINE_JOINTS) >= 2,
+                "component {}: a spline spine needs at least 2 joints",
+                c.id
+            );
+        }
+        if c.kind == Kind::Spline || (c.kind == Kind::Spine && c.options.spline) {
+            ensure!(
+                (2..=16).contains(&c.options.curve_controls(c.kind == Kind::Spine)),
+                "component {}: a spline needs 2 to 16 curve controls",
+                c.id
+            );
+        }
+        if matches!(c.kind, Kind::Arm | Kind::Leg | Kind::QuadLeg) {
+            ensure!(
+                c.side != Side::Center,
+                "component {}: arms and legs need a side (left or right)",
+                c.id
+            );
+        }
+        let limb = matches!(c.kind, Kind::Arm | Kind::Leg | Kind::QuadLeg);
+        ensure!(
+            !c.options.bendy || limb,
+            "component {}: only arms and legs can be bendy",
+            c.id
+        );
+        ensure!(
+            c.options.soft == 0.0 || limb,
+            "component {}: only arms and legs have soft IK",
+            c.id
+        );
+        ensure!(
+            (0.0..=1.0).contains(&c.options.soft),
+            "component {}: soft must be 0 to 1 (got {})",
+            c.id,
+            c.options.soft
+        );
+        ensure!(
+            c.options.spring == 0.0 || c.kind == Kind::QuadLeg,
+            "component {}: only quad legs have a spring hock",
+            c.id
+        );
+        ensure!(
+            (0.0..=1.0).contains(&c.options.spring),
+            "component {}: spring must be 0 to 1 (got {})",
+            c.id,
+            c.options.spring
+        );
+        ensure!(
+            !c.options.knee_up || matches!(c.kind, Kind::Leg | Kind::QuadLeg),
+            "component {}: only legs and quad legs fold their knee up",
+            c.id
+        );
+        ensure!(
+            !c.options.board || c.kind == Kind::Face,
+            "component {}: only the face has a face board",
+            c.id
+        );
+        if c.kind == Kind::Face {
+            ensure!(
+                c.options.joints.unwrap_or(0) <= MAX_LIP_JOINTS,
+                "component {}: a face takes 0 to {MAX_LIP_JOINTS} extra lip joints a side",
+                c.id
+            );
+        }
+        if c.kind == Kind::Spine {
+            let n = g.spine_joints(c);
+            ensure!(
+                (1..=16).contains(&n),
+                "component {}: spine joints must be 1 to 16",
+                c.id
+            );
+        }
+        for (k, guide) in c.guides.iter().enumerate() {
+            if let Some(from) = &guide.from {
+                ensure!(
+                    c.kind == Kind::Chain,
+                    "component {}: only chains fork (guide {} grows from {from})",
+                    c.id,
+                    guide.name
+                );
+                ensure!(
+                    c.guides[..k].iter().any(|g| &g.name == from),
+                    "component {}: guide {} grows from {from}, which isn't a guide before it",
+                    c.id,
+                    guide.name
+                );
+            }
+        }
+        if is_branched(c) {
+            let mut names = HashSet::new();
+            for guide in &c.guides {
+                ensure!(
+                    names.insert(guide.name.as_str()),
+                    "component {}: two guides are called {} (a forking chain needs its guide names unique)",
+                    c.id,
+                    guide.name
+                );
+            }
+        }
+        ensure!(
+            c.options.feathers == 0 || c.kind == Kind::Arm,
+            "component {}: only arms (wings) have feathers",
+            c.id
+        );
+        ensure!(
+            c.options.feathers <= MAX_FEATHERS,
+            "component {}: a wing takes 0 to {MAX_FEATHERS} feathers a row (got {})",
+            c.id,
+            c.options.feathers
+        );
+        ensure!(
+            c.options.feather_rows <= MAX_FEATHER_ROWS,
+            "component {}: a wing takes 1 to {MAX_FEATHER_ROWS} rows of feathers (got {})",
+            c.id,
+            c.options.feather_rows
+        );
+        for guide in &c.guides {
+            ensure!(
+                guide.position.is_finite(),
+                "component {}: guide {} isn't a finite position",
+                c.id,
+                guide.name
+            );
+        }
+    }
+    ensure!(
+        g.components.iter().filter(|c| c.kind == Kind::Root).count() == 1,
+        "there must be exactly one root component"
+    );
+    Ok(())
+}
+
+fn build_root(b: &mut Builder, at: Vec3) -> Result<()> {
+    let tail = at + Vec3::Z * 0.15 * b.h;
+    b.check_bone("root", at, tail)?;
+    let i =
+        b.sk.add("root", None, at, tail, Side::Center, Region::Center);
+    b.sk.bones[i].deform = false;
+    b.sk.bones[i].component = b.component.clone();
+    b.control(
+        ctrl_name("root"),
+        ControlKind::Root,
+        ControlParent::None,
+        Some("root"),
+        at,
+        Vec3::Y,
+        Shape::Circle,
+        0.25 * b.h,
+        ROOT,
+    );
+    Ok(())
+}
+
+fn build_spine(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
+    let h = b.h;
+    let pelvis = c.position("pelvis").unwrap();
+    let chest = c.position("chest").unwrap();
+    let joints = c.options.joints.unwrap_or(b.rules.spine_joints);
+    // The pelvis points up into the first spine joint.
+    let start = pelvis + Vec3::Y * 0.04 * h;
+    b.bone(
+        "pelvis",
+        parent,
+        pelvis,
+        start,
+        Side::Center,
+        Region::Center,
+    )?;
+    let mut prev = "pelvis".to_string();
+    for i in 0..joints {
+        let name = spine_name(i);
+        let t0 = i as f32 / joints as f32;
+        let t1 = (i + 1) as f32 / joints as f32;
+        b.bone(
+            &name,
+            &prev,
+            start.lerp(chest, t0),
+            start.lerp(chest, t1),
+            Side::Center,
+            Region::Center,
+        )?;
+        prev = name;
+    }
+
+    let cog_parent = b.parent_control(parent);
+    b.control(
+        "cog_ctrl".into(),
+        ControlKind::Cog,
+        cog_parent,
+        None,
+        pelvis,
+        Vec3::Y,
+        Shape::Square,
+        0.17 * h,
+        CENTER,
+    );
+    if c.options.spline {
+        // The hips control drives the pelvis and starts the curve; the chest
+        // control ends it and turns the top joint.
+        b.control(
+            "hips_ctrl".into(),
+            ControlKind::Fk,
+            ControlParent::Control("cog_ctrl".into()),
+            Some("pelvis"),
+            pelvis,
+            Vec3::Y,
+            Shape::Circle,
+            0.14 * h,
+            CENTER,
+        );
+        let k = c.options.curve_controls(true);
+        let mut curve = vec!["hips_ctrl".to_string()];
+        curve.extend((1..k - 1).map(|i| {
+            if k == 3 {
+                "spine_mid_ctrl".to_string()
+            } else {
+                format!("spine_mid_{i:02}_ctrl")
+            }
+        }));
+        curve.push("chest_ctrl".into());
+        let fk: Vec<String> = (1..k).map(|i| format!("spine_fk_{i:02}_ctrl")).collect();
+        let bones: Vec<String> = (0..joints).map(spine_name).collect();
+        spline_controls(
+            b,
+            Spline {
+                name: &c.id,
+                bones: &bones,
+                curve: &curve,
+                fk: &fk,
+                parent: ControlParent::Control("cog_ctrl".into()),
+                curve_size: 0.12 * h,
+                fk_size: 0.15 * h,
+                color: CENTER,
+            },
+        );
+        b.chest_space
+            .insert(spine_name(joints - 1), "chest_ctrl".into());
+        return Ok(());
+    }
+    b.control(
+        ctrl_name("pelvis"),
+        ControlKind::Fk,
+        ControlParent::Control("cog_ctrl".into()),
+        Some("pelvis"),
+        pelvis,
+        Vec3::Y,
+        Shape::Circle,
+        0.13 * h,
+        CENTER,
+    );
+    let mut parent_ctrl = "cog_ctrl".to_string();
+    for i in 0..joints {
+        let n = spine_name(i);
+        let bone = b.sk.bone(&n).unwrap().clone();
+        b.control(
+            ctrl_name(&n),
+            ControlKind::Fk,
+            ControlParent::Control(parent_ctrl),
+            Some(&n),
+            bone.head,
+            bone.direction(),
+            Shape::Circle,
+            0.12 * h,
+            CENTER,
+        );
+        parent_ctrl = ctrl_name(&n);
+    }
+    Ok(())
+}
+
+fn build_head(b: &mut Builder, parent: &str, neck: Vec3, head: Vec3, top: Vec3) -> Result<()> {
+    b.bone("neck_01", parent, neck, head, Side::Center, Region::Center)?;
+    b.bone("head", "neck_01", head, top, Side::Center, Region::Center)?;
+    let mut parent_ctrl = b.parent_control(parent);
+    b.head_chest = b.chest_of(&parent_ctrl);
+    for (n, size) in [("neck_01", 0.06), ("head", 0.08)] {
+        let bone = b.sk.bone(n).unwrap().clone();
+        b.control(
+            ctrl_name(n),
+            ControlKind::Fk,
+            parent_ctrl,
+            Some(n),
+            bone.head,
+            bone.direction(),
+            Shape::Circle,
+            size * b.h,
+            CENTER,
+        );
+        parent_ctrl = ControlParent::Control(ctrl_name(n));
+    }
+    Ok(())
+}
+
+fn limb_region(kind: Kind, side: Side) -> Region {
+    match (kind, side) {
+        (Kind::Arm, Side::Left) => Region::ArmL,
+        (Kind::Arm, _) => Region::ArmR,
+        (_, Side::Left) => Region::LegL,
+        _ => Region::LegR,
+    }
+}
+
+fn build_arm(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
+    let side = c.side;
+    let s = side.suffix();
+    let p = |n: &str| c.position(n).unwrap();
+    // A quadruped's front leg: elbow and wrist below the belly line. Its skin
+    // falls in the leg region, it starts in IK and its IK control stands upright.
+    let planted =
+        b.rules.planted_front_legs && p("elbow").y < b.crotch_y && p("wrist").y < b.crotch_y;
+    let region = limb_region(if planted { Kind::Leg } else { Kind::Arm }, side);
+    let (pre, chain) = b.limb_names(c, "arm")?;
+    let clav = format!("{pre}clavicle{s}");
+    b.bone(
+        &clav,
+        parent,
+        p("clavicle"),
+        p("shoulder"),
+        side,
+        Region::Center,
+    )?;
+    b.link(&clav, region);
+    b.link(parent, region);
+    let names = [
+        format!("{pre}upperarm{s}"),
+        format!("{pre}lowerarm{s}"),
+        format!("{pre}hand{s}"),
+    ];
+    let points = [p("shoulder"), p("elbow"), p("wrist"), p("hand_tip")];
+    let bend = limb_bones(b, &names, &clav, &points, side, region, &c.options)?;
+
+    let color = side_color(side);
+    let clav_parent = b.parent_control(parent);
+    if let Some(chest) = b.chest_of(&clav_parent) {
+        b.arm_chest.insert(chain.clone(), chest);
+    }
+    let cb = b.sk.bone(&clav).unwrap().clone();
+    b.control(
+        ctrl_name(&clav),
+        ControlKind::Fk,
+        clav_parent,
+        Some(&clav),
+        cb.tail,
+        cb.direction(),
+        Shape::Diamond,
+        0.035 * b.h,
+        color,
+    );
+    limb_controls(
+        b,
+        "arm",
+        side,
+        &names,
+        ControlParent::Control(ctrl_name(&clav)),
+        Limb {
+            name: chain,
+            blend: if planted { 1.0 } else { 0.0 },
+            upright_ik: planted,
+            soft: c.options.soft,
+            bend,
+            ..Limb::default()
+        },
+    );
+    build_feathers(
+        b,
+        c,
+        &names[1],
+        &names[2],
+        [p("elbow"), p("wrist"), p("hand_tip")],
+    )
+}
+
+/// A wing's feathers (see [`Options::feathers`]): rows of feather chains
+/// along the forearm and hand, each pointing back from the wing and sweeping
+/// toward the tip over the hand, longer toward the tip; the rows above the
+/// first are shorter coverts. Each joint has an FK control; the first hangs
+/// under a fan offset turned by the spread control's `spread`.
+fn build_feathers(
+    b: &mut Builder,
+    c: &Component,
+    forearm: &str,
+    hand: &str,
+    [elbow, wrist, tip]: [Vec3; 3],
+) -> Result<()> {
+    let count = c.options.feathers;
+    if count == 0 {
+        return Ok(());
+    }
+    let rows = c.options.feather_rows.clamp(1, MAX_FEATHER_ROWS);
+    let (side, s) = (c.side, c.side.suffix());
+    let base = id_base(&c.id, side);
+    let color = side_color(side);
+    let fore = elbow.distance(wrist);
+    let span = fore + wrist.distance(tip);
+    // Back from the wing (the body faces +Z), square to a segment.
+    let back_of = |d: Vec3| (-Vec3::Z + d * d.z).try_normalize().unwrap_or(Vec3::NEG_Y);
+    let up_of = |d: Vec3, back: Vec3| {
+        let n = d.cross(back).normalize();
+        if n.y < 0.0 { -n } else { n }
+    };
+    let fan_ctrl = format!("{base}_feathers{s}_ctrl");
+    let hand_dir = (tip - wrist).normalize();
+    let hand_back = back_of(hand_dir);
+    b.control(
+        fan_ctrl.clone(),
+        ControlKind::Fan,
+        ControlParent::Bone(hand.to_string()),
+        None,
+        wrist + hand_back * 0.3 * span,
+        up_of(hand_dir, hand_back),
+        Shape::QuarterCircle,
+        0.12 * span,
+        color,
+    );
+    let mut feathers = Vec::new();
+    for row in 0..rows {
+        for i in 0..count {
+            // Along the wing from just past the elbow to the tip; each row
+            // above the first sits half a feather further out.
+            let mut u = if count == 1 {
+                0.5
+            } else {
+                i as f32 / (count - 1) as f32
+            };
+            if row % 2 == 1 {
+                u = (u + 0.5 / count as f32).min(1.0);
+            }
+            let at = span * (0.08 + 0.92 * u);
+            let (parent, root, d) = if at < fore {
+                let d = (wrist - elbow).normalize();
+                (forearm, elbow + d * at, d)
+            } else {
+                (hand, wrist + hand_dir * (at - fore), hand_dir)
+            };
+            let back = back_of(d);
+            let up = up_of(d, back);
+            // The hand's feathers sweep toward the tip, up to 60 degrees there.
+            let sweep = (60f32).to_radians() * ((at - fore) / (span - fore).max(1e-6)).max(0.0);
+            let dir = (back * sweep.cos() + d * sweep.sin()).normalize();
+            let length = span * (0.32 + 0.18 * u) * 0.6f32.powi(row as i32);
+            let root = root + up * (0.012 * b.h * row as f32);
+            let mut prev = parent.to_string();
+            let mut prev_ctrl = b.parent_control(parent);
+            let mut first = None;
+            for j in 0..FEATHER_JOINTS {
+                let bone = format!("{base}_feather{}_{:02}_{:02}{s}", row + 1, i + 1, j + 1);
+                let a = root + dir * (length * j as f32 / FEATHER_JOINTS as f32);
+                let e = root + dir * (length * (j + 1) as f32 / FEATHER_JOINTS as f32);
+                b.bone(&bone, &prev, a, e, side, limb_region(Kind::Arm, side))?;
+                let ctrl = ctrl_name(&bone);
+                b.control(
+                    ctrl.clone(),
+                    ControlKind::Fk,
+                    prev_ctrl,
+                    Some(&bone),
+                    a,
+                    dir,
+                    Shape::Circle,
+                    (length / FEATHER_JOINTS as f32 * 0.35).clamp(0.006 * b.h, 0.04 * b.h),
+                    color,
+                );
+                first.get_or_insert((bone.clone(), ctrl.clone()));
+                prev = bone;
+                prev_ctrl = ControlParent::Control(ctrl);
+            }
+            let (bone, control) = first.unwrap();
+            feathers.push(FanFeather {
+                control,
+                bone,
+                parent: parent.to_string(),
+                pivot: root,
+                axis: dir.cross(d).normalize(),
+                angle: if count == 1 {
+                    0.0
+                } else {
+                    FEATHER_FAN_DEGREES * (2.0 * u - 1.0)
+                },
+            });
+        }
+    }
+    b.rig.feathers.push(FeatherFan {
+        name: c.id.clone(),
+        control: fan_ctrl,
+        feathers,
+    });
+    Ok(())
+}
+
+fn build_leg(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
+    let side = c.side;
+    let s = side.suffix();
+    let region = limb_region(Kind::Leg, side);
+    let p = |n: &str| c.position(n).unwrap();
+    b.link(parent, region);
+    let (pre, chain) = b.limb_names(c, "leg")?;
+    let names = [
+        format!("{pre}thigh{s}"),
+        format!("{pre}calf{s}"),
+        format!("{pre}foot{s}"),
+    ];
+    let points = [p("hip"), p("knee"), p("ankle"), p("ball")];
+    let bend = limb_bones(b, &names, parent, &points, side, region, &c.options)?;
+    let ball = format!("{pre}ball{s}");
+    b.bone(&ball, &names[2], p("ball"), p("toe"), side, region)?;
+
+    let fk_parent = b.parent_control(parent);
+    let foot = FootRoll {
+        heel: p("heel"),
+        ball: p("ball"),
+        toe_tip: p("toe"),
+        ball_bone: ball.clone(),
+        ball_control: ctrl_name(&ball),
+        break_angle: b.rules.foot_break_degrees,
+    };
+    limb_controls(
+        b,
+        "leg",
+        side,
+        &names,
+        fk_parent,
+        Limb {
+            name: chain,
+            blend: 1.0,
+            upright_ik: true,
+            foot: Some(foot),
+            soft: c.options.soft,
+            bend,
+            knee_up: c.options.knee_up,
+            ..Limb::default()
+        },
+    );
+    toe_control(b, side, &names[2], ball);
+    Ok(())
+}
+
+/// The toe (ball) control: it follows the foot bone in both IK and FK.
+fn toe_control(b: &mut Builder, side: Side, foot: &str, ball: String) {
+    let bb = b.sk.bone(&ball).unwrap().clone();
+    b.control(
+        ctrl_name(&ball),
+        ControlKind::Fk,
+        ControlParent::Bone(foot.to_string()),
+        Some(&ball),
+        bb.head,
+        bb.direction(),
+        Shape::Circle,
+        0.035 * b.h,
+        side_color(side),
+    );
+    b.blended.insert(ball);
+}
+
+/// A three-segment hind leg: thigh, calf and hock (twist helpers on the thigh
+/// and calf), then the paw (`foot`) and toes (`ball`). The thigh and calf solve
+/// as a two-bone IK aimed at the hock, which a hock control at the ankle swings;
+/// the paw keeps the biped leg's reverse-foot roll. Bendy, the thigh and calf
+/// get bend joints and the knee a pin, as a leg's do; `soft` eases the reach to
+/// the hock and `spring` lets the hock swing with the thigh.
+fn build_quad_leg(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
+    let side = c.side;
+    let s = side.suffix();
+    let region = limb_region(Kind::Leg, side);
+    let p = |n: &str| c.position(n).unwrap();
+    b.link(parent, region);
+    let (pre, chain) = b.limb_names(c, "leg")?;
+    let segments = [
+        format!("{pre}thigh{s}"),
+        format!("{pre}calf{s}"),
+        format!("{pre}hock{s}"),
+    ];
+    let points = [p("hip"), p("knee"), p("hock"), p("ankle")];
+    let bend = limb_bones(b, &segments, parent, &points, side, region, &c.options)?;
+    let foot = format!("{pre}foot{s}");
+    b.bone(&foot, &segments[2], p("ankle"), p("ball"), side, region)?;
+    let ball = format!("{pre}ball{s}");
+    b.bone(&ball, &foot, p("ball"), p("toe"), side, region)?;
+
+    let fk_parent = b.parent_control(parent);
+    let roll = FootRoll {
+        heel: p("heel"),
+        ball: p("ball"),
+        toe_tip: p("toe"),
+        ball_bone: ball.clone(),
+        ball_control: ctrl_name(&ball),
+        break_angle: b.rules.foot_break_degrees,
+    };
+    let names = [segments[0].clone(), segments[1].clone(), foot.clone()];
+    limb_controls(
+        b,
+        "leg",
+        side,
+        &names,
+        fk_parent,
+        Limb {
+            name: chain,
+            blend: 1.0,
+            upright_ik: true,
+            foot: Some(roll),
+            hock: Some(segments[2].clone()),
+            soft: c.options.soft,
+            spring: c.options.spring,
+            bend,
+            knee_up: c.options.knee_up,
+        },
+    );
+    toe_control(b, side, &foot, ball);
+    Ok(())
+}
+
+/// Upper, lower and end bones through `points`, plus twist helpers on the far half
+/// of the upper and lower segments (mannequin names). Upper twists counter half of
+/// their own twist so the shoulder and hip don't candy-wrap; lower twists carry
+/// half of the hand or foot twist.
+///
+/// A bendy limb instead gets [`BEND_JOINTS`] joints along the whole of each
+/// segment, which take its skin (the segment bone stops deforming). Their twist
+/// shares grow toward the far end, up to the share the single helper has.
+/// Returns the bend joints of the upper and lower segments.
+fn limb_bones(
+    b: &mut Builder,
+    names: &[String; 3],
+    parent: &str,
+    points: &[Vec3; 4],
+    side: Side,
+    region: Region,
+    options: &Options,
+) -> Result<Option<[Vec<String>; 2]>> {
+    let mut prev = parent.to_string();
+    for (i, name) in names.iter().enumerate() {
+        b.bone(name, &prev, points[i], points[i + 1], side, region)?;
+        prev = name.clone();
+    }
+    // The upper bone also blends into the torso.
+    let upper = b.sk.index_of(&names[0]).unwrap();
+    b.sk.bones[upper].links.push(Region::Center);
+    if options.bendy {
+        let t = |i: usize| i as f32 / BEND_JOINTS as f32;
+        let mut out: [Vec<String>; 2] = Default::default();
+        for (k, (seg, factor, source)) in
+            [(&names[0], -0.5, &names[0]), (&names[1], 0.5, &names[2])]
+                .into_iter()
+                .enumerate()
+        {
+            let si = b.sk.index_of(seg).unwrap();
+            let bone = b.sk.bones[si].clone();
+            for n in 0..BEND_JOINTS {
+                let name = twist_joint_name(seg, n + 1);
+                let i = b.bone(
+                    &name,
+                    seg,
+                    bone.head.lerp(bone.tail, t(n)),
+                    bone.head.lerp(bone.tail, t(n + 1)),
+                    side,
+                    region,
+                )?;
+                // Each joint blends across the same regions as its segment (the
+                // upper one into the torso).
+                b.sk.bones[i].links = bone.links.clone();
+                if options.twist {
+                    b.sk.bones[i].twist = Some(Twist {
+                        source: source.clone(),
+                        factor: factor * t(n + 1),
+                    });
+                }
+                out[k].push(name);
+            }
+            // After its joints, so they aren't built as hanging from a helper.
+            b.sk.bones[si].deform = false;
+        }
+        return Ok(Some(out));
+    }
+    if options.twist {
+        for (seg, factor, source) in [(&names[0], -0.5, &names[0]), (&names[1], 0.5, &names[2])] {
+            let bone = b.sk.bone(seg).unwrap().clone();
+            let i = b.bone(
+                &twist_name(seg),
+                seg,
+                bone.head.lerp(bone.tail, 0.5),
+                bone.tail,
+                side,
+                region,
+            )?;
+            b.sk.bones[i].twist = Some(Twist {
+                source: source.clone(),
+                factor,
+            });
+        }
+    }
+    Ok(None)
+}
+
+/// How a limb's IK is set up.
+#[derive(Default)]
+struct Limb {
+    /// The IK chain's name (`arm_l`, `leg_l`, `leg2_l`).
+    name: String,
+    /// Initial IK/FK blend: 1 = IK.
+    blend: f32,
+    /// The IK control stands upright (feet, paws) instead of following the upper bone.
+    upright_ik: bool,
+    foot: Option<FootRoll>,
+    /// The hock bone of a three-segment leg, between the lower and end bones.
+    hock: Option<String>,
+    /// Default of the `soft` attribute.
+    soft: f32,
+    /// Default of the hock's `spring` attribute (three-segment legs).
+    spring: f32,
+    /// Bend joints of the upper and lower segments, for a bendy limb.
+    bend: Option<[Vec<String>; 2]>,
+    /// The knee folds up (a splayed spider leg): the pole goes above it.
+    knee_up: bool,
+}
+
+fn limb_controls(
+    b: &mut Builder,
+    kind: &str,
+    side: Side,
+    names: &[String; 3],
+    fk_parent: ControlParent,
+    limb: Limb,
+) {
+    let h = b.h;
+    let color = side_color(side);
+    let [up, lo, end] = names.clone().map(|n| b.sk.bone(&n).unwrap().clone());
+    let hock = limb.hock.as_ref().map(|n| b.sk.bone(n).unwrap().clone());
+    let (size, bend_fallback) = if kind == "arm" {
+        (0.045 * h, -Vec3::Z)
+    } else if limb.knee_up {
+        (0.06 * h, Vec3::Y)
+    } else {
+        (0.06 * h, Vec3::Z)
+    };
+
+    let mut parent = fk_parent;
+    for bone in [Some(&up), Some(&lo), hock.as_ref(), Some(&end)]
+        .into_iter()
+        .flatten()
+    {
+        b.control(
+            fk_name(&bone.name),
+            ControlKind::Fk,
+            parent,
+            Some(&bone.name),
+            bone.head,
+            bone.direction(),
+            Shape::Circle,
+            size,
+            color,
+        );
+        parent = ControlParent::Control(fk_name(&bone.name));
+        b.blended.insert(bone.name.clone());
+    }
+
+    let ik = format!("{}_ik_ctrl", end.name);
+    let ik_axis = if limb.upright_ik {
+        Vec3::Y
+    } else {
+        up.direction()
+    };
+    let root = if b.has_control("root_ctrl") {
+        ControlParent::Control("root_ctrl".into())
+    } else {
+        ControlParent::None
+    };
+    b.control(
+        ik.clone(),
+        ControlKind::IkEffector,
+        root.clone(),
+        Some(&end.name),
+        end.head,
+        ik_axis,
+        Shape::Cube,
+        size,
+        color,
+    );
+
+    // The pole sits straight ahead of the knee (behind the elbow): forward or
+    // back, square to the limb, at about half the limb's length. A sideways lean
+    // in the guides doesn't swing it out to the side. On a three-segment leg the
+    // two-bone solve ends at the hock, so that is the limb it squares to.
+    let solve_end = hock.as_ref().map_or(end.head, |k| k.head);
+    let axis = (solve_end - up.head).try_normalize().unwrap_or(Vec3::NEG_Y);
+    let bend = (bend_fallback - axis * bend_fallback.dot(axis))
+        .try_normalize()
+        .unwrap_or(bend_fallback);
+    let reach = b.rules.pole_reach * (up.head.distance(lo.head) + lo.head.distance(solve_end));
+    let pole = format!("{}_pole_ctrl", lo.name);
+    b.control(
+        pole.clone(),
+        ControlKind::Pole,
+        root,
+        None,
+        lo.head + bend * reach.max(b.rules.pole_min_reach * h),
+        bend,
+        Shape::Diamond,
+        0.025 * h,
+        color,
+    );
+
+    // The hock control stands at the ankle and points up the hock: turning it
+    // swings the hock about the ankle, which moves where the knee solve aims.
+    let hock_segment = hock.map(|k| {
+        let control = format!("{}_ik_ctrl", k.name);
+        b.control(
+            control.clone(),
+            ControlKind::Hock,
+            ControlParent::Control(ik.clone()),
+            None,
+            k.tail,
+            (k.head - k.tail).try_normalize().unwrap_or(Vec3::Y),
+            Shape::Diamond,
+            0.03 * h,
+            color,
+        );
+        HockSegment {
+            fk_control: fk_name(&k.name),
+            bone: k.name,
+            control,
+            default_spring: limb.spring,
+        }
+    });
+
+    // Bendy: a pin at the elbow or knee, following the lower bone, and a bend
+    // control at the middle of each segment, following its segment.
+    let bendy = limb.bend.map(|[upper_joints, lower_joints]| {
+        let pin = format!("{}_pin_ctrl", lo.name);
+        b.control(
+            pin.clone(),
+            ControlKind::Pin,
+            ControlParent::Bone(lo.name.clone()),
+            None,
+            lo.head,
+            lo.direction(),
+            Shape::Sphere,
+            0.025 * h,
+            color,
+        );
+        let mut segment = |bone: &crate::skeleton::Bone, joints: Vec<String>| {
+            let control = format!("{}_bend_ctrl", bone.name);
+            b.control(
+                control.clone(),
+                ControlKind::Bend,
+                ControlParent::Bone(bone.name.clone()),
+                None,
+                bone.head.lerp(bone.tail, 0.5),
+                bone.direction(),
+                Shape::Octagon,
+                0.8 * size,
+                color,
+            );
+            BendSegment {
+                bone: bone.name.clone(),
+                control,
+                joints,
+            }
+        };
+        Bendy {
+            pin,
+            upper: segment(&up, upper_joints),
+            lower: segment(&lo, lower_joints),
+        }
+    });
+
+    b.rig.ik_chains.push(IkChain {
+        name: limb.name,
+        upper: up.name.clone(),
+        lower: lo.name.clone(),
+        end: end.name.clone(),
+        ik_control: ik,
+        pole_control: pole,
+        fk_controls: [fk_name(&up.name), fk_name(&lo.name), fk_name(&end.name)],
+        default_blend: limb.blend,
+        default_stretch: 0.0,
+        foot: limb.foot,
+        hock: hock_segment,
+        default_soft: limb.soft,
+        soft_zone: SOFT_ZONE,
+        bendy,
+    });
+}
+
+/// The guide that guide `k` (from 1) of a chain grows from: the one its
+/// `from` names among the guides before it, else the guide before it.
+pub fn guide_from(c: &Component, k: usize) -> usize {
+    c.guides[k]
+        .from
+        .as_ref()
+        .and_then(|f| c.guides[..k].iter().position(|g| &g.name == f))
+        .unwrap_or(k - 1)
+}
+
+/// Whether a chain forks: a guide grows from one other than the guide before it.
+pub fn is_branched(c: &Component) -> bool {
+    c.kind == Kind::Chain && (1..c.guides.len()).any(|k| guide_from(c, k) != k - 1)
+}
+
+/// An FK chain, forking wherever a guide grows from an earlier guide than
+/// the one before it: bone `k` runs from guide `from(k)` to guide `k` and
+/// hangs from the bone ending at `from(k)`, its control from that bone's.
+fn build_chain(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
+    let region =
+        b.sk.bone(parent)
+            .map(|p| p.region)
+            .unwrap_or(Region::Center);
+    let (names, _) = id_names(c);
+    let froms: Vec<usize> = (1..c.guides.len()).map(|k| guide_from(c, k)).collect();
+    let bone_at = |guide: usize| {
+        if guide == 0 {
+            parent.to_string()
+        } else {
+            names[guide - 1].clone()
+        }
+    };
+    for (i, name) in names.iter().enumerate() {
+        let from = froms[i];
+        b.bone(
+            name,
+            &bone_at(from),
+            c.guides[from].position,
+            c.guides[i + 1].position,
+            c.side,
+            region,
+        )?;
+    }
+    let base_ctrl = b.parent_control(parent);
+    for (i, name) in names.iter().enumerate() {
+        let bone = b.sk.bone(name).unwrap().clone();
+        let size = (bone.length() * 0.6).clamp(0.008 * b.h, 0.06 * b.h);
+        let parent_ctrl = match froms[i] {
+            0 => base_ctrl.clone(),
+            from => ControlParent::Control(ctrl_name(&names[from - 1])),
+        };
+        b.control(
+            ctrl_name(name),
+            ControlKind::Fk,
+            parent_ctrl,
+            Some(name),
+            bone.head,
+            bone.direction(),
+            Shape::Circle,
+            size,
+            side_color(c.side),
+        );
+    }
+    Ok(())
+}
+
+/// A tentacle: joints spread evenly along the guides (one per guide segment
+/// unless the options set a count), driven by curve controls with an FK layer.
+fn build_spline(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
+    let region =
+        b.sk.bone(parent)
+            .map(|p| p.region)
+            .unwrap_or(Region::Center);
+    let (names, controls) = id_names(c);
+    let guides: Vec<Vec3> = c.guides.iter().map(|g| g.position).collect();
+    let points = if names.len() + 1 == guides.len() {
+        guides
+    } else {
+        resample(&guides, names.len() + 1)
+    };
+    let mut prev = parent.to_string();
+    for (i, name) in names.iter().enumerate() {
+        b.bone(name, &prev, points[i], points[i + 1], c.side, region)?;
+        prev = name.clone();
+    }
+    let k = c.options.curve_controls(false);
+    let (curve, fk) = controls.split_at(k);
+    let length: f32 = points.windows(2).map(|w| w[0].distance(w[1])).sum();
+    let size = (length / k as f32 * 0.3).clamp(0.01 * b.h, 0.07 * b.h);
+    let parent_ctrl = b.parent_control(parent);
+    spline_controls(
+        b,
+        Spline {
+            name: &c.id,
+            bones: &names,
+            curve,
+            fk,
+            parent: parent_ctrl,
+            curve_size: size,
+            fk_size: size * 1.5,
+            color: side_color(c.side),
+        },
+    );
+    Ok(())
+}
+
+/// What `spline_controls` builds on a chain of bones already in the skeleton.
+struct Spline<'a> {
+    name: &'a str,
+    bones: &'a [String],
+    /// Curve control names, start to end. A first name that is already a
+    /// control (the spine's hips) is used as it is.
+    curve: &'a [String],
+    /// FK layer names, one fewer than the curve controls.
+    fk: &'a [String],
+    /// Where the start control and the FK layer hang.
+    parent: ControlParent,
+    curve_size: f32,
+    fk_size: f32,
+    color: [f32; 3],
+}
+
+/// Curve controls spread along a chain (near the peaks of their curve
+/// weights), an FK layer carrying them, and the chain's [`SplineChain`].
+fn spline_controls(b: &mut Builder, s: Spline) {
+    let bones: Vec<_> = s
+        .bones
+        .iter()
+        .map(|n| b.sk.bone(n).unwrap().clone())
+        .collect();
+    // The curve runs through the joints' heads; the last joint hangs off its end.
+    let points: Vec<Vec3> = bones.iter().map(|bone| bone.head).collect();
+    let params = arc_params(&points);
+    let k = s.curve.len();
+    let spots: Vec<(Vec3, Vec3)> = greville(k)
+        .into_iter()
+        .map(|t| {
+            let i = segment_at(&params, t);
+            let span = (params[i + 1] - params[i]).max(1e-9);
+            let f = ((t - params[i]) / span).clamp(0.0, 1.0);
+            let dir = (points[i + 1] - points[i]).try_normalize();
+            (points[i].lerp(points[i + 1], f), dir.unwrap_or(Vec3::Y))
+        })
+        .collect();
+    if !b.has_control(&s.curve[0]) {
+        b.control(
+            s.curve[0].clone(),
+            ControlKind::Spline,
+            s.parent.clone(),
+            None,
+            spots[0].0,
+            spots[0].1,
+            Shape::Square,
+            s.curve_size,
+            s.color,
+        );
+    }
+    let mut parent = s.parent;
+    for i in 0..k - 1 {
+        b.control(
+            s.fk[i].clone(),
+            ControlKind::Fk,
+            parent,
+            None,
+            spots[i].0,
+            spots[i].1,
+            Shape::Circle,
+            s.fk_size,
+            s.color,
+        );
+        parent = ControlParent::Control(s.fk[i].clone());
+        b.control(
+            s.curve[i + 1].clone(),
+            ControlKind::Spline,
+            parent.clone(),
+            None,
+            spots[i + 1].0,
+            spots[i + 1].1,
+            Shape::Square,
+            s.curve_size,
+            s.color,
+        );
+    }
+    let weights = params.iter().map(|&u| spline_basis(k, u)).collect();
+    b.rig.splines.push(SplineChain {
+        name: s.name.to_string(),
+        bones: s.bones.to_vec(),
+        controls: s.curve.to_vec(),
+        fk_controls: s.fk.to_vec(),
+        settings: s.curve[k - 1].clone(),
+        points,
+        params,
+        weights,
+        default_stretch: 1.0,
+        default_volume: 0.0,
+        default_slide: 0.0,
+    });
+}
+
+/// Each point's distance along the polyline through them, as a fraction of its length.
+fn arc_params(points: &[Vec3]) -> Vec<f32> {
+    let mut acc = vec![0.0f32];
+    for w in points.windows(2) {
+        acc.push(acc.last().unwrap() + w[0].distance(w[1]));
+    }
+    let total = acc.last().copied().unwrap_or(0.0).max(1e-9);
+    acc.into_iter().map(|d| d / total).collect()
+}
+
+/// The polyline segment holding fraction `t` of its length.
+fn segment_at(params: &[f32], t: f32) -> usize {
+    params
+        .windows(2)
+        .position(|w| t <= w[1])
+        .unwrap_or(params.len() - 2)
+}
+
+/// `count` points evenly spaced along the polyline through `points`.
+fn resample(points: &[Vec3], count: usize) -> Vec<Vec3> {
+    let params = arc_params(points);
+    (0..count)
+        .map(|j| {
+            let t = j as f32 / (count - 1).max(1) as f32;
+            let i = segment_at(&params, t);
+            let span = (params[i + 1] - params[i]).max(1e-9);
+            points[i].lerp(points[i + 1], ((t - params[i]) / span).clamp(0.0, 1.0))
+        })
+        .collect()
+}
+
+/// Knots of a clamped uniform B-spline with `count` control points, and its degree.
+fn spline_knots(count: usize) -> (Vec<f32>, usize) {
+    let degree = (count - 1).min(3);
+    let inner = count - degree - 1;
+    let mut knots = vec![0.0; degree + 1];
+    knots.extend((1..=inner).map(|i| i as f32 / (inner + 1) as f32));
+    knots.extend(std::iter::repeat_n(1.0, degree + 1));
+    (knots, degree)
+}
+
+/// The weight of each of `count` curve controls at `u` (0 to 1 along the
+/// chain): the basis of a clamped uniform B-spline of degree up to 3. The
+/// weights sum to 1, change smoothly, and the end controls own the ends.
+pub fn spline_basis(count: usize, u: f32) -> Vec<f32> {
+    let (knots, degree) = spline_knots(count);
+    let u = u.clamp(0.0, 1.0);
+    let mut n: Vec<f32> = (0..knots.len() - 1)
+        .map(|i| {
+            let inside = if u >= 1.0 {
+                i == count - 1
+            } else {
+                knots[i] <= u && u < knots[i + 1]
+            };
+            if inside { 1.0 } else { 0.0 }
+        })
+        .collect();
+    let ratio = |num: f32, den: f32| if den > 0.0 { num / den } else { 0.0 };
+    for p in 1..=degree {
+        n = (0..n.len() - 1)
+            .map(|i| {
+                ratio(u - knots[i], knots[i + p] - knots[i]) * n[i]
+                    + ratio(knots[i + p + 1] - u, knots[i + p + 1] - knots[i + 1]) * n[i + 1]
+            })
+            .collect();
+    }
+    n
+}
+
+/// Where each curve control sits along the chain (0 to 1): the Greville
+/// abscissae of the B-spline, near the peak of each control's weight.
+fn greville(count: usize) -> Vec<f32> {
+    let (knots, degree) = spline_knots(count);
+    (0..count)
+        .map(|i| knots[i + 1..=i + degree].iter().sum::<f32>() / degree as f32)
+        .collect()
+}
+
+/// One bone per eye, pointing at the target, aimed by a control in front of it;
+/// both aim controls hang from a master that moves the gaze as a whole.
+fn build_eyes(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
+    let p = |n: &str| c.position(n).unwrap();
+    let (l, r, target) = (p("eye_l"), p("eye_r"), p("target"));
+    let mid = (l + r) * 0.5;
+    let gaze = target - mid;
+    ensure!(
+        gaze.length() > 0.02 * b.h,
+        "component {}: the eye target must be in front of the eyes",
+        c.id
+    );
+    let dir = gaze.normalize();
+    let master = id_names(c).1.remove(0);
+    let parent_ctrl = b.parent_control(parent);
+    let spread = l.distance(r).max(0.01 * b.h);
+    b.control(
+        master.clone(),
+        ControlKind::Aim,
+        parent_ctrl,
+        None,
+        target,
+        dir,
+        Shape::Square,
+        spread * 1.1,
+        CENTER,
+    );
+    for (name, side, eye) in [("eye_l", Side::Left, l), ("eye_r", Side::Right, r)] {
+        b.bone(
+            name,
+            parent,
+            eye,
+            eye + dir * (0.02 * b.h),
+            side,
+            Region::Center,
+        )?;
+        b.control(
+            format!("{name}_aim_ctrl"),
+            ControlKind::Aim,
+            ControlParent::Control(master.clone()),
+            Some(name),
+            eye + gaze,
+            dir,
+            Shape::Circle,
+            spread * 0.3,
+            side_color(side),
+        );
+    }
+    Ok(())
+}
+
+fn build_jaw(b: &mut Builder, jaw: Vec3, chin: Vec3, parent: &str) -> Result<()> {
+    b.bone("jaw", parent, jaw, chin, Side::Center, Region::Center)?;
+    let parent_ctrl = b.parent_control(parent);
+    b.control(
+        ctrl_name("jaw"),
+        ControlKind::Fk,
+        parent_ctrl,
+        Some("jaw"),
+        chin,
+        (chin - jaw).normalize(),
+        Shape::Circle,
+        0.03 * b.h,
+        CENTER,
+    );
+    Ok(())
+}
+
+/// Face joints hang from the head (the lower lip from the jaw when there is one).
+/// Each is a short joint pointing out of the face with a control that moves and
+/// rotates it, and only weights the skin near it. With eyes built first, the
+/// eyelids pivot on the eyeball so rotating their control blinks.
+fn build_face(b: &mut Builder, c: &Component, parent: &str) -> Result<()> {
+    let len = 0.012 * b.h;
+    let extras: Vec<Guide> = lip_joints(c)
+        .into_iter()
+        .map(|j| Guide {
+            name: j.name,
+            position: j.position,
+            from: None,
+        })
+        .collect();
+    for g in c.guides.iter().chain(&extras) {
+        let name = g.name.as_str();
+        let side = if name.ends_with("_l") {
+            Side::Left
+        } else if name.ends_with("_r") {
+            Side::Right
+        } else {
+            Side::Center
+        };
+        let bone_parent = if name.starts_with("lip_low") && b.sk.bone("jaw").is_some() {
+            "jaw"
+        } else {
+            parent
+        };
+        let eye = name
+            .strip_prefix("lid_")
+            .and_then(|_| b.sk.bone(&format!("eye{}", side.suffix())))
+            .map(|e| e.head);
+        let (head, tail) = match eye {
+            Some(e) if e.distance(g.position) > 1e-3 * b.h => (e, g.position),
+            _ => (g.position, g.position + Vec3::Z * len),
+        };
+        let i = b.bone(name, bone_parent, head, tail, side, Region::Center)?;
+        let reach = if name.starts_with("lip") || name.starts_with("lid") {
+            0.022
+        } else {
+            0.03
+        };
+        let bone = &mut b.sk.bones[i];
+        bone.translate = true;
+        bone.reach = Some(reach * b.h);
+        let parent_ctrl = b.parent_control(bone_parent);
+        b.control(
+            ctrl_name(name),
+            ControlKind::Fk,
+            parent_ctrl,
+            Some(name),
+            g.position + Vec3::Z * (0.012 * b.h),
+            Vec3::Z,
+            Shape::Diamond,
+            0.0045 * b.h,
+            side_color(side),
+        );
+    }
+    Ok(())
+}
+
+/// The most extra lip joints a face takes on each lip, each side.
+pub const MAX_LIP_JOINTS: usize = 3;
+
+/// An extra lip joint of a face: between the middle of a lip and a corner.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LipJoint {
+    /// `lip_up_1_l`: the upper lip's first joint out from the middle, on the left.
+    pub name: String,
+    pub position: Vec3,
+    pub upper: bool,
+    /// How far out toward the corner: 0 in the middle, 1 at the corner.
+    pub out: f32,
+    pub side: Side,
+}
+
+/// The face's extra lip joints (its `joints` option, none when unset): on each
+/// lip, evenly from the middle toward each corner, on an arc that bows forward
+/// like the mouth does.
+pub fn lip_joints(c: &Component) -> Vec<LipJoint> {
+    let n = c.options.joints.unwrap_or(0).min(MAX_LIP_JOINTS);
+    let mut out = Vec::new();
+    for (lip, upper) in [("up", true), ("low", false)] {
+        let Some(mid) = c.position(&format!("lip_{lip}")) else {
+            continue;
+        };
+        for (side, s) in [(Side::Left, "l"), (Side::Right, "r")] {
+            let Some(corner) = c.position(&format!("lip_corner_{s}")) else {
+                continue;
+            };
+            for k in 1..=n {
+                let t = k as f32 / (n + 1) as f32;
+                let mut p = mid.lerp(corner, t);
+                p.z = corner.z + (mid.z - corner.z) * (1.0 - t * t);
+                out.push(LipJoint {
+                    name: format!("lip_{lip}_{k}_{s}"),
+                    position: p,
+                    upper,
+                    out: t,
+                    side,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The face board's offsets as they are made: each face control's drives.
+struct Drives<'a> {
+    b: &'a Builder,
+    offsets: Vec<face_board::BoardOffset>,
+}
+
+impl Drives<'_> {
+    /// `bone`'s control moves `t` metres and turns `r` degrees for a unit of
+    /// `part` going `dir`. Skipped when the rig has no such control.
+    fn add(&mut self, bone: &str, part: &str, dir: Dir, t: Vec3, r: Vec3) {
+        let control = ctrl_name(bone);
+        let Some(head) = self.b.sk.bone(bone).map(|x| x.head) else {
+            return;
+        };
+        if !self.b.has_control(&control) || (t == Vec3::ZERO && r == Vec3::ZERO) {
+            return;
+        }
+        let i = match self.offsets.iter().position(|o| o.control == control) {
+            Some(i) => i,
+            None => {
+                self.offsets.push(face_board::BoardOffset {
+                    control,
+                    pivot: head,
+                    drives: Vec::new(),
+                });
+                self.offsets.len() - 1
+            }
+        };
+        let drives = &mut self.offsets[i].drives;
+        match drives.iter_mut().find(|d| d.part == part && d.dir == dir) {
+            Some(d) => {
+                d.translate += t;
+                d.rotate += r;
+            }
+            None => drives.push(face_board::BoardDrive {
+                part: part.to_string(),
+                dir,
+                translate: t,
+                rotate: r,
+            }),
+        }
+    }
+}
+
+/// The face board: a panel beside the head (on the character's left, level
+/// with the face) whose sliders move and turn the face controls, and the lip
+/// seal on the lip joints. See [`face_board`].
+fn build_board(b: &mut Builder, c: &Component) -> Result<()> {
+    use face_board::{HANDLE, LAYOUT, PANEL, STEP};
+    let h = b.h;
+    let step = STEP * h;
+    let parent = c.parent.as_deref().unwrap_or("head");
+    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for g in &c.guides {
+        lo = lo.min(g.position);
+        hi = hi.max(g.position);
+    }
+    ensure!(
+        lo.x <= hi.x,
+        "component {}: the face has no guides to place its board by",
+        c.id
+    );
+    let center = Vec3::new(hi.x + 0.05 * h + PANEL[0] * step, (lo.y + hi.y) * 0.5, hi.z);
+    let at = |p: [f32; 2]| center + Vec3::new(p[0], p[1], 0.0) * step;
+    let frame = "board_ctrl".to_string();
+    let top = LAYOUT
+        .iter()
+        .find(|s| s.part.is_empty())
+        .map_or([0.0, PANEL[1]], |s| s.at);
+    let parent_ctrl = b.parent_control(parent);
+    b.control(
+        frame.clone(),
+        ControlKind::Board,
+        parent_ctrl,
+        None,
+        at(top),
+        Vec3::Z,
+        Shape::FourArrows,
+        0.8 * step,
+        CENTER,
+    );
+    if let Some(ctrl) = b.rig.controls.last_mut() {
+        ctrl.extra = face_board::panel_lines(center, step);
+    }
+    let mut sliders = Vec::new();
+    for slot in LAYOUT.iter().filter(|s| !s.part.is_empty()) {
+        let name = format!("board_{}_ctrl", slot.part);
+        let side = if slot.part.ends_with("_l") {
+            Side::Left
+        } else if slot.part.ends_with("_r") {
+            Side::Right
+        } else {
+            Side::Center
+        };
+        b.control(
+            name.clone(),
+            ControlKind::Slider,
+            ControlParent::Control(frame.clone()),
+            None,
+            at(slot.at),
+            Vec3::Z,
+            Shape::Circle,
+            HANDLE * step,
+            side_color(side),
+        );
+        sliders.push(face_board::Slider {
+            part: slot.part.to_string(),
+            control: name,
+            travel: slot.travel * step,
+            x: slot.x,
+            y: slot.y,
+        });
+    }
+
+    let v = |x: f32, y: f32, z: f32| Vec3::new(x, y, z) * h;
+    let turn = |x: f32| Vec3::new(x, 0.0, 0.0);
+    let lips = lip_joints(c);
+    let mut d = Drives {
+        b,
+        offsets: Vec::new(),
+    };
+    for (s, sx) in [("l", 1.0f32), ("r", -1.0)] {
+        // The right side mirrors the left: side to side swaps.
+        let m = |t: Vec3| Vec3::new(t.x * sx, t.y, t.z);
+        let side_dir = |dir: Dir| if sx < 0.0 { dir.mirrored() } else { dir };
+        let brow = format!("brow_{s}");
+        let brows = [
+            (
+                "in",
+                v(0.0, 0.010, 0.001),
+                v(0.0, -0.006, 0.001),
+                v(-0.005, -0.002, 0.001),
+                Vec3::ZERO,
+            ),
+            (
+                "mid",
+                v(0.0, 0.011, 0.001),
+                v(0.0, -0.006, 0.0),
+                v(-0.003, -0.001, 0.0),
+                v(0.002, 0.0, 0.0),
+            ),
+            (
+                "out",
+                v(0.0, 0.008, 0.0),
+                v(0.0, -0.005, 0.0),
+                Vec3::ZERO,
+                v(0.003, 0.001, 0.0),
+            ),
+        ];
+        for (bone, up, down, inward, outward) in brows {
+            let bone = format!("brow_{bone}_{s}");
+            d.add(&bone, &brow, Dir::YPos, up, Vec3::ZERO);
+            d.add(&bone, &brow, Dir::YNeg, down, Vec3::ZERO);
+            d.add(&bone, &brow, side_dir(Dir::XNeg), m(inward), Vec3::ZERO);
+            d.add(&bone, &brow, side_dir(Dir::XPos), m(outward), Vec3::ZERO);
+        }
+        // Lids: turned about the eye to meet a little below the middle of
+        // the eye when they pivot on it, else slid shut.
+        let lid = format!("lid_{s}");
+        let (up, low) = (format!("lid_up_{s}"), format!("lid_low_{s}"));
+        let lid_bones = (d.b.sk.bone(&up).cloned(), d.b.sk.bone(&low).cloned());
+        if let (Some(ub), Some(lb)) = lid_bones {
+            let on_eye = c
+                .position(&up)
+                .is_some_and(|g| g.distance(ub.head) > 1e-4 * h);
+            if on_eye {
+                let angle = |p: Vec3, eye: Vec3| (p.y - eye.y).atan2(p.z - eye.z).to_degrees();
+                let (au, al) = (angle(ub.tail, ub.head), angle(lb.tail, lb.head));
+                let meet = al + 0.3 * (au - al);
+                d.add(&up, &lid, Dir::YNeg, Vec3::ZERO, turn(au - meet));
+                d.add(&low, &lid, Dir::YNeg, Vec3::ZERO, turn(al - meet));
+                d.add(&up, &lid, Dir::YPos, Vec3::ZERO, turn(-15.0));
+                d.add(&low, &lid, Dir::YPos, Vec3::ZERO, turn(8.0));
+            } else {
+                let gap = (ub.head.y - lb.head.y).max(0.002 * h);
+                let y = |k: f32| Vec3::new(0.0, k * gap, 0.0);
+                d.add(&up, &lid, Dir::YNeg, y(-0.7), Vec3::ZERO);
+                d.add(&low, &lid, Dir::YNeg, y(0.3), Vec3::ZERO);
+                d.add(&up, &lid, Dir::YPos, y(0.3), Vec3::ZERO);
+                d.add(&low, &lid, Dir::YPos, y(-0.2), Vec3::ZERO);
+            }
+        }
+        let cheek = format!("cheek_{s}");
+        d.add(
+            &cheek,
+            &cheek,
+            Dir::YPos,
+            m(v(0.001, 0.006, 0.002)),
+            Vec3::ZERO,
+        );
+        d.add(&cheek, &cheek, Dir::YNeg, v(0.0, -0.003, 0.0), Vec3::ZERO);
+        // Mouth corners, with the lip joints on that side taking a share by
+        // how far out toward the corner they are.
+        let corner = format!("corner_{s}");
+        let suffix = format!("_{s}");
+        let mut on_side: Vec<(String, f32)> = vec![(format!("lip_corner_{s}"), 1.0)];
+        on_side.extend(
+            lips.iter()
+                .filter(|j| j.side.suffix() == suffix)
+                .map(|j| (j.name.clone(), j.out * j.out)),
+        );
+        for (bone, k) in &on_side {
+            let k = *k;
+            d.add(
+                bone,
+                &corner,
+                Dir::YPos,
+                m(v(0.002, 0.007, -0.002)) * k,
+                Vec3::ZERO,
+            );
+            d.add(
+                bone,
+                &corner,
+                Dir::YNeg,
+                v(0.0, -0.006, 0.0) * k,
+                Vec3::ZERO,
+            );
+            let wide = m(v(0.007, 0.0, -0.002)) * k;
+            d.add(bone, &corner, side_dir(Dir::XPos), wide, Vec3::ZERO);
+            let narrow = m(v(-0.006, 0.0, 0.003)) * k;
+            d.add(bone, &corner, side_dir(Dir::XNeg), narrow, Vec3::ZERO);
+        }
+        d.add(&cheek, &corner, Dir::YPos, v(0.0, 0.003, 0.001), Vec3::ZERO);
+    }
+    d.add("nose", "nose", Dir::YPos, v(0.0, 0.004, 0.001), Vec3::ZERO);
+    d.add("nose", "nose", Dir::YNeg, v(0.0, -0.002, 0.0), Vec3::ZERO);
+    let mut every_lip: Vec<String> = ["lip_up", "lip_low", "lip_corner_l", "lip_corner_r"]
+        .map(String::from)
+        .to_vec();
+    every_lip.extend(lips.iter().map(|j| j.name.clone()));
+    for bone in &every_lip {
+        d.add(bone, "mouth", Dir::XPos, v(0.006, 0.0, 0.0), Vec3::ZERO);
+        d.add(bone, "mouth", Dir::XNeg, v(-0.006, 0.0, 0.0), Vec3::ZERO);
+        d.add(bone, "mouth", Dir::YPos, v(0.0, 0.005, 0.0), Vec3::ZERO);
+        d.add(bone, "mouth", Dir::YNeg, v(0.0, -0.005, 0.0), Vec3::ZERO);
+    }
+    for (lip, upper, raise, lower) in [
+        (
+            "lip_up",
+            true,
+            v(0.0, 0.004, 0.0005),
+            v(0.0, -0.003, -0.001),
+        ),
+        (
+            "lip_low",
+            false,
+            v(0.0, 0.003, -0.001),
+            v(0.0, -0.004, 0.0005),
+        ),
+    ] {
+        let mut bones = vec![(lip.to_string(), 1.0)];
+        bones.extend(
+            lips.iter()
+                .filter(|j| j.upper == upper)
+                .map(|j| (j.name.clone(), 1.0 - j.out)),
+        );
+        for (bone, k) in &bones {
+            d.add(bone, lip, Dir::YPos, raise * *k, Vec3::ZERO);
+            d.add(bone, lip, Dir::YNeg, lower * *k, Vec3::ZERO);
+        }
+    }
+    d.add("jaw", "jaw", Dir::YNeg, Vec3::ZERO, turn(25.0));
+    d.add("jaw", "jaw", Dir::YPos, Vec3::ZERO, turn(-3.0));
+    d.add(
+        "jaw",
+        "jaw",
+        Dir::XPos,
+        Vec3::ZERO,
+        Vec3::new(0.0, 8.0, 0.0),
+    );
+    d.add(
+        "jaw",
+        "jaw",
+        Dir::XNeg,
+        Vec3::ZERO,
+        Vec3::new(0.0, -8.0, 0.0),
+    );
+    let offsets = d.offsets;
+
+    // The lip seal: each upper lip joint with the lower one across from it.
+    let head = |name: &str| b.sk.bone(name).map(|x| x.head);
+    let (Some(left), Some(right)) = (head("lip_corner_l"), head("lip_corner_r")) else {
+        bail!("component {}: the face has no lip corners", c.id);
+    };
+    let width = (left.x - right.x).abs().max(1e-4 * h);
+    let mut pairs = vec![("lip_up".to_string(), "lip_low".to_string())];
+    for j in lips.iter().filter(|j| j.upper) {
+        pairs.push((j.name.clone(), j.name.replacen("lip_up", "lip_low", 1)));
+    }
+    let pairs = pairs
+        .into_iter()
+        .filter_map(|(u, l)| {
+            let (hu, hl) = (head(&u)?, head(&l)?);
+            Some(face_board::LipPair {
+                upper_control: ctrl_name(&u),
+                lower_control: ctrl_name(&l),
+                along: ((left.x - hu.x) / width).clamp(0.0, 1.0),
+                rest_gap: hu.distance(hl),
+                upper: u,
+                lower: l,
+            })
+        })
+        .collect();
+    b.rig.face_board = Some(FaceBoard {
+        frame,
+        sliders,
+        offsets,
+        seal: Some(face_board::LipSeal {
+            frame_bone: parent.to_string(),
+            release: 0.3 * width,
+            pairs,
+        }),
+    });
+    Ok(())
+}
+
+/// Space switching, as animators expect from production rigs: hands can follow the
+/// world, body, chest or head; feet the world or body; poles their goal; the head
+/// its neck, the chest, the body or the world.
+fn assign_spaces(b: &mut Builder) {
+    let optional = |b: &Builder, names: &[Option<&str>]| -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for n in names.iter().flatten() {
+            if b.has_control(n) && !out.iter().any(|o| o == n) {
+                out.push(n.to_string());
+            }
+        }
+        out
+    };
+    let mut assignments: Vec<(String, Vec<String>)> = Vec::new();
+    for chain in &b.rig.ik_chains {
+        let spaces = if chain.foot.is_none() {
+            let chest = b.arm_chest.get(&chain.name).map(String::as_str);
+            optional(
+                b,
+                &[
+                    Some("root_ctrl"),
+                    Some("cog_ctrl"),
+                    chest,
+                    Some("head_ctrl"),
+                ],
+            )
+        } else {
+            optional(b, &[Some("root_ctrl"), Some("cog_ctrl")])
+        };
+        assignments.push((chain.ik_control.clone(), spaces));
+        assignments.push((
+            chain.pole_control.clone(),
+            optional(b, &[Some("root_ctrl"), Some(&chain.ik_control)]),
+        ));
+    }
+    if b.has_control("head_ctrl") && b.has_control("neck_01_ctrl") {
+        let chest = b.head_chest.clone();
+        assignments.push((
+            "head_ctrl".into(),
+            optional(
+                b,
+                &[
+                    Some("neck_01_ctrl"),
+                    chest.as_deref(),
+                    Some("cog_ctrl"),
+                    Some("root_ctrl"),
+                ],
+            ),
+        ));
+    }
+    let eyes: Vec<(String, String)> = b
+        .rig
+        .controls
+        .iter()
+        .filter(|c| c.kind == ControlKind::Aim && c.bone.is_none())
+        .filter_map(|c| match &c.parent {
+            ControlParent::Control(p) => Some((c.name.clone(), p.clone())),
+            _ => None,
+        })
+        .collect();
+    for (name, parent) in eyes {
+        let spaces = optional(b, &[Some(&parent), Some("cog_ctrl"), Some("root_ctrl")]);
+        assignments.push((name, spaces));
+    }
+    for (name, spaces) in assignments {
+        // The first space must be the control's own parent, and a single space is
+        // no switch at all.
+        let Some(ctrl) = b.rig.controls.iter_mut().find(|c| c.name == name) else {
+            continue;
+        };
+        if spaces.len() > 1 && ctrl.parent == ControlParent::Control(spaces[0].clone()) {
+            ctrl.spaces = spaces;
+        }
+    }
+}
+
+/// The guide that mirrors guide `index` of component `comp`, as (component, guide):
+/// the same guide on the twin component, or the other eye.
+/// The other side's name of a guide named `*_l` or `*_r` in a two-sided component.
+fn paired_guide(name: &str) -> Option<String> {
+    if let Some(base) = name.strip_suffix("_l") {
+        Some(format!("{base}_r"))
+    } else {
+        name.strip_suffix("_r").map(|base| format!("{base}_l"))
+    }
+}
+
+pub fn mirror_guide(g: &Guides, comp: usize, index: usize) -> Option<(usize, usize)> {
+    let c = g.components.get(comp)?;
+    if matches!(c.kind, Kind::Eyes | Kind::Face) {
+        let other = paired_guide(&c.guides.get(index)?.name)?;
+        return Some((comp, c.guides.iter().position(|x| x.name == other)?));
+    }
+    let twin = twin_id(c)?;
+    let t = g.components.iter().position(|o| o.id == twin)?;
+    (index < g.components[t].guides.len()).then_some((t, index))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{demo::demo_humanoid, landmarks::detect};
+
+    #[test]
+    fn face_joints() {
+        let mut g = demo_guides();
+        add_preset(&mut g, Preset::Eyes, &AddOptions::default()).unwrap();
+        add_preset(&mut g, Preset::Jaw, &AddOptions::default()).unwrap();
+        add_preset(&mut g, Preset::Face, &AddOptions::default()).unwrap();
+        assert!(add_preset(&mut g, Preset::Face, &AddOptions::default()).is_err());
+        let Built {
+            skeleton: sk,
+            controls,
+        } = build(&g).unwrap();
+        for name in FACE_GUIDES {
+            let bone = sk.bone(name).unwrap();
+            assert!(bone.translate && bone.reach.is_some(), "{name}");
+            let ctrl = controls.control(&ctrl_name(name)).unwrap();
+            assert_eq!(ctrl.bone.as_deref(), Some(name));
+        }
+        let parent_of = |n: &str| sk.bones[sk.bone(n).unwrap().parent.unwrap()].name.clone();
+        assert_eq!(parent_of("lip_low"), "jaw");
+        assert_eq!(parent_of("brow_in_l"), "head");
+        // Eyelids pivot on the eyeball.
+        assert_eq!(
+            sk.bone("lid_up_l").unwrap().head,
+            sk.bone("eye_l").unwrap().head
+        );
+        assert_eq!(sk.bone("brow_out_l").unwrap().side, Side::Left);
+
+        // Mirroring and symmetric moves pair the two sides inside the component.
+        let face = g
+            .components
+            .iter()
+            .position(|c| c.kind == Kind::Face)
+            .unwrap();
+        let i = g.components[face]
+            .guides
+            .iter()
+            .position(|x| x.name == "cheek_l")
+            .unwrap();
+        let (fc, j) = mirror_guide(&g, face, i).unwrap();
+        assert_eq!(
+            (fc, g.components[fc].guides[j].name.as_str()),
+            (face, "cheek_r")
+        );
+        g.components[face].guides[i].position.y += 0.01;
+        mirror_side(&mut g, Side::Left);
+        let (l, r) = (
+            g.components[face].guides[i].position,
+            g.components[face].guides[j].position,
+        );
+        assert!((l.y - r.y).abs() < 1e-6 && (l.x + r.x - 2.0 * g.body.center_x).abs() < 1e-5);
+    }
+
+    #[test]
+    fn eyes_and_jaw() {
+        let mut g = demo_guides();
+        add_preset(&mut g, Preset::Eyes, &AddOptions::default()).unwrap();
+        add_preset(&mut g, Preset::Jaw, &AddOptions::default()).unwrap();
+        assert!(add_preset(&mut g, Preset::Eyes, &AddOptions::default()).is_err());
+        let Built {
+            skeleton: sk,
+            controls,
+        } = build(&g).unwrap();
+        for bone in ["eye_l", "eye_r", "jaw"] {
+            assert_eq!(sk.bone(bone).unwrap().parent, sk.index_of("head"));
+        }
+        let master = controls.control("eyes_ctrl").unwrap();
+        assert_eq!(
+            (master.kind, master.bone.as_deref()),
+            (ControlKind::Aim, None)
+        );
+        assert_eq!(master.parent, ControlParent::Control("head_ctrl".into()));
+        assert!(master.spaces.contains(&"root_ctrl".to_string()));
+        let aim = controls.control("eye_l_aim_ctrl").unwrap();
+        assert_eq!(aim.bone.as_deref(), Some("eye_l"));
+        // Each eye bone points at its own aim control: a parallel gaze.
+        let eye = sk.bone("eye_l").unwrap();
+        assert!(eye.direction().dot((aim.position - eye.head).normalize()) > 0.9999);
+        assert_eq!(
+            controls.control("jaw_ctrl").unwrap().bone.as_deref(),
+            Some("jaw")
+        );
+        let jaw = sk.bone("jaw").unwrap();
+        assert!(
+            jaw.tail.y < jaw.head.y && jaw.tail.z > jaw.head.z,
+            "the chin is below and in front of the hinge"
+        );
+
+        // The eyes mirror as a pair.
+        let i = g
+            .components
+            .iter()
+            .position(|c| c.kind == Kind::Eyes)
+            .unwrap();
+        assert_eq!(mirror_guide(&g, i, 0), Some((i, 1)));
+        assert_eq!(mirror_guide(&g, i, 2), None);
+        g.components[i].guides[0].position.y += 0.01;
+        mirror_side(&mut g, Side::Left);
+        let e = &g.components[i];
+        assert!(
+            (mirror(e.guides[0].position, g.body.center_x) - e.guides[1].position).length() < 1e-6
+        );
+    }
+
+    fn demo_guides() -> Guides {
+        biped(&detect(&demo_humanoid()))
+    }
+
+    #[test]
+    fn biped_builds_a_symmetric_connected_skeleton() {
+        let Built { skeleton: sk, .. } = build(&demo_guides()).unwrap();
+        assert_eq!(sk.bones.len(), 1 + 1 + SPINE_JOINTS + 2 + 2 * (4 + 4 + 4));
+        let t = sk.bone("lowerarm_twist_01_l").unwrap();
+        assert_eq!(t.twist.as_ref().unwrap().source, "hand_l");
+        assert_eq!(t.component, "arm_l");
+        assert_eq!(twist_name("calf_r"), "calf_twist_01_r");
+        assert_eq!(sk.bones.iter().filter(|b| b.parent.is_none()).count(), 1);
+        let l = sk.bone("hand_l").unwrap();
+        let r = sk.bone("hand_r").unwrap();
+        assert!((l.head.x + r.head.x).abs() < 1e-4 && (l.head.y - r.head.y).abs() < 1e-5);
+        for b in &sk.bones {
+            assert!(b.length() > 1e-3, "{} is degenerate", b.name);
+        }
+        // Skin blends across the joints between regions.
+        assert!(sk.bone("spine_03").unwrap().links.contains(&Region::ArmL));
+        assert!(sk.bone("pelvis").unwrap().links.contains(&Region::LegR));
+        assert!(sk.bone("thigh_l").unwrap().links.contains(&Region::Center));
+    }
+
+    #[test]
+    fn every_control_parent_exists_and_precedes_its_children() {
+        let Built {
+            skeleton: sk,
+            controls: rig,
+        } = build(&demo_guides()).unwrap();
+        for (i, c) in rig.controls.iter().enumerate() {
+            match &c.parent {
+                ControlParent::Control(p) => {
+                    let pi = rig.controls.iter().position(|x| &x.name == p).expect(p);
+                    assert!(pi < i, "{} listed before parent {p}", c.name);
+                }
+                ControlParent::Bone(b) => assert!(sk.bone(b).is_some()),
+                ControlParent::None => assert_eq!(c.kind, ControlKind::Root),
+            }
+            if let Some(b) = &c.bone {
+                assert!(sk.bone(b).is_some(), "{b}");
+            }
+            // Spaces start with the control's parent and only name earlier controls.
+            if let Some(first) = c.spaces.first() {
+                assert_eq!(
+                    c.parent,
+                    ControlParent::Control(first.clone()),
+                    "{}",
+                    c.name
+                );
+            }
+            for sp in &c.spaces {
+                let si = rig.controls.iter().position(|x| &x.name == sp).expect(sp);
+                assert!(si < i, "{} space {sp} comes later", c.name);
+            }
+        }
+        assert_eq!(rig.ik_chains.len(), 4);
+        // Every left limb control has its right twin for pose mirroring.
+        for chain in rig.ik_chains.iter().filter(|c| c.name.ends_with("_l")) {
+            let mut limb = vec![chain.ik_control.clone(), chain.pole_control.clone()];
+            limb.extend(chain.fk_controls.iter().cloned());
+            for left in limb {
+                let right = left.replace("_l_", "_r_");
+                assert!(rig.mirror_pairs.contains(&[left.clone(), right]), "{left}");
+            }
+        }
+        assert!(rig.mirror_pairs.iter().all(|[l, r]| l != r));
+        assert_eq!(rig.control("hand_l_ik_ctrl").unwrap().spaces.len(), 4);
+        assert_eq!(
+            rig.control("head_ctrl").unwrap().spaces,
+            ["neck_01_ctrl", "spine_03_ctrl", "cog_ctrl", "root_ctrl"]
+        );
+        let legs: Vec<_> = rig.ik_chains.iter().filter(|c| c.foot.is_some()).collect();
+        assert_eq!(legs.len(), 2);
+        let f = legs[0].foot.as_ref().unwrap();
+        assert!(f.heel.z < f.ball.z && f.ball.z < f.toe_tip.z);
+        // Poles sit in front of knees and behind elbows.
+        assert!(
+            rig.control("calf_l_pole_ctrl").unwrap().position.z > sk.bone("calf_l").unwrap().head.z
+        );
+        assert!(
+            rig.control("lowerarm_l_pole_ctrl").unwrap().position.z
+                < sk.bone("lowerarm_l").unwrap().head.z
+        );
+        // Straight ahead, not off to the side.
+        for (pole, joint) in [
+            ("calf_l_pole_ctrl", "calf_l"),
+            ("lowerarm_l_pole_ctrl", "lowerarm_l"),
+        ] {
+            let off = rig.control(pole).unwrap().position - sk.bone(joint).unwrap().head;
+            assert!(
+                off.x.abs() < 0.05 * off.length(),
+                "{pole} leans sideways: {off}"
+            );
+        }
+    }
+
+    #[test]
+    fn moving_a_guide_moves_the_rebuilt_bone() {
+        let mut g = demo_guides();
+        let arm = g.components.iter_mut().find(|c| c.id == "arm_l").unwrap();
+        arm.guides[2].position += Vec3::new(0.0, 0.05, -0.02);
+        let elbow = arm.guides[2].position;
+        let sk = build(&g).unwrap().skeleton;
+        assert_eq!(sk.bone("lowerarm_l").unwrap().head, elbow);
+        assert_eq!(sk.bone("upperarm_l").unwrap().tail, elbow);
+    }
+
+    #[test]
+    fn spine_joint_count_is_an_option() {
+        let mut g = demo_guides();
+        g.components[1].options.joints = Some(5);
+        // The head and arms hang from the top spine joint.
+        for c in &mut g.components {
+            if c.parent.as_deref() == Some("spine_03") {
+                c.parent = Some("spine_05".into());
+            }
+        }
+        let Built {
+            skeleton: sk,
+            controls: rig,
+        } = build(&g).unwrap();
+        assert!(sk.bone("spine_05").is_some());
+        assert_eq!(
+            rig.control("clavicle_l_ctrl").unwrap().parent,
+            ControlParent::Control("spine_05_ctrl".into())
+        );
+    }
+
+    #[test]
+    fn fingers_tail_and_chain_presets_add_and_remove() {
+        let mut g = demo_guides();
+        let fingers = add_preset(&mut g, Preset::Fingers, &AddOptions::default()).unwrap();
+        assert_eq!(fingers.len(), 10);
+        let tail = add_preset(&mut g, Preset::Tail, &AddOptions::default()).unwrap();
+        assert_eq!(tail, ["tail"]);
+        let ear = AddOptions {
+            parent: Some("head".into()),
+            joints: Some(2),
+            id: Some("ear".into()),
+            ..Default::default()
+        };
+        assert_eq!(add_preset(&mut g, Preset::Chain, &ear).unwrap(), ["ear"]);
+        let Built {
+            skeleton: sk,
+            controls: rig,
+        } = build(&g).unwrap();
+        for n in [
+            "thumb_01_l",
+            "pinky_03_r",
+            "index_02_l",
+            "tail_05",
+            "ear_02",
+        ] {
+            assert!(sk.bone(n).is_some(), "{n}");
+        }
+        assert_eq!(sk.bone("index_01_l").unwrap().region, Region::ArmL);
+        // Fingers follow the hand bone in IK and FK; the tail hangs from the pelvis control.
+        assert_eq!(
+            rig.control("index_01_l_ctrl").unwrap().parent,
+            ControlParent::Bone("hand_l".into())
+        );
+        assert_eq!(
+            rig.control("tail_01_ctrl").unwrap().parent,
+            ControlParent::Control("pelvis_ctrl".into())
+        );
+        // Thumbs sit in front of the other fingers.
+        assert!(sk.bone("thumb_01_l").unwrap().head.z > sk.bone("index_01_l").unwrap().head.z);
+
+        // Removing an arm takes its fingers with it.
+        let removed = remove(&mut g, "arm_l").unwrap();
+        assert_eq!(removed.len(), 6);
+        assert!(g.component("index_l").is_none() && g.component("index_r").is_some());
+        assert!(add_preset(&mut g, Preset::Fingers, &AddOptions::default()).is_err());
+    }
+
+    #[test]
+    fn rejects_broken_layouts() {
+        let mut g = demo_guides();
+        g.components[3].parent = Some("nope".into());
+        let e = build(&g).err().unwrap().to_string();
+        assert!(e.contains("nope"), "{e}");
+
+        let mut g = demo_guides();
+        g.components[3].guides.pop();
+        assert!(build(&g).is_err());
+
+        let mut g = demo_guides();
+        let dup = g.components[3].clone();
+        g.components.push(dup);
+        assert!(build(&g).is_err());
+
+        let mut g = demo_guides();
+        let p = g.components[4].guides[1].position;
+        g.components[4].guides[2].position = p;
+        let e = build(&g).err().unwrap().to_string();
+        assert!(e.contains("no length"), "{e}");
+    }
+
+    #[test]
+    fn mirror_and_spine_joint_helpers() {
+        let mut g = demo_guides();
+        g.components[3].guides[2].position += Vec3::new(0.0, -0.1, 0.0);
+        assert_eq!(mirror_side(&mut g, Side::Left), 2);
+        let l = g.component("arm_l").unwrap().guides[2].position;
+        let r = g.component("arm_r").unwrap().guides[2].position;
+        assert!((mirror_point(&g, l) - r).length() < 1e-5);
+        assert_eq!(
+            twin_id(g.component("leg_r").unwrap()).as_deref(),
+            Some("leg_l")
+        );
+
+        set_spine_joints(&mut g, "spine", 5).unwrap();
+        assert_eq!(
+            g.component("head").unwrap().parent.as_deref(),
+            Some("spine_05")
+        );
+        let sk = build(&g).unwrap().skeleton;
+        assert_eq!(
+            sk.bone("clavicle_l").unwrap().parent,
+            sk.index_of("spine_05")
+        );
+        assert!(set_spine_joints(&mut g, "spine", 0).is_err());
+    }
+
+    #[test]
+    fn guides_round_trip_through_json() {
+        let g = demo_guides();
+        let text = serde_json::to_string_pretty(&g).unwrap();
+        let back: Guides = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.components.len(), g.components.len());
+        assert!(back.components.iter().all(|c| c.options.twist));
+        // Options left at their defaults stay out of the file.
+        assert!(!text.contains("bendy") && !text.contains("soft"));
+        let mut g = demo_guides();
+        set_limb_options(&mut g, true, 0.3);
+        let back: Guides = serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
+        let arm = back.component("arm_l").unwrap();
+        assert!(arm.options.bendy && arm.options.soft == 0.3);
+        assert!(!back.component("spine").unwrap().options.bendy);
+    }
+
+    #[test]
+    fn bendy_limbs_arc_their_joints_from_bend_and_pin_controls() {
+        let mut g = demo_guides();
+        set_limb_options(&mut g, true, 0.4);
+        let built = build(&g).unwrap();
+        assert_controls_consistent(&built);
+        let (sk, rig) = (&built.skeleton, &built.controls);
+        // Each limb trades its two twist helpers for BEND_JOINTS per segment.
+        let plain = build(&demo_guides()).unwrap().skeleton.bones.len();
+        assert_eq!(sk.bones.len(), plain + 4 * 2 * (BEND_JOINTS - 1));
+        assert_eq!(rig.ik_chains.len(), 4);
+        for chain in &rig.ik_chains {
+            assert_eq!(chain.default_soft, 0.4);
+            let bendy = chain.bendy.as_ref().expect(&chain.name);
+            let pin = rig.control(&bendy.pin).unwrap();
+            assert_eq!(pin.kind, ControlKind::Pin);
+            assert_eq!(pin.parent, ControlParent::Bone(chain.lower.clone()));
+            assert_eq!(pin.position, sk.bone(&chain.lower).unwrap().head);
+            for (seg, bone) in [(&bendy.upper, &chain.upper), (&bendy.lower, &chain.lower)] {
+                assert_eq!(&seg.bone, bone);
+                let segment = sk.bone(bone).unwrap();
+                assert!(!segment.deform, "{bone} hands its skin to the bend joints");
+                let ctrl = rig.control(&seg.control).unwrap();
+                assert_eq!(ctrl.kind, ControlKind::Bend);
+                assert_eq!(ctrl.parent, ControlParent::Bone(bone.clone()));
+                assert!((ctrl.position - segment.head.lerp(segment.tail, 0.5)).length() < 1e-5);
+                // Evenly spaced joints from the segment's start to its end, in order.
+                assert_eq!(seg.joints.len(), BEND_JOINTS);
+                let mut at = segment.head;
+                let mut share = 0.0f32;
+                for (n, name) in seg.joints.iter().enumerate() {
+                    let j = sk.bone(name).unwrap();
+                    assert_eq!(name, &twist_joint_name(bone, n + 1));
+                    assert!(j.deform && !j.translate, "{name}");
+                    assert_eq!(sk.bones[j.parent.unwrap()].name, *bone);
+                    assert!(
+                        (j.head - at).length() < 1e-5,
+                        "{name} starts where the last ended"
+                    );
+                    at = j.tail;
+                    assert_eq!(j.links, segment.links, "{name} blends like its segment");
+                    let t = j.twist.as_ref().unwrap();
+                    assert!(
+                        t.factor.abs() > share,
+                        "{name}: twist shares grow along the segment"
+                    );
+                    share = t.factor.abs();
+                }
+                assert!((at - segment.tail).length() < 1e-5);
+                assert!(
+                    (share - 0.5).abs() < 1e-6,
+                    "the far joint takes the usual share"
+                );
+            }
+            // The bendy controls are mirrored with the rest of the limb.
+            if chain.name.ends_with("_l") {
+                for c in [&bendy.pin, &bendy.upper.control, &bendy.lower.control] {
+                    assert!(rig.mirror_pairs.iter().any(|[l, _]| l == c), "{c}");
+                }
+            }
+        }
+        // Segment bones stop deforming but still turn their children (no position copy).
+        assert!(!sk.bone("lowerarm_l").unwrap().translate);
+        assert!(!sk.bone("hand_l").unwrap().translate);
+        assert!(
+            sk.bone("pelvis").unwrap().translate,
+            "hangs from the root helper"
+        );
+        // Without twist the bend joints still arc, just without twist shares.
+        g.components
+            .iter_mut()
+            .for_each(|c| c.options.twist = false);
+        let sk = build(&g).unwrap().skeleton;
+        assert!(
+            sk.bone("calf_twist_04_l")
+                .is_some_and(|b| b.twist.is_none())
+        );
+    }
+
+    #[test]
+    fn bendy_and_soft_are_checked() {
+        let mut g = quadruped(1.0);
+        let tail = g.components.iter_mut().find(|c| c.id == "tail").unwrap();
+        tail.options.bendy = true;
+        let e = build(&g).err().unwrap().to_string();
+        assert!(e.contains("only arms and legs can be bendy"), "{e}");
+        let mut g = quadruped(1.0);
+        g.components
+            .iter_mut()
+            .find(|c| c.id == "tail")
+            .unwrap()
+            .options
+            .soft = 0.2;
+        assert!(build(&g).is_err());
+        // The hock spring belongs to quad legs only, from 0 to 1.
+        let mut g = demo_guides();
+        g.components
+            .iter_mut()
+            .find(|c| c.kind == Kind::Leg)
+            .unwrap()
+            .options
+            .spring = 0.5;
+        let e = build(&g).err().unwrap().to_string();
+        assert!(e.contains("only quad legs have a spring hock"), "{e}");
+        let mut g = quadruped(1.0);
+        assert_eq!(set_hock_spring(&mut g, 1.5), 2);
+        let e = build(&g).err().unwrap().to_string();
+        assert!(e.contains("spring must be 0 to 1"), "{e}");
+        let mut g = demo_guides();
+        set_limb_options(&mut g, false, 1.5);
+        let e = build(&g).err().unwrap().to_string();
+        assert!(e.contains("soft must be 0 to 1"), "{e}");
+        // Soft alone keeps the plain skeleton; every IK limb carries its default.
+        let mut g = demo_guides();
+        set_limb_options(&mut g, false, 0.25);
+        let built = build(&g).unwrap();
+        assert_eq!(
+            built.skeleton.bones.len(),
+            build(&demo_guides()).unwrap().skeleton.bones.len()
+        );
+        assert!(
+            built
+                .controls
+                .ik_chains
+                .iter()
+                .all(|c| c.default_soft == 0.25 && c.bendy.is_none())
+        );
+    }
+
+    /// Quad legs take the bendy and soft options the arms and legs have: bend
+    /// joints on the thigh and calf (the hock stays one bone), a knee pin, the
+    /// soft default, and the hock spring's default on the hock segment.
+    #[test]
+    fn quad_legs_are_bendy_soft_and_sprung() {
+        let mut g = quadruped(0.8);
+        set_limb_options(&mut g, true, 0.3);
+        assert_eq!(set_hock_spring(&mut g, 0.75), 2);
+        let built = build(&g).unwrap();
+        let sk = &built.skeleton;
+        for s in ["_l", "_r"] {
+            let leg = built
+                .controls
+                .ik_chains
+                .iter()
+                .find(|c| c.name == format!("leg{s}"))
+                .unwrap();
+            assert_eq!(leg.default_soft, 0.3);
+            let hock = leg.hock.as_ref().unwrap();
+            assert_eq!(hock.default_spring, 0.75);
+            let bendy = leg.bendy.as_ref().expect("bendy hind leg");
+            assert_eq!(bendy.upper.bone, format!("thigh{s}"));
+            assert_eq!(bendy.lower.bone, format!("calf{s}"));
+            assert_eq!(bendy.pin, format!("calf{s}_pin_ctrl"));
+            for seg in [&bendy.upper, &bendy.lower] {
+                assert_eq!(seg.joints.len(), BEND_JOINTS);
+                let bone = sk.bone(&seg.bone).unwrap();
+                assert!(
+                    !bone.deform,
+                    "{} hands its skin to its bend joints",
+                    seg.bone
+                );
+                // The bend joints run end to end along their segment.
+                let first = sk.bone(&seg.joints[0]).unwrap();
+                let last = sk.bone(seg.joints.last().unwrap()).unwrap();
+                assert!(first.head.distance(bone.head) < 1e-5);
+                assert!(last.tail.distance(bone.tail) < 1e-5);
+                assert!(seg.joints.iter().all(|j| sk.bone(j).unwrap().deform));
+            }
+            // The lower curve ends at the hock joint, where the calf ends.
+            assert!(
+                sk.bone(&format!("calf{s}"))
+                    .unwrap()
+                    .tail
+                    .distance(sk.bone(&hock.bone).unwrap().head)
+                    < 1e-5
+            );
+            // The hock keeps one deforming bone and its FK control.
+            assert!(sk.bone(&hock.bone).unwrap().deform);
+            assert!(built.controls.control(&hock.fk_control).is_some());
+            assert!(built.controls.control(&bendy.upper.control).is_some());
+        }
+        // The front legs (arms) are bendy too; the guides round-trip the options.
+        assert!(built.controls.ik_chains.iter().all(|c| c.bendy.is_some()));
+        let text = serde_json::to_string(&g).unwrap();
+        let back: Guides = serde_json::from_str(&text).unwrap();
+        let hind = back.component("hind_leg_l").unwrap();
+        assert!(hind.options.bendy && hind.options.soft == 0.3 && hind.options.spring == 0.75);
+        // Unset, the spring isn't written and reads back as 0.
+        let plain = serde_json::to_string(&quadruped(0.8)).unwrap();
+        assert!(!plain.contains("spring"));
+    }
+
+    /// The horse's hind legs start with a full spring hock; the dog's, bird's
+    /// and dinosaur's with none.
+    #[test]
+    fn horse_hocks_spring_and_dinosaur_stands_on_quad_legs() {
+        let spring = |g: &Guides| -> Vec<f32> {
+            build(g)
+                .unwrap()
+                .controls
+                .ik_chains
+                .iter()
+                .filter_map(|c| c.hock.as_ref().map(|h| h.default_spring))
+                .collect()
+        };
+        assert_eq!(spring(&horse(1.8)), [1.0, 1.0]);
+        assert_eq!(spring(&quadruped(0.8)), [0.0, 0.0]);
+        assert_eq!(spring(&bird(0.5)), [0.0, 0.0]);
+        let dino = dinosaur(1.6);
+        assert_eq!(spring(&dino), [0.0, 0.0]);
+        let built = build(&dino).unwrap();
+        // Short arms start in FK (they hang above the belly); the legs in IK.
+        for c in &built.controls.ik_chains {
+            let want = if c.name.starts_with("arm") { 0.0 } else { 1.0 };
+            assert_eq!(c.default_blend, want, "{}", c.name);
+        }
+        assert_eq!(built.controls.splines.len(), 1, "the spline tail");
+        assert_eq!(built.controls.splines[0].bones.len(), DINOSAUR_TAIL_JOINTS);
+        // The horse's front legs are planted and its layout reads as four-legged.
+        let horse = build(&horse(1.8)).unwrap();
+        let front = horse
+            .controls
+            .ik_chains
+            .iter()
+            .find(|c| c.name == "arm_l")
+            .unwrap();
+        assert_eq!(front.default_blend, 1.0);
+        assert_eq!(crate::orient::layout_name(&super::horse(1.8)), "dog");
+        assert_eq!(crate::orient::layout_name(&dino), "creature");
+    }
+
+    /// Bones and controls as comparable values.
+    fn fingerprint(g: &Guides) -> Vec<String> {
+        let b = build(g).unwrap();
+        let bones = b.skeleton.bones.iter().map(|x| {
+            format!(
+                "{} {:?} {:.5} {:.5} {}",
+                x.name,
+                x.parent,
+                x.head,
+                x.tail,
+                x.links.len()
+            )
+        });
+        let controls = b.controls.controls.iter().map(|c| {
+            format!(
+                "{} {:?} {:.5} {:.5} {:.5}",
+                c.name, c.parent, c.position, c.axis, c.size
+            )
+        });
+        let chains = b.controls.ik_chains.iter().map(|k| {
+            format!(
+                "{} {} {:?}",
+                k.name,
+                k.default_blend,
+                k.foot.as_ref().map(|f| f.break_angle)
+            )
+        });
+        bones.chain(controls).chain(chains).collect()
+    }
+
+    #[test]
+    fn files_are_stamped_and_old_ones_keep_their_rules() {
+        assert_eq!(rules(1), RULES_V1);
+        assert_eq!(SPINE_JOINTS, RULES_V1.spine_joints);
+        let dir = std::env::temp_dir().join(format!("hive_versions_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for g in [demo_guides(), quadruped(1.0)] {
+            // Written: stamped with this version.
+            let path = dir.join("a.guides.json");
+            g.save(&path).unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(json["hive_rig"], crate::version::CURRENT);
+            assert_eq!(json["version"], GUIDES_VERSION);
+            let back = Guides::load(&path).unwrap();
+            assert_eq!(back.written_by.as_deref(), Some(crate::version::CURRENT));
+            assert!(back.newer_warning().is_none());
+            assert_eq!(fingerprint(&back), fingerprint(&g));
+
+            // A file from before stamps (no `hive_rig`, version 1) opens and
+            // builds exactly as before; saving it stamps it and keeps its version.
+            let mut old = json.clone();
+            old.as_object_mut().unwrap().remove("hive_rig");
+            std::fs::write(&path, old.to_string()).unwrap();
+            let back = Guides::load(&path).unwrap();
+            assert_eq!(back.written_by, None);
+            assert!(
+                back.origin().contains("before version stamps"),
+                "{}",
+                back.origin()
+            );
+            assert!(back.newer_warning().is_none());
+            assert_eq!(fingerprint(&back), fingerprint(&g));
+            back.save(&path).unwrap();
+            let again = Guides::load(&path).unwrap();
+            assert_eq!(again.version, 1);
+            assert_eq!(again.written_by.as_deref(), Some(crate::version::CURRENT));
+
+            // From a newer hive-rig: loads (unknown settings ignored), warns, and
+            // builds with the newest rules this one knows.
+            for (key, value) in [
+                ("hive_rig", serde_json::json!("99.0.0")),
+                ("version", serde_json::json!(GUIDES_VERSION + 1)),
+            ] {
+                let mut newer = json.clone();
+                newer[key] = value;
+                newer["a_setting_from_the_future"] = serde_json::json!({ "x": 1 });
+                std::fs::write(&path, newer.to_string()).unwrap();
+                let back = Guides::load(&path).unwrap();
+                let w = back.newer_warning().expect("a newer file warns");
+                assert!(w.contains("newer"), "{w}");
+                assert_eq!(back.rules(), RULES_V1);
+                assert_eq!(fingerprint(&back), fingerprint(&g));
+            }
+        }
+        // The rig file is stamped too, and warns when a newer hive-rig wrote it.
+        let mesh = crate::demo::demo_humanoid();
+        let rig = crate::rig::build_rig(mesh, "v", demo_guides(), Default::default()).unwrap();
+        let mut json = serde_json::to_value(&rig).unwrap();
+        assert_eq!(json["hive_rig"], crate::version::CURRENT);
+        assert_eq!(json["guides"]["hive_rig"], crate::version::CURRENT);
+        let back: crate::rig::Rig = serde_json::from_value(json.clone()).unwrap();
+        assert!(back.newer_warning().is_none());
+        json["hive_rig"] = "99.0.0".into();
+        let back: crate::rig::Rig = serde_json::from_value(json).unwrap();
+        assert!(back.newer_warning().unwrap().contains("99.0.0"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn every_shape_styles_a_control_from_guides_json() {
+        let mut g = demo_guides();
+        let names: Vec<String> = build(&g)
+            .unwrap()
+            .controls
+            .controls
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        for (name, shape) in names.iter().zip(Shape::ALL) {
+            let style = ControlStyle {
+                shape: Some(shape),
+                ..Default::default()
+            };
+            set_control_style(&mut g, name, style).unwrap();
+        }
+        // Through guides.json and back, as the CLI, app and DCC rebuilds read it.
+        let back: Guides = serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
+        let built = build(&back).unwrap();
+        for (name, shape) in names.iter().zip(Shape::ALL) {
+            let c = built.controls.control(name).unwrap();
+            assert_eq!(c.shape, shape);
+            assert_eq!(c.outline().len(), shape.strokes().len(), "{name}");
+        }
+    }
+
+    #[test]
+    fn custom_shapes_and_line_widths_reach_the_built_controls() {
+        let mut g = demo_guides();
+        let hand = "hand_l_ik_ctrl".to_string();
+        let star = CustomShape::line(
+            vec![[0.0, 2.0], [0.5, 0.5], [2.0, 0.0], [0.5, -0.5], [0.0, -2.0]],
+            false,
+            true,
+        );
+        // A shape the guides don't have is refused.
+        let change = StyleChange {
+            custom: Some("star".into()),
+            line_width: Some(2.5),
+            ..Default::default()
+        };
+        assert!(restyle(&mut g, &hand, change.clone(), StyleScope::WithTwin).is_err());
+        add_custom_shape(&mut g, "star", star.clone()).unwrap();
+        assert!(add_custom_shape(&mut g, "a/b", star.clone()).is_err());
+        let changed = restyle(&mut g, &hand, change, StyleScope::WithTwin).unwrap();
+        assert_eq!(changed, ["hand_l_ik_ctrl", "hand_r_ik_ctrl"]);
+        let built = build(&g).unwrap();
+        for name in &changed {
+            let c = built.controls.control(name).unwrap();
+            assert_eq!(c.custom.as_ref().unwrap().name, "star");
+            assert_eq!(c.line_width, Some(2.5));
+            // Drawn from the custom lines (mirrored into one loop), at the
+            // control's size; Unreal gets the look-alike.
+            let outline = c.outline();
+            assert_eq!(outline.len(), 1);
+            assert_eq!(outline[0].len(), 9);
+            let reach = outline[0]
+                .iter()
+                .map(|p| p.distance(c.position))
+                .fold(0.0, f32::max);
+            assert!((reach - c.size).abs() < 1e-5, "{reach} vs {}", c.size);
+            assert_eq!(c.shape, star.look_alike());
+            let json = serde_json::to_value(c).unwrap();
+            assert_eq!(json["custom"]["name"], "star");
+            assert_eq!(json["line_width"], 2.5);
+            assert_eq!(json["outline"][0].as_array().unwrap().len(), 9);
+        }
+        // The guides keep the shape and the look through a save.
+        let text = serde_json::to_string(&g).unwrap();
+        let back: Guides = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.custom_shapes["star"], star);
+        assert_eq!(back.control_styles[&hand].custom.as_deref(), Some("star"));
+        // A built-in shape replaces the custom one, and the other way.
+        restyle(
+            &mut g,
+            &hand,
+            StyleChange {
+                shape: Some(Shape::Gear),
+                ..Default::default()
+            },
+            StyleScope::One,
+        )
+        .unwrap();
+        let built = build(&g).unwrap();
+        let c = built.controls.control(&hand).unwrap();
+        assert!(c.custom.is_none() && c.shape == Shape::Gear && c.line_width == Some(2.5));
+        // Widths are kept in range; removing the shape gives the twin its
+        // built-in shape back and keeps its width.
+        restyle(
+            &mut g,
+            "hand_r_ik_ctrl",
+            StyleChange {
+                line_width: Some(99.0),
+                ..Default::default()
+            },
+            StyleScope::One,
+        )
+        .unwrap();
+        assert_eq!(g.control_styles["hand_r_ik_ctrl"].line_width, Some(10.0));
+        assert_eq!(remove_custom_shape(&mut g, "star").unwrap(), 1);
+        assert!(remove_custom_shape(&mut g, "star").is_err());
+        let built = build(&g).unwrap();
+        let r = built.controls.control("hand_r_ik_ctrl").unwrap();
+        assert!(r.custom.is_none() && r.line_width == Some(10.0));
+    }
+
+    #[test]
+    fn restyling_reaches_the_twin_and_the_component() {
+        let mut g = demo_guides();
+        let built = build(&g).unwrap();
+        let ik = built
+            .controls
+            .ik_chains
+            .iter()
+            .find(|c| c.name == "arm_l")
+            .unwrap();
+        let (hand, hand_r) = (ik.ik_control.clone(), ik.ik_control.replace("_l_", "_r_"));
+        assert!(built.controls.control(&hand_r).is_some(), "{hand_r}");
+        // One control: only it changes.
+        let changed = restyle(
+            &mut g,
+            &hand,
+            StyleChange {
+                shape: Some(Shape::Gear),
+                ..Default::default()
+            },
+            StyleScope::One,
+        )
+        .unwrap();
+        assert_eq!(changed, vec![hand.clone()]);
+        assert!(!g.control_styles.contains_key(&hand_r));
+        // With its twin: same shape and size; a side colour swaps sides,
+        // any other colour is the same on both.
+        restyle(
+            &mut g,
+            &hand,
+            StyleChange {
+                size: Some(0.09),
+                color: Some(LEFT),
+                ..Default::default()
+            },
+            StyleScope::WithTwin,
+        )
+        .unwrap();
+        let (l, r) = (
+            g.control_styles[&hand].clone(),
+            g.control_styles[&hand_r].clone(),
+        );
+        assert_eq!(
+            (l.shape, l.size, l.color),
+            (Some(Shape::Gear), Some(0.09), Some(LEFT))
+        );
+        assert_eq!((r.shape, r.size, r.color), (None, Some(0.09), Some(RIGHT)));
+        let green = [0.2, 0.9, 0.3];
+        restyle(
+            &mut g,
+            &hand_r,
+            StyleChange {
+                color: Some(green),
+                ..Default::default()
+            },
+            StyleScope::WithTwin,
+        )
+        .unwrap();
+        assert_eq!(g.control_styles[&hand].color, Some(green));
+        assert_eq!(g.control_styles[&hand_r].color, Some(green));
+        // A whole component, twins too, scaled from each control's own size.
+        let before = build(&g).unwrap();
+        let comp = before
+            .controls
+            .control(&ik.fk_controls[0])
+            .unwrap()
+            .component
+            .clone();
+        let changed = restyle(
+            &mut g,
+            &ik.fk_controls[0],
+            StyleChange {
+                scale: Some(2.0),
+                ..Default::default()
+            },
+            StyleScope::Component { twins: true },
+        )
+        .unwrap();
+        let own: Vec<_> = before
+            .controls
+            .controls
+            .iter()
+            .filter(|c| c.component == comp)
+            .collect();
+        assert!(
+            own.len() > 3 && changed.len() == 2 * own.len(),
+            "{changed:?}"
+        );
+        let after = build(&g).unwrap();
+        for name in &changed {
+            let (a, b) = (
+                after.controls.control(name).unwrap(),
+                before.controls.control(name).unwrap(),
+            );
+            assert!((a.size - 2.0 * b.size).abs() < 1e-6, "{name}");
+        }
+        // Reset takes the looks off again, and a bad size is refused.
+        assert_eq!(
+            reset_styles(&mut g, changed.iter().map(String::as_str)),
+            changed.len()
+        );
+        assert!(!g.control_styles.contains_key(&hand));
+        let bad = StyleChange {
+            size: Some(-1.0),
+            ..Default::default()
+        };
+        assert!(restyle(&mut g, &hand, bad, StyleScope::One).is_err());
+        assert!(
+            restyle(
+                &mut g,
+                "no_such_ctrl",
+                StyleChange::default(),
+                StyleScope::One
+            )
+            .is_err()
+        );
+        assert_eq!(twin_color(CENTER), CENTER);
+    }
+
+    #[test]
+    fn control_styles_import_and_attach() {
+        let mut g = demo_guides();
+        // A styled control keeps its look through a rebuild, and clears when reset.
+        let built = build(&g).unwrap();
+        let name = built.controls.controls[0].name.clone();
+        set_control_style(
+            &mut g,
+            &name,
+            ControlStyle {
+                shape: Some(Shape::Cube),
+                size: Some(0.02),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let styled = build(&g).unwrap();
+        let c = styled.controls.control(&name).unwrap();
+        assert_eq!((c.shape, c.size), (Shape::Cube, 0.02));
+        let json = serde_json::to_string(&g).unwrap();
+        let back: Guides = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.control_styles.get(&name).unwrap().shape,
+            Some(Shape::Cube)
+        );
+        set_control_style(&mut g, &name, ControlStyle::default()).unwrap();
+        assert!(g.control_styles.is_empty());
+        assert!(
+            set_control_style(
+                &mut g,
+                &name,
+                ControlStyle {
+                    size: Some(0.0),
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+
+        // A tail from another layout comes in on the chosen bone and builds.
+        let mut src = demo_guides();
+        add_preset(&mut src, Preset::Tail, &AddOptions::default()).unwrap();
+        let mut dst = demo_guides();
+        let ids = import(&mut dst, &src, "pelvis").unwrap();
+        assert_eq!(ids, vec!["tail".to_string()]);
+        assert_eq!(
+            dst.component("tail").unwrap().parent.as_deref(),
+            Some("pelvis")
+        );
+        assert!(build(&dst).unwrap().skeleton.bone("tail_01").is_some());
+        // Importing it again clashes with the id, and body parts are refused.
+        assert!(import(&mut dst, &src, "pelvis").is_err());
+        assert!(
+            import(&mut demo_guides(), &demo_guides(), "pelvis")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(import(&mut demo_guides(), &src, "no_such_bone").is_err());
+
+        // Attaching moves a part and keeps the layout buildable.
+        attach(&mut dst, "tail", "head").unwrap();
+        assert!(
+            build(&dst)
+                .unwrap()
+                .skeleton
+                .bone("tail_01")
+                .unwrap()
+                .parent
+                .is_some()
+        );
+        assert!(attach(&mut dst, "tail", "no_such_bone").is_err());
+
+        // A part can hang from one built after it: the order follows the parent.
+        let last = build(&dst)
+            .unwrap()
+            .skeleton
+            .bones
+            .iter()
+            .rev()
+            .find(|b| b.component == "tail")
+            .unwrap()
+            .name
+            .clone();
+        attach(&mut dst, "arm_l", &last).unwrap();
+        let at = |id: &str| dst.components.iter().position(|c| c.id == id).unwrap();
+        assert!(at("tail") < at("arm_l"));
+        // Hanging a part from its own child, or its own bones, is refused.
+        let before = dst.components.len();
+        assert!(attach(&mut dst, "tail", "hand_l").is_err());
+        assert!(attach(&mut dst, "tail", &last).is_err());
+        assert_eq!(dst.components.len(), before);
+    }
+
+    /// Control parents and spaces only name controls listed earlier, and every
+    /// bone a control or chain names exists.
+    fn assert_controls_consistent(built: &Built) {
+        let (sk, rig) = (&built.skeleton, &built.controls);
+        for (i, c) in rig.controls.iter().enumerate() {
+            match &c.parent {
+                ControlParent::Control(p) => {
+                    let pi = rig.controls.iter().position(|x| &x.name == p).expect(p);
+                    assert!(pi < i, "{} listed before parent {p}", c.name);
+                }
+                ControlParent::Bone(b) => assert!(sk.bone(b).is_some(), "{b}"),
+                ControlParent::None => assert_eq!(c.kind, ControlKind::Root),
+            }
+            if let Some(b) = &c.bone {
+                assert!(sk.bone(b).is_some(), "{b}");
+            }
+            for sp in &c.spaces {
+                let si = rig.controls.iter().position(|x| &x.name == sp).expect(sp);
+                assert!(si < i, "{} space {sp} comes later", c.name);
+            }
+        }
+        for k in &rig.ik_chains {
+            for b in k.bones() {
+                assert!(sk.bone(b).is_some(), "{b}");
+            }
+            let mut ctrls: Vec<&str> = vec![&k.ik_control, &k.pole_control];
+            ctrls.extend(k.fk_controls.iter().map(String::as_str));
+            if let Some(h) = &k.hock {
+                ctrls.extend([h.fk_control.as_str(), h.control.as_str()]);
+            }
+            for c in ctrls {
+                assert!(rig.control(c).is_some(), "{c}");
+            }
+        }
+    }
+
+    #[test]
+    fn quadruped_layout_builds_three_segment_hind_legs() {
+        let g = quadruped(0.8);
+        let built = build(&g).unwrap();
+        assert_controls_consistent(&built);
+        let Built {
+            skeleton: sk,
+            controls: rig,
+        } = &built;
+        let parent_of = |n: &str| sk.bones[sk.bone(n).unwrap().parent.unwrap()].name.clone();
+        for s in ["_l", "_r"] {
+            // thigh > calf > hock > foot (paw) > ball (toes), from the pelvis.
+            assert_eq!(parent_of(&format!("thigh{s}")), "pelvis");
+            assert_eq!(parent_of(&format!("calf{s}")), format!("thigh{s}"));
+            assert_eq!(parent_of(&format!("hock{s}")), format!("calf{s}"));
+            assert_eq!(parent_of(&format!("foot{s}")), format!("hock{s}"));
+            assert_eq!(parent_of(&format!("ball{s}")), format!("foot{s}"));
+            assert_eq!(
+                sk.bone(&format!("calf_twist_01{s}"))
+                    .unwrap()
+                    .twist
+                    .as_ref()
+                    .unwrap()
+                    .source,
+                format!("hock{s}")
+            );
+            // Front legs are planted arms: leg skin, IK by default.
+            assert_eq!(parent_of(&format!("hand{s}")), format!("lowerarm{s}"));
+        }
+        assert_eq!(sk.bone("lowerarm_l").unwrap().region, Region::LegL);
+        assert_eq!(sk.bone("hock_r").unwrap().region, Region::LegR);
+        assert!(sk.bone("tail_05").is_some() && sk.bone("head").is_some());
+        assert_eq!(rig.ik_chains.len(), 4);
+
+        let leg = rig.ik_chains.iter().find(|k| k.name == "leg_l").unwrap();
+        assert_eq!(leg.bones(), ["thigh_l", "calf_l", "hock_l", "foot_l"]);
+        assert_eq!(leg.default_blend, 1.0);
+        let hock = leg.hock.as_ref().unwrap();
+        assert_eq!(
+            (hock.bone.as_str(), hock.fk_control.as_str()),
+            ("hock_l", "hock_l_fk_ctrl")
+        );
+        let hc = rig.control(&hock.control).unwrap();
+        assert_eq!(hc.kind, ControlKind::Hock);
+        assert_eq!(hc.parent, ControlParent::Control(leg.ik_control.clone()));
+        assert_eq!(hc.position, sk.bone("foot_l").unwrap().head);
+        // FK runs thigh > calf > hock > paw.
+        assert_eq!(
+            rig.control("foot_l_fk_ctrl").unwrap().parent,
+            ControlParent::Control("hock_l_fk_ctrl".into())
+        );
+        assert_eq!(
+            rig.control("hock_l_fk_ctrl").unwrap().parent,
+            ControlParent::Control("calf_l_fk_ctrl".into())
+        );
+        let f = leg.foot.as_ref().unwrap();
+        assert!(f.heel.z < f.ball.z && f.ball.z < f.toe_tip.z);
+        assert_eq!(f.ball_bone, "ball_l");
+
+        // The knee points forward and the hock back, and the pole sits straight
+        // ahead of the knee, square to the hip-to-hock line.
+        let (hip, knee, hk) = (
+            sk.bone("thigh_l").unwrap().head,
+            sk.bone("calf_l").unwrap().head,
+            sk.bone("hock_l").unwrap().head,
+        );
+        assert!(knee.z > hip.lerp(hk, 0.5).z && hk.z < sk.bone("foot_l").unwrap().tail.z);
+        let off = rig.control(&leg.pole_control).unwrap().position - knee;
+        assert!(off.z > 0.0 && off.x.abs() < 0.05 * off.length(), "{off}");
+        assert!(off.normalize().dot((hk - hip).normalize()).abs() < 1e-4);
+
+        let front = rig.ik_chains.iter().find(|k| k.name == "arm_l").unwrap();
+        assert!(front.hock.is_none() && front.foot.is_none());
+        assert_eq!(front.default_blend, 1.0);
+        let elbow = sk.bone("lowerarm_l").unwrap().head;
+        assert!(rig.control(&front.pole_control).unwrap().position.z < elbow.z);
+        assert_eq!(rig.control(&front.ik_control).unwrap().axis, Vec3::Y);
+        // A biped's arm is unchanged: FK by default, IK control along the arm.
+        let biped_rig = build(&demo_guides()).unwrap().controls;
+        let arm = biped_rig
+            .ik_chains
+            .iter()
+            .find(|k| k.name == "arm_l")
+            .unwrap();
+        assert_eq!(arm.default_blend, 0.0);
+        assert!(arm.hock.is_none());
+
+        // Guides round-trip, mirror and keep their kind's guide names.
+        let json = serde_json::to_string(&g).unwrap();
+        assert!(json.contains("\"quad_leg\""));
+        let mut back: Guides = serde_json::from_str(&json).unwrap();
+        let i = back
+            .components
+            .iter()
+            .position(|c| c.id == "hind_leg_l")
+            .unwrap();
+        back.components[i].guides[2].position.z -= 0.02;
+        assert_eq!(mirror_side(&mut back, Side::Left), 2);
+        let (l, r) = (
+            back.component("hind_leg_l").unwrap().guides[2].position,
+            back.component("hind_leg_r").unwrap().guides[2].position,
+        );
+        assert!((mirror_point(&back, l) - r).length() < 1e-6);
+        assert!(build(&back).is_ok());
+    }
+
+    #[test]
+    fn quad_legs_preset_and_naming() {
+        // Swap a biped's legs for hind legs.
+        let mut g = demo_guides();
+        assert!(add_preset(&mut g, Preset::QuadLegs, &AddOptions::default()).is_err());
+        remove(&mut g, "leg_l").unwrap();
+        remove(&mut g, "leg_r").unwrap();
+        let ids = add_preset(&mut g, Preset::QuadLegs, &AddOptions::default()).unwrap();
+        assert_eq!(ids, ["hind_leg_l", "hind_leg_r"]);
+        let built = build(&g).unwrap();
+        assert_controls_consistent(&built);
+        let sk = &built.skeleton;
+        let floor = g.body.floor;
+        let toe = sk.bone("ball_l").unwrap().tail;
+        assert!(
+            (toe.y - floor).abs() < 0.05 * g.body.height,
+            "the paw reaches the floor"
+        );
+        assert!(sk.bone("hock_l").unwrap().head.x > g.body.center_x);
+        assert!(sk.bone("hock_r").unwrap().head.x < g.body.center_x);
+        assert!(
+            add_preset(
+                &mut g,
+                Preset::QuadLegs,
+                &AddOptions {
+                    side: Some(Side::Center),
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+
+        // Another naming convention renames the hock parts with everything else.
+        let mut q = quadruped(0.8);
+        q.naming = crate::naming::Preset::Prefix.naming();
+        let rig = crate::rig::build_rig(
+            crate::demo::demo_quadruped(),
+            "dog",
+            q,
+            crate::RigOptions::default(),
+        )
+        .unwrap();
+        let built = Built {
+            skeleton: rig.skeleton,
+            controls: rig.controls,
+        };
+        assert_controls_consistent(&built);
+        let hock = built.controls.ik_chains[2].hock.as_ref().unwrap();
+        assert_eq!(
+            (hock.bone.as_str(), hock.control.as_str()),
+            ("L_hock_jnt", "L_hock_ik_ctrl")
+        );
+    }
+
+    #[test]
+    fn toes_hang_from_the_ball_of_each_foot() {
+        let mut g = demo_guides();
+        let ids = add_preset(&mut g, Preset::Toes, &AddOptions::default()).unwrap();
+        assert_eq!(ids.len(), 10);
+        let built = build(&g).unwrap();
+        for side in ["_l", "_r"] {
+            let toe = built.skeleton.bone(&format!("toe_big_01{side}")).unwrap();
+            let ball = built.skeleton.bone(&format!("ball{side}")).unwrap();
+            assert_eq!(toe.parent, built.skeleton.index_of(&ball.name));
+        }
+        // Toes are plain FK chains: a control per joint, as fingers have.
+        assert!(
+            built.controls.control("ctrl_toe_big_01_l").is_some()
+                || built
+                    .controls
+                    .controls
+                    .iter()
+                    .any(|c| c.name.contains("toe_big"))
+        );
+        let mut no_side = demo_guides();
+        assert!(
+            add_preset(
+                &mut no_side,
+                Preset::Toes,
+                &AddOptions {
+                    side: Some(Side::Center),
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn spline_weights_are_a_smooth_partition_of_unity() {
+        for count in 2..=8 {
+            let at = greville(count);
+            assert_eq!((at[0], at[count - 1]), (0.0, 1.0), "{count}");
+            assert!(at.windows(2).all(|w| w[0] < w[1]), "{count}: {at:?}");
+            for i in 0..=40 {
+                let u = i as f32 / 40.0;
+                let w = spline_basis(count, u);
+                assert_eq!(w.len(), count);
+                assert!((w.iter().sum::<f32>() - 1.0).abs() < 1e-5, "{count} {u}");
+                assert!(w.iter().all(|x| *x >= -1e-6), "{count} {u} {w:?}");
+            }
+            // The end controls own the ends of the curve.
+            assert!((spline_basis(count, 0.0)[0] - 1.0).abs() < 1e-6);
+            assert!((spline_basis(count, 1.0)[count - 1] - 1.0).abs() < 1e-6);
+        }
+        // Four controls make one cubic segment: the Bernstein weights.
+        let w = spline_basis(4, 0.5);
+        for (got, want) in w.iter().zip([0.125, 0.375, 0.375, 0.125]) {
+            assert!((got - want).abs() < 1e-6, "{w:?}");
+        }
+    }
+
+    #[test]
+    fn tentacle_preset_builds_a_curve_driven_chain() {
+        let mut g = demo_guides();
+        let added = add_preset(&mut g, Preset::Tentacle, &AddOptions::default()).unwrap();
+        assert_eq!(added, ["tentacle"]);
+        let built = build(&g).unwrap();
+        assert_controls_consistent(&built);
+        let sp = &built.controls.splines[0];
+        assert_eq!(sp.bones.len(), 8);
+        assert_eq!(sp.bones[0], "tentacle_01");
+        assert_eq!(
+            sp.controls,
+            [
+                "tentacle_ik_01_ctrl",
+                "tentacle_ik_02_ctrl",
+                "tentacle_ik_03_ctrl",
+                "tentacle_ik_04_ctrl"
+            ]
+        );
+        assert_eq!(sp.fk_controls.len(), 3);
+        assert_eq!(sp.settings, "tentacle_ik_04_ctrl");
+        let base = built.skeleton.bone("tentacle_01").unwrap().parent.unwrap();
+        assert_eq!(built.skeleton.bones[base].name, "pelvis");
+        // A point per joint head, each weighted by the controls.
+        assert_eq!(
+            (sp.points.len(), sp.params.len(), sp.weights.len()),
+            (8, 8, 8)
+        );
+        for w in &sp.weights {
+            assert!((w.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+        }
+        // The FK layer carries the curve controls: each FK control's child is the next curve control.
+        for (i, fk) in sp.fk_controls.iter().enumerate() {
+            let next = built.controls.control(&sp.controls[i + 1]).unwrap();
+            assert_eq!(next.parent, ControlParent::Control(fk.clone()));
+            assert_eq!(next.kind, ControlKind::Spline);
+        }
+        // The id names list every bone and control the component builds.
+        let (bones, ctrls) = id_names(g.component("tentacle").unwrap());
+        assert_eq!(bones, sp.bones);
+        for c in ctrls {
+            assert!(built.controls.control(&c).is_some(), "{c}");
+        }
+
+        // Joint and control counts are options; the joints are resampled along the guides.
+        let c = g
+            .components
+            .iter_mut()
+            .find(|c| c.id == "tentacle")
+            .unwrap();
+        c.options.joints = Some(12);
+        c.options.controls = Some(5);
+        let first = c.guides[0].position;
+        let last = c.guides.last().unwrap().position;
+        let built = build(&g).unwrap();
+        assert_controls_consistent(&built);
+        let sp = &built.controls.splines[0];
+        assert_eq!(
+            (sp.bones.len(), sp.controls.len(), sp.fk_controls.len()),
+            (12, 5, 4)
+        );
+        let sk = &built.skeleton;
+        assert!((sk.bone("tentacle_01").unwrap().head - first).length() < 1e-5);
+        assert!((sk.bone("tentacle_12").unwrap().tail - last).length() < 1e-4);
+        let lengths: Vec<f32> = sp
+            .bones
+            .iter()
+            .map(|b| sk.bone(b).unwrap().length())
+            .collect();
+        assert!(
+            lengths.iter().all(|l| (l - lengths[0]).abs() < 1e-4),
+            "{lengths:?}"
+        );
+
+        // Bad counts are refused.
+        let c = g
+            .components
+            .iter_mut()
+            .find(|c| c.id == "tentacle")
+            .unwrap();
+        c.options.controls = Some(1);
+        assert!(build(&g).is_err());
+        let c = g
+            .components
+            .iter_mut()
+            .find(|c| c.id == "tentacle")
+            .unwrap();
+        c.options.controls = None;
+        c.options.joints = Some(1);
+        assert!(build(&g).is_err());
+        let mut g = demo_guides();
+        let opts = AddOptions {
+            parent: Some("head".into()),
+            joints: Some(4),
+            controls: Some(3),
+            id: Some("tendril".into()),
+            ..AddOptions::default()
+        };
+        add_preset(&mut g, Preset::Tentacle, &opts).unwrap();
+        let built = build(&g).unwrap();
+        assert_eq!(built.controls.splines[0].controls.len(), 3);
+        assert!(built.skeleton.bone("tendril_04").is_some());
+        assert!(
+            add_preset(
+                &mut g,
+                Preset::Tentacle,
+                &AddOptions {
+                    joints: Some(1),
+                    ..AddOptions::default()
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn spline_spine_uses_hips_and_chest_controls() {
+        let mut g = demo_guides();
+        set_spine_spline(&mut g, "spine", true, None).unwrap();
+        let built = build(&g).unwrap();
+        assert_controls_consistent(&built);
+        let rig = &built.controls;
+        let sp = &rig.splines[0];
+        assert_eq!(sp.bones, ["spine_01", "spine_02", "spine_03"]);
+        assert_eq!(sp.controls, ["hips_ctrl", "spine_mid_ctrl", "chest_ctrl"]);
+        assert_eq!(sp.fk_controls, ["spine_fk_01_ctrl", "spine_fk_02_ctrl"]);
+        // The hips drive the pelvis (and the legs hang from them); no per-joint FK.
+        let hips = rig.control("hips_ctrl").unwrap();
+        assert_eq!(
+            (hips.kind, hips.bone.as_deref()),
+            (ControlKind::Fk, Some("pelvis"))
+        );
+        assert!(rig.control("pelvis_ctrl").is_none() && rig.control("spine_01_ctrl").is_none());
+        assert_eq!(
+            rig.control("thigh_l_fk_ctrl").unwrap().parent,
+            ControlParent::Control("hips_ctrl".into())
+        );
+        // Parts on the top joint follow the bone, with the chest control as their chest space.
+        assert_eq!(
+            rig.control("clavicle_l_ctrl").unwrap().parent,
+            ControlParent::Bone("spine_03".into())
+        );
+        assert!(
+            rig.control("hand_l_ik_ctrl")
+                .unwrap()
+                .spaces
+                .contains(&"chest_ctrl".to_string())
+        );
+        assert!(
+            rig.control("head_ctrl")
+                .unwrap()
+                .spaces
+                .contains(&"chest_ctrl".to_string())
+        );
+        // The bones are the same as the FK spine's, so attachments are untouched.
+        let fk = build(&demo_guides()).unwrap();
+        let names = |b: &Built| {
+            b.skeleton
+                .bones
+                .iter()
+                .map(|x| x.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&built), names(&fk));
+
+        // More curve controls, a joint count change, then back to FK.
+        set_spine_spline(&mut g, "spine", true, Some(5)).unwrap();
+        set_spine_joints(&mut g, "spine", 6).unwrap();
+        let built = build(&g).unwrap();
+        assert_controls_consistent(&built);
+        let sp = &built.controls.splines[0];
+        assert_eq!(sp.controls.len(), 5);
+        assert_eq!(sp.controls[1], "spine_mid_01_ctrl");
+        assert_eq!(sp.bones.len(), 6);
+        assert!(
+            set_spine_joints(&mut g, "spine", 1).is_err(),
+            "a spline spine needs two joints"
+        );
+        assert!(set_spine_spline(&mut g, "spine", true, Some(1)).is_err());
+        set_spine_spline(&mut g, "spine", false, None).unwrap();
+        let built = build(&g).unwrap();
+        assert!(built.controls.splines.is_empty());
+        assert!(built.controls.control("spine_06_ctrl").is_some());
+        // The option is saved only when on.
+        let json = serde_json::to_string(&g).unwrap();
+        assert!(!json.contains("\"spline\""));
+        set_spine_spline(&mut g, "spine", true, None).unwrap();
+        let back: Guides = serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
+        assert!(back.component("spine").unwrap().options.spline);
+    }
+
+    #[test]
+    fn spline_names_follow_the_naming_convention_and_sides() {
+        let mut g = demo_guides();
+        set_spine_spline(&mut g, "spine", true, None).unwrap();
+        let opts = AddOptions {
+            parent: Some("hand_l".into()),
+            joints: Some(3),
+            ..AddOptions::default()
+        };
+        add_preset(&mut g, Preset::Tentacle, &opts).unwrap();
+        let opts = AddOptions {
+            parent: Some("hand_r".into()),
+            joints: Some(3),
+            ..AddOptions::default()
+        };
+        add_preset(&mut g, Preset::Tentacle, &opts).unwrap();
+        let mut built = build(&g).unwrap();
+        let sp = built
+            .controls
+            .splines
+            .iter()
+            .find(|s| s.name == "tentacle_l")
+            .unwrap();
+        assert_eq!(sp.bones[0], "tentacle_01_l");
+        assert_eq!(sp.controls[0], "tentacle_l_ik_01_ctrl");
+        assert!(built.controls.mirror_pairs.contains(&[
+            "tentacle_l_ik_02_ctrl".into(),
+            "tentacle_r_ik_02_ctrl".into()
+        ]));
+        let naming = crate::naming::Preset::Prefix.naming();
+        naming
+            .apply(&mut built.skeleton, &mut built.controls)
+            .unwrap();
+        for sp in &built.controls.splines {
+            for b in &sp.bones {
+                assert!(built.skeleton.bone(b).is_some(), "{b}");
+            }
+            for c in sp
+                .controls
+                .iter()
+                .chain(&sp.fk_controls)
+                .chain([&sp.settings])
+            {
+                assert!(built.controls.control(c).is_some(), "{c}");
+            }
+        }
+        let sp = built
+            .controls
+            .splines
+            .iter()
+            .find(|s| s.name == "tentacle_l")
+            .unwrap();
+        assert_eq!(sp.controls[0], "L_tentacle_ik_01_ctrl");
+        assert_eq!(built.controls.splines[0].controls[0], "C_hips_ctrl");
+    }
+
+    #[test]
+    fn every_spider_leg_has_ik_with_its_own_names() {
+        use crate::pose::{Channels, Pose, evaluate};
+        let g = spider(0.4);
+        let built = build(&g).unwrap();
+        assert_controls_consistent(&built);
+        let (sk, rig) = (&built.skeleton, &built.controls);
+        assert_eq!(rig.ik_chains.len(), 2 * SPIDER_LEGS);
+        let chains: HashSet<&str> = rig.ik_chains.iter().map(|k| k.name.as_str()).collect();
+        assert_eq!(chains.len(), 2 * SPIDER_LEGS, "{chains:?}");
+        for name in ["leg_l", "leg_r", "leg2_l", "leg3_r", "leg4_l", "leg4_r"] {
+            assert!(chains.contains(name), "{name}: {chains:?}");
+        }
+        let leg2 = rig.ik_chains.iter().find(|k| k.name == "leg2_l").unwrap();
+        assert_eq!(leg2.ik_control, "leg2_foot_l_ik_ctrl");
+        assert_eq!(leg2.pole_control, "leg2_calf_l_pole_ctrl");
+        assert_eq!(leg2.upper, "leg2_thigh_l");
+        assert_eq!(leg2.hock.as_ref().unwrap().control, "leg2_hock_l_ik_ctrl");
+        assert_eq!(leg2.foot.as_ref().unwrap().ball_control, "leg2_ball_l_ctrl");
+        for k in &rig.ik_chains {
+            // Every control of every leg is its own, and the left ones pair
+            // with the right leg's.
+            let mut own = vec![k.ik_control.clone(), k.pole_control.clone()];
+            own.extend(k.fk_controls.iter().cloned());
+            for o in rig.ik_chains.iter().filter(|o| o.name != k.name) {
+                assert!(!own.contains(&o.ik_control) && !own.contains(&o.pole_control));
+            }
+            if k.name.ends_with("_l") {
+                for c in own {
+                    let r = c.replace("_l_", "_r_");
+                    assert!(
+                        rig.mirror_pairs.contains(&[c.clone(), r.clone()]),
+                        "{c} pairs with {r}"
+                    );
+                }
+            }
+            // The knee folds up, so the pole sits above it.
+            let knee = sk.bone(&k.lower).unwrap().head;
+            let pole = rig.control(&k.pole_control).unwrap().position;
+            assert!(pole.y > knee.y + 0.05 * g.body.height, "{}", k.name);
+        }
+
+        // At rest the IK legs hold the guides' pose; moving one leg's goal
+        // moves that leg alone.
+        let rest = evaluate(sk, rig, &Pose::default());
+        for (i, m) in rest.bones.iter().enumerate() {
+            assert!(
+                m.abs_diff_eq(glam::Mat4::IDENTITY, 1e-4),
+                "{} moves at rest",
+                sk.bones[i].name
+            );
+        }
+        let mut pose = Pose::default();
+        pose.set_channels(
+            &leg2.ik_control,
+            Channels {
+                translate: Vec3::new(0.02, 0.05, 0.03),
+                ..Channels::default()
+            },
+        );
+        let posed = evaluate(sk, rig, &pose);
+        let moved = |bone: &str| {
+            let i = sk.index_of(bone).unwrap();
+            posed.head(sk, i).distance(sk.bones[i].head)
+        };
+        assert!(moved("leg2_foot_l") > 0.03, "{}", moved("leg2_foot_l"));
+        assert!(moved("leg2_calf_l") > 1e-3);
+        for other in ["foot_l", "leg3_foot_l", "leg2_foot_r", "leg4_calf_l"] {
+            assert!(moved(other) < 1e-5, "{other} moved {}", moved(other));
+        }
+
+        // The checks know the knees and hocks fold up.
+        let issues = crate::checks::check(&g, None);
+        assert!(issues.is_empty(), "{issues:?}");
+    }
+
+    #[test]
+    fn extra_limbs_take_their_component_names() {
+        // A second pair of hind legs on a dog, with an id of their own.
+        let mut g = quadruped(0.8);
+        let spine = spine_name(1);
+        let opts = AddOptions {
+            id: Some("mid_leg".into()),
+            parent: Some(spine.clone()),
+            ..AddOptions::default()
+        };
+        assert!(add_preset(&mut g, Preset::QuadLegs, &AddOptions::default()).is_err());
+        let ids = add_preset(&mut g, Preset::QuadLegs, &opts).unwrap();
+        assert_eq!(ids, ["mid_leg_l", "mid_leg_r"]);
+        let built = build(&g).unwrap();
+        assert_controls_consistent(&built);
+        let names: Vec<&str> = built
+            .controls
+            .ik_chains
+            .iter()
+            .map(|k| k.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["arm_l", "arm_r", "leg_l", "leg_r", "mid_leg_l", "mid_leg_r"]
+        );
+        let mid = &built.controls.ik_chains[4];
+        assert_eq!(
+            (
+                mid.upper.as_str(),
+                mid.end.as_str(),
+                mid.ik_control.as_str()
+            ),
+            (
+                "mid_leg_thigh_l",
+                "mid_leg_foot_l",
+                "mid_leg_foot_l_ik_ctrl"
+            )
+        );
+        let sk = &built.skeleton;
+        let thigh = sk.bone("mid_leg_thigh_l").unwrap();
+        assert_eq!(sk.bones[thigh.parent.unwrap()].name, spine);
+        let pair = ["mid_leg_foot_l_ik_ctrl", "mid_leg_foot_r_ik_ctrl"].map(String::from);
+        assert!(built.controls.mirror_pairs.contains(&pair));
+        // The extra legs follow the naming convention like the rest.
+        let (mut sk, mut ct) = (built.skeleton.clone(), built.controls.clone());
+        crate::naming::Preset::Prefix
+            .naming()
+            .apply(&mut sk, &mut ct)
+            .unwrap();
+        assert!(sk.bone("L_mid_leg_thigh_jnt").is_some());
+        assert!(ct.control("L_mid_leg_foot_ik_ctrl").is_some());
+
+        // An extra arm, too.
+        let mut b = demo_guides();
+        let mut arm = b.component("arm_l").unwrap().clone();
+        arm.id = "arm2_l".into();
+        for guide in &mut arm.guides {
+            guide.position.y -= 0.15;
+        }
+        b.components.push(arm);
+        let built = build(&b).unwrap();
+        assert_controls_consistent(&built);
+        assert!(built.skeleton.bone("arm2_upperarm_l").is_some());
+        assert!(built.controls.ik_chains.iter().any(|k| k.name == "arm2_l"));
+
+        // A second limb that would reuse the first one's IK name is refused
+        // with a hint.
+        let mut c = demo_guides();
+        let mut leg = c.component("leg_l").unwrap().clone();
+        leg.id = "hind_leg_l".into();
+        c.components.insert(3, leg);
+        let err = build(&c).err().unwrap().to_string();
+        assert!(err.contains("needs another id"), "{err}");
+        // Only legs fold their knees up.
+        let mut d = demo_guides();
+        d.components
+            .iter_mut()
+            .find(|x| x.id == "arm_l")
+            .unwrap()
+            .options
+            .knee_up = true;
+        assert!(build(&d).is_err());
+    }
+
+    #[test]
+    fn wings_grow_rows_of_feathers_under_a_spread_control() {
+        let mut g = crate::demo::Creature::Bird.guides();
+        let ids = set_feathers(&mut g, Some("wing_l"), 5, 2).unwrap();
+        assert_eq!(ids, ["wing_l", "wing_r"], "the twin gets them too");
+        let b = build(&g).unwrap();
+        let sk = &b.skeleton;
+        assert_eq!(b.controls.feathers.len(), 2);
+        let feather_bones = sk
+            .bones
+            .iter()
+            .filter(|x| x.name.contains("_feather"))
+            .count();
+        assert_eq!(feather_bones, 2 * 2 * 5 * FEATHER_JOINTS);
+        for fan in &b.controls.feathers {
+            assert_eq!(fan.feathers.len(), 10, "{}", fan.name);
+            assert_eq!(
+                b.controls.control(&fan.control).unwrap().kind,
+                ControlKind::Fan
+            );
+            for f in &fan.feathers {
+                let bone = sk.bone(&f.bone).unwrap();
+                assert_eq!(sk.bones[bone.parent.unwrap()].name, f.parent);
+                let ctrl = b.controls.control(&f.control).unwrap();
+                assert_eq!(ctrl.kind, ControlKind::Fk);
+                assert_eq!(ctrl.bone.as_deref(), Some(f.bone.as_str()));
+                assert!(f.angle.abs() <= FEATHER_FAN_DEGREES + 1e-4);
+                assert!((f.axis.length() - 1.0).abs() < 1e-4);
+                // A feather's turn is about its own root.
+                let m = f.matrix(1.0);
+                assert!(m.transform_point3(f.pivot).distance(f.pivot) < 1e-5);
+                assert!(f.matrix(0.0).abs_diff_eq(glam::Mat4::IDENTITY, 1e-6));
+            }
+            // Each row fans from closing in at the elbow to opening at the tip.
+            let row = &fan.feathers[..5];
+            assert!(row[0].angle < 0.0 && row[4].angle > 0.0);
+            assert!(row.windows(2).all(|w| w[0].angle < w[1].angle));
+            // The second row of feathers on each feather is shorter.
+            let len = |f: &FanFeather| sk.bone(&f.bone).unwrap().length();
+            assert!(len(&fan.feathers[5]) < len(&fan.feathers[0]));
+        }
+        // The wings mirror.
+        let cx = g.body.center_x;
+        let l = sk.bone("wing_feather1_03_01_l").unwrap();
+        let r = sk.bone("wing_feather1_03_01_r").unwrap();
+        assert!(mirror(l.head, cx).distance(r.head) < 1e-4);
+        assert!(mirror(l.tail, cx).distance(r.tail) < 1e-4);
+
+        // Out of range or on the wrong part: refused, and nothing changes.
+        let before = serde_json::to_string(&g).unwrap();
+        assert!(set_feathers(&mut g, Some("wing_l"), MAX_FEATHERS + 1, 1).is_err());
+        assert!(set_feathers(&mut g, Some("wing_l"), 3, 0).is_err());
+        assert!(set_feathers(&mut g, Some("wing_l"), 3, MAX_FEATHER_ROWS + 1).is_err());
+        assert!(set_feathers(&mut g, Some("leg_l"), 3, 1).is_err());
+        assert_eq!(serde_json::to_string(&g).unwrap(), before);
+        let mut legs = g.clone();
+        for c in legs.components.iter_mut().filter(|c| c.kind != Kind::Arm) {
+            c.options.feathers = 2;
+        }
+        assert!(build(&legs).is_err(), "only arms take feathers");
+
+        // The feathers survive a save, and come off again.
+        let back: Guides = serde_json::from_str(&before).unwrap();
+        assert_eq!(build(&back).unwrap().controls.feathers.len(), 2);
+        assert_eq!(set_feathers(&mut g, None, 0, 1).unwrap().len(), 2);
+        let bare = build(&g).unwrap();
+        assert!(bare.controls.feathers.is_empty());
+        assert!(!serde_json::to_string(&g).unwrap().contains("feather"));
+    }
+
+    #[test]
+    fn chains_fork_with_fk_on_every_branch() {
+        let mut g = crate::demo::Creature::Bird.guides();
+        add_preset(&mut g, Preset::Antlers, &AddOptions::default()).unwrap();
+        let b = build(&g).unwrap();
+        let sk = &b.skeleton;
+        for id in ["antler_l", "antler_r"] {
+            let c = g.component(id).unwrap();
+            assert!(is_branched(c), "{id}");
+            let (names, ctrls) = id_names(c);
+            assert_eq!(names.len(), c.guides.len() - 1);
+            for k in 1..c.guides.len() {
+                let bone = sk.bone(&names[k - 1]).unwrap();
+                let from = guide_from(c, k);
+                // Each bone starts where its fork guide is, under the bone
+                // that ends there, and so does its control.
+                assert!(bone.head.distance(c.guides[from].position) < 1e-5);
+                let parent = &sk.bones[bone.parent.unwrap()].name;
+                let ctrl = b.controls.control(&ctrls[k - 1]).unwrap();
+                if from == 0 {
+                    assert_eq!(parent, "head");
+                } else {
+                    assert_eq!(parent, &names[from - 1]);
+                    assert_eq!(ctrl.parent, ControlParent::Control(ctrls[from - 1].clone()));
+                }
+            }
+            // Two tines hang off the beam's second and third joints.
+            let tine = |n: &str| c.guides.iter().position(|x| x.name == n).unwrap();
+            assert_eq!(c.guides[guide_from(c, tine("tine1"))].name, "j2");
+            assert_eq!(c.guides[guide_from(c, tine("tine2"))].name, "j3");
+        }
+        assert!(add_preset(&mut g, Preset::Antlers, &AddOptions::default()).is_err());
+
+        // A new branch goes on both antlers, mirrored.
+        let names = add_branch(&mut g, "antler_l", "j4", 2).unwrap();
+        assert_eq!(names, ["b1_1", "b1_2"]);
+        let b = build(&g).unwrap();
+        let (l, r) = (
+            g.component("antler_l").unwrap(),
+            g.component("antler_r").unwrap(),
+        );
+        let cx = g.body.center_x;
+        for (gl, gr) in l.guides.iter().zip(&r.guides) {
+            assert_eq!((&gl.name, &gl.from), (&gr.name, &gr.from));
+            assert!(mirror(gl.position, cx).distance(gr.position) < 1e-4);
+        }
+        let first = l.guides.iter().position(|x| x.name == "b1_1").unwrap();
+        assert_eq!(l.guides[guide_from(l, first)].name, "j4");
+        assert_eq!(guide_from(l, first + 1), first, "b1_2 runs on from b1_1");
+        let (bones, _) = id_names(l);
+        let tip = b.skeleton.bone(&bones[first]).unwrap();
+        assert_eq!(b.skeleton.bones[tip.parent.unwrap()].name, bones[first - 1]);
+        // The forks survive a save.
+        let back: Guides = serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
+        assert_eq!(
+            build(&back).unwrap().skeleton.bones.len(),
+            b.skeleton.bones.len()
+        );
+
+        // Forks only on chains, from guides the chain has, back up the chain.
+        assert!(add_branch(&mut g, "antler_l", "nope", 2).is_err());
+        assert!(add_branch(&mut g, "wing_l", "elbow", 2).is_err());
+        assert!(add_branch(&mut g, "antler_l", "j2", 0).is_err());
+        let mut bad = g.clone();
+        let c = bad
+            .components
+            .iter_mut()
+            .find(|c| c.id == "antler_l")
+            .unwrap();
+        c.guides[1].from = Some("tine2".into());
+        assert!(build(&bad).is_err(), "a fork from a later guide");
+        let mut bad = g.clone();
+        let c = bad
+            .components
+            .iter_mut()
+            .find(|c| c.id == "wing_l")
+            .unwrap();
+        c.guides[1].from = Some(c.guides[0].name.clone());
+        assert!(build(&bad).is_err(), "a fork on a wing");
+    }
+
+    /// Every library part on the demo biped: it builds, hangs from bones that
+    /// exist, keeps its controls consistent, and added twice gets names of its
+    /// own (or is refused when a rig has only one).
+    #[test]
+    fn library_parts_build_and_never_clash() {
+        let ids_of =
+            |g: &Guides| -> Vec<String> { g.components.iter().map(|c| c.id.clone()).collect() };
+        let plain = AddOptions::default();
+        let both = |opts: AddOptions| opts;
+        // (preset, options, can be added twice)
+        let cases: Vec<(Preset, AddOptions, bool)> = vec![
+            (
+                Preset::Arms,
+                AddOptions {
+                    bendy: true,
+                    ..plain.clone()
+                },
+                true,
+            ),
+            (Preset::Legs, plain.clone(), true),
+            (
+                Preset::Wings,
+                AddOptions {
+                    count: Some(5),
+                    rows: Some(2),
+                    ..plain.clone()
+                },
+                true,
+            ),
+            (
+                Preset::SpiderLegs,
+                AddOptions {
+                    count: Some(2),
+                    ..plain.clone()
+                },
+                true,
+            ),
+            (Preset::Ears, plain.clone(), false),
+            (
+                Preset::Horns,
+                AddOptions {
+                    joints: Some(4),
+                    ..plain.clone()
+                },
+                false,
+            ),
+            (Preset::Ponytail, plain.clone(), false),
+            (Preset::Cape, plain.clone(), true),
+            (
+                Preset::Skirt,
+                AddOptions {
+                    count: Some(8),
+                    joints: Some(2),
+                    ..plain.clone()
+                },
+                true,
+            ),
+            (Preset::Prop, plain.clone(), true),
+            (
+                Preset::Tail,
+                AddOptions {
+                    spline: true,
+                    ..plain.clone()
+                },
+                true,
+            ),
+            (
+                Preset::Fingers,
+                AddOptions {
+                    count: Some(3),
+                    joints: Some(2),
+                    ..plain.clone()
+                },
+                false,
+            ),
+            (
+                Preset::Toes,
+                AddOptions {
+                    count: Some(2),
+                    ..plain.clone()
+                },
+                false,
+            ),
+            (
+                Preset::Tentacle,
+                both(AddOptions {
+                    joints: Some(6),
+                    controls: Some(3),
+                    ..plain.clone()
+                }),
+                true,
+            ),
+            (Preset::Antlers, plain.clone(), false),
+        ];
+        for (preset, opts, repeats) in cases {
+            let mut g = demo_guides();
+            let before = ids_of(&g);
+            let added =
+                add_preset(&mut g, preset, &opts).unwrap_or_else(|e| panic!("{preset:?}: {e:#}"));
+            assert!(!added.is_empty(), "{preset:?}");
+            for id in &added {
+                assert!(!before.contains(id), "{preset:?} reused {id}");
+                let c = g.component(id).unwrap();
+                let parent = c.parent.as_deref().unwrap();
+                let built = build(&g).unwrap();
+                assert!(
+                    built.skeleton.bone(parent).is_some(),
+                    "{id} hangs from {parent}"
+                );
+                assert_controls_consistent(&built);
+            }
+            let mut unique = ids_of(&g);
+            unique.sort();
+            unique.dedup();
+            assert_eq!(
+                unique.len(),
+                g.components.len(),
+                "{preset:?} made duplicate ids"
+            );
+            let again = add_preset(&mut g, preset, &opts);
+            if repeats {
+                let more = again.unwrap_or_else(|e| panic!("{preset:?} twice: {e:#}"));
+                assert!(
+                    more.iter().all(|id| !added.contains(id)),
+                    "{preset:?}: {more:?}"
+                );
+                let built = build(&g).unwrap();
+                assert_controls_consistent(&built);
+            } else {
+                assert!(again.is_err(), "{preset:?} twice should be refused");
+                assert_eq!(
+                    g.components.len(),
+                    before.len() + added.len(),
+                    "{preset:?} left a mess"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn library_options_reach_the_components() {
+        // Arms: a second pair is named arm2, hangs lower, and is bendy on request.
+        let mut g = demo_guides();
+        let ids = add_preset(
+            &mut g,
+            Preset::Arms,
+            &AddOptions {
+                bendy: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ids, ["arm2_l", "arm2_r"]);
+        let (first, second) = (
+            g.component("arm_l").unwrap(),
+            g.component("arm2_l").unwrap(),
+        );
+        assert!(second.options.bendy && !first.options.bendy);
+        assert!(second.position("shoulder").unwrap().y < first.position("shoulder").unwrap().y);
+        assert_eq!(
+            add_preset(&mut g, Preset::Arms, &AddOptions::default()).unwrap(),
+            ["arm3_l", "arm3_r"]
+        );
+        // One side only.
+        let one = add_preset(
+            &mut g,
+            Preset::Arms,
+            &AddOptions {
+                side: Some(Side::Right),
+                id: Some("claw".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(one, ["claw_r"]);
+        assert!(build(&g).is_ok());
+
+        // Wings carry their feathers and fan control.
+        let mut g = demo_guides();
+        add_preset(
+            &mut g,
+            Preset::Wings,
+            &AddOptions {
+                count: Some(4),
+                rows: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                g.component("wing_l").unwrap().options.feathers,
+                g.component("wing_l").unwrap().options.feather_rows
+            ),
+            (4, 2)
+        );
+        assert_eq!(build(&g).unwrap().controls.feathers.len(), 2);
+
+        // Spider legs: pairs numbered after the legs a rig has, knees up.
+        let mut g = demo_guides();
+        let ids = add_preset(
+            &mut g,
+            Preset::SpiderLegs,
+            &AddOptions {
+                count: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ids, ["leg2_l", "leg2_r", "leg3_l", "leg3_r"]);
+        assert!(g.component("leg3_r").unwrap().options.knee_up);
+        let ik: Vec<_> = build(&g)
+            .unwrap()
+            .controls
+            .ik_chains
+            .iter()
+            .map(|k| k.name.clone())
+            .collect();
+        assert!(ik.contains(&"leg3_r".to_string()), "{ik:?}");
+        // On the spider creature the new pairs come after its eight.
+        let mut s = spider(1.0);
+        let ids = add_preset(&mut s, Preset::SpiderLegs, &AddOptions::default()).unwrap();
+        assert_eq!(ids, ["leg5_l", "leg5_r"]);
+
+        // A tail either follows a curve or has an FK control a bone.
+        let mut g = demo_guides();
+        add_preset(
+            &mut g,
+            Preset::Tail,
+            &AddOptions {
+                spline: true,
+                controls: Some(3),
+                joints: Some(6),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let tail = g.component("tail").unwrap();
+        assert_eq!(
+            (tail.kind, tail.options.controls, tail.guides.len()),
+            (Kind::Spline, Some(3), 7)
+        );
+        let mut g = demo_guides();
+        add_preset(&mut g, Preset::Tail, &AddOptions::default()).unwrap();
+        assert_eq!(g.component("tail").unwrap().kind, Kind::Chain);
+
+        // Fingers: how many, and how many bones each.
+        let mut g = demo_guides();
+        let ids = add_preset(
+            &mut g,
+            Preset::Fingers,
+            &AddOptions {
+                count: Some(3),
+                joints: Some(2),
+                side: Some(Side::Left),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ids, ["thumb_l", "index_l", "middle_l"]);
+        assert_eq!(g.component("index_l").unwrap().guides.len(), 3);
+        assert!(
+            add_preset(
+                &mut g,
+                Preset::Fingers,
+                &AddOptions {
+                    count: Some(6),
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+
+        // A cape is strips side by side; a second cape numbers itself.
+        let mut g = demo_guides();
+        let ids = add_preset(
+            &mut g,
+            Preset::Cape,
+            &AddOptions {
+                count: Some(4),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ids, ["cape_1", "cape_2", "cape_3", "cape_4"]);
+        assert_eq!(
+            add_preset(&mut g, Preset::Cape, &AddOptions::default()).unwrap()[0],
+            "cape2_1"
+        );
+
+        // A prop in either hand, and in both when asked twice.
+        let mut g = demo_guides();
+        assert_eq!(
+            add_preset(&mut g, Preset::Prop, &AddOptions::default()).unwrap(),
+            ["prop_r"]
+        );
+        let left = add_preset(
+            &mut g,
+            Preset::Prop,
+            &AddOptions {
+                side: Some(Side::Left),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(left, ["prop_l"]);
+        assert_eq!(
+            g.component("prop_l").unwrap().parent.as_deref(),
+            Some("hand_l")
+        );
+
+        // Parts that need a part the rig lacks say so, and change nothing.
+        let mut g = snake(1.0);
+        let n = g.components.len();
+        assert!(add_preset(&mut g, Preset::Prop, &AddOptions::default()).is_err());
+        assert_eq!(g.components.len(), n);
+        // Arms, legs and wings also work on a layout that lost them.
+        let mut g = demo_guides();
+        for id in ["arm_l", "arm_r", "leg_l", "leg_r"] {
+            remove(&mut g, id).unwrap();
+        }
+        assert_eq!(
+            add_preset(&mut g, Preset::Arms, &AddOptions::default()).unwrap(),
+            ["arm_l", "arm_r"]
+        );
+        assert_eq!(
+            add_preset(&mut g, Preset::Legs, &AddOptions::default()).unwrap(),
+            ["leg_l", "leg_r"]
+        );
+        let built = build(&g).unwrap();
+        assert!(
+            built.skeleton.bone("upperarm_l").is_some() && built.skeleton.bone("thigh_r").is_some()
+        );
+    }
+}

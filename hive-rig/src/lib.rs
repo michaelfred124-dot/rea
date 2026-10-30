@@ -1,0 +1,45 @@
+//! Hive: an automatic humanoid rigger.
+//!
+//! Give it a character mesh in T-pose or A-pose (OBJ, glTF or GLB). It finds the
+//! body landmarks, places premade components with editable guides, builds a
+//! game-ready skeleton from them, computes skin weights, designs
+//! an animator control rig, and exports it for Blender, Maya and Unreal Engine:
+//!
+//! * `<name>.glb` – skinned mesh + skeleton, with the source's objects, UVs,
+//!   normals, vertex colours, materials, textures and blendshapes
+//! * `<name>.fbx` – the same skinned mesh, skeleton and bind pose for game engines (on request)
+//! * `<name>_textures/` – the texture images, named from the other files
+//! * `<name>_blender.py` – rebuilds mesh, armature, weights and controls in Blender
+//! * `<name>_maya.py` – rebuilds mesh, joints, skinCluster and controls in Maya
+//! * `<name>_unreal.py` – imports the .glb and builds a Control Rig Blueprint
+//! * `<name>.guides.json` – the editable component layout, for rebuilding
+//! * `<name>.hive.json` – the full rig description for other tools
+
+pub mod checks;
+pub mod components;
+pub mod controls;
+pub mod custom_shapes;
+pub mod demo;
+pub mod edits;
+pub mod export;
+pub mod face_board;
+pub mod import;
+pub mod joints;
+pub mod landmarks;
+pub mod mesh;
+pub mod naming;
+pub mod orient;
+pub mod pose;
+pub mod readers;
+pub mod rig;
+pub mod scene;
+pub mod shapes;
+pub mod skeleton;
+pub mod skin;
+pub mod structure;
+pub mod template;
+pub mod version;
+pub mod voxel;
+
+pub use export::Target;
+pub use rig::{Rig, RigOptions, auto_rig, build_rig};
