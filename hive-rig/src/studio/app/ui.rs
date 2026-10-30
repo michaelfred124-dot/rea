@@ -23,15 +23,14 @@ use hive_rig::skin::{Engine, INFLUENCE_CAP};
 use hive_rig::template::{self, Listed, Scope, Source, Template};
 
 use super::update::{self, UpdateState};
-use super::{
-    Category, Doc, Drag, FingerSides, Mode, Pose, RigPick, Studio, Tool, count, push_undo,
-};
+use super::{Category, Drag, Mode, Pose, RigPick, Studio, Tool, count, push_undo};
 use crate::joints;
 use crate::theme::{
     self, ACCENT, BORDER, CARD, CARD_HI, ERR, OK, TEXT, TEXT_DIM, TEXT_FAINT, WARN,
 };
 use crate::view::{self, Projector};
 
+mod library_panel;
 mod skin_panel;
 
 const PICK_RADIUS: f32 = 10.0;
@@ -61,6 +60,9 @@ const PANEL_TOP: f32 = 72.0;
 const DOCK_CLEARANCE: f32 = 118.0;
 const OUTLINER_WIDTH: f32 = 252.0;
 const PROPERTIES_WIDTH: f32 = 300.0;
+
+/// An outliner row: component index, id, kind, side and indent inside its group.
+type OutlinerRow<'a> = (usize, &'a str, Kind, Side, usize);
 
 fn kind_label(k: Kind) -> &'static str {
     match k {
@@ -171,124 +173,6 @@ enum NamingChoice {
     Preset(Preset),
     Custom,
 }
-
-/// A premade part in the rigging window.
-struct LibraryPart {
-    art: Art,
-    title: &'static str,
-    text: &'static str,
-    category: Category,
-    add: fn(&mut Studio),
-    /// Parts a rig can only have one of.
-    once: Option<Kind>,
-}
-
-const LIBRARY: [LibraryPart; 13] = [
-    LibraryPart {
-        art: Art::Face,
-        title: "Face",
-        text: "Brows, eyelids, cheeks, nose and lips as joints.",
-        category: Category::Face,
-        add: Studio::add_face,
-        once: Some(Kind::Face),
-    },
-    LibraryPart {
-        art: Art::Eyes,
-        title: "Eyes",
-        text: "Both eyes aim at one look-at control.",
-        category: Category::Face,
-        add: Studio::add_eyes,
-        once: Some(Kind::Eyes),
-    },
-    LibraryPart {
-        art: Art::Jaw,
-        title: "Jaw",
-        text: "A hinge that opens the mouth.",
-        category: Category::Face,
-        add: Studio::add_jaw,
-        once: Some(Kind::Jaw),
-    },
-    LibraryPart {
-        art: Art::Ears,
-        title: "Ears",
-        text: "A two-bone chain on each side of the head.",
-        category: Category::Face,
-        add: Studio::add_ears,
-        once: None,
-    },
-    LibraryPart {
-        art: Art::Antlers,
-        title: "Antlers",
-        text: "Forking FK chains on the head, a control on every branch.",
-        category: Category::Face,
-        add: Studio::add_antlers,
-        once: None,
-    },
-    LibraryPart {
-        art: Art::Fingers,
-        title: "Fingers",
-        text: "Thumb to pinky, three joints each.",
-        category: Category::Body,
-        add: Studio::add_fingers,
-        once: None,
-    },
-    LibraryPart {
-        art: Art::Toes,
-        title: "Toes",
-        text: "Five toes on each foot, from the ball.",
-        category: Category::Body,
-        add: Studio::add_toes,
-        once: None,
-    },
-    LibraryPart {
-        art: Art::HindLegs,
-        title: "Hind legs",
-        text: "Thigh, calf, hock and paw with IK, for quadrupeds. Remove the legs first.",
-        category: Category::Body,
-        add: Studio::add_hind_legs,
-        once: Some(Kind::QuadLeg),
-    },
-    LibraryPart {
-        art: Art::Tail,
-        title: "Tail",
-        text: "An FK tail from the pelvis.",
-        category: Category::Body,
-        add: Studio::add_tail,
-        once: None,
-    },
-    LibraryPart {
-        art: Art::Tentacle,
-        title: "Tentacle",
-        text: "Curve controls bend it smoothly, with stretch, volume and FK.",
-        category: Category::Body,
-        add: Studio::add_tentacle,
-        once: None,
-    },
-    LibraryPart {
-        art: Art::Ponytail,
-        title: "Ponytail",
-        text: "Hair that swings from the back of the head.",
-        category: Category::Extras,
-        add: Studio::add_ponytail,
-        once: None,
-    },
-    LibraryPart {
-        art: Art::Prop,
-        title: "Prop",
-        text: "A weapon socket in the right hand.",
-        category: Category::Extras,
-        add: Studio::add_prop,
-        once: None,
-    },
-    LibraryPart {
-        art: Art::Chain,
-        title: "Chain",
-        text: "An FK chain on any bone. Set it up below.",
-        category: Category::Extras,
-        add: Studio::add_chain,
-        once: None,
-    },
-];
 
 impl Studio {
     pub fn ui(&mut self, ui: &mut Ui) {
@@ -931,14 +815,39 @@ impl Studio {
     fn outliner(&mut self, ctx: &egui::Context) {
         let Some(doc) = &self.doc else { return };
         // The attachment tree, each component under the one owning its parent bone.
-        let rows: Vec<(usize, String, Kind, Side, usize)> =
+        let rows: Vec<(usize, String, Kind, Side, usize, Category)> =
             super::outliner_rows(&doc.guides, doc.preview.as_ref().ok())
                 .into_iter()
                 .map(|(i, depth)| {
                     let c = &doc.guides.components[i];
-                    (i, c.id.clone(), c.kind, c.side, depth)
+                    (
+                        i,
+                        c.id.clone(),
+                        c.kind,
+                        c.side,
+                        depth,
+                        super::library::group_of(c),
+                    )
                 })
                 .collect();
+        // Grouped like the rigging window; inside a group the tree keeps its
+        // order, indented by the parents that are in the same group.
+        let groups = [
+            (Category::Body, "Body"),
+            (Category::Creature, "Wings and creatures"),
+            (Category::Face, "Face"),
+            (Category::Extras, "Extras"),
+        ];
+        let mut sections: Vec<Vec<OutlinerRow>> = vec![Vec::new(); 4];
+        let mut open_parents: Vec<Vec<usize>> = vec![Vec::new(); 4];
+        for &(i, ref id, kind, side, depth, group) in &rows {
+            let g = groups.iter().position(|(c, _)| *c == group).unwrap_or(0);
+            while open_parents[g].last().is_some_and(|&d| d >= depth) {
+                open_parents[g].pop();
+            }
+            sections[g].push((i, id, kind, side, open_parents[g].len()));
+            open_parents[g].push(depth);
+        }
         let max_h = ctx.content_rect().height() - PANEL_TOP - DOCK_CLEARANCE - 70.0;
 
         floating_area(
@@ -963,34 +872,56 @@ impl Studio {
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
                         let shift = ui.input(|i| i.modifiers.shift);
-                        for &(i, ref id, kind, side, depth) in &rows {
-                            let order = self.picked.iter().position(|(p, _)| p == id);
-                            let selected = order.is_some();
-                            // Pick order shows once there are several: the last is the parent.
-                            let badge = order
-                                .filter(|_| self.picked.len() > 1)
-                                .map(|n| n + 1 == self.picked.len());
-                            let row =
-                                component_row(ui, id, kind, side, depth.min(4), selected, badge);
-                            if row.clicked() {
-                                if shift {
-                                    self.toggle_pick(i, None);
-                                } else if selected && self.picked.len() == 1 {
-                                    self.selected = None;
-                                    self.sync_picks();
-                                } else {
-                                    self.pick_one(i, None);
-                                }
-                                self.mode = Mode::Guides;
+                        for (section, (_, name)) in sections.iter().zip(&groups) {
+                            if section.is_empty() {
+                                continue;
                             }
-                            row.context_menu(|ui| {
-                                self.mode = Mode::Guides;
-                                self.parent_menu(ui, Some((i, None)));
-                                if ui.button("Select only this").clicked() {
-                                    self.pick_one(i, None);
-                                    ui.close();
-                                }
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                theme::label_caps(ui, name);
+                                ui.label(
+                                    RichText::new(section.len().to_string())
+                                        .color(TEXT_FAINT)
+                                        .size(11.0),
+                                );
                             });
+                            for &(i, id, kind, side, depth) in section {
+                                let id = &id.to_string();
+                                let order = self.picked.iter().position(|(p, _)| p == id);
+                                let selected = order.is_some();
+                                // Pick order shows once there are several: the last is the parent.
+                                let badge = order
+                                    .filter(|_| self.picked.len() > 1)
+                                    .map(|n| n + 1 == self.picked.len());
+                                let row = component_row(
+                                    ui,
+                                    id,
+                                    kind,
+                                    side,
+                                    depth.min(4),
+                                    selected,
+                                    badge,
+                                );
+                                if row.clicked() {
+                                    if shift {
+                                        self.toggle_pick(i, None);
+                                    } else if selected && self.picked.len() == 1 {
+                                        self.selected = None;
+                                        self.sync_picks();
+                                    } else {
+                                        self.pick_one(i, None);
+                                    }
+                                    self.mode = Mode::Guides;
+                                }
+                                row.context_menu(|ui| {
+                                    self.mode = Mode::Guides;
+                                    self.parent_menu(ui, Some((i, None)));
+                                    if ui.button("Select only this").clicked() {
+                                        self.pick_one(i, None);
+                                        ui.close();
+                                    }
+                                });
+                            }
                         }
                     });
                 ui.add_space(4.0);
@@ -2625,79 +2556,6 @@ impl Studio {
 
     // ----------------------------------------------------------------------- rigging window
 
-    fn library_window(&mut self, ctx: &egui::Context) {
-        if !self.library_open {
-            return;
-        }
-        let screen = ctx.content_rect();
-        let width = 900f32.min(screen.width() - 60.0);
-        let kinds: Vec<Kind> = self
-            .doc
-            .as_ref()
-            .map(|d| d.guides.components.iter().map(|c| c.kind).collect())
-            .unwrap_or_default();
-        let mut close = false;
-        let modal = egui::Modal::new(egui::Id::unique("library"))
-            .frame(dialog_frame())
-            .backdrop_color(Color32::from_black_alpha(140))
-            .show(ctx, |ui| {
-                ui.set_width(width);
-                close |= dialog_header(
-                    ui,
-                    "Add a component",
-                    "Premade parts land on the guides, ready to adjust. Shift+A opens this window.",
-                );
-                ui.add_space(4.0);
-                let mut cat = self.category;
-                theme::segmented(
-                    ui,
-                    &mut cat,
-                    &[
-                        (Category::All, "All"),
-                        (Category::Face, "Face"),
-                        (Category::Body, "Body"),
-                        (Category::Extras, "Extras"),
-                        (Category::Templates, "Templates"),
-                    ],
-                );
-                self.category = cat;
-                ui.add_space(8.0);
-                if self.category == Category::Templates {
-                    close |= self.template_cards(ui, width);
-                    return;
-                }
-                let parts: Vec<&LibraryPart> = LIBRARY
-                    .iter()
-                    .filter(|p| self.category == Category::All || p.category == self.category)
-                    .collect();
-                let gap = 12.0;
-                let cols = 5;
-                let card_w = ((width - (cols - 1) as f32 * gap) / cols as f32).floor();
-                for row in parts.chunks(cols) {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = gap;
-                        for part in row {
-                            let added = part.once.is_some_and(|k| kinds.contains(&k));
-                            if part_card(ui, card_w, part, added).clicked() && !added {
-                                let before = self.status_serial;
-                                (part.add)(self);
-                                self.mode = Mode::Guides;
-                                if self.status_serial != before && !self.error {
-                                    close = true;
-                                }
-                            }
-                        }
-                    });
-                    ui.add_space(gap - 8.0);
-                }
-                ui.add_space(4.0);
-                self.library_options(ui);
-            });
-        if close || modal.should_close() {
-            self.library_open = false;
-        }
-    }
-
     /// The Templates category: a card per template, then saving and the folders.
     /// Returns whether a template was loaded.
     fn template_cards(&mut self, ui: &mut Ui, width: f32) -> bool {
@@ -2775,65 +2633,6 @@ impl Studio {
                 }
             });
         loaded
-    }
-
-    fn library_options(&mut self, ui: &mut Ui) {
-        let bones = self.doc.as_ref().map(Doc::bone_names).unwrap_or_default();
-        if !bones.contains(&self.chain_parent) {
-            self.chain_parent = bones
-                .iter()
-                .find(|b| b.as_str() == "head")
-                .or(bones.first())
-                .cloned()
-                .unwrap_or_default();
-        }
-        egui::Frame::new()
-            .fill(Color32::from_rgb(17, 20, 26))
-            .stroke(Stroke::new(1.0, BORDER))
-            .corner_radius(12)
-            .inner_margin(12)
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    theme::label_caps(ui, "Options");
-                    ui.add_space(8.0);
-                    ui.label(RichText::new("Fingers on").color(TEXT_DIM));
-                    theme::segmented(
-                        ui,
-                        &mut self.finger_sides,
-                        &[
-                            (FingerSides::Both, "Both"),
-                            (FingerSides::Left, "Left"),
-                            (FingerSides::Right, "Right"),
-                        ],
-                    );
-                    ui.add_space(12.0);
-                    ui.label(RichText::new("Tail bones").color(TEXT_DIM));
-                    ui.add(egui::DragValue::new(&mut self.tail_joints).range(2..=24));
-                });
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    theme::label_caps(ui, "Chain");
-                    ui.add_space(8.0);
-                    ui.label(RichText::new("on").color(TEXT_DIM));
-                    egui::ComboBox::from_id_salt("chain_parent")
-                        .selected_text(self.chain_parent.as_str())
-                        .height(320.0)
-                        .show_ui(ui, |ui| {
-                            for b in &bones {
-                                ui.selectable_value(&mut self.chain_parent, b.clone(), b);
-                            }
-                        });
-                    ui.label(RichText::new("bones").color(TEXT_DIM));
-                    ui.add(egui::DragValue::new(&mut self.chain_joints).range(1..=24));
-                    ui.label(RichText::new("name").color(TEXT_DIM));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.chain_id)
-                            .hint_text("automatic")
-                            .desired_width(110.0),
-                    );
-                });
-            });
     }
 
     // ----------------------------------------------------------------------- export window
@@ -4430,116 +4229,6 @@ fn dock_icon(painter: &egui::Painter, c: Pos2, icon: Icon, color: Color32) {
 }
 
 // --------------------------------------------------------------------------- rigging window art
-
-#[derive(Clone, Copy)]
-enum Art {
-    Face,
-    Toes,
-    HindLegs,
-    Eyes,
-    Jaw,
-    Ears,
-    Fingers,
-    Tail,
-    Tentacle,
-    Antlers,
-    Ponytail,
-    Prop,
-    Chain,
-}
-
-fn part_card(ui: &mut Ui, width: f32, part: &LibraryPart, added: bool) -> egui::Response {
-    let height = 204.0;
-    let sense = if added {
-        Sense::hover()
-    } else {
-        Sense::click()
-    };
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), sense);
-    let hovered = response.hovered() && !added;
-    let painter = ui.painter();
-    painter.rect_filled(rect, 14, if hovered { CARD_HI } else { CARD });
-    painter.rect_stroke(
-        rect,
-        14,
-        Stroke::new(
-            if hovered { 1.5 } else { 1.0 },
-            if hovered {
-                ACCENT.gamma_multiply(0.8)
-            } else {
-                BORDER
-            },
-        ),
-        egui::StrokeKind::Inside,
-    );
-    let art = Rect::from_min_size(rect.min + Vec2::splat(6.0), Vec2::new(width - 12.0, 128.0));
-    paint_art_backdrop(painter, art, hovered);
-    illustration(&painter.with_clip_rect(art), art, part.art, hovered);
-    if added {
-        let chip = Rect::from_min_size(
-            art.right_top() + Vec2::new(-60.0, 8.0),
-            Vec2::new(52.0, 20.0),
-        );
-        painter.rect_filled(chip, 10, OK.gamma_multiply(0.2));
-        painter.text(
-            chip.center(),
-            Align2::CENTER_CENTER,
-            "Added",
-            FontId::proportional(11.0),
-            OK,
-        );
-    } else {
-        let plus = art.right_top() + Vec2::new(-16.0, 16.0);
-        painter.circle_filled(
-            plus,
-            11.0,
-            if hovered {
-                ACCENT
-            } else {
-                Color32::from_black_alpha(90)
-            },
-        );
-        let ink = if hovered {
-            theme::ACCENT_TEXT
-        } else {
-            TEXT_DIM
-        };
-        painter.line_segment(
-            [plus - Vec2::new(4.5, 0.0), plus + Vec2::new(4.5, 0.0)],
-            Stroke::new(1.8, ink),
-        );
-        painter.line_segment(
-            [plus - Vec2::new(0.0, 4.5), plus + Vec2::new(0.0, 4.5)],
-            Stroke::new(1.8, ink),
-        );
-    }
-    painter.text(
-        Pos2::new(rect.left() + 14.0, art.bottom() + 12.0),
-        Align2::LEFT_TOP,
-        part.title,
-        FontId::proportional(15.5),
-        if added { TEXT_DIM } else { TEXT },
-    );
-    let galley = painter.layout(
-        part.text.to_string(),
-        FontId::proportional(12.0),
-        TEXT_DIM,
-        width - 28.0,
-    );
-    painter.galley(
-        Pos2::new(rect.left() + 14.0, art.bottom() + 34.0),
-        galley,
-        TEXT_DIM,
-    );
-    if added {
-        response.on_hover_text(format!("The rig already has {}", part.title.to_lowercase()))
-    } else {
-        response
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .on_hover_text(format!("Add {}", part.title.to_lowercase()))
-    }
-}
-
 /// A card in the Templates category: the template's guides seen from the
 /// front, its name, what it holds and where it comes from.
 fn template_card(ui: &mut Ui, width: f32, l: &Listed) -> egui::Response {
@@ -4762,399 +4451,6 @@ fn hot_chain(painter: &egui::Painter, pts: &[Pos2], width: f32, hot: bool) {
         && let Some(first) = pts.first()
     {
         brackets(painter, *first, r + 4.0, Stroke::new(1.6, HANDLE));
-    }
-}
-
-/// Illustrations for the rigging window: a small mannequin, or a bust for face
-/// parts, with the part the component adds picked out in honey.
-fn illustration(painter: &egui::Painter, r: Rect, art: Art, hot: bool) {
-    match art {
-        Art::Face | Art::Eyes | Art::Jaw | Art::Ears | Art::Antlers | Art::Ponytail => {
-            bust(painter, r, art, hot)
-        }
-        Art::Fingers
-        | Art::Toes
-        | Art::HindLegs
-        | Art::Tail
-        | Art::Tentacle
-        | Art::Prop
-        | Art::Chain => figure(painter, r, art, hot),
-    }
-}
-
-fn figure(painter: &egui::Painter, r: Rect, art: Art, hot: bool) {
-    // A 100-unit-tall mannequin facing the viewer: its left is on screen right.
-    let k = r.height() * 0.84 / 100.0;
-    let origin = Pos2::new(r.center().x, r.top() + r.height() * 0.06);
-    let pt = |x: f32, y: f32| origin + Vec2::new(x * k, y * k);
-    let limb = Stroke::new(5.5 * k, SKIN);
-    // Body.
-    painter.add(egui::Shape::convex_polygon(
-        vec![
-            pt(-12.0, 20.0),
-            pt(12.0, 20.0),
-            pt(9.5, 38.0),
-            pt(8.0, 53.0),
-            pt(-8.0, 53.0),
-            pt(-9.5, 38.0),
-        ],
-        SKIN,
-        Stroke::NONE,
-    ));
-    painter.circle_filled(pt(0.0, 9.0), 7.5 * k, SKIN);
-    painter.line_segment([pt(0.0, 14.0), pt(0.0, 21.0)], Stroke::new(4.0 * k, SKIN));
-    let arm = |s: f32| [pt(12.0 * s, 21.0), pt(23.0 * s, 34.0), pt(32.0 * s, 46.0)];
-    let leg = |s: f32| {
-        [
-            pt(5.5 * s, 52.0),
-            pt(6.5 * s, 74.0),
-            pt(7.0 * s, 94.0),
-            pt(9.5 * s, 98.0),
-        ]
-    };
-    for s in [-1.0f32, 1.0] {
-        let a = arm(s);
-        painter.add(egui::Shape::line(a.to_vec(), limb));
-        painter.circle_filled(a[2], 3.2 * k, SKIN);
-        let l = leg(s);
-        painter.add(egui::Shape::line(l.to_vec(), Stroke::new(6.5 * k, SKIN)));
-    }
-    // Skeleton.
-    let bone = Stroke::new(1.2, BONE);
-    let spine = [
-        pt(0.0, 52.0),
-        pt(0.0, 37.0),
-        pt(0.0, 22.0),
-        pt(0.0, 16.0),
-        pt(0.0, 9.0),
-    ];
-    painter.add(egui::Shape::line(spine.to_vec(), bone));
-    for s in [-1.0f32, 1.0] {
-        let a = arm(s);
-        painter.add(egui::Shape::line(
-            vec![pt(0.0, 22.0), a[0], a[1], a[2]],
-            bone,
-        ));
-        let l = leg(s);
-        painter.add(egui::Shape::line(
-            vec![pt(0.0, 52.0), l[0], l[1], l[2], l[3]],
-            bone,
-        ));
-    }
-    let dot = 2.4;
-    for (x, y) in [
-        (0.0, 52.0),
-        (0.0, 37.0),
-        (0.0, 22.0),
-        (0.0, 16.0),
-        (0.0, 9.0),
-    ] {
-        joint(painter, pt(x, y), x, dot);
-    }
-    for s in [-1.0f32, 1.0] {
-        for (x, y) in [
-            (12.0, 21.0),
-            (23.0, 34.0),
-            (32.0, 46.0),
-            (5.5, 52.0),
-            (6.5, 74.0),
-            (7.0, 94.0),
-        ] {
-            joint(painter, pt(x * s, y), x * s, dot);
-        }
-    }
-
-    match art {
-        Art::Fingers => {
-            for s in [-1.0f32, 1.0] {
-                let wrist = pt(32.0 * s, 46.0);
-                painter.circle_filled(
-                    wrist + Vec2::new(2.0 * s * k, 5.0 * k),
-                    9.0 * k,
-                    ACCENT.gamma_multiply(0.16),
-                );
-                for (dx, dy) in [(-1.5, 6.5), (1.0, 8.5), (3.2, 8.8), (5.2, 8.0), (6.8, 6.2)] {
-                    let base = wrist + Vec2::new(1.5 * s * k, 2.5 * k);
-                    let tip = wrist + Vec2::new(dx * s * k, dy * k);
-                    let mid = base.lerp(tip, 0.5);
-                    hot_chain(painter, &[base, mid, tip], 1.0, hot);
-                }
-            }
-        }
-        Art::Toes => {
-            // Five toes fanning out from each foot's ball.
-            for s in [-1.0f32, 1.0] {
-                let ball = pt(9.5 * s, 97.0);
-                painter.circle_filled(ball, 3.0 * k, ACCENT.gamma_multiply(0.16));
-                for (dx, dy) in [
-                    (3.2, 3.5),
-                    (2.5, 1.2),
-                    (1.2, 0.4),
-                    (-0.2, -0.2),
-                    (-1.5, -1.0),
-                ] {
-                    let tip = ball + Vec2::new(dx * s * k * 2.0, dy * k * 2.0);
-                    let base = ball;
-                    let mid = base.lerp(tip, 0.5);
-                    hot_chain(painter, &[base, mid, tip], 1.0, hot);
-                }
-            }
-        }
-        Art::HindLegs => {
-            // A zigzag hind leg on each side: thigh, calf, hock and paw.
-            for s in [-1.0f32, 1.0] {
-                let pts: Vec<Pos2> = [
-                    (5.5, 52.0),
-                    (9.5, 67.0),
-                    (4.5, 82.0),
-                    (7.0, 93.0),
-                    (11.0, 97.0),
-                ]
-                .into_iter()
-                .map(|(x, y)| pt(x * s, y))
-                .collect();
-                hot_chain(painter, &pts, 2.0, hot);
-            }
-        }
-        Art::Tail => {
-            let pts: Vec<Pos2> = [
-                (3.0, 55.0),
-                (9.0, 63.0),
-                (16.0, 68.0),
-                (23.0, 68.0),
-                (28.0, 64.0),
-                (31.0, 58.0),
-            ]
-            .into_iter()
-            .map(|(x, y)| pt(x, y))
-            .collect();
-            hot_chain(painter, &pts, 2.2, hot);
-        }
-        Art::Tentacle => {
-            // A wavy chain from the pelvis with square curve controls along it.
-            let pts: Vec<Pos2> = (0..9)
-                .map(|i| {
-                    let t = i as f32 / 8.0;
-                    let x = 4.0 + 40.0 * t;
-                    let y = 58.0 + 16.0 * t - 7.0 * (t * std::f32::consts::TAU).sin();
-                    pt(x, y)
-                })
-                .collect();
-            hot_chain(painter, &pts, 1.4, hot);
-            let honey = if hot {
-                Color32::from_rgb(255, 205, 100)
-            } else {
-                ACCENT
-            };
-            for i in [0, 3, 5, 8] {
-                painter.rect_stroke(
-                    Rect::from_center_size(pts[i], Vec2::splat(5.5 * k)),
-                    1,
-                    Stroke::new(1.6, honey),
-                    egui::StrokeKind::Middle,
-                );
-            }
-        }
-        Art::Prop => {
-            let hand = pt(-32.0, 46.0);
-            let tip = pt(-46.0, 14.0);
-            let dir = (tip - hand).normalized();
-            let n = Vec2::new(-dir.y, dir.x);
-            let guard = hand + dir * 5.0 * k;
-            painter.add(egui::Shape::line(
-                vec![hand, tip],
-                Stroke::new(8.0, ACCENT.gamma_multiply(0.18)),
-            ));
-            painter.add(egui::Shape::convex_polygon(
-                vec![guard + n * 2.2 * k, tip, guard - n * 2.2 * k],
-                if hot {
-                    Color32::from_rgb(255, 205, 100)
-                } else {
-                    ACCENT
-                },
-                Stroke::NONE,
-            ));
-            painter.line_segment(
-                [guard + n * 5.0 * k, guard - n * 5.0 * k],
-                Stroke::new(2.5, ACCENT),
-            );
-            painter.circle_stroke(hand, 4.5, Stroke::new(1.8, ACCENT));
-        }
-        Art::Chain => {
-            let pts: Vec<Pos2> = [
-                (13.0, 22.0),
-                (17.0, 29.0),
-                (19.5, 36.5),
-                (20.5, 44.0),
-                (20.0, 51.0),
-            ]
-            .into_iter()
-            .map(|(x, y)| pt(x + 4.0, y))
-            .collect();
-            hot_chain(painter, &pts, 1.8, hot);
-        }
-        _ => {}
-    }
-}
-
-fn bust(painter: &egui::Painter, r: Rect, art: Art, hot: bool) {
-    let rad = r.height() * 0.26;
-    let hc = r.center() - Vec2::new(0.0, r.height() * 0.1);
-    let p = |x: f32, y: f32| hc + Vec2::new(x * rad, y * rad);
-    // Shoulders, neck and head.
-    painter.add(egui::Shape::convex_polygon(
-        vec![p(-1.7, 1.55), p(1.7, 1.55), p(2.6, 2.6), p(-2.6, 2.6)],
-        SKIN,
-        Stroke::NONE,
-    ));
-    painter.rect_filled(Rect::from_min_max(p(-0.38, 0.6), p(0.38, 1.7)), 4, SKIN);
-    painter.circle_filled(hc, rad, SKIN);
-    // Neck and head bones.
-    let bone = Stroke::new(1.2, BONE);
-    painter.line_segment([p(0.0, 1.6), p(0.0, 0.25)], bone);
-    painter.line_segment([p(0.0, 0.25), p(0.0, -0.95)], bone);
-    joint(painter, p(0.0, 1.6), 0.0, 2.6);
-    joint(painter, p(0.0, 0.25), 0.0, 2.6);
-
-    match art {
-        Art::Face => {
-            // A joint on each brow, lid, cheek and lip, like the face guides.
-            for sx in [-1.0f32, 1.0] {
-                let brow = [p(0.18 * sx, -0.42), p(0.4 * sx, -0.5), p(0.62 * sx, -0.42)];
-                hot_chain(painter, &brow, 1.4, hot);
-                painter.circle_stroke(
-                    p(0.4 * sx, -0.14),
-                    0.15 * rad,
-                    Stroke::new(1.0, Color32::from_rgb(28, 30, 36)),
-                );
-                for y in [-0.3, 0.02] {
-                    joint(painter, p(0.4 * sx, y), sx, 2.4);
-                }
-                joint(painter, p(0.55 * sx, 0.3), sx, 2.6);
-            }
-            joint(painter, p(0.0, 0.18), 0.0, 2.6);
-            let mouth = [p(-0.3, 0.6), p(0.0, 0.53), p(0.3, 0.6)];
-            painter.add(egui::Shape::line(
-                mouth.to_vec(),
-                Stroke::new(1.4, Color32::from_rgb(28, 30, 36)),
-            ));
-            hot_chain(painter, &mouth, 1.4, hot);
-            hot_chain(painter, &[p(0.0, 0.68)], 1.4, hot);
-        }
-        Art::Eyes => {
-            let target = p(1.6, -1.15);
-            for sx in [-1.0f32, 1.0] {
-                let eye = p(0.36 * sx, -0.08);
-                painter.extend(egui::Shape::dashed_line(
-                    &[eye, target],
-                    Stroke::new(1.2, ACCENT.gamma_multiply(0.75)),
-                    4.0,
-                    3.0,
-                ));
-                painter.circle_filled(eye, 0.19 * rad, Color32::from_rgb(222, 226, 235));
-                painter.circle_filled(
-                    eye + (target - eye).normalized() * 0.07 * rad,
-                    0.09 * rad,
-                    Color32::from_rgb(28, 30, 36),
-                );
-                painter.circle_stroke(
-                    eye,
-                    0.19 * rad + 2.0,
-                    Stroke::new(
-                        1.6,
-                        if hot {
-                            Color32::from_rgb(255, 205, 100)
-                        } else {
-                            ACCENT
-                        },
-                    ),
-                );
-            }
-            let d = 6.0;
-            painter.add(egui::Shape::convex_polygon(
-                vec![
-                    target + Vec2::new(0.0, -d),
-                    target + Vec2::new(d, 0.0),
-                    target + Vec2::new(0.0, d),
-                    target + Vec2::new(-d, 0.0),
-                ],
-                ACCENT,
-                Stroke::new(1.0, theme::ACCENT_TEXT),
-            ));
-        }
-        Art::Jaw => {
-            let outline: Vec<Pos2> = [
-                (-0.86, 0.05),
-                (-0.62, 0.72),
-                (0.0, 1.05),
-                (0.62, 0.72),
-                (0.86, 0.05),
-            ]
-            .into_iter()
-            .map(|(x, y)| p(x, y + 0.08))
-            .collect();
-            painter.add(egui::Shape::line(
-                outline.clone(),
-                Stroke::new(7.0, ACCENT.gamma_multiply(0.16)),
-            ));
-            painter.add(egui::Shape::line(outline, Stroke::new(2.0, ACCENT)));
-            painter.add(egui::Shape::line(
-                arc(p(0.0, 0.55), 0.32 * rad, -2.6, -0.54),
-                Stroke::new(1.6, Color32::from_rgb(28, 30, 36)),
-            ));
-            hot_chain(painter, &[p(0.0, 0.12), p(0.0, 1.05)], 2.0, hot);
-        }
-        Art::Ears => {
-            for sx in [-1.0f32, 1.0] {
-                let shape = vec![p(0.88 * sx, 0.2), p(1.55 * sx, -0.95), p(1.0 * sx, -0.45)];
-                painter.add(egui::Shape::convex_polygon(
-                    shape,
-                    SKIN,
-                    Stroke::new(1.0, ACCENT.gamma_multiply(0.6)),
-                ));
-                hot_chain(
-                    painter,
-                    &[
-                        p(0.92 * sx, -0.05),
-                        p(1.18 * sx, -0.48),
-                        p(1.45 * sx, -0.85),
-                    ],
-                    1.6,
-                    hot,
-                );
-            }
-        }
-        Art::Antlers => {
-            // A beam rising from each side of the head, a tine forking off it.
-            for sx in [-1.0f32, 1.0] {
-                let beam = [
-                    p(0.45 * sx, -0.9),
-                    p(0.8 * sx, -1.35),
-                    p(1.0 * sx, -1.8),
-                    p(1.05 * sx, -2.25),
-                ];
-                hot_chain(painter, &beam, 1.6, hot);
-                hot_chain(painter, &[beam[1], p(0.5 * sx, -1.75)], 1.6, hot);
-                hot_chain(painter, &[beam[2], p(1.45 * sx, -2.1)], 1.6, hot);
-            }
-        }
-        Art::Ponytail => {
-            // A hair cap, then the tail swinging down one side.
-            painter.add(egui::Shape::line(
-                arc(hc, rad * 1.02, 0.2, std::f32::consts::PI - 0.2),
-                Stroke::new(4.0, Color32::from_rgb(86, 94, 112)),
-            ));
-            let pts = [
-                p(0.35, -1.0),
-                p(0.95, -0.85),
-                p(1.3, -0.3),
-                p(1.42, 0.4),
-                p(1.36, 1.1),
-                p(1.5, 1.75),
-            ];
-            hot_chain(painter, &pts, 2.0, hot);
-        }
-        _ => {}
     }
 }
 

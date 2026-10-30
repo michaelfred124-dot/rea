@@ -2,7 +2,7 @@
 //! the guides, build and export.
 //!
 //! `HiveRig [character, rig or guides file] [--demo [dog|bird|spider|snake|horse|dinosaur]] [--build] [--weights BONE] [--paint] [--dab add|subtract|replace|scale|smooth|mend]
-//! [--lock BONE] [--bend DEGREES] [--bend-axis x|y|z] [--tools] [--window paint|smooth|tools|vertices]... [--vertices] [--hover] [--library] [--templates] [--export]
+//! [--lock BONE] [--bend DEGREES] [--bend-axis x|y|z] [--tools] [--window paint|smooth|tools|vertices]... [--vertices] [--hover] [--library] [--card PART] [--category body|creature|face|extras|templates] [--add-part PART[,PART...]] [--templates] [--export]
 //! [--select COMPONENT[,COMPONENT...]] [--pick NAME] [--pose BONE[=DEGREES[@x|y|z]]] [--set CONTROL=TX,TY,TZ,RX,RY,RZ]... [--attr CONTROL.NAME=VALUE]... [--shape NAME=WEIGHT]... [--feathers COUNT[,ROWS]]
 //! [--corrective] [--inbetween WEIGHT] [--sculpt grab|smooth|relax|inflate|erase] [--all-bones]
 //! [--bone-filter TEXT] [--add-demo [dog|bird|...]] [--build-all] [--character NAME]
@@ -52,6 +52,12 @@ struct Launch {
     /// Show the influences of the vertex at the brush spot, as on hover.
     hover: bool,
     library: bool,
+    /// `--card PART`: pick that card in the rigging window.
+    card: Option<String>,
+    /// `--category NAME`: the rigging window's filter.
+    category: Option<String>,
+    /// `--add-part A,B`: add these library parts, one after another.
+    add_parts: Vec<String>,
     templates: bool,
     export: bool,
     select: Option<String>,
@@ -159,6 +165,17 @@ fn parse_args() -> Launch {
             Some("--vertices") => launch.vertices = true,
             Some("--hover") => launch.hover = true,
             Some("--library") => launch.library = true,
+            Some("--card") => launch.card = args.next().map(|s| s.to_string_lossy().into_owned()),
+            Some("--category") => {
+                launch.library = true;
+                launch.category = args.next().map(|s| s.to_string_lossy().into_owned())
+            }
+            Some("--add-part") => launch.add_parts.extend(
+                args.next()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .into_iter()
+                    .flat_map(|s| s.split(',').map(str::to_string).collect::<Vec<_>>()),
+            ),
             Some("--templates") => {
                 launch.library = true;
                 launch.templates = true;
@@ -371,7 +388,21 @@ fn main() -> eframe::Result {
             studio.set_window(w, true);
         }
     }
+    for key in &launch.add_parts {
+        studio.add_part(key);
+    }
+    if let Some(part) = launch.card.as_deref().and_then(app::library_part) {
+        studio.pick_part(part);
+    }
     studio.library_open = launch.library;
+    studio.category = match launch.category.as_deref() {
+        Some("body") => app::Category::Body,
+        Some("creature") => app::Category::Creature,
+        Some("face") => app::Category::Face,
+        Some("extras") => app::Category::Extras,
+        Some("templates") => app::Category::Templates,
+        _ => studio.category,
+    };
     if launch.templates {
         studio.category = app::Category::Templates;
     }

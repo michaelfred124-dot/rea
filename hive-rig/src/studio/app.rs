@@ -11,9 +11,7 @@ use eframe::egui::{self, Color32};
 use glam::Vec3;
 
 use hive_rig::checks::{self, Issue, Surface};
-use hive_rig::components::{
-    self, AddOptions, Built, Component, ControlStyle, Guide, Guides, Kind, Options, Preset,
-};
+use hive_rig::components::{self, Built, ControlStyle, Guides, Kind};
 use hive_rig::joints::Joint;
 use hive_rig::naming::Naming;
 use hive_rig::orient::{Choice, Detection, Orientation};
@@ -171,8 +169,10 @@ pub enum Mode {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Category {
     All,
-    Face,
     Body,
+    /// Wings, extra limbs, horns and the like.
+    Creature,
+    Face,
     Extras,
     /// Saved setups: the built-in templates and the ones in the template folders.
     Templates,
@@ -302,11 +302,11 @@ pub struct Studio {
     pub warn: bool,
     /// Bumped on every status change, so the UI can show it as a notification.
     pub status_serial: u64,
-    pub finger_sides: FingerSides,
-    pub tail_joints: usize,
-    pub chain_parent: String,
-    pub chain_joints: usize,
-    pub chain_id: String,
+    /// The part picked in the rigging window, the choices made for each part
+    /// and the search text.
+    pub lib_pick: Option<&'static str>,
+    pub lib_opts: HashMap<&'static str, library::PartOptions>,
+    pub lib_search: String,
     /// Bone or control picked in the build stages, shown in Properties.
     pub rig_pick: Option<RigPick>,
     pub pose: Option<Pose>,
@@ -388,11 +388,9 @@ impl Default for Studio {
             error: false,
             warn: false,
             status_serial: 0,
-            finger_sides: FingerSides::Both,
-            tail_joints: 5,
-            chain_parent: String::new(),
-            chain_joints: 3,
-            chain_id: String::new(),
+            lib_pick: None,
+            lib_opts: HashMap::new(),
+            lib_search: String::new(),
             skin_tools: SkinTools::default(),
             drag: None,
             stroke: None,
@@ -1304,71 +1302,6 @@ impl Studio {
         self.weight_colors = None;
     }
 
-    /// Toes on the feet, on the same side choice as fingers.
-    pub fn add_toes(&mut self) {
-        let side = match self.finger_sides {
-            FingerSides::Both => None,
-            FingerSides::Left => Some(Side::Left),
-            FingerSides::Right => Some(Side::Right),
-        };
-        self.add(
-            Preset::Toes,
-            AddOptions {
-                side,
-                ..AddOptions::default()
-            },
-        );
-    }
-
-    /// Three-segment hind legs on the pelvis, on the same side choice as fingers.
-    /// A side that already has a leg is refused; remove that leg first.
-    pub fn add_hind_legs(&mut self) {
-        let side = match self.finger_sides {
-            FingerSides::Both => None,
-            FingerSides::Left => Some(Side::Left),
-            FingerSides::Right => Some(Side::Right),
-        };
-        self.add(
-            Preset::QuadLegs,
-            AddOptions {
-                side,
-                ..AddOptions::default()
-            },
-        );
-    }
-
-    pub fn add_fingers(&mut self) {
-        let side = match self.finger_sides {
-            FingerSides::Both => None,
-            FingerSides::Left => Some(Side::Left),
-            FingerSides::Right => Some(Side::Right),
-        };
-        let opts = AddOptions {
-            side,
-            ..AddOptions::default()
-        };
-        self.add(Preset::Fingers, opts);
-    }
-
-    pub fn add_tail(&mut self) {
-        let opts = AddOptions {
-            joints: Some(self.tail_joints),
-            ..AddOptions::default()
-        };
-        self.add(Preset::Tail, opts);
-    }
-
-    /// A curve-driven tentacle from the pelvis (8 joints, 4 curve controls);
-    /// its counts change in Properties.
-    pub fn add_tentacle(&mut self) {
-        self.add(Preset::Tentacle, AddOptions::default());
-    }
-
-    /// Forking FK chains on each side of the head; more forks come from Properties.
-    pub fn add_antlers(&mut self) {
-        self.add(Preset::Antlers, AddOptions::default());
-    }
-
     /// Fork chain `id` at its guide `from` with a branch of `joints` (and its twin).
     pub fn add_branch(&mut self, id: &str, from: &str, joints: usize) {
         let (id, from) = (id.to_string(), from.to_string());
@@ -1393,45 +1326,6 @@ impl Studio {
                 )
             })
         });
-    }
-
-    pub fn add_chain(&mut self) {
-        let id = self.chain_id.trim();
-        let opts = AddOptions {
-            parent: Some(self.chain_parent.clone()).filter(|p| !p.is_empty()),
-            joints: Some(self.chain_joints),
-            id: (!id.is_empty()).then(|| id.to_string()),
-            ..AddOptions::default()
-        };
-        self.add(Preset::Chain, opts);
-    }
-
-    fn add(&mut self, preset: Preset, opts: AddOptions) {
-        let added = self.edit("add that component", |g| {
-            let ids = components::add_preset(g, preset, &opts)?;
-            Ok(format!("Added {}.", ids.join(", ")))
-        });
-        if added && let Some(doc) = &self.doc {
-            self.selected = Some((doc.guides.components.len() - 1, None));
-        }
-    }
-
-    /// Eyes with a look-at control, pushed onto the front of the face.
-    pub fn add_eyes(&mut self) {
-        self.add(Preset::Eyes, AddOptions::default());
-        self.snap_to_face(Kind::Eyes, &["eye_l", "eye_r"], 0.012);
-    }
-
-    /// A jaw, with the chin on the front of the face.
-    pub fn add_jaw(&mut self) {
-        self.add(Preset::Jaw, AddOptions::default());
-        self.snap_to_face(Kind::Jaw, &["chin"], 0.0);
-    }
-
-    /// Face joints (brows, eyelids, cheeks, nose, lips), pushed onto the face.
-    pub fn add_face(&mut self) {
-        self.add(Preset::Face, AddOptions::default());
-        self.snap_to_face(Kind::Face, &components::FACE_GUIDES, 0.003);
     }
 
     /// Copy one side's skin weights onto the other on the built rig.
@@ -1756,86 +1650,6 @@ impl Studio {
         doc.refresh();
     }
 
-    /// A pair of ears on the head, two bones each.
-    pub fn add_ears(&mut self) {
-        self.add_custom("add ears", |g| {
-            let (head, top, h) = head_frame(g)?;
-            let mut ids = Vec::new();
-            for side in [Side::Left, Side::Right] {
-                let s = side.sign();
-                let start = head.lerp(top, 0.45) + Vec3::X * (0.055 * h * s);
-                let dir = Vec3::new(0.45 * s, 1.0, -0.15).normalize();
-                let id = format!("ear{}", side.suffix());
-                g.components
-                    .push(chain(&id, side, "head", start, dir, 0.07 * h, 2));
-                ids.push(id);
-            }
-            Ok(ids)
-        });
-    }
-
-    /// A ponytail hanging from the back of the head.
-    pub fn add_ponytail(&mut self) {
-        self.add_custom("add a ponytail", |g| {
-            let (head, top, h) = head_frame(g)?;
-            let start = head.lerp(top, 0.6) - Vec3::Z * (0.06 * h);
-            let dir = Vec3::new(0.0, -0.7, -1.0).normalize();
-            g.components.push(chain(
-                "ponytail",
-                Side::Center,
-                "head",
-                start,
-                dir,
-                0.22 * h,
-                4,
-            ));
-            Ok(vec!["ponytail".into()])
-        });
-    }
-
-    /// A one-bone prop (weapon, tool) socket in the right hand.
-    pub fn add_prop(&mut self) {
-        self.add_custom("add a prop bone", |g| {
-            let built = components::build(g)?;
-            let hand = built
-                .skeleton
-                .bone("hand_r")
-                .ok_or_else(|| anyhow::anyhow!("the rig has no right hand (hand_r)"))?;
-            let h = g.body.height;
-            let start = hand.head.lerp(hand.tail, 0.5);
-            g.components.push(chain(
-                "prop_r",
-                Side::Right,
-                "hand_r",
-                start,
-                Vec3::Z,
-                0.12 * h,
-                1,
-            ));
-            Ok(vec!["prop_r".into()])
-        });
-    }
-
-    fn add_custom(
-        &mut self,
-        what: &str,
-        change: impl FnOnce(&mut Guides) -> anyhow::Result<Vec<String>>,
-    ) {
-        let added = self.edit(what, |g| {
-            let ids = change(g)?;
-            for id in &ids {
-                anyhow::ensure!(
-                    g.components.iter().filter(|c| &c.id == id).count() == 1,
-                    "{id} already exists"
-                );
-            }
-            Ok(format!("Added {}.", ids.join(", ")))
-        });
-        if added && let Some(doc) = &self.doc {
-            self.selected = Some((doc.guides.components.len() - 1, None));
-        }
-    }
-
     pub fn remove_selected(&mut self) {
         let Some((c, _)) = self.selected else { return };
         let Some(id) = self.doc.as_ref().map(|d| d.guides.components[c].id.clone()) else {
@@ -2072,46 +1886,6 @@ impl Studio {
     }
 }
 
-/// The head component's head and head-top guides, and the body height.
-fn head_frame(g: &Guides) -> anyhow::Result<(Vec3, Vec3, f32)> {
-    let head = g
-        .components
-        .iter()
-        .find(|c| c.kind == Kind::Head)
-        .ok_or_else(|| anyhow::anyhow!("the rig has no head component"))?;
-    Ok((
-        head.position("head").unwrap(),
-        head.position("head_top").unwrap(),
-        g.body.height,
-    ))
-}
-
-/// An FK chain component of `joints` bones from `start` along `dir`.
-fn chain(
-    id: &str,
-    side: Side,
-    parent: &str,
-    start: Vec3,
-    dir: Vec3,
-    length: f32,
-    joints: usize,
-) -> Component {
-    Component {
-        id: id.into(),
-        kind: Kind::Chain,
-        side,
-        parent: Some(parent.into()),
-        guides: (0..=joints)
-            .map(|k| Guide {
-                name: format!("j{}", k + 1),
-                position: start + dir * (length * k as f32 / joints as f32),
-                from: None,
-            })
-            .collect(),
-        options: Options::default(),
-    }
-}
-
 /// Distance along the ray to where it crosses triangle abc, if it does.
 fn ray_triangle(origin: Vec3, dir: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
     let (e1, e2) = (b - a, c - a);
@@ -2214,6 +1988,8 @@ fn push_undo(undo: &mut Vec<Guides>, g: &Guides) {
 
 mod cast;
 mod control_shapes;
+mod library;
+pub use library::part as library_part;
 mod posing;
 mod readers;
 mod shapes;
@@ -2421,6 +2197,191 @@ mod tests {
 
         s.undo();
         assert!(s.doc.as_ref().unwrap().guides.naming.is_default());
+    }
+
+    /// Every card of the rigging window adds its part to the demo character,
+    /// selects its first guide, says what to adjust, and shows as added.
+    #[test]
+    fn every_library_part_adds_on_the_demo() {
+        use library::{Action, LIBRARY};
+        for part in LIBRARY.iter() {
+            let mut s = demo_studio();
+            match part.key {
+                // The demo has these: take them off first.
+                "arms" | "legs" | "hind_legs" => {
+                    let ids = if part.key == "arms" {
+                        ["arm_l", "arm_r"]
+                    } else {
+                        ["leg_l", "leg_r"]
+                    };
+                    for id in ids {
+                        s.edit("take the leg off", |g| {
+                            Ok(components::remove(g, id)?.join(", "))
+                        });
+                    }
+                }
+                // The face already comes with its board: take it off first.
+                "face_board" => {
+                    s.add_part("face");
+                    let doc = s.doc.as_mut().unwrap();
+                    for c in &mut doc.guides.components {
+                        c.options.board = false;
+                    }
+                    doc.refresh();
+                }
+                _ => {}
+            }
+            let before = s.doc.as_ref().unwrap().guides.components.len();
+            let tally = part.tally(&s.doc.as_ref().unwrap().guides);
+            assert!(s.add_part(part.key), "{}: {}", part.key, s.status);
+            assert!(!s.error, "{}: {}", part.key, s.status);
+            let g = &s.doc.as_ref().unwrap().guides;
+            components::build(g).unwrap_or_else(|e| panic!("{}: {e:#}", part.key));
+            let Some((comp, Some(0))) = s.selected else {
+                panic!("{}: first guide not selected: {:?}", part.key, s.selected);
+            };
+            assert!(s.status.contains(part.hint), "{}: {}", part.key, s.status);
+            match part.action {
+                Action::Preset(_) => {
+                    assert!(g.components.len() > before || part.key == "face_board");
+                    assert!(
+                        part.tally(g) > tally || part.key == "face_board",
+                        "{}",
+                        part.key
+                    );
+                    assert!(
+                        s.status.contains(&g.components[comp].id),
+                        "{}: {}",
+                        part.key,
+                        s.status
+                    );
+                    if part.single {
+                        // A second one is refused and changes nothing.
+                        let n = g.components.len();
+                        assert!(!s.add_part(part.key) && s.error, "{}", part.key);
+                        assert_eq!(s.doc.as_ref().unwrap().guides.components.len(), n);
+                    }
+                }
+                Action::Spine => assert_eq!(g.components[comp].kind, Kind::Spine),
+                Action::Head => assert_eq!(g.components[comp].kind, Kind::Head),
+            }
+        }
+    }
+
+    #[test]
+    fn library_options_and_counts() {
+        let mut s = demo_studio();
+        let part = |k| library::part(k).unwrap();
+        let (arms, extra, fingers, wings) = (
+            part("arms"),
+            part("extra_arms"),
+            part("fingers"),
+            part("wings"),
+        );
+        let tally = |s: &Studio, p: &library::LibraryPart| p.tally(&s.doc.as_ref().unwrap().guides);
+        // The demo has one pair of arms and no extra ones.
+        assert_eq!((tally(&s, arms), tally(&s, extra)), (1, 0));
+        // Extra arms repeat, named so they don't clash, and bendy on request.
+        s.part_options(extra).bendy = true;
+        assert!(
+            s.add_part("extra_arms") && s.add_part("extra_arms"),
+            "{}",
+            s.status
+        );
+        assert_eq!(tally(&s, extra), 2);
+        let g = &s.doc.as_ref().unwrap().guides;
+        assert!(g.component("arm2_r").unwrap().options.bendy);
+        assert!(g.component("arm3_l").is_some());
+        // Fingers on one hand, three of them, then the other hand.
+        {
+            let o = s.part_options(fingers);
+            o.sides = FingerSides::Left;
+            o.count = 3;
+            o.joints = 2;
+        }
+        assert!(s.add_part("fingers"), "{}", s.status);
+        assert_eq!(tally(&s, fingers), 1);
+        s.part_options(fingers).sides = FingerSides::Right;
+        assert!(s.add_part("fingers"), "{}", s.status);
+        assert_eq!(tally(&s, fingers), 2);
+        let g = &s.doc.as_ref().unwrap().guides;
+        assert!(g.component("middle_l").is_some() && g.component("ring_l").is_none());
+        assert_eq!(g.component("index_r").unwrap().guides.len(), 3);
+        // Wings: the feather count and rows reach the wing.
+        {
+            let o = s.part_options(wings);
+            o.count = 4;
+            o.rows = 2;
+        }
+        assert!(s.add_part("wings"), "{}", s.status);
+        let w = s
+            .doc
+            .as_ref()
+            .unwrap()
+            .guides
+            .component("wing_l")
+            .unwrap()
+            .options
+            .clone();
+        assert_eq!((w.feathers, w.feather_rows), (4, 2));
+        // The spine card edits the spine every rig has.
+        s.pick_part(part("spine"));
+        assert_eq!(s.part_options(part("spine")).joints, 3);
+        {
+            let o = s.part_options(part("spine"));
+            o.joints = 5;
+            o.spline = true;
+            o.controls = 4;
+        }
+        assert!(s.add_part("spine"), "{}", s.status);
+        let g = &s.doc.as_ref().unwrap().guides;
+        let spine = g.components.iter().find(|c| c.kind == Kind::Spine).unwrap();
+        assert!(spine.options.spline && g.spine_joints(spine) == 5);
+        assert!(components::build(g).is_ok());
+        // The window's groups: wings are creatures, fingers are body, a cape is an extra.
+        s.add_part("cape");
+        let g = &s.doc.as_ref().unwrap().guides;
+        let group = |id: &str| library::group_of(g.component(id).unwrap());
+        assert_eq!(group("wing_l"), Category::Creature);
+        assert_eq!(group("thumb_l"), Category::Body);
+        assert_eq!(group("cape_1"), Category::Extras);
+        assert_eq!(group("arm2_l"), Category::Body);
+    }
+
+    /// A rig with parts from every category builds, with each part's bones.
+    #[test]
+    fn library_parts_build_into_a_rig() {
+        let mut s = demo_studio();
+        for key in [
+            "extra_arms",
+            "wings",
+            "horns",
+            "ears",
+            "tail",
+            "cape",
+            "skirt",
+            "fingers",
+            "toes",
+            "extra_legs",
+        ] {
+            assert!(s.add_part(key), "{key}: {}", s.status);
+        }
+        assert!(s.build(), "{}", s.status);
+        let rig = s.doc.as_ref().unwrap().rig.as_ref().unwrap();
+        for b in [
+            "arm2_upperarm_l",
+            "wing_feather1_01_01_l",
+            "horn_03_r",
+            "ear_02_l",
+            "tail_05",
+            "cape_3_04",
+            "skirt_6_03",
+            "thumb_03_l",
+            "toe_big_03_r",
+            "leg2_thigh_l",
+        ] {
+            assert!(rig.skeleton.bone(b).is_some(), "missing {b}");
+        }
     }
 
     #[test]

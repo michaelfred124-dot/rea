@@ -35,7 +35,8 @@ a joint; with Symmetry on, its twin on the other side follows.
   for right to left), Symmetry, the Guides / Skeleton / Controls views, Mesh,
   X-ray, Weights, Undo, Redo, Frame and Export. The honeycomb button in the
   middle builds the rig.
-* **The outliner** (left) lists the components as their attachment tree: each
+* **The outliner** (left) lists the components in the same groups as the rigging
+  window (Body, Wings and creatures, Face, Extras), each as its attachment tree: a
   component sits under the one owning the bone it hangs from (a leg hung from
   the head is listed under the head). **Properties** (right)
   shows the rig summary, the pre-build [checks](#checks-before-building), [blendshapes](#blendshapes-and-corrective-shapes) (a searchable shape list with a slider each, correctives, in-betweens and the sculpt brushes), [pose readers](#cone-and-rbf-readers-and-helper-joints) (cone and RBF, with helper joints), [skin weights](#skin-weights-in-the-app) (the mesh tool, a searchable bone list, the paint brush, mirror and copy, the vertex inspector, locks, fixes and the vertex selection) and naming, or, with a component
@@ -43,10 +44,13 @@ a joint; with Symmetry on, its twin on the other side follows.
   toggle, a tentacle's joint and curve-control counts), exact guide positions and the names its
   bones will export as. Click a panel's title to fold it away.
 * **The rigging window** (Add, or Shift+A) is the library of premade parts, each
-  with an illustration: face joints, eyes with a look-at control, a jaw, ears, fingers, toes, a
-  tail, a curve-driven tentacle, a ponytail, a prop socket in the right hand, three-segment hind legs
-  for quadrupeds, and a custom chain. Its **Templates** category lists saved
-  setups (see [Rig templates](#rig-templates)).
+  a card with an illustration, in four groups (Body, Wings and creatures, Face,
+  Extras) with a search box. Click a card to see its options (sides, bones,
+  parent bone, bendy, FK or curve) and press **Add**, or press the **+** on a card to add
+  it as it is. A card shows what the rig has (**Added**, **2 added**), repeatable
+  parts can be added again under names of their own, and the new part is
+  selected, framed and explained in the toast. See [The component library](#the-component-library).
+  Its **Templates** category lists saved setups (see [Rig templates](#rig-templates)).
 * **The export window** (Ctrl+E) picks the programs (and **Export FBX** for
   game engines), the naming convention, the file name and the folder. With
   several characters, **Export every character** writes them all and the
@@ -537,6 +541,49 @@ hive-rig components out/hero.guides.json            # list the layout
 hive-rig rebuild out/hero.hive.json                 # rebuild from the edited guides
 hive-rig rig other_character.glb --guides out/hero.guides.json   # reuse a layout
 ```
+
+## The component library
+
+Every premade part is a preset of `hive-rig add <guides> <preset>` and a card in
+the app's rigging window, both built by the same code. Guides are placed from the
+current layout (fingers on the hands, ears on the head, an extra pair of arms
+below the first), so the part lands near where it belongs. Parts that can repeat
+number themselves (`arm2`, `arm3`, `wing2`, `cape2`) and a name that is taken is
+refused with a message, never overwritten.
+
+| Group | Card (preset) | Options |
+| --- | --- | --- |
+| Body | Arms (`arms`), Legs (`legs`) | `--side`, `--bendy`, `--parent` |
+| Body | Spine, Neck and head | joint count, FK or curve drive (`hive-rig spine`); every rig has them |
+| Body | Fingers, Toes (`fingers`, `toes`) | `--side`, `--count` 1 to 5 (thumb first), `--joints` bones each |
+| Body | Hind legs (`quad_legs`) | `--side`, `--bendy`, `--parent`, `--id` for another pair |
+| Body | Tail (`tail`) | `--joints`, `--spline` for a curve drive, `--controls`, `--parent` |
+| Body | Tentacle (`tentacle`) | `--joints`, `--controls`, `--parent` |
+| Wings and creatures | Wings (`wings`) | `--count` feathers a row, `--rows`, `--bendy`, `--side`, `--parent` |
+| Wings and creatures | Extra arms (`arms` again) | a second, third... pair: `arm2`, `arm3`, hung from the nearest spine bone |
+| Wings and creatures | Extra legs (`spider_legs`) | `--count` pairs along the spine, each with IK, FK and the knee folding up |
+| Wings and creatures | Antlers, Horns, Ears (`antlers`, `horns`, `ears`) | `--side`, `--joints`, `--parent` |
+| Wings and creatures | Spline spine | `hive-rig spine --spline true --joints N --controls K` |
+| Face | Face, Eyes, Jaw, Face board (`face`, `eyes`, `jaw`, `face_board`) | `--joints` extra lip joints (face and board) |
+| Extras | Ponytail (`ponytail`), Cape (`cape`), Skirt (`skirt`) | `--joints` bones, `--count` strips, `--parent` |
+| Extras | Prop (`prop`), Chain (`chain`) | `--side` hand (right by default), `--parent`, `--joints`, `--id` |
+
+```bash
+hive-rig add out/hero.guides.json arms --bendy         # arm2_l and arm2_r, a second pair for a four-armed hero
+hive-rig add out/hero.guides.json wings --count 8 --rows 2   # wing_l and wing_r with sixteen feathers each
+hive-rig add out/hero.guides.json spider_legs --count 3      # leg2_l ... leg4_r, knees folding up
+hive-rig add out/hero.guides.json horns --joints 4
+hive-rig add out/hero.guides.json cape --count 5 --joints 4  # cape_1 ... cape_5, FK strips from the upper back
+hive-rig add out/hero.guides.json skirt                      # six strips around the hips
+hive-rig add out/hero.guides.json tail --spline --joints 8   # a curve-driven tail
+hive-rig add out/hero.guides.json fingers --count 4 --joints 2   # cartoon hands
+hive-rig rebuild out/hero.hive.json
+```
+
+Every part exports through the Blender, Maya and Unreal builders like any other
+component (checked in real Blender and against the Maya and Unreal stubs: see
+[Testing](#testing)). Limbs always have IK and FK with a switch; there is no
+FK-only limb yet.
 
 ### Spline chains: tentacles and a spline spine
 
@@ -1474,6 +1521,8 @@ python3 -I tests/fbx_to_ascii.py hero.fbx hero_ascii.fbx   # a binary FBX rewrit
 python3 tests/dcc_stub_run.py maya out/hive_demo_maya.py      # Python-level check
 python3 tests/dcc_stub_run.py unreal out/hive_demo_unreal.py  # Python-level check
 pip install bpy && python tests/blender_check.py out/hive_demo_blender.py out/hive_demo.glb
+# The component library: add parts to the demo's guides, rebuild, then run the three checks above
+hive-rig add out/hive_demo.guides.json wings && hive-rig add out/hive_demo.guides.json arms --bendy && hive-rig rebuild out/hive_demo.hive.json
 python tests/blender_scene_check.py out/duel_rigs/duel_scene_blender.py # several characters, held props
 python3 tests/dcc_stub_run.py maya out/duel_rigs/duel_scene_maya.py      # scene builders run too
 python -I tests/blender_skin_eval.py out/hive_demo.hive.json            # skin weight quality
